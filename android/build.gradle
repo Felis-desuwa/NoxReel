@@ -1,0 +1,11 @@
+// 根构建脚本。插件版本在这里声明，模块里只 apply。
+// 版本组合是刻意选的：AGP 7.4.2 + Gradle 7.6.3 + Kotlin 1.8.22，
+// 这套能在 JDK 17 上跑，也不强制 JDK 17 之外的东西。
+plugins {
+    id 'com.android.application' version '7.4.2' apply false
+    id 'org.jetbrains.kotlin.android' version '1.8.22' apply false
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.buildDir
+}

@@ -30,3 +30,14 @@ Thumbs.db
 .env
 .env.local
 *.mmdb
+
+# 安卓构建产物
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/*.iml
+*.apk
+*.keystore
+*.jks

@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>SyncWatch</title>
+<style>
+  :root { --bg:#14121f; --panel:#1e1b2e; --accent:#7c6bff; --text:#e8e6f0; --dim:#a09cb5; --good:#4ecb8d; --bad:#ff6b6b; --warn:#ffcc66; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin:0; height:100%; font-family: system-ui, "Segoe UI", Roboto, sans-serif; color:var(--text); }
+  body { background: transparent; }               /* 透明，露出底下 ExoPlayer 画面 */
+  button { font: inherit; cursor: pointer; border:none; border-radius:10px; padding:12px 16px; background:var(--panel); color:var(--text); }
+  button.primary { background: var(--accent); color:#fff; font-weight:600; }
+  button:active { opacity:.85; }
+  input, textarea { font: inherit; width:100%; padding:12px; border-radius:10px; border:1px solid #332f47; background:#17151f; color:var(--text); }
+  textarea { resize: vertical; }
+  label { display:block; font-size:13px; color:var(--dim); margin:14px 0 6px; }
+
+  /* -------- 大厅 -------- */
+  #lobby { position:fixed; inset:0; overflow:auto; background:var(--bg); padding:24px 20px 40px; }
+  #lobby h1 { font-size:22px; margin:8px 0 2px; }
+  #lobby .sub { color:var(--dim); font-size:13px; margin-bottom:18px; }
+  .tabs { display:flex; gap:8px; margin:18px 0 4px; }
+  .tabs button { flex:1; background:transparent; border:1px solid #332f47; color:var(--dim); }
+  .tabs button.on { background:var(--panel); color:var(--text); border-color:var(--accent); }
+  .panel { display:none; }
+  .panel.on { display:block; }
+  .hint { font-size:12px; color:var(--dim); margin-top:8px; line-height:1.6; }
+  #log { margin-top:18px; font-size:12px; color:var(--dim); white-space:pre-wrap; max-height:26vh; overflow:auto; border-top:1px solid #26233a; padding-top:10px; }
+  .log-good { color:var(--good); } .log-bad { color:var(--bad); } .log-warn { color:var(--warn); }
+
+  /* -------- 播放层（叠在视频上） -------- */
+  #stage { position:fixed; inset:0; display:none; pointer-events:none; }   /* 默认不吃触摸，露出播放画面 */
+  #stage .bar { position:absolute; left:0; right:0; padding:12px 16px; background:linear-gradient(#000a,#0000); pointer-events:auto; }
+  #topbar { top:0; display:flex; align-items:center; gap:12px; }
+  #film { font-weight:600; font-size:15px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #peers { font-size:12px; color:var(--dim); }
+  #status { font-size:12px; color:var(--dim); margin-top:2px; width:100%; }
+  #botbar { bottom:0; background:linear-gradient(#0000,#000c); display:flex; flex-direction:column; gap:8px; padding-bottom:20px; }
+  #buf { height:4px; border-radius:2px; background:#ffffff22; overflow:hidden; }
+  #buf > i { display:block; height:100%; width:0; background:var(--accent); }
+  .row { display:flex; align-items:center; gap:12px; }
+  #pp { width:52px; height:44px; padding:0; font-size:18px; }
+  #seek { flex:1; }
+  #time { font-size:12px; color:var(--dim); min-width:92px; text-align:right; font-variant-numeric: tabular-nums; }
+  #waiting { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#000b; border:1px solid var(--warn);
+             color:var(--warn); padding:14px 20px; border-radius:12px; font-size:14px; display:none; text-align:center; max-width:80%; }
+</style>
+</head>
+<body>
+
+  <!-- 大厅：加入房间 -->
+  <div id="lobby">
+    <h1>SyncWatch</h1>
+    <div class="sub">P2P 同步观影 · 手机作为观众加入（不做房主）</div>
+
+    <label>你的昵称</label>
+    <input id="name" placeholder="比如：小明的手机" maxlength="20" />
+
+    <div class="tabs">
+      <button id="tab-server" class="on">信令服务器</button>
+      <button id="tab-manual">极简粘贴</button>
+    </div>
+
+    <!-- 信令服务器模式 -->
+    <div id="panel-server" class="panel on">
+      <label>信令服务器地址</label>
+      <input id="url" placeholder="ws://电脑局域网IP:8080" />
+      <label>房间号（和电脑端填一样的）</label>
+      <input id="room" placeholder="比如：movie-night" />
+      <button class="primary" id="join" style="margin-top:16px; width:100%">加入房间</button>
+      <div class="hint">电脑端启动信令服务器后，把它所在电脑的局域网 IP 填这里（例如 <code>ws://192.168.1.20:8080</code>）。手机和电脑要在同一网络，或电脑有公网地址。</div>
+    </div>
+
+    <!-- 极简粘贴模式 -->
+    <div id="panel-manual" class="panel">
+      <label>粘贴房主给你的邀请码</label>
+      <textarea id="host-code" rows="4" placeholder="SW1-..."></textarea>
+      <button class="primary" id="gen-answer" style="margin-top:12px; width:100%">生成应答码</button>
+      <div id="answer-wrap" style="display:none">
+        <label>把这段应答码发回给房主（他粘贴后才连上）</label>
+        <textarea id="answer-out" rows="4" readonly></textarea>
+        <button id="copy-answer" style="margin-top:8px; width:100%">复制应答码</button>
+      </div>
+      <div class="hint">极简模式不需要服务器，但要你俩手动互传一次邀请码/应答码。适合没有信令服务器时用。</div>
+    </div>
+
+    <div id="log"></div>
+  </div>
+
+  <!-- 播放层：叠在 ExoPlayer 画面之上 -->
+  <div id="stage">
+    <div id="topbar" class="bar">
+      <div>
+        <div id="film">—</div>
+        <div id="status"></div>
+      </div>
+      <div id="peers"></div>
+    </div>
+
+    <div id="waiting"></div>
+
+    <div id="botbar" class="bar">
+      <div id="buf"><i></i></div>
+      <div class="row">
+        <button id="pp">▶</button>
+        <input id="seek" type="range" min="0" max="1000" value="0" />
+        <div id="time">0:00 / 0:00</div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="js/app-android.js"></script>
+</body>
+</html>
