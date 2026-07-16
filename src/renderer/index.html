@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ws: wss:;"
+    />
+    <title>SyncWatch</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- 启动闸门：地区校验 + 依赖检查 -->
+      <section id="view-boot" class="view active">
+        <div class="boot">
+          <div class="logo">SyncWatch</div>
+          <div class="boot-status" id="boot-status">正在检查运行环境…</div>
+          <div class="spinner" id="boot-spinner"></div>
+        </div>
+      </section>
+
+      <header id="topbar" class="hidden">
+        <div class="brand">SyncWatch</div>
+        <div class="topbar-right">
+          <span class="pill" id="pill-geo"></span>
+          <span class="pill" id="pill-deps"></span>
+          <button class="ghost" id="btn-settings">设置</button>
+        </div>
+      </header>
+
+      <!-- 首页 -->
+      <section id="view-home" class="view">
+        <div class="home">
+          <!-- 所在地区不在设计范围内时的告知。只提示，不阻止。 -->
+          <div class="notice hidden" id="geo-notice">
+            <div class="notice-body">
+              <b>你所在的地区不在本软件的设计范围内</b>
+              <p id="geo-notice-text"></p>
+            </div>
+            <button class="notice-x" id="geo-notice-x" title="知道了">×</button>
+          </div>
+
+          <h1>和朋友一起看，片子只要一个人有</h1>
+          <p class="sub">
+            拖一个视频进来生成邀请码，其他人不需要这个文件就能加入 ——
+            边下边播，谁的网卡了大家一起等他。
+          </p>
+
+          <div class="cards">
+            <div class="card drop" id="dropzone">
+              <div class="card-icon">＋</div>
+              <h3>发起放映</h3>
+              <p>把 MP4 或 MKV 拖到这里，或者点击选择</p>
+              <p class="fine">最大 5GB · 只支持你自己合法拥有的内容</p>
+            </div>
+
+            <div class="card">
+              <div class="card-icon">→</div>
+              <h3>加入放映</h3>
+              <p>粘贴朋友给你的邀请码</p>
+              <textarea id="join-code" placeholder="SW1-…" spellcheck="false"></textarea>
+              <button class="primary" id="btn-join">加入</button>
+              <div class="err" id="join-err"></div>
+            </div>
+          </div>
+
+          <p class="tos">
+            本软件仅用于观看你自有的合法内容，不提供任何内容搜索或资源索引功能。
+            使用即表示你确认对所分享文件拥有合法权利。<br />
+            软件仅针对北美网络环境设计与测试，其他地区未做适配，P2P 直连可能无法建立。
+          </p>
+        </div>
+      </section>
+
+      <!-- 准备中：检测 / 转封装 / 计算分片哈希 -->
+      <section id="view-prepare" class="view">
+        <div class="prepare">
+          <h2 id="prep-title">正在准备文件</h2>
+          <div class="file-line" id="prep-file"></div>
+          <div class="steps" id="prep-steps"></div>
+          <div class="bar"><div class="bar-fill" id="prep-bar"></div></div>
+          <div class="prep-note" id="prep-note"></div>
+          <div class="prep-actions" id="prep-actions"></div>
+        </div>
+      </section>
+
+      <!-- 房间 -->
+      <section id="view-room" class="view">
+        <div class="room">
+          <div class="room-main">
+            <div class="film">
+              <div class="film-name" id="room-file"></div>
+              <div class="film-meta" id="room-meta"></div>
+            </div>
+
+            <!-- 核心可视化：连续水位线 vs 播放头 -->
+            <div class="buffer-block">
+              <div class="buffer-legend">
+                <span><i class="sw-play"></i>播放位置</span>
+                <span><i class="sw-safe"></i>可连续播放</span>
+                <span><i class="sw-have"></i>已下载（含空洞）</span>
+              </div>
+              <div class="buffer" id="buffer">
+                <div class="buf-have" id="buf-have"></div>
+                <div class="buf-safe" id="buf-safe"></div>
+                <div class="buf-head" id="buf-head"></div>
+                <canvas class="buf-map" id="buf-map"></canvas>
+              </div>
+              <div class="buffer-stats" id="buffer-stats"></div>
+            </div>
+
+            <div class="status-banner" id="status-banner"></div>
+
+            <div class="controls">
+              <button class="primary big" id="btn-playpause" disabled>播放</button>
+              <div class="time" id="time-display">0:00 / 0:00</div>
+              <button class="ghost" id="btn-reveal">打开文件位置</button>
+            </div>
+
+            <div class="log" id="event-log"></div>
+          </div>
+
+          <aside class="room-side">
+            <div class="side-block">
+              <h4>成员 <span class="count" id="peer-count">0</span></h4>
+              <div id="peer-list" class="peer-list"></div>
+            </div>
+
+            <div class="side-block" id="invite-block">
+              <h4>邀请</h4>
+              <div id="invite-body"></div>
+            </div>
+
+            <div class="side-block">
+              <h4>传输</h4>
+              <div class="kv" id="transfer-stats"></div>
+            </div>
+
+            <button class="ghost danger" id="btn-leave">离开房间</button>
+          </aside>
+        </div>
+      </section>
+
+      <!-- 设置 -->
+      <div id="modal" class="modal hidden">
+        <div class="modal-box">
+          <h3 id="modal-title">设置</h3>
+          <div id="modal-body"></div>
+          <div class="modal-actions">
+            <button class="ghost" id="modal-cancel">取消</button>
+            <button class="primary" id="modal-ok">确定</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

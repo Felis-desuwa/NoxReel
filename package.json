@@ -1,0 +1,34 @@
+{
+  "name": "syncwatch",
+  "version": "0.1.0",
+  "description": "P2P 同步观影分发软件 — 边下边播，播放位置优先调度，全员缓冲联动",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "signal": "node signaling-server/server.js",
+    "dist": "electron-builder"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "build": {
+    "appId": "com.syncwatch.app",
+    "productName": "SyncWatch",
+    "win": {
+      "target": "nsis"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ]
+  },
+  "allowScripts": {
+    "electron@31.7.7": true
+  }
+}
