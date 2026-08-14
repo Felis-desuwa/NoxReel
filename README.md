@@ -17,10 +17,13 @@ npm install
 npm start                # 启动客户端
 npm run signal           # （可选）本机跑一个信令服务器
 npm test                 # 单元测试
-npm run dist             # 生成 Windows 一键安装包 dist/SyncWatch-Setup-*.exe
+npm run dist             # 同时生成完整离线包和小型联网安装器
+npm run dist:offline     # 仅生成完整离线安装包
+npm run dist:web         # 仅生成小型联网安装器
 ```
 
-正式 Windows 安装包已内置 mpv 和 yt-dlp；从源码运行时，也可以自行安装它们，或通过
+完整 Windows 安装包已内置 mpv 和 yt-dlp；小型联网安装器本身体积很小，会在安装时从
+对应 GitHub Release 下载压缩应用包。从源码运行时，也可以自行安装它们，或通过
 `SYNCWATCH_MPV_PATH` / `SYNCWATCH_YTDLP_PATH` 指定路径。ffmpeg 仍是本地 MP4 按需转封装组件。
 
 需要信令服务器时，双击 `启动信令服务器.bat`。
@@ -30,7 +33,11 @@ npm run dist             # 生成 Windows 一键安装包 dist/SyncWatch-Setup-*
 > 当命令执行，满屏报错还启动失败。PowerShell 能正确处理 UTF-8，所以逻辑放那边。
 > （那几个 .ps1 存的是 UTF-8 带 BOM —— Windows PowerShell 5.1 没 BOM 会按 ANSI 读，中文照样乱。）
 
-支持 **MP4 / MOV / M4V / MKV**，5GB 以内。
+支持 **MP4 / MOV / M4V / MKV**，10GB 以内。
+
+房间内可以由房主继续增加或切换本地视频/视频链接，不必让成员退出重连；房间人数可设为
+2–16 人。成员区只显示真正建立 P2P 连接的用户，并给出逐连接的上行、下行速度和延迟。
+手动分享尚未完成握手时不会再产生“待加入”幽灵用户。播放器窗口被关掉后可从房间重新打开。
 
 （.mov 和 .mp4 其实是同一个容器格式 ISOBMFF，box 结构完全一致 —— 同一个解析器不加改动就能读两者，ffprobe 也把它们报成同一个 demuxer。按后缀区别对待没有依据，所以一视同仁。）
 
@@ -149,7 +156,7 @@ BLOCKED_COUNTRIES=CN ALLOW_UNKNOWN=0 MAXMIND_DB=./GeoLite2-Country.mmdb npm run 
 - 全部补齐后还原文件与原文件 **SHA-256 逐字节一致**
 - 断点续传（这里抓到并修了一个真 bug —— `close()` 先标记 `closed` 导致位图永远写不出去，续传静默失效）
 - 位图在主进程和渲染进程两套独立实现之间往返一致
-- 5GB 上限
+- 10GB 上限
 
 **传输与调度**
 
@@ -176,7 +183,7 @@ BLOCKED_COUNTRIES=CN ALLOW_UNKNOWN=0 MAXMIND_DB=./GeoLite2-Country.mmdb npm run 
 - **真实网络下的 NAT 打洞成功率** —— 测试是本机环回，ICE 直接走 host 候选，没真正打过洞。这是唯一需要两台异地机器才能验的部分，也是剩下最大的技术风险。
 - **TURN 中继路径** —— 没有 TURN 服务器可测。
 - **多人（3+）同时在场** —— 逻辑支持，但只测过两个 peer。星型/网状拓扑下的转发扩散没实测。
-- **接近 5GB 上限** —— 实测到 1.75GB / 16 分钟，没跑过更大的。
+- **接近 10GB 上限** —— 算法与稀疏文件偏移已覆盖，真实媒体目前实测到 1.75GB / 16 分钟。
 
 ## 端到端测试抓到的问题
 

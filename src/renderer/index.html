@@ -52,7 +52,7 @@
               <div class="card-icon">＋</div>
               <h3>发起放映</h3>
               <p>把 MP4 或 MKV 拖到这里，或者点击选择</p>
-              <p class="fine">最大 5GB · 只支持你自己合法拥有的内容</p>
+              <p class="fine">最大 10GB · 只支持你自己合法拥有的内容</p>
             </div>
 
             <div class="card link-card">
@@ -69,7 +69,7 @@
               <div class="card-icon">→</div>
               <h3>加入放映</h3>
               <p>粘贴朋友给你的邀请码</p>
-              <textarea id="join-code" placeholder="SW1-…" spellcheck="false"></textarea>
+              <textarea id="join-code" placeholder="SW2-…（兼容旧版 SW1）" spellcheck="false"></textarea>
               <button class="primary" id="btn-join">加入</button>
               <div class="err" id="join-err"></div>
             </div>
@@ -129,6 +129,7 @@
             <div class="controls">
               <button class="primary big" id="btn-playpause" disabled>播放</button>
               <div class="time" id="time-display">0:00 / 0:00</div>
+              <button class="ghost hidden" id="btn-reopen">重新打开播放器</button>
               <button class="ghost" id="btn-reveal">打开文件位置</button>
             </div>
 
@@ -144,6 +145,14 @@
             <div class="side-block" id="invite-block">
               <h4>邀请</h4>
               <div id="invite-body"></div>
+            </div>
+
+            <div class="side-block hidden" id="media-switch-block">
+              <h4>增加 / 切换视频</h4>
+              <button class="ghost" id="btn-switch-file">选择本地视频</button>
+              <input id="room-video-link" type="url" placeholder="https://…" spellcheck="false" />
+              <button class="ghost" id="btn-switch-link">切换到视频链接</button>
+              <p class="fine">成员保持连接，房主换片后会自动同步到全房。</p>
             </div>
 
             <div class="side-block">

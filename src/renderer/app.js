@@ -32,6 +32,10 @@ const S = {
   filePath: null,
   isSeeder: false,
   mpvRunning: false,
+  switchingMedia: false,
+  mediaRevision: 0,
+  roomCapacity: Math.max(2, Math.min(16, Number(localStorage.getItem('sw.roomCapacity')) || 4)),
+  pendingManualPeer: null,
   settings: {
     signalUrl: localStorage.getItem('sw.signalUrl') || 'ws://localhost:8080',
     stun: localStorage.getItem('sw.stun') || 'stun:stun.l.google.com:19302',
@@ -52,6 +56,22 @@ const fmtBytes = (b) => {
 };
 
 const fmtRate = (bps) => (bps > 0 ? `${fmtBytes(bps)}/s` : '—');
+const clampCapacity = (value) => Math.max(2, Math.min(16, Number.parseInt(value, 10) || 4));
+
+function connectedPeerCount() {
+  return (S.swarm?.peerList() || []).filter((p) => p.state === 'connected' || p.state === 'completed').length;
+}
+
+async function copyCode(code, button, idleLabel = '复制邀请码') {
+  try {
+    await Promise.resolve(window.sw.clipboard.writeText(code));
+    button.textContent = `已复制完整 ${code.length} 字符 ✓`;
+    setTimeout(() => (button.textContent = idleLabel), 1800);
+  } catch (e) {
+    button.textContent = '复制失败，请手动全选';
+    log(`复制邀请码失败：${e.message || e}`, 'bad');
+  }
+}
 
 const fmtTime = (s) => {
   if (!s || !isFinite(s) || s < 0) s = 0;
@@ -244,11 +264,10 @@ function setSteps(steps) {
 }
 
 async function startHost(filePath) {
-  S.role = 'host';
-  S.hostId = S.peerId; // 房主就是自己，角色权威在我这
-  S.isSeeder = true;
-  S.sourceType = 'file';
-  S.filePath = filePath;
+  if (!roomEntered) {
+    S.role = 'host';
+    S.hostId = S.peerId; // 房主就是自己，角色权威在我这
+  }
 
   show('view-prepare');
   $('prep-title').textContent = '正在准备文件';
@@ -295,7 +314,6 @@ async function startHost(filePath) {
       try {
         const { outPath } = await window.sw.media.remux(filePath);
         filePath = outPath;
-        S.filePath = outPath;
         $('prep-note').textContent = `已转封装到：${outPath}`;
       } finally {
         off();
@@ -327,14 +345,13 @@ async function startHost(filePath) {
     steps[3].state = 'active';
     setSteps(steps);
 
+    manifest = { ...manifest, roomRevision: S.mediaRevision + 1 };
     const state = await window.sw.store.openSeed(manifest, filePath);
-    S.manifest = manifest;
-    S.sessionId = state.sessionId;
 
     steps[3].state = 'done';
     setSteps(steps);
 
-    await enterRoom();
+    await activateFileSession({ manifest, state, filePath, isSeeder: true });
   } catch (e) {
     console.error(e);
     prepFail(e.message || String(e));
@@ -346,10 +363,10 @@ async function startHostLink(rawUrl) {
   $('link-err').textContent = '';
   if (!url) return;
 
-  S.role = 'host';
-  S.hostId = S.peerId;
-  S.isSeeder = true; // 链接模式没有 P2P 分片；视为媒体始终可用，避免触发文件缓冲联动
-  S.sourceType = 'link';
+  if (!roomEntered) {
+    S.role = 'host';
+    S.hostId = S.peerId;
+  }
 
   show('view-prepare');
   $('prep-title').textContent = '正在解析视频链接';
@@ -364,18 +381,92 @@ async function startHostLink(rawUrl) {
   ]);
 
   try {
-    S.linkInfo = await window.sw.media.inspectLink(url);
-    S.filePath = S.linkInfo.url;
+    const linkInfo = await window.sw.media.inspectLink(url);
     $('prep-bar').style.width = '85%';
     setSteps([
       { label: '验证链接', state: 'done' },
       { label: '解析视频信息', state: 'done' },
       { label: '创建同步房间', state: 'active' },
     ]);
-    await enterRoom();
+    await activateLinkSession(linkInfo, { revision: S.mediaRevision + 1, broadcast: true });
   } catch (e) {
     console.error(e);
     prepFail(e.message || String(e));
+  }
+}
+
+async function stopCurrentMedia() {
+  const oldSessionId = S.sessionId;
+  S.switchingMedia = true;
+  S.mpvRunning = false;
+  $('btn-playpause').disabled = true;
+  $('btn-reopen')?.classList.add('hidden');
+  await window.sw.mpv.quit().catch(() => {});
+  S.swarm?.clearSession();
+  if (oldSessionId) await window.sw.store.close(oldSessionId).catch(() => {});
+}
+
+async function activateFileSession({ manifest, state, filePath, isSeeder }) {
+  await stopCurrentMedia();
+  S.mediaRevision = Number(manifest.roomRevision) > 0
+    ? Math.max(S.mediaRevision, Number(manifest.roomRevision))
+    : S.mediaRevision + 1;
+  manifest.roomRevision = S.mediaRevision;
+  S.sourceType = 'file';
+  S.linkInfo = null;
+  S.manifest = manifest;
+  S.sessionId = state.sessionId;
+  S.filePath = filePath;
+  S.isSeeder = !!isSeeder;
+
+  initSwarmAndSync();
+  S.sync.resetMedia({ isSeeder: S.isSeeder });
+  S.swarm.setSession({ manifest, sessionId: state.sessionId, isSeeder: S.isSeeder, state });
+  S.sync.sizeHint = manifest.size;
+  S.switchingMedia = false;
+
+  if (!roomEntered) await enterRoom();
+  else {
+    show('view-room');
+    refreshMediaUi();
+    onSessionReady();
+    maybeLaunchPlayer(S.swarm.progress());
+    log(`已切换到：${manifest.name}`, 'good');
+  }
+}
+
+async function activateLinkSession(linkInfo, { revision, broadcast = false } = {}) {
+  await stopCurrentMedia();
+  S.mediaRevision = Number(revision) > 0 ? Math.max(S.mediaRevision, Number(revision)) : S.mediaRevision + 1;
+  S.sourceType = 'link';
+  S.linkInfo = linkInfo;
+  S.manifest = null;
+  S.sessionId = null;
+  S.filePath = linkInfo.url;
+  S.isSeeder = true; // 链接由每台电脑直接读取，不需要 P2P 分片
+
+  initSwarmAndSync();
+  S.sync.resetMedia({ isSeeder: true });
+  S.switchingMedia = false;
+
+  if (!roomEntered) await enterRoom();
+  else {
+    show('view-room');
+    refreshMediaUi();
+    await onLinkSessionReady();
+    log(`已切换到链接：${linkInfo.title || linkInfo.url}`, 'good');
+  }
+
+  if (broadcast && S.role === 'host') {
+    for (const peer of S.swarm.peers.values()) {
+      peer.send({
+        t: MSG.MEDIA_LINK,
+        url: linkInfo.url,
+        title: linkInfo.title,
+        duration: linkInfo.duration || 0,
+        revision: S.mediaRevision,
+      });
+    }
   }
 }
 
@@ -416,7 +507,7 @@ function prepFail(msg) {
 }
 
 function backHome() {
-  show('view-home');
+  show(roomEntered ? 'view-room' : 'view-home');
 }
 
 /* ------------------------------ 加入放映 ------------------------------ */
@@ -447,6 +538,7 @@ async function joinViaManual(payload) {
   S.hostId = payload.from; // 邀请码里带着房主身份，认它做角色权威
   S.mode = 'manual';
   S.isSeeder = false;
+  S.roomCapacity = clampCapacity(payload.maxMembers || S.roomCapacity);
 
   show('view-prepare');
   $('prep-title').textContent = '正在建立点对点连接';
@@ -489,11 +581,7 @@ async function joinViaManual(payload) {
   `;
   $('answer-code').value = code;
   $('answer-code').select();
-  $('copy-answer').onclick = () => {
-    navigator.clipboard.writeText(code);
-    $('copy-answer').textContent = '已复制 ✓';
-    setTimeout(() => ($('copy-answer').textContent = '复制应答码'), 1500);
-  };
+  $('copy-answer').onclick = () => copyCode(code, $('copy-answer'), '复制应答码');
 
   // 连上之后 swarm 会收到清单，那时才真正进房
   peer.once('open', () => enterRoom());
@@ -505,6 +593,7 @@ async function joinViaServer(payload) {
   S.hostId = payload.from; // 邀请码里带着房主身份，认它做角色权威
   S.mode = 'server';
   S.isSeeder = false;
+  S.roomCapacity = clampCapacity(payload.maxMembers || S.roomCapacity);
 
   show('view-prepare');
   $('prep-title').textContent = '正在连接信令服务器';
@@ -539,7 +628,13 @@ async function joinViaServer(payload) {
 /* ------------------------------ 信令连接 ------------------------------ */
 
 async function connectSignaling(url, roomId) {
-  const sig = new WsSignaling({ url, roomId, peerId: S.peerId, name: S.name });
+  const sig = new WsSignaling({
+    url,
+    roomId,
+    peerId: S.peerId,
+    name: S.name,
+    maxMembers: S.role === 'host' ? S.roomCapacity : 0,
+  });
   S.signaling = sig;
 
   // 规则：房间里的老成员向新来的发起 offer。这样不会两边同时发 offer 撞车。
@@ -572,6 +667,15 @@ async function connectSignaling(url, roomId) {
   });
 
   sig.on('peer-leave', ({ peerId }) => S.swarm.removePeer(peerId));
+  sig.on('joined', ({ maxMembers }) => {
+    if (maxMembers) S.roomCapacity = clampCapacity(maxMembers);
+    renderCapacityStatus();
+  });
+  sig.on('room-config', ({ maxMembers }) => {
+    S.roomCapacity = clampCapacity(maxMembers);
+    renderCapacityStatus();
+    log(`房间人数上限已设为 ${S.roomCapacity}`, 'good');
+  });
   sig.on('reconnecting', ({ in: ms }) => log(`信令断开，${Math.round(ms / 1000)} 秒后重连（已建立的直连不受影响）`, 'warn'));
   sig.on('error', (e) => log(`信令错误：${e.message}`, 'bad'));
 
@@ -592,6 +696,7 @@ function wirePeer(peer, sig) {
         url: S.linkInfo.url,
         title: S.linkInfo.title,
         duration: S.linkInfo.duration || 0,
+        revision: S.mediaRevision,
       });
     }
   });
@@ -615,11 +720,10 @@ function wirePeer(peer, sig) {
 
 async function handleMediaLink(msg, peer) {
   // 片源类型只能由邀请码中钉死的房主指定，防止普通成员替换全房媒体。
-  if (S.role === 'host' || !S.hostId || peer.peerId !== S.hostId || S.linkInfo) return;
+  if (S.role === 'host' || !S.hostId || peer.peerId !== S.hostId) return;
   if (typeof msg.url !== 'string') return;
+  if (Number(msg.revision) && Number(msg.revision) <= S.mediaRevision) return;
 
-  S.sourceType = 'link';
-  S.isSeeder = true;
   show('view-prepare');
   $('prep-title').textContent = '正在本机解析房主的视频链接';
   $('prep-file').textContent = msg.title || msg.url;
@@ -633,15 +737,14 @@ async function handleMediaLink(msg, peer) {
 
   try {
     const local = await window.sw.media.inspectLink(msg.url);
-    S.linkInfo = {
+    if (Number(msg.revision) && Number(msg.revision) <= S.mediaRevision) return;
+    const linkInfo = {
       ...local,
       title: msg.title || local.title,
       duration: Number(msg.duration) || local.duration || 0,
     };
-    S.filePath = S.linkInfo.url;
     $('prep-bar').style.width = '90%';
-    await enterRoom();
-    await onLinkSessionReady();
+    await activateLinkSession(linkInfo, { revision: Number(msg.revision) || S.mediaRevision + 1 });
   } catch (e) {
     prepFail(`这个视频链接在你的电脑上无法解析：${e.message || e}`);
   }
@@ -706,14 +809,21 @@ function initSwarmAndSync() {
   });
 
   // 我这边还没有文件 → 对方把清单发来了 → 建接收会话
-  S.swarm.on('manifest-offer', async ({ manifest }) => {
-    if (S.manifest) return;
-    S.manifest = manifest;
+  S.swarm.on('manifest-offer', async ({ manifest, from }) => {
+    if (S.role === 'host') return;
+    if (S.hostId && from !== S.hostId) {
+      log('忽略了非房主发来的换片请求', 'warn');
+      return;
+    }
+    const revision = Number(manifest.roomRevision) || 0;
+    if (revision && revision <= S.mediaRevision) return;
+
     const state = await window.sw.store.openLeech(manifest, null);
-    S.sessionId = state.sessionId;
-    S.filePath = state.filePath;
-    S.swarm.setSession({ manifest, sessionId: state.sessionId, isSeeder: false, state });
-    S.sync.sizeHint = manifest.size;
+    if (revision && revision <= S.mediaRevision) {
+      await window.sw.store.close(state.sessionId).catch(() => {});
+      return;
+    }
+    await activateFileSession({ manifest, state, filePath: state.filePath, isSeeder: false });
 
     log(
       state.resumed
@@ -722,8 +832,6 @@ function initSwarmAndSync() {
       'good'
     );
 
-    await enterRoom();
-    onSessionReady();
     maybeLaunchPlayer(S.swarm.progress()); // 续传时片头可能早就有了，不必再等
   });
 
@@ -766,17 +874,23 @@ async function enterRoom() {
 
   show('view-room');
 
-  renderFilmInfo();
+  refreshMediaUi();
   renderMyRole();
   renderInvite();
   renderPeers([]);
-  renderProgress(S.swarm.progress());
-  $('btn-reveal').classList.toggle('hidden', S.sourceType === 'link');
-  $('buffer').classList.toggle('link-mode', S.sourceType === 'link');
 
   // 片源进房时会话已经就绪；观众要等清单到了才由 manifest-offer 那边调
   if (S.isSeeder && S.manifest) onSessionReady();
   else if (S.sourceType === 'link' && S.linkInfo) await onLinkSessionReady();
+}
+
+function refreshMediaUi() {
+  renderFilmInfo();
+  renderProgress(S.swarm?.progress());
+  $('btn-reveal').classList.toggle('hidden', S.sourceType === 'link');
+  $('buffer').classList.toggle('link-mode', S.sourceType === 'link');
+  $('media-switch-block')?.classList.toggle('hidden', S.role !== 'host');
+  $('btn-reopen')?.classList.toggle('hidden', S.mpvRunning || !S.filePath);
 }
 
 /**
@@ -813,6 +927,7 @@ const HEAD_READY_BYTES = 8 * 1024 * 1024;
 /** 会话就绪：同步引擎立刻开工（哪怕播放器还没起，也要参与 stall 计算）。 */
 function onSessionReady() {
   renderFilmInfo();
+  S.syncStarted = true;
   S.sync.start();
   if (S.isSeeder) launchPlayer(); // 片源本地就有完整文件，不用等
 }
@@ -820,11 +935,9 @@ function onSessionReady() {
 async function onLinkSessionReady() {
   if (!S.linkInfo) return;
   renderFilmInfo();
-  if (!S.syncStarted) {
-    S.syncStarted = true;
-    if (S.linkInfo.duration) S.sync.setMediaInfo({ duration: S.linkInfo.duration, size: 0 });
-    S.sync.start();
-  }
+  S.syncStarted = true;
+  if (S.linkInfo.duration) S.sync.setMediaInfo({ duration: S.linkInfo.duration, size: 0 });
+  S.sync.start();
   await launchPlayer();
   renderProgress(S.swarm.progress());
 }
@@ -841,9 +954,11 @@ async function launchPlayer() {
   try {
     await window.sw.mpv.launch(S.filePath, true);
     $('btn-playpause').disabled = false;
+    $('btn-reopen')?.classList.add('hidden');
     log('mpv 已启动（先暂停着，等所有人就绪）', 'good');
   } catch (e) {
     S.mpvRunning = false; // 占位撤回，否则再也不会重试
+    $('btn-reopen')?.classList.remove('hidden');
     if (e.message.includes('mpv')) {
       log('没找到 mpv，无法播放。装好 mpv 后点右上角「重新检测」。', 'bad');
       showDepsHelp();
@@ -871,6 +986,12 @@ async function renderInvite() {
   }
 
   box.innerHTML = `
+    <div class="capacity-row">
+      <label for="room-capacity">房间人数上限</label>
+      <input type="number" id="room-capacity" min="2" max="16" value="${S.roomCapacity}" />
+      <button class="ghost" id="capacity-apply">应用</button>
+    </div>
+    <p class="fine" id="capacity-status"></p>
     <button class="primary" id="inv-server">用信令服务器邀请</button>
     <button class="ghost" id="inv-manual">极简模式（零服务器）</button>
     <p id="inv-hint">信令服务器只转发连接地址，不碰视频内容。极简模式连这个都不要，代价是要手动来回粘贴两次。</p>
@@ -879,6 +1000,28 @@ async function renderInvite() {
 
   $('inv-server').onclick = inviteViaServer;
   $('inv-manual').onclick = inviteViaManual;
+  $('capacity-apply').onclick = applyRoomCapacity;
+  renderCapacityStatus();
+}
+
+function renderCapacityStatus() {
+  const input = $('room-capacity');
+  const status = $('capacity-status');
+  if (input) input.value = String(S.roomCapacity);
+  if (status) status.textContent = `当前 ${connectedPeerCount() + 1} / ${S.roomCapacity} 人（包含房主）`;
+}
+
+function applyRoomCapacity() {
+  const next = clampCapacity($('room-capacity')?.value);
+  const current = connectedPeerCount() + 1;
+  if (next < current) {
+    $('capacity-status').textContent = `当前已有 ${current} 人，人数上限不能低于当前人数。`;
+    return;
+  }
+  S.roomCapacity = next;
+  localStorage.setItem('sw.roomCapacity', String(next));
+  S.signaling?.setMaxMembers(next);
+  renderCapacityStatus();
 }
 
 async function inviteViaServer() {
@@ -900,19 +1043,16 @@ async function inviteViaServer() {
       from: S.peerId,
       name: S.name,
       file: inviteMediaInfo(),
+      maxMembers: S.roomCapacity,
     });
 
     out.innerHTML = `
-      <textarea readonly rows="3" id="inv-code"></textarea>
+      <textarea readonly rows="4" id="inv-code"></textarea>
       <button class="primary" id="inv-copy">复制邀请码</button>
-      <p>发给任何人，可以重复使用。房间会一直开着直到你离开。</p>
+      <p>完整短码共 ${code.length} 字符，可重复使用。房间会一直开着直到你离开。</p>
     `;
     $('inv-code').value = code;
-    $('inv-copy').onclick = () => {
-      navigator.clipboard.writeText(code);
-      $('inv-copy').textContent = '已复制 ✓';
-      setTimeout(() => ($('inv-copy').textContent = '复制邀请码'), 1500);
-    };
+    $('inv-copy').onclick = () => copyCode(code, $('inv-copy'));
     log(`房间已开：${S.roomId}`, 'good');
   } catch (e) {
     out.innerHTML = `
@@ -928,9 +1068,15 @@ async function inviteViaServer() {
  * 而且大家都只连到发起者（星型），彼此之间不互连。
  */
 async function inviteViaManual() {
+  if (connectedPeerCount() + 1 >= S.roomCapacity) {
+    $('inv-out').innerHTML = `<p style="color:var(--danger)">房间已满（${S.roomCapacity} 人）。请先调高人数上限。</p>`;
+    return;
+  }
   S.mode = 'manual';
   const out = $('inv-out');
   out.innerHTML = '<p>正在收集网络候选地址（几秒钟）…</p>';
+
+  S.pendingManualPeer?.close();
 
   const peer = new Peer({
     peerId: `pending-${Math.random().toString(36).slice(2, 8)}`,
@@ -939,8 +1085,7 @@ async function inviteViaManual() {
     iceServers: iceServers(),
     trickle: false,
   });
-  wirePeer(peer);
-  S.swarm.addPeer(peer);
+  S.pendingManualPeer = peer;
 
   const offer = await peer.createOffer();
   const code = await encodeCode({
@@ -949,40 +1094,43 @@ async function inviteViaManual() {
     name: S.name,
     sdp: offer,
     file: inviteMediaInfo(),
+    maxMembers: S.roomCapacity,
   });
 
   out.innerHTML = `
-    <textarea readonly rows="3" id="inv-code"></textarea>
+    <textarea readonly rows="4" id="inv-code"></textarea>
     <button class="primary" id="inv-copy">复制邀请码</button>
+    <p>完整邀请码共 ${code.length} 字符；在对方真正连上前，不会计入成员列表。</p>
     <p><b>第 2 步：</b>对方会给你一段应答码，粘到这里：</p>
-    <textarea rows="3" id="inv-answer" placeholder="SW1-…"></textarea>
+    <textarea rows="3" id="inv-answer" placeholder="SW2-…（也兼容 SW1）"></textarea>
     <button class="ghost" id="inv-accept">完成连接</button>
     <p id="inv-status"></p>
   `;
   $('inv-code').value = code;
-  $('inv-copy').onclick = () => {
-    navigator.clipboard.writeText(code);
-    $('inv-copy').textContent = '已复制 ✓';
-    setTimeout(() => ($('inv-copy').textContent = '复制邀请码'), 1500);
-  };
+  $('inv-copy').onclick = () => copyCode(code, $('inv-copy'));
 
   $('inv-accept').onclick = async () => {
     const raw = $('inv-answer').value.trim();
     if (!raw) return;
+    let registered = false;
     try {
       const payload = await decodeCode(raw);
       if (payload.k !== 'answer') throw new Error('这不是应答码');
 
-      // 应答码里才带着对面的真实身份，把占位 id 换掉。
-      // 必须走 swarm.renamePeer —— 它维护着好几张按 peerId 索引的表。
-      S.swarm.renamePeer(peer.peerId, payload.from, payload.name || '观众');
-
+      // 只有拿到真实身份后才登记到 swarm，避免“点分享就多一个待加入用户”的幽灵成员。
+      peer.peerId = payload.from;
+      peer.name = payload.name || '观众';
+      wirePeer(peer);
+      S.swarm.addPeer(peer);
+      registered = true;
+      S.pendingManualPeer = null;
       await peer.acceptAnswer(payload.sdp);
       $('inv-status').textContent = '正在打洞…';
       peer.once('open', () => {
         $('inv-status').textContent = `${peer.name} 已连上 ✓`;
       });
     } catch (e) {
+      if (registered) S.swarm.removePeer(peer.peerId);
       $('inv-status').textContent = e.message;
     }
   };
@@ -1067,7 +1215,7 @@ function drawChunkMap() {
   const scale = w / n;
   let runStart = -1;
 
-  // 连续段合并成一条画，比一片一格快得多（5GB 有 2500 片）
+  // 连续段合并成一条画，比一片一格快得多（10GB 有 5120 片）
   for (let i = 0; i <= n; i++) {
     const on = i < n && have[i] === 1;
     if (on && runStart === -1) runStart = i;
@@ -1082,7 +1230,9 @@ const ROLE_LABEL = { host: '房主', admin: '管理员', guest: '游客' };
 
 function renderPeers(list) {
   list = list || S.swarm?.peerList() || [];
+  list = list.filter((p) => p.state === 'connected' || p.state === 'completed');
   $('peer-count').textContent = list.length;
+  renderCapacityStatus();
 
   if (!list.length) {
     $('peer-list').innerHTML = `<p class="fine" style="padding:4px">还没有人加入。用右边的邀请码叫人。</p>`;
@@ -1110,12 +1260,12 @@ function renderPeers(list) {
           : `<span class="role-badge ${role}">${ROLE_LABEL[role]}</span>`;
       const mediaProgress =
         S.sourceType === 'link'
-          ? `<div class="peer-sub">链接同步 · ${p.rtt != null ? `${p.rtt}ms` : '—'}</div>`
+          ? `<div class="peer-sub">延迟 ${p.rtt != null ? `${p.rtt}ms` : '—'} · P2P 媒体速度 —（各自读取原网站）</div>`
           : `<div class="peer-bar"><div style="width:${(p.remoteRatio * 100).toFixed(1)}%"></div></div>
              <div class="peer-sub">
                持有 ${(p.remoteRatio * 100).toFixed(0)}% ·
-               ${p.rtt != null ? `${p.rtt}ms` : '—'} ·
-               ↓${fmtRate(p.downRate)}
+               延迟 ${p.rtt != null ? `${p.rtt}ms` : '—'} ·
+               ↓ ${fmtRate(p.downRate)} · ↑ ${fmtRate(p.upRate)}
              </div>`;
       return `
         <div class="peer">
@@ -1205,7 +1355,10 @@ window.sw.mpv.onTick((snap) => {
 window.sw.mpv.onExit(({ code }) => {
   S.mpvRunning = false;
   $('btn-playpause').disabled = true;
-  log(`mpv 退出了（code ${code}）`, 'warn');
+  if (!S.switchingMedia && S.filePath) {
+    $('btn-reopen')?.classList.remove('hidden');
+    log(`播放器已关闭（code ${code}），可在房间里重新打开`, 'warn');
+  }
   renderStatus();
 });
 
@@ -1218,6 +1371,18 @@ $('btn-playpause').onclick = () => {
   S.sync.userSetPaused(!S.sync.intendedPaused);
   renderStatus();
 };
+
+$('btn-reopen').onclick = launchPlayer;
+
+$('btn-switch-file').onclick = async () => {
+  const path = await window.sw.dialog.pickVideo();
+  if (path) startHost(path);
+};
+
+$('btn-switch-link').onclick = () => startHostLink($('room-video-link').value);
+$('room-video-link').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') startHostLink(e.currentTarget.value);
+});
 
 $('btn-reveal').onclick = () => {
   if (S.filePath) window.sw.store.reveal(S.filePath);
@@ -1259,6 +1424,11 @@ $('btn-settings').onclick = () => {
         <p class="hint">只转发连接地址，不接触视频内容。自己跑一个：<code>npm run signal</code></p>
       </div>
       <div class="field">
+        <label>新房间默认人数上限（2–16）</label>
+        <input type="number" id="set-capacity" min="2" max="16" value="${S.roomCapacity}" />
+        <p class="hint">进入房间后，房主也可以在邀请区实时调整。</p>
+      </div>
+      <div class="field">
         <label>STUN 服务器</label>
         <input type="text" id="set-stun" value="${esc(S.settings.stun)}" />
         <p class="hint">用来发现自己的公网地址，不传数据。</p>
@@ -1287,6 +1457,7 @@ $('btn-settings').onclick = () => {
     onOk: () => {
       S.name = $('set-name').value.trim() || S.name;
       S.settings.signalUrl = $('set-signal').value.trim();
+      S.roomCapacity = clampCapacity($('set-capacity').value);
       S.settings.stun = $('set-stun').value.trim();
       S.settings.turnEnabled = $('set-turn-on').checked;
       S.settings.turnUrl = $('set-turn-url').value.trim();
@@ -1295,6 +1466,7 @@ $('btn-settings').onclick = () => {
 
       localStorage.setItem('sw.name', S.name);
       localStorage.setItem('sw.signalUrl', S.settings.signalUrl);
+      localStorage.setItem('sw.roomCapacity', String(S.roomCapacity));
       localStorage.setItem('sw.stun', S.settings.stun);
       localStorage.setItem('sw.turnEnabled', S.settings.turnEnabled ? '1' : '0');
       localStorage.setItem('sw.turnUrl', S.settings.turnUrl);

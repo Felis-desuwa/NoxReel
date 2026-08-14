@@ -727,7 +727,10 @@ input:focus {
 }
 
 #invite-body textarea {
-  height: 70px;
+  min-height: 88px;
+  height: auto;
+  resize: vertical;
+  overflow-wrap: anywhere;
   margin-bottom: 8px;
 }
 #invite-body button {
@@ -738,6 +741,29 @@ input:focus {
   font-size: 11px;
   color: var(--dim);
   line-height: 1.6;
+}
+.capacity-row {
+  display: grid;
+  grid-template-columns: 1fr 58px 58px;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.capacity-row input,
+.capacity-row button {
+  width: 100%;
+  margin: 0 !important;
+  padding: 6px;
+}
+#media-switch-block input,
+#media-switch-block button {
+  width: 100%;
+  margin-bottom: 7px;
+}
+#media-switch-block p {
+  margin-top: 2px;
 }
 
 /* ------------------------------ 弹窗 ------------------------------ */

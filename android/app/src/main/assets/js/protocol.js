@@ -24,6 +24,8 @@ export const BUFFER_LOW_WATER = 1 * 1024 * 1024;
 export const MSG = {
   HELLO: 'hello',
   MANIFEST: 'manifest',
+  MANIFEST_START: 'manifest-start',
+  MANIFEST_PART: 'manifest-part',
   BITFIELD: 'bitfield',
   HAVE: 'have',
   REQUEST: 'request',

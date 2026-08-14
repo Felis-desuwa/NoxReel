@@ -79,6 +79,26 @@ export class SyncEngine extends Emitter {
     }
   }
 
+  /** 房间不散、只换影片：清空时间轴与缓冲共识，角色和 Peer 身份继续保留。 */
+  resetMedia({ isSeeder = this.isSeeder } = {}) {
+    this.isSeeder = !!isSeeder;
+    this.duration = 0;
+    this.bytesPerSecond = 0;
+    this.sizeHint = 0;
+    this.lastTick = null;
+    this.localStalled = false;
+    this.stalledPeers.clear();
+    this.intendedPaused = true;
+    this.shared = {
+      paused: true,
+      position: 0,
+      lamport: this.shared.lamport + 1,
+      by: this.peerId,
+    };
+    this.emit('state', this.status());
+    if (this.started && this.canIControl()) this._broadcastSync(0);
+  }
+
   get stallThresholdBytes() {
     return this.bytesPerSecond ? this.bytesPerSecond * STALL_THRESHOLD_SECONDS : FALLBACK_STALL_BYTES;
   }

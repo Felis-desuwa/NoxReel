@@ -1,6 +1,6 @@
 {
   "name": "syncwatch",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "P2P 同步观影分发软件 — 边下边播，播放位置优先调度，全员缓冲联动",
   "main": "src/main/main.js",
   "scripts": {
@@ -9,7 +9,9 @@
     "test": "node --test",
     "prepare:runtime": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-runtime.ps1",
     "predist": "npm run prepare:runtime",
-    "dist": "electron-builder --win nsis"
+    "dist": "npm run dist:offline && npm run dist:web",
+    "dist:offline": "electron-builder --win nsis",
+    "dist:web": "electron-builder --win nsis-web"
   },
   "author": "",
   "license": "MIT",
@@ -21,6 +23,7 @@
     "ws": "^8.18.0"
   },
   "build": {
+    "compression": "maximum",
     "appId": "com.syncwatch.app",
     "productName": "SyncWatch",
     "win": {
@@ -29,6 +32,16 @@
       "signAndEditExecutable": false
     },
     "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "SyncWatch"
+    },
+    "nsisWeb": {
+      "artifactName": "SyncWatch-WebSetup-${version}.${ext}",
+      "appPackageUrl": "https://github.com/Felis-desuwa/SyncWatch/releases/download/v${version}",
       "oneClick": true,
       "perMachine": false,
       "allowElevation": true,

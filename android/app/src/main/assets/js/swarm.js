@@ -13,6 +13,8 @@ import { Scheduler } from './scheduler.js';
 const TICK_MS = 250;
 const SERVE_CONCURRENCY = 2; // 每个 peer 同时最多给他发 2 片，多了会把 ctrl 通道也拖慢
 const PING_MS = 3000;
+const MANIFEST_HASHES_PER_PART = 600; // 约 40KB/条，稳稳低于 DataChannel 常见 64KB 单消息上限
+const MAX_MANIFEST_PARTS = 32;
 
 export class Swarm extends Emitter {
   constructor({ peerId, name }) {
@@ -46,6 +48,7 @@ export class Swarm extends Emitter {
   /* --------------------------- 会话与位图 --------------------------- */
 
   setSession({ manifest, sessionId, isSeeder, state }) {
+    this.clearSession({ notify: false });
     this.manifest = manifest;
     this.sessionId = sessionId;
     this.isSeeder = isSeeder;
@@ -67,6 +70,33 @@ export class Swarm extends Emitter {
     // 已经连上的人还不知道我有什么，补发一遍
     for (const p of this.peers.values()) this._sendIntro(p);
     this.emit('progress', this.progress());
+  }
+
+  /** 切换影片时只清媒体会话，保留房间里的 Peer 连接与计时器。 */
+  clearSession({ notify = true } = {}) {
+    for (const [index, info] of this.inflight) {
+      this.peers.get(info.peerId)?.send({ t: MSG.CANCEL, index });
+      this.peers.get(info.peerId)?.inflight.delete(index);
+    }
+    this.manifest = null;
+    this.sessionId = null;
+    this.isSeeder = false;
+    this.have = null;
+    this.haveCount = 0;
+    this.contiguousBytes = 0;
+    this.complete = false;
+    this.scheduler = null;
+    this.playbackByte = 0;
+    this.inflight.clear();
+    this.assembler.clear();
+    for (const peer of this.peers.values()) {
+      peer.remoteManifest = null;
+      peer.remoteHave = null;
+      peer.pendingManifest = null;
+      peer.inflight.clear();
+      peer.ready = false;
+    }
+    if (notify) this.emit('progress', this.progress());
   }
 
   setDuration(d) {
@@ -104,6 +134,7 @@ export class Swarm extends Emitter {
       peer.hello(this.peerId, this.name);
       this._sendIntro(peer);
       this.emit('peer-open', this._peerInfo(peer));
+      this.emit('peers', this.peerList());
     });
 
     peer.on('ctrl', (msg) => this._onCtrl(peer, msg));
@@ -171,9 +202,36 @@ export class Swarm extends Emitter {
 
   _sendIntro(peer) {
     if (!this.manifest) return;
-    peer.send({ t: MSG.MANIFEST, manifest: this.manifest });
+    this._sendManifest(peer, this.manifest);
     peer.send({ t: MSG.BITFIELD, bits: packBitfield(this.have) });
     peer.ready = true;
+  }
+
+  _sendManifest(peer, manifest) {
+    if (manifest.hashes.length <= MANIFEST_HASHES_PER_PART) {
+      peer.send({ t: MSG.MANIFEST, manifest });
+      return;
+    }
+    const { hashes, ...meta } = manifest;
+    const totalParts = Math.ceil(hashes.length / MANIFEST_HASHES_PER_PART);
+    peer.send({ t: MSG.MANIFEST_START, meta, totalParts });
+    for (let index = 0; index < totalParts; index++) {
+      peer.send({
+        t: MSG.MANIFEST_PART,
+        fileId: manifest.fileId,
+        index,
+        hashes: hashes.slice(index * MANIFEST_HASHES_PER_PART, (index + 1) * MANIFEST_HASHES_PER_PART),
+      });
+    }
+  }
+
+  _handleManifest(peer, manifest) {
+    if (!manifest?.fileId || !Array.isArray(manifest.hashes) || manifest.hashes.length !== manifest.chunkCount) return;
+    const previous = this.manifest;
+    peer.remoteManifest = manifest;
+    if (!previous || manifest.fileId !== previous.fileId) {
+      this.emit('manifest-offer', { manifest, from: peer.peerId, replacing: !!previous });
+    }
   }
 
   _peerInfo(peer) {
@@ -184,6 +242,7 @@ export class Swarm extends Emitter {
       state: peer.pc.iceConnectionState,
       rtt: peer.rtt ? Math.round(peer.rtt) : null,
       downRate: peer.downRate || 0,
+      upRate: peer.upRate || 0,
       bytesReceived: peer.bytesReceived,
       bytesSent: peer.bytesSent,
       remoteRatio: this.manifest?.chunkCount ? remoteCount / this.manifest.chunkCount : 0,
@@ -211,13 +270,45 @@ export class Swarm extends Emitter {
         break;
 
       case MSG.MANIFEST:
-        peer.remoteManifest = msg.manifest;
-        // 我还不知道要下什么 → 上层去建接收会话
-        if (!this.manifest) this.emit('manifest-offer', { manifest: msg.manifest, from: peer.peerId });
-        else if (msg.manifest.fileId !== this.manifest.fileId) {
-          this.emit('mismatch', { peerId: peer.peerId, theirs: msg.manifest, mine: this.manifest });
+        this._handleManifest(peer, msg.manifest);
+        break;
+
+      case MSG.MANIFEST_START: {
+        const totalParts = Number(msg.totalParts);
+        const meta = msg.meta;
+        if (
+          !meta?.fileId ||
+          !Number.isInteger(totalParts) ||
+          totalParts < 1 ||
+          totalParts > MAX_MANIFEST_PARTS ||
+          !Number.isInteger(meta.chunkCount) ||
+          meta.chunkCount < 1
+        ) break;
+        peer.pendingManifest = { meta, totalParts, parts: new Array(totalParts), received: 0 };
+        break;
+      }
+
+      case MSG.MANIFEST_PART: {
+        const pending = peer.pendingManifest;
+        const index = Number(msg.index);
+        if (
+          !pending ||
+          msg.fileId !== pending.meta.fileId ||
+          !Number.isInteger(index) ||
+          index < 0 ||
+          index >= pending.totalParts ||
+          !Array.isArray(msg.hashes) ||
+          msg.hashes.length > MANIFEST_HASHES_PER_PART ||
+          pending.parts[index]
+        ) break;
+        pending.parts[index] = msg.hashes;
+        pending.received++;
+        if (pending.received === pending.totalParts) {
+          peer.pendingManifest = null;
+          this._handleManifest(peer, { ...pending.meta, hashes: pending.parts.flat() });
         }
         break;
+      }
 
       case MSG.BITFIELD:
         if (peer.remoteManifest || this.manifest) {

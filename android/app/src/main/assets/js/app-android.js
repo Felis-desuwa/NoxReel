@@ -29,6 +29,7 @@ const S = {
   playerTimer: null,
   prog: { contiguousBytes: 0, complete: false },
   entered: false,
+  mediaRevision: 0,
 };
 
 /* ------------------------------ DOM 小工具 ------------------------------ */
@@ -120,9 +121,24 @@ function initSwarmAndSync() {
 }
 
 /* ------------------------- 收到清单 → 开会话 ------------------------- */
-function onManifestOffer({ manifest }) {
-  if (S.manifest) return;
+function onManifestOffer({ manifest, from }) {
+  const knownHost = S.hostId || S.sync?.hostId;
+  if (knownHost && from !== knownHost) {
+    log('已忽略非房主发来的换片请求', 'warn');
+    return;
+  }
+  const revision = Number(manifest.roomRevision) || 0;
+  if (revision && revision <= S.mediaRevision) return;
+
+  if (S.playerTimer) clearInterval(S.playerTimer);
+  S.playerTimer = null;
+  S.playerStarted = false;
+  window.swPlayer.release();
+  S.swarm.clearSession();
+  if (S.sessionId) window.sw.store.close(S.sessionId);
+
   S.manifest = manifest;
+  S.mediaRevision = revision || S.mediaRevision + 1;
   try {
     S.sessionId = window.sw.store.openLeech(manifest);
   } catch (e) {
@@ -131,6 +147,7 @@ function onManifestOffer({ manifest }) {
   }
   const state = window.sw.store.sessionState(S.sessionId);
   S.swarm.setSession({ manifest, sessionId: S.sessionId, isSeeder: false, state });
+  S.sync.resetMedia({ isSeeder: false });
   S.sync.setMediaInfo({ duration: 0, size: manifest.size });
   S.sync.start();
 
@@ -315,7 +332,9 @@ function renderStatus(p) {
 }
 
 function renderPeers() {
-  const n = S.swarm ? S.swarm.peers.size : 0;
+  const n = S.swarm
+    ? S.swarm.peerList().filter((p) => p.state === 'connected' || p.state === 'completed').length
+    : 0;
   $('peers').textContent = n ? `${n} 人在线` : '等待连接…';
 }
 
