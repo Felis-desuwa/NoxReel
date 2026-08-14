@@ -13,16 +13,18 @@
  * 2MB 的 Buffer 走 IPC 是结构化克隆，开销可接受，换来的是不用引 node-webrtc。
  */
 
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, clipboard } = require('electron');
 const path = require('path');
 const os = require('os');
 const fsp = require('fs/promises');
+const { pathToFileURL } = require('url');
 
 const store = require('./fileStore');
 const media = require('./media');
 const linkMedia = require('./linkMedia');
 const geo = require('./geo');
 const { MpvController, findMpv } = require('./mpv');
+const validate = require('./security');
 
 let win = null;
 /** @type {MpvController|null} */
@@ -30,6 +32,35 @@ let mpv = null;
 
 const DOWNLOAD_DIR = path.join(app.getPath('downloads'), 'NoxReel');
 const WORK_DIR = path.join(os.tmpdir(), 'noxreel');
+const MAIN_PAGE = path.join(__dirname, '..', 'renderer', 'index.html');
+const MAIN_PAGE_URL = pathToFileURL(MAIN_PAGE).href;
+
+app.enableSandbox();
+
+function isTrustedSender(event) {
+  return Boolean(
+    win &&
+      !win.isDestroyed() &&
+      event.sender === win.webContents &&
+      event.senderFrame === win.webContents.mainFrame &&
+      event.senderFrame?.url === MAIN_PAGE_URL
+  );
+}
+
+function secureHandle(channel, handler) {
+  ipcMain.handle(channel, async (event, ...args) => {
+    if (!isTrustedSender(event)) throw new Error('已拒绝不受信任页面的请求');
+    return handler(...args);
+  });
+}
+
+function safeExternalUrl(raw) {
+  try {
+    return validate.externalUrl(raw);
+  } catch {
+    return null;
+  }
+}
 
 function createWindow() {
   win = new BrowserWindow({
@@ -40,19 +71,35 @@ function createWindow() {
     backgroundColor: '#0e1116',
     title: 'NoxReel',
     icon: path.join(__dirname, '..', 'renderer', 'assets', 'noxreel-icon.png'),
+    ...(process.platform === 'win32'
+      ? {
+          titleBarStyle: 'hidden',
+          titleBarOverlay: {
+            color: '#070c17',
+            symbolColor: '#aebbd0',
+            height: 48,
+          },
+        }
+      : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
     },
   });
   win.setMenuBarVisibility(false);
-  win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+  win.loadFile(MAIN_PAGE);
+
+  win.webContents.on('will-navigate', (event, url) => {
+    if (url !== MAIN_PAGE_URL) event.preventDefault();
+  });
+  win.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
 
   // 外链一律走系统浏览器，不在应用里开新窗口
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:\/\//.test(url)) shell.openExternal(url);
+    const safeUrl = safeExternalUrl(url);
+    if (safeUrl) setImmediate(() => shell.openExternal(safeUrl).catch(() => {}));
     return { action: 'deny' };
   });
 }
@@ -85,7 +132,7 @@ async function cleanup() {
 
 /* ---------------------------------- 环境 ---------------------------------- */
 
-ipcMain.handle('env:status', async () => {
+secureHandle('env:status', async () => {
   const tools = media.toolStatus();
   const linkTools = linkMedia.toolStatus();
   return {
@@ -99,11 +146,15 @@ ipcMain.handle('env:status', async () => {
   };
 });
 
-ipcMain.handle('geo:check', async (_e, opts) => geo.check(opts || {}));
+secureHandle('geo:check', async (opts) => {
+  const value = opts === undefined ? {} : validate.plainObject(opts, '地区检测参数');
+  if (value.force !== undefined && typeof value.force !== 'boolean') throw new TypeError('无效的强制检测参数');
+  return geo.check({ force: value.force === true });
+});
 
 /* --------------------------------- 文件相关 -------------------------------- */
 
-ipcMain.handle('dialog:pickVideo', async () => {
+secureHandle('dialog:pickVideo', async () => {
   const r = await dialog.showOpenDialog(win, {
     title: '选择要一起看的视频',
     properties: ['openFile'],
@@ -112,48 +163,64 @@ ipcMain.handle('dialog:pickVideo', async () => {
   return r.canceled ? null : r.filePaths[0];
 });
 
-ipcMain.handle('media:inspect', async (_e, filePath) => media.inspect(filePath));
+secureHandle('media:inspect', async (filePath) => media.inspect(validate.absolutePath(filePath)));
 
-ipcMain.handle('media:remux', async (_e, filePath) => {
-  const { outPath } = await media.remux(filePath, WORK_DIR, {
+secureHandle('media:remux', async (filePath) => {
+  const { outPath } = await media.remux(validate.absolutePath(filePath), WORK_DIR, {
     onProgress: (p) => send('media:remuxProgress', { progress: p }),
   });
   return { outPath };
 });
 
-ipcMain.handle('media:inspectLink', async (_e, url) => linkMedia.inspectLink(url));
+secureHandle('media:inspectLink', async (url) => linkMedia.inspectLink(validate.httpUrl(url, '视频链接')));
 
-ipcMain.handle('store:buildManifest', async (_e, filePath) => {
-  return store.buildManifest(filePath, (p) => send('store:hashProgress', p));
+secureHandle('store:buildManifest', async (filePath) => {
+  return store.buildManifest(validate.absolutePath(filePath), (p) => send('store:hashProgress', p));
 });
 
-ipcMain.handle('store:openSeed', async (_e, { manifest, filePath }) => store.openSeed(manifest, filePath));
+secureHandle('store:openSeed', async (payload) => {
+  const { manifest, filePath } = validate.plainObject(payload, '做种参数');
+  return store.openSeed(validate.manifest(manifest), validate.absolutePath(filePath));
+});
 
-ipcMain.handle('store:openLeech', async (_e, { manifest, destDir }) =>
-  store.openLeech(manifest, destDir || DOWNLOAD_DIR)
-);
+secureHandle('store:openLeech', async (payload) => {
+  const { manifest, destDir } = validate.plainObject(payload, '接收参数');
+  const outputDir = destDir == null ? DOWNLOAD_DIR : validate.absolutePath(destDir, '下载目录');
+  return store.openLeech(validate.manifest(manifest), outputDir);
+});
 
-ipcMain.handle('store:readChunk', async (_e, { sessionId, index }) => {
-  const buf = await store.readChunk(sessionId, index);
+secureHandle('store:readChunk', async (payload) => {
+  const { sessionId, index } = validate.plainObject(payload, '读取分片参数');
+  const buf = await store.readChunk(validate.sessionId(sessionId), validate.integer(index, '分片下标', { min: 0 }));
   // 转成 ArrayBuffer 交给渲染进程，避免 Buffer 被序列化成 {type:'Buffer',data:[...]}
   return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
 });
 
-ipcMain.handle('store:writeChunk', async (_e, { sessionId, index, data }) =>
-  store.writeChunk(sessionId, index, Buffer.from(data))
-);
+secureHandle('store:writeChunk', async (payload) => {
+  const { sessionId, index, data } = validate.plainObject(payload, '写入分片参数');
+  return store.writeChunk(
+    validate.sessionId(sessionId),
+    validate.integer(index, '分片下标', { min: 0 }),
+    Buffer.from(validate.binary(data))
+  );
+});
 
-ipcMain.handle('store:state', async (_e, sessionId) => store.state(sessionId));
+secureHandle('store:state', async (sessionId) => store.state(validate.sessionId(sessionId)));
 
-ipcMain.handle('store:close', async (_e, sessionId) => store.close(sessionId));
+secureHandle('store:close', async (sessionId) => store.close(validate.sessionId(sessionId)));
 
-ipcMain.handle('store:reveal', async (_e, filePath) => {
-  shell.showItemInFolder(filePath);
+secureHandle('store:reveal', async (filePath) => {
+  shell.showItemInFolder(validate.absolutePath(filePath));
 });
 
 /* ---------------------------------- mpv ---------------------------------- */
 
-ipcMain.handle('mpv:launch', async (_e, { filePath, startPaused }) => {
+secureHandle('mpv:launch', async (payload) => {
+  const { filePath, startPaused } = validate.plainObject(payload, '播放器启动参数');
+  const source = /^https?:\/\//i.test(filePath)
+    ? validate.httpUrl(filePath, '媒体链接')
+    : validate.absolutePath(filePath, '媒体路径');
+  if (typeof startPaused !== 'boolean') throw new TypeError('无效的暂停参数');
   if (mpv) await mpv.quit().catch(() => {});
   mpv = new MpvController();
 
@@ -161,39 +228,48 @@ ipcMain.handle('mpv:launch', async (_e, { filePath, startPaused }) => {
   mpv.on('exit', (info) => send('mpv:exit', info));
   mpv.on('error', (err) => send('mpv:error', { message: err.message }));
 
-  return mpv.launch(filePath, { startPaused });
+  return mpv.launch(source, { startPaused });
 });
 
-ipcMain.handle('mpv:setPause', async (_e, paused) => {
+secureHandle('mpv:setPause', async (paused) => {
+  if (typeof paused !== 'boolean') throw new TypeError('无效的暂停参数');
   if (!mpv) throw new Error('mpv 未启动');
   return mpv.setPause(paused);
 });
 
-ipcMain.handle('mpv:seek', async (_e, seconds) => {
+secureHandle('mpv:seek', async (seconds) => {
   if (!mpv) throw new Error('mpv 未启动');
-  return mpv.seek(seconds);
+  return mpv.seek(validate.finiteNumber(seconds, '播放位置', { min: 0, max: 10 ** 9 }));
 });
 
-ipcMain.handle('mpv:osd', async (_e, { text, duration }) => {
+secureHandle('mpv:osd', async (payload) => {
+  const { text, duration } = validate.plainObject(payload, '播放器提示参数');
   if (!mpv) return;
-  return mpv.osd(text, duration);
+  return mpv.osd(
+    validate.string(text, '提示文本', { max: 1000, allowEmpty: true }),
+    validate.integer(duration, '提示时长', { min: 0, max: 60_000 })
+  );
 });
 
-ipcMain.handle('mpv:snapshot', async () => (mpv ? mpv.snapshot() : { running: false }));
+secureHandle('mpv:snapshot', async () => (mpv ? mpv.snapshot() : { running: false }));
 
-ipcMain.handle('mpv:quit', async () => {
+secureHandle('mpv:quit', async () => {
   if (mpv) await mpv.quit();
   mpv = null;
 });
 
 /* --------------------------------- 杂项 ---------------------------------- */
 
-ipcMain.handle('app:openExternal', async (_e, url) => {
-  if (/^https?:\/\//.test(url)) await shell.openExternal(url);
+secureHandle('app:openExternal', async (url) => {
+  await shell.openExternal(validate.externalUrl(url));
 });
 
-ipcMain.handle('app:ensureDirs', async () => {
+secureHandle('app:ensureDirs', async () => {
   await fsp.mkdir(DOWNLOAD_DIR, { recursive: true });
   await fsp.mkdir(WORK_DIR, { recursive: true });
   return { downloadDir: DOWNLOAD_DIR, workDir: WORK_DIR };
+});
+
+secureHandle('clipboard:writeText', async (text) => {
+  clipboard.writeText(validate.string(String(text ?? ''), '剪贴板文本', { max: 2 * 1024 * 1024, allowEmpty: true }));
 });

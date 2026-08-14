@@ -15,6 +15,7 @@ const net = require('net');
 const path = require('path');
 const os = require('os');
 const { EventEmitter } = require('events');
+const { randomBytes } = require('crypto');
 const { findBin } = require('./findBin');
 const { findYtDlp } = require('./linkMedia');
 
@@ -58,7 +59,7 @@ class MpvController extends EventEmitter {
   }
 
   _ipcPath() {
-    const token = Math.random().toString(36).slice(2, 10);
+    const token = randomBytes(16).toString('hex');
     return process.platform === 'win32'
       ? `\\\\.\\pipe\\noxreel-${token}`
       : path.join(os.tmpdir(), `noxreel-${token}.sock`);

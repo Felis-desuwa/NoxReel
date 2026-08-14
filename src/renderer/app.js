@@ -13,9 +13,44 @@ import { encodeCode, decodeCode, WsSignaling, randomRoomId, randomPeerId } from 
  */
 
 const $ = (id) => document.getElementById(id);
+const randomInt = (min, max) => {
+  const value = crypto.getRandomValues(new Uint32Array(1))[0];
+  return min + (value % (max - min + 1));
+};
+
+function make(tag, options = {}, children = []) {
+  const node = document.createElement(tag);
+  if (options.id) node.id = options.id;
+  if (options.className) node.className = options.className;
+  if (options.text !== undefined) node.textContent = String(options.text);
+  if (options.attrs) {
+    for (const [name, value] of Object.entries(options.attrs)) node.setAttribute(name, String(value));
+  }
+  if (options.props) Object.assign(node, options.props);
+  for (const child of children.flat(Infinity)) {
+    if (child == null) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+function replace(target, ...children) {
+  const node = typeof target === 'string' ? $(target) : target;
+  node.replaceChildren(...children.flat(Infinity));
+  return node;
+}
+
+function field(label, ...children) {
+  return make('div', { className: 'field' }, [make('label', { text: label }), ...children]);
+}
+
+function hint(...children) {
+  return make('p', { className: 'hint' }, children);
+}
+
 const S = {
   peerId: randomPeerId(),
-  name: localStorage.getItem('sw.name') || `观众-${Math.floor(Math.random() * 900 + 100)}`,
+  name: localStorage.getItem('sw.name') || `观众-${randomInt(100, 999)}`,
   mode: null, // 'manual' | 'server'
   role: null, // 'host' | 'guest'（发起 or 加入，跟权限角色是两回事）
   hostId: null, // 房主的 peerId —— 角色权威只认它，从邀请码得来
@@ -95,8 +130,7 @@ function log(text, kind = '') {
   const line = document.createElement('div');
   line.className = `log-line ${kind}`;
   const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-  line.innerHTML = `<span class="log-time">${t}</span><span></span>`;
-  line.lastChild.textContent = text;
+  line.append(make('span', { className: 'log-time', text: t }), make('span', { text }));
   el.appendChild(line);
   el.scrollTop = el.scrollHeight;
   while (el.children.length > 300) el.removeChild(el.firstChild);
@@ -177,38 +211,43 @@ function updateDepsPill() {
 }
 
 function showDepsHelp() {
+  const dependency = (label, found, missing) =>
+    field(
+      label,
+      found ? hint('已找到：', make('code', { text: found })) : hint(missing)
+    );
+
   openModal({
     title: '缺少外部依赖',
-    body: `
-      <p class="fine">NoxReel 不自研播放器、编解码器和网站解析器，靠这些成熟组件干活：</p>
-      <div class="field">
-        <label>mpv —— 播放器（必需）</label>
-        <p class="hint">
-          ${S.env.mpv ? `已找到：<code>${esc(S.env.mpv)}</code>` : '未找到。装好后重启本软件即可。'}
-        </p>
-      </div>
-      <div class="field">
-        <label>ffmpeg —— 转封装（按需）</label>
-        <p class="hint">
-          ${S.env.ffmpeg ? `已找到：<code>${esc(S.env.ffmpeg)}</code>` : '未找到。只有当片子需要转封装时才会用到。'}
-        </p>
-      </div>
-      <div class="field">
-        <label>yt-dlp —— 视频网页解析（按需）</label>
-        <p class="hint">
-          ${S.env.ytDlp ? `已找到：<code>${esc(S.env.ytDlp)}</code>` : '未找到。MP4/HLS 直链仍可播放，视频网站页面链接不可用。'}
-        </p>
-      </div>
-      <div class="field">
-        <label>安装方式（任选其一）</label>
-        <p class="hint">
-          <code>winget install shinchiro.mpv Gyan.FFmpeg yt-dlp.yt-dlp</code><br />
-          <code>scoop install mpv ffmpeg yt-dlp</code><br />
-          或者手动下载后，把可执行文件路径写进环境变量
-          <code>SYNCWATCH_MPV_PATH</code> / <code>SYNCWATCH_FFMPEG_PATH</code> / <code>SYNCWATCH_YTDLP_PATH</code>。
-        </p>
-      </div>
-    `,
+    body: () => [
+      make('p', {
+        className: 'fine',
+        text: 'NoxReel 不自研播放器、编解码器和网站解析器，靠这些成熟组件干活：',
+      }),
+      dependency('mpv —— 播放器（必需）', S.env.mpv, '未找到。装好后重启本软件即可。'),
+      dependency('ffmpeg —— 转封装（按需）', S.env.ffmpeg, '未找到。只有当片子需要转封装时才会用到。'),
+      dependency(
+        'yt-dlp —— 视频网页解析（按需）',
+        S.env.ytDlp,
+        '未找到。MP4/HLS 直链仍可播放，视频网站页面链接不可用。'
+      ),
+      field(
+        '安装方式（任选其一）',
+        hint(
+          make('code', { text: 'winget install shinchiro.mpv Gyan.FFmpeg yt-dlp.yt-dlp' }),
+          make('br'),
+          make('code', { text: 'scoop install mpv ffmpeg yt-dlp' }),
+          make('br'),
+          '或者手动下载后，把可执行文件路径写进环境变量 ',
+          make('code', { text: 'SYNCWATCH_MPV_PATH' }),
+          ' / ',
+          make('code', { text: 'SYNCWATCH_FFMPEG_PATH' }),
+          ' / ',
+          make('code', { text: 'SYNCWATCH_YTDLP_PATH' }),
+          '。'
+        )
+      ),
+    ],
     okText: '重新检测',
     onOk: async () => {
       S.env = await window.sw.env.status();
@@ -217,9 +256,6 @@ function showDepsHelp() {
     },
   });
 }
-
-const esc = (s) =>
-  String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 /* ------------------------------ 发起放映 ------------------------------ */
 
@@ -253,14 +289,18 @@ window.addEventListener('dragover', (e) => e.preventDefault());
 window.addEventListener('drop', (e) => e.preventDefault());
 
 function setSteps(steps) {
-  $('prep-steps').innerHTML = steps
-    .map(
-      (s) =>
-        `<div class="step ${s.state}"><span class="step-mark">${
-          s.state === 'done' ? '✓' : s.state === 'active' ? '▸' : '·'
-        }</span><span>${esc(s.label)}</span></div>`
+  replace(
+    'prep-steps',
+    steps.map((step) =>
+      make('div', { className: `step ${step.state}` }, [
+        make('span', {
+          className: 'step-mark',
+          text: step.state === 'done' ? '✓' : step.state === 'active' ? '▸' : '·',
+        }),
+        make('span', { text: step.label }),
+      ])
     )
-    .join('');
+  );
 }
 
 async function startHost(filePath) {
@@ -273,7 +313,7 @@ async function startHost(filePath) {
   $('prep-title').textContent = '正在准备文件';
   $('prep-file').textContent = filePath;
   $('prep-bar').style.width = '0%';
-  $('prep-actions').innerHTML = '';
+  replace('prep-actions');
   $('prep-note').textContent = '';
 
   const steps = [
@@ -373,7 +413,7 @@ async function startHostLink(rawUrl) {
   $('prep-file').textContent = url;
   $('prep-bar').style.width = '35%';
   $('prep-note').textContent = '只读取媒体信息，不下载视频。每位参与者会直接从原始网站播放。';
-  $('prep-actions').innerHTML = '';
+  replace('prep-actions');
   setSteps([
     { label: '验证链接', state: 'done' },
     { label: '解析视频信息', state: 'active' },
@@ -474,20 +514,22 @@ function confirmRemux(info) {
   return new Promise((resolve) => {
     openModal({
       title: '这个文件需要先转封装',
-      body: `
-        <p class="fine">${esc(info.reason)}</p>
-        <div class="field" style="margin-top:14px">
-          <label>会做什么</label>
-          <p class="hint">
-            只重写容器外壳，把索引挪到文件开头。视频和音频数据原样搬运，
-            <b>不重新编码</b>，画质无损，通常几十秒完成。
-          </p>
-        </div>
-        <div class="field">
-          <label>产物</label>
-          <p class="hint">生成一个新文件，原文件不动。</p>
-        </div>
-      `,
+      body: () => {
+        const action = field(
+          '会做什么',
+          hint(
+            '只重写容器外壳，把索引挪到文件开头。视频和音频数据原样搬运，',
+            make('b', { text: '不重新编码' }),
+            '，画质无损，通常几十秒完成。'
+          )
+        );
+        action.style.marginTop = '14px';
+        return [
+          make('p', { className: 'fine', text: info.reason }),
+          action,
+          field('产物', hint('生成一个新文件，原文件不动。')),
+        ];
+      },
       okText: '转封装并继续',
       onOk: () => {
         resolve(true);
@@ -502,8 +544,9 @@ function prepFail(msg) {
   $('prep-title').textContent = '没法用这个文件';
   $('prep-note').textContent = msg;
   $('prep-bar').style.width = '0%';
-  $('prep-actions').innerHTML = '<button class="ghost" id="prep-back">返回</button>';
-  $('prep-back').onclick = backHome;
+  const back = make('button', { id: 'prep-back', className: 'ghost', text: '返回' });
+  back.onclick = backHome;
+  replace('prep-actions', back);
 }
 
 function backHome() {
@@ -573,12 +616,18 @@ async function joinViaManual(payload) {
   ]);
   $('prep-bar').style.width = '75%';
   $('prep-title').textContent = '把这段应答码发回给发起者';
-  $('prep-note').innerHTML =
-    '<b>还差最后一步：</b>把下面这段发回给对方，他粘贴之后连接才建立。这一来一回是「零服务器」的代价 —— 没有服务器帮你们交换地址，就只能你们自己传。';
-  $('prep-actions').innerHTML = `
-    <textarea id="answer-code" readonly rows="4" style="width:100%"></textarea>
-    <button class="primary" id="copy-answer">复制应答码</button>
-  `;
+  replace(
+    'prep-note',
+    make('b', { text: '还差最后一步：' }),
+    '把下面这段发回给对方，他粘贴之后连接才建立。这一来一回是「零服务器」的代价 —— 没有服务器帮你们交换地址，就只能你们自己传。'
+  );
+  const answerArea = make('textarea', {
+    id: 'answer-code',
+    attrs: { readonly: '', rows: 4 },
+  });
+  answerArea.style.width = '100%';
+  const copyAnswer = make('button', { id: 'copy-answer', className: 'primary', text: '复制应答码' });
+  replace('prep-actions', answerArea, copyAnswer);
   $('answer-code').value = code;
   $('answer-code').select();
   $('copy-answer').onclick = () => copyCode(code, $('copy-answer'), '复制应答码');
@@ -981,22 +1030,31 @@ async function renderInvite() {
   const box = $('invite-body');
 
   if (S.role !== 'host') {
-    box.innerHTML = `<p>你是通过邀请加入的。要拉更多人进来，让发起者再生成一个邀请码。</p>`;
+    replace(box, make('p', { text: '你是通过邀请加入的。要拉更多人进来，让发起者再生成一个邀请码。' }));
     return;
   }
 
-  box.innerHTML = `
-    <div class="capacity-row">
-      <label for="room-capacity">房间人数上限</label>
-      <input type="number" id="room-capacity" min="2" max="16" value="${S.roomCapacity}" />
-      <button class="ghost" id="capacity-apply">应用</button>
-    </div>
-    <p class="fine" id="capacity-status"></p>
-    <button class="primary" id="inv-server">用信令服务器邀请</button>
-    <button class="ghost" id="inv-manual">极简模式（零服务器）</button>
-    <p id="inv-hint">信令服务器只转发连接地址，不碰视频内容。极简模式连这个都不要，代价是要手动来回粘贴两次。</p>
-    <div id="inv-out"></div>
-  `;
+  const capacityInput = make('input', {
+    id: 'room-capacity',
+    attrs: { type: 'number', min: 2, max: 16 },
+    props: { value: String(S.roomCapacity) },
+  });
+  replace(
+    box,
+    make('div', { className: 'capacity-row' }, [
+      make('label', { text: '房间人数上限', attrs: { for: 'room-capacity' } }),
+      capacityInput,
+      make('button', { className: 'ghost', id: 'capacity-apply', text: '应用' }),
+    ]),
+    make('p', { className: 'fine', id: 'capacity-status' }),
+    make('button', { className: 'primary', id: 'inv-server', text: '用信令服务器邀请' }),
+    make('button', { className: 'ghost', id: 'inv-manual', text: '极简模式（零服务器）' }),
+    make('p', {
+      id: 'inv-hint',
+      text: '信令服务器只转发连接地址，不碰视频内容。极简模式连这个都不要，代价是要手动来回粘贴两次。',
+    }),
+    make('div', { id: 'inv-out' })
+  );
 
   $('inv-server').onclick = inviteViaServer;
   $('inv-manual').onclick = inviteViaManual;
@@ -1026,7 +1084,7 @@ function applyRoomCapacity() {
 
 async function inviteViaServer() {
   const out = $('inv-out');
-  out.innerHTML = '<p>正在连接信令服务器…</p>';
+  replace(out, make('p', { text: '正在连接信令服务器…' }));
 
   try {
     if (!S.signaling) {
@@ -1046,20 +1104,27 @@ async function inviteViaServer() {
       maxMembers: S.roomCapacity,
     });
 
-    out.innerHTML = `
-      <textarea readonly rows="4" id="inv-code"></textarea>
-      <button class="primary" id="inv-copy">复制邀请码</button>
-      <p>完整短码共 ${code.length} 字符，可重复使用。房间会一直开着直到你离开。</p>
-    `;
+    replace(
+      out,
+      make('textarea', { id: 'inv-code', attrs: { readonly: '', rows: 4 } }),
+      make('button', { className: 'primary', id: 'inv-copy', text: '复制邀请码' }),
+      make('p', { text: `完整短码共 ${code.length} 字符，可重复使用。房间会一直开着直到你离开。` })
+    );
     $('inv-code').value = code;
     $('inv-copy').onclick = () => copyCode(code, $('inv-copy'));
     log(`房间已开：${S.roomId}`, 'good');
   } catch (e) {
-    out.innerHTML = `
-      <p style="color:var(--danger)">${esc(e.message)}</p>
-      <p>信令服务器没跑起来的话，可以在本机执行 <code>npm run signal</code>，
-      或者直接用下面的极简模式。</p>
-    `;
+    const error = make('p', { text: e.message });
+    error.style.color = 'var(--danger)';
+    replace(
+      out,
+      error,
+      make('p', {}, [
+        '信令服务器没跑起来的话，可以在本机执行 ',
+        make('code', { text: 'npm run signal' }),
+        '，或者直接用下面的极简模式。',
+      ])
+    );
   }
 }
 
@@ -1069,17 +1134,19 @@ async function inviteViaServer() {
  */
 async function inviteViaManual() {
   if (connectedPeerCount() + 1 >= S.roomCapacity) {
-    $('inv-out').innerHTML = `<p style="color:var(--danger)">房间已满（${S.roomCapacity} 人）。请先调高人数上限。</p>`;
+    const full = make('p', { text: `房间已满（${S.roomCapacity} 人）。请先调高人数上限。` });
+    full.style.color = 'var(--danger)';
+    replace('inv-out', full);
     return;
   }
   S.mode = 'manual';
   const out = $('inv-out');
-  out.innerHTML = '<p>正在收集网络候选地址（几秒钟）…</p>';
+  replace(out, make('p', { text: '正在收集网络候选地址（几秒钟）…' }));
 
   S.pendingManualPeer?.close();
 
   const peer = new Peer({
-    peerId: `pending-${Math.random().toString(36).slice(2, 8)}`,
+    peerId: `pending-${crypto.randomUUID().replaceAll('-', '').slice(0, 6)}`,
     name: '待加入',
     initiator: true,
     iceServers: iceServers(),
@@ -1097,15 +1164,19 @@ async function inviteViaManual() {
     maxMembers: S.roomCapacity,
   });
 
-  out.innerHTML = `
-    <textarea readonly rows="4" id="inv-code"></textarea>
-    <button class="primary" id="inv-copy">复制邀请码</button>
-    <p>完整邀请码共 ${code.length} 字符；在对方真正连上前，不会计入成员列表。</p>
-    <p><b>第 2 步：</b>对方会给你一段应答码，粘到这里：</p>
-    <textarea rows="3" id="inv-answer" placeholder="NR2-…（兼容 SW2 / SW1）"></textarea>
-    <button class="ghost" id="inv-accept">完成连接</button>
-    <p id="inv-status"></p>
-  `;
+  replace(
+    out,
+    make('textarea', { id: 'inv-code', attrs: { readonly: '', rows: 4 } }),
+    make('button', { className: 'primary', id: 'inv-copy', text: '复制邀请码' }),
+    make('p', { text: `完整邀请码共 ${code.length} 字符；在对方真正连上前，不会计入成员列表。` }),
+    make('p', {}, [make('b', { text: '第 2 步：' }), '对方会给你一段应答码，粘到这里：']),
+    make('textarea', {
+      id: 'inv-answer',
+      attrs: { rows: 3, placeholder: 'NR2-…（兼容 SW2 / SW1）' },
+    }),
+    make('button', { className: 'ghost', id: 'inv-accept', text: '完成连接' }),
+    make('p', { id: 'inv-status' })
+  );
   $('inv-code').value = code;
   $('inv-copy').onclick = () => copyCode(code, $('inv-copy'));
 
@@ -1138,6 +1209,14 @@ async function inviteViaManual() {
 
 /* ------------------------------- 渲染 ------------------------------- */
 
+function stat(label, value) {
+  return make('span', {}, [make('b', { text: label }), ` ${value}`]);
+}
+
+function kv(label, value) {
+  return make('div', { className: 'kv-row' }, [make('span', { text: label }), make('span', { text: value })]);
+}
+
 function renderProgress(p) {
   if (!p) return;
 
@@ -1147,17 +1226,19 @@ function renderProgress(p) {
     const snap = S.sync?.lastTick;
     const playRatio = snap && S.sync.duration ? Math.min(1, (snap.position || 0) / S.sync.duration) : 0;
     $('buf-head').style.left = `${(playRatio * 100).toFixed(2)}%`;
-    $('buffer-stats').innerHTML = `
-      <span><b>来源</b> 原始视频网站</span>
-      <span><b>同步</b> 播放 / 暂停 / 跳转</span>
-      <span><b>缓冲</b> 由各自的 mpv 管理</span>
-    `;
-    $('transfer-stats').innerHTML = `
-      <div class="kv-row"><span>视频传输</span><span>原网站 → 每位成员</span></div>
-      <div class="kv-row"><span>房间消息</span><span>P2P 加密直连</span></div>
-      <div class="kv-row"><span>连接数</span><span>${S.swarm.peers.size}</span></div>
-      <div class="kv-row"><span>模式</span><span>${S.mode === 'manual' ? '极简（零服务器）' : '信令服务器'}</span></div>
-    `;
+    replace(
+      'buffer-stats',
+      stat('来源', '原始视频网站'),
+      stat('同步', '播放 / 暂停 / 跳转'),
+      stat('缓冲', '由各自的 mpv 管理')
+    );
+    replace(
+      'transfer-stats',
+      kv('视频传输', '原网站 → 每位成员'),
+      kv('房间消息', 'P2P 加密直连'),
+      kv('连接数', S.swarm.peers.size),
+      kv('模式', S.mode === 'manual' ? '极简（零服务器）' : '信令服务器')
+    );
     return;
   }
 
@@ -1173,20 +1254,22 @@ function renderProgress(p) {
 
   drawChunkMap();
 
-  $('buffer-stats').innerHTML = `
-    <span><b>已下载</b> ${(p.ratio * 100).toFixed(1)}%（${p.haveCount}/${p.chunkCount} 片）</span>
-    <span><b>可连续播放到</b> ${fmtBytes(p.contiguousBytes)}</span>
-    <span><b>在途</b> ${p.inflight} 片</span>
-    <span><b>速度</b> ${fmtRate(p.downRate)}</span>
-  `;
+  replace(
+    'buffer-stats',
+    stat('已下载', `${(p.ratio * 100).toFixed(1)}%（${p.haveCount}/${p.chunkCount} 片）`),
+    stat('可连续播放到', fmtBytes(p.contiguousBytes)),
+    stat('在途', `${p.inflight} 片`),
+    stat('速度', fmtRate(p.downRate))
+  );
 
-  $('transfer-stats').innerHTML = `
-    <div class="kv-row"><span>已收</span><span>${fmtBytes(p.received)}</span></div>
-    <div class="kv-row"><span>已发</span><span>${fmtBytes(p.sent)}</span></div>
-    <div class="kv-row"><span>下行</span><span>${fmtRate(p.downRate)}</span></div>
-    <div class="kv-row"><span>连接数</span><span>${S.swarm.peers.size}</span></div>
-    <div class="kv-row"><span>模式</span><span>${S.mode === 'manual' ? '极简（零服务器）' : '信令服务器'}</span></div>
-  `;
+  replace(
+    'transfer-stats',
+    kv('已收', fmtBytes(p.received)),
+    kv('已发', fmtBytes(p.sent)),
+    kv('下行', fmtRate(p.downRate)),
+    kv('连接数', S.swarm.peers.size),
+    kv('模式', S.mode === 'manual' ? '极简（零服务器）' : '信令服务器')
+  );
 
   // 播放位置告诉调度器，它据此决定先下哪些片
   if (snap) {
@@ -1235,49 +1318,61 @@ function renderPeers(list) {
   renderCapacityStatus();
 
   if (!list.length) {
-    $('peer-list').innerHTML = `<p class="fine" style="padding:4px">还没有人加入。用右边的邀请码叫人。</p>`;
+    const empty = make('p', { className: 'fine', text: '还没有人加入。用右边的邀请码叫人。' });
+    empty.style.padding = '4px';
+    replace('peer-list', empty);
     return;
   }
 
   const iAmHost = S.sync?.myRole() === 'host';
-
-  $('peer-list').innerHTML = list
-    .map((p) => {
-      const stalled = S.sync?.stalledPeers.has(p.peerId);
-      const role = S.sync?.roleOf(p.peerId) || 'guest';
-      const dotClass =
-        p.state === 'connected' || p.state === 'completed'
-          ? 'connected'
-          : p.state === 'failed'
-          ? 'failed'
-          : 'checking';
-      // 房主可以给每个人（房主自己除外）在管理员/游客之间切换。
-      const roleCtl =
+  replace(
+    'peer-list',
+    list.map((peer) => {
+      const stalled = S.sync?.stalledPeers.has(peer.peerId);
+      const candidateRole = S.sync?.roleOf(peer.peerId) || 'guest';
+      const role = ROLE_LABEL[candidateRole] ? candidateRole : 'guest';
+      const roleControl =
         iAmHost && role !== 'host'
-          ? `<button class="role-toggle" data-peer="${esc(p.peerId)}" data-next="${
-              role === 'admin' ? 'guest' : 'admin'
-            }">${role === 'admin' ? '设为游客' : '设为管理员'}</button>`
-          : `<span class="role-badge ${role}">${ROLE_LABEL[role]}</span>`;
-      const mediaProgress =
-        S.sourceType === 'link'
-          ? `<div class="peer-sub">延迟 ${p.rtt != null ? `${p.rtt}ms` : '—'} · P2P 媒体速度 —（各自读取原网站）</div>`
-          : `<div class="peer-bar"><div style="width:${(p.remoteRatio * 100).toFixed(1)}%"></div></div>
-             <div class="peer-sub">
-               持有 ${(p.remoteRatio * 100).toFixed(0)}% ·
-               延迟 ${p.rtt != null ? `${p.rtt}ms` : '—'} ·
-               ↓ ${fmtRate(p.downRate)} · ↑ ${fmtRate(p.upRate)}
-             </div>`;
-      return `
-        <div class="peer">
-          <div class="peer-top">
-            <span class="peer-name ${stalled ? 'stalled' : ''}">${esc(p.name)}</span>
-            <span class="dot ${dotClass}"></span>
-          </div>
-          <div class="peer-role">${roleCtl}</div>
-          ${mediaProgress}
-        </div>`;
+          ? make('button', {
+              className: 'role-toggle',
+              text: role === 'admin' ? '设为游客' : '设为管理员',
+              attrs: { 'data-peer': peer.peerId, 'data-next': role === 'admin' ? 'guest' : 'admin' },
+            })
+          : make('span', { className: `role-badge ${role}`, text: ROLE_LABEL[role] });
+
+      let mediaProgress;
+      if (S.sourceType === 'link') {
+        mediaProgress = [
+          make('div', {
+            className: 'peer-sub',
+            text: `延迟 ${peer.rtt != null ? `${peer.rtt}ms` : '—'} · P2P 媒体速度 —（各自读取原网站）`,
+          }),
+        ];
+      } else {
+        const ratio = Math.max(0, Math.min(1, Number(peer.remoteRatio) || 0));
+        const barValue = make('div');
+        barValue.style.width = `${(ratio * 100).toFixed(1)}%`;
+        mediaProgress = [
+          make('div', { className: 'peer-bar' }, [barValue]),
+          make('div', {
+            className: 'peer-sub',
+            text: `持有 ${(ratio * 100).toFixed(0)}% · 延迟 ${
+              peer.rtt != null ? `${peer.rtt}ms` : '—'
+            } · ↓ ${fmtRate(peer.downRate)} · ↑ ${fmtRate(peer.upRate)}`,
+          }),
+        ];
+      }
+
+      return make('div', { className: 'peer' }, [
+        make('div', { className: 'peer-top' }, [
+          make('span', { className: `peer-name ${stalled ? 'stalled' : ''}`, text: peer.name }),
+          make('span', { className: 'dot connected' }),
+        ]),
+        make('div', { className: 'peer-role' }, [roleControl]),
+        ...mediaProgress,
+      ]);
     })
-    .join('');
+  );
 }
 
 // 房主点「设为管理员/游客」—— 事件委托，省得每次重画都重新接线。
@@ -1413,46 +1508,78 @@ $('buffer').onclick = (e) => {
 $('btn-settings').onclick = () => {
   openModal({
     title: '设置',
-    body: `
-      <div class="field">
-        <label>你的昵称</label>
-        <input type="text" id="set-name" value="${esc(S.name)}" />
-      </div>
-      <div class="field">
-        <label>信令服务器</label>
-        <input type="text" id="set-signal" value="${esc(S.settings.signalUrl)}" />
-        <p class="hint">只转发连接地址，不接触视频内容。自己跑一个：<code>npm run signal</code></p>
-      </div>
-      <div class="field">
-        <label>新房间默认人数上限（2–16）</label>
-        <input type="number" id="set-capacity" min="2" max="16" value="${S.roomCapacity}" />
-        <p class="hint">进入房间后，房主也可以在邀请区实时调整。</p>
-      </div>
-      <div class="field">
-        <label>STUN 服务器</label>
-        <input type="text" id="set-stun" value="${esc(S.settings.stun)}" />
-        <p class="hint">用来发现自己的公网地址，不传数据。</p>
-      </div>
-      <div class="field">
-        <label class="check">
-          <input type="checkbox" id="set-turn-on" ${S.settings.turnEnabled ? 'checked' : ''} />
-          启用 TURN 中继兜底
-        </label>
-        <p class="hint">
-          双方都在严格 NAT（CGNAT、卫星网络）后面时，打洞会失败，这时数据要经过中继转发。
-          中继会看到加密后的流量并产生带宽成本，所以需要你自己提供服务器 —— 我们不代运营。
-        </p>
-      </div>
-      <div class="field">
-        <label>TURN 地址</label>
-        <input type="text" id="set-turn-url" value="${esc(S.settings.turnUrl)}" placeholder="turn:example.com:3478" />
-      </div>
-      <div class="field">
-        <label>TURN 用户名 / 密码</label>
-        <input type="text" id="set-turn-user" value="${esc(S.settings.turnUser)}" placeholder="用户名" />
-        <input type="text" id="set-turn-pass" value="${esc(S.settings.turnPass)}" placeholder="密码" style="margin-top:6px" />
-      </div>
-    `,
+    body: () => {
+      const turnPassword = make('input', {
+        id: 'set-turn-pass',
+        attrs: { type: 'text', placeholder: '密码' },
+        props: { value: S.settings.turnPass },
+      });
+      turnPassword.style.marginTop = '6px';
+      return [
+        field(
+          '你的昵称',
+          make('input', { id: 'set-name', attrs: { type: 'text' }, props: { value: S.name } })
+        ),
+        field(
+          '信令服务器',
+          make('input', {
+            id: 'set-signal',
+            attrs: { type: 'text' },
+            props: { value: S.settings.signalUrl },
+          }),
+          hint('只转发连接地址，不接触视频内容。自己跑一个：', make('code', { text: 'npm run signal' }))
+        ),
+        field(
+          '新房间默认人数上限（2–16）',
+          make('input', {
+            id: 'set-capacity',
+            attrs: { type: 'number', min: 2, max: 16 },
+            props: { value: String(S.roomCapacity) },
+          }),
+          hint('进入房间后，房主也可以在邀请区实时调整。')
+        ),
+        field(
+          'STUN 服务器',
+          make('input', {
+            id: 'set-stun',
+            attrs: { type: 'text' },
+            props: { value: S.settings.stun },
+          }),
+          hint('用来发现自己的公网地址，不传数据。')
+        ),
+        make('div', { className: 'field' }, [
+          make('label', { className: 'check' }, [
+            make('input', {
+              id: 'set-turn-on',
+              attrs: { type: 'checkbox' },
+              props: { checked: S.settings.turnEnabled },
+            }),
+            '启用 TURN 中继兜底',
+          ]),
+          hint(
+            '双方都在严格 NAT（CGNAT、卫星网络）后面时，打洞会失败，这时数据要经过中继转发。',
+            '中继会看到加密后的流量并产生带宽成本，所以需要你自己提供服务器 —— 我们不代运营。'
+          ),
+        ]),
+        field(
+          'TURN 地址',
+          make('input', {
+            id: 'set-turn-url',
+            attrs: { type: 'text', placeholder: 'turn:example.com:3478' },
+            props: { value: S.settings.turnUrl },
+          })
+        ),
+        field(
+          'TURN 用户名 / 密码',
+          make('input', {
+            id: 'set-turn-user',
+            attrs: { type: 'text', placeholder: '用户名' },
+            props: { value: S.settings.turnUser },
+          }),
+          turnPassword
+        ),
+      ];
+    },
     okText: '保存',
     onOk: () => {
       S.name = $('set-name').value.trim() || S.name;
@@ -1482,7 +1609,8 @@ let modalOnCancel = null;
 
 function openModal({ title, body, okText = '确定', onOk, onCancel }) {
   $('modal-title').textContent = title;
-  $('modal-body').innerHTML = body;
+  const content = typeof body === 'function' ? body() : body;
+  replace('modal-body', ...(Array.isArray(content) ? content : [content]));
   $('modal-ok').textContent = okText;
   modalOnOk = onOk;
   modalOnCancel = onCancel;

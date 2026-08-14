@@ -172,11 +172,14 @@ input:focus {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 18px;
+  min-height: 48px;
+  padding: 8px 156px 8px 18px;
   border-bottom: 1px solid var(--line);
   background: rgba(7, 12, 23, 0.92);
   backdrop-filter: blur(18px);
   flex-shrink: 0;
+  -webkit-app-region: drag;
+  user-select: none;
 }
 .brand {
   display: flex;
@@ -195,6 +198,12 @@ input:focus {
   display: flex;
   align-items: center;
   gap: 8px;
+  -webkit-app-region: no-drag;
+}
+
+/* 隐藏原生白色标题栏后，启动页也要保留一块可拖动区域。 */
+#view-boot.active {
+  -webkit-app-region: drag;
 }
 .pill {
   font-size: 11px;

@@ -5,7 +5,7 @@
  * contextIsolation 开着，渲染进程拿不到 Node —— 它只能用这里明确暴露的这些方法。
  */
 
-const { clipboard, contextBridge, ipcRenderer, webUtils } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const on = (channel) => (cb) => {
   const h = (_e, payload) => cb(payload);
@@ -15,7 +15,7 @@ const on = (channel) => (cb) => {
 
 contextBridge.exposeInMainWorld('sw', {
   clipboard: {
-    writeText: (text) => clipboard.writeText(String(text || '')),
+    writeText: (text) => ipcRenderer.invoke('clipboard:writeText', text),
   },
   env: {
     status: () => ipcRenderer.invoke('env:status'),
