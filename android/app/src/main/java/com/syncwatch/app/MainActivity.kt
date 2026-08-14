@@ -70,7 +70,7 @@ class MainActivity : AppCompatActivity() {
 
         web.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(m: ConsoleMessage): Boolean {
-                Log.d("SyncWatch/web", "${m.message()} @${m.sourceId()}:${m.lineNumber()}")
+                Log.d("NoxReel/web", "${m.message()} @${m.sourceId()}:${m.lineNumber()}")
                 return true
             }
             // 纯数据通道用不到摄像头/麦克风；万一请求了一律放行，别卡住 WebRTC

@@ -20,6 +20,7 @@ const fsp = require('fs/promises');
 
 const store = require('./fileStore');
 const media = require('./media');
+const linkMedia = require('./linkMedia');
 const geo = require('./geo');
 const { MpvController, findMpv } = require('./mpv');
 
@@ -27,8 +28,8 @@ let win = null;
 /** @type {MpvController|null} */
 let mpv = null;
 
-const DOWNLOAD_DIR = path.join(app.getPath('downloads'), 'SyncWatch');
-const WORK_DIR = path.join(os.tmpdir(), 'syncwatch');
+const DOWNLOAD_DIR = path.join(app.getPath('downloads'), 'NoxReel');
+const WORK_DIR = path.join(os.tmpdir(), 'noxreel');
 
 function createWindow() {
   win = new BrowserWindow({
@@ -37,7 +38,8 @@ function createWindow() {
     minWidth: 900,
     minHeight: 640,
     backgroundColor: '#0e1116',
-    title: 'SyncWatch',
+    title: 'NoxReel',
+    icon: path.join(__dirname, '..', 'renderer', 'assets', 'noxreel-icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -85,10 +87,12 @@ async function cleanup() {
 
 ipcMain.handle('env:status', async () => {
   const tools = media.toolStatus();
+  const linkTools = linkMedia.toolStatus();
   return {
     mpv: findMpv(),
     ffmpeg: tools.ffmpeg,
     ffprobe: tools.ffprobe,
+    ytDlp: linkTools.ytDlp,
     downloadDir: DOWNLOAD_DIR,
     platform: process.platform,
     version: app.getVersion(),
@@ -116,6 +120,8 @@ ipcMain.handle('media:remux', async (_e, filePath) => {
   });
   return { outPath };
 });
+
+ipcMain.handle('media:inspectLink', async (_e, url) => linkMedia.inspectLink(url));
 
 ipcMain.handle('store:buildManifest', async (_e, filePath) => {
   return store.buildManifest(filePath, (p) => send('store:hashProgress', p));

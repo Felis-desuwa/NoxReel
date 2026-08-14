@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
-<title>SyncWatch</title>
+<title>NoxReel</title>
 <style>
   :root { --bg:#14121f; --panel:#1e1b2e; --accent:#7c6bff; --text:#e8e6f0; --dim:#a09cb5; --good:#4ecb8d; --bad:#ff6b6b; --warn:#ffcc66; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -51,7 +51,7 @@
 
   <!-- 大厅：加入房间 -->
   <div id="lobby">
-    <h1>SyncWatch</h1>
+    <h1>NoxReel</h1>
     <div class="sub">P2P 同步观影 · 手机作为观众加入（不做房主）</div>
 
     <label>你的昵称</label>
@@ -75,7 +75,7 @@
     <!-- 极简粘贴模式 -->
     <div id="panel-manual" class="panel">
       <label>粘贴房主给你的邀请码</label>
-      <textarea id="host-code" rows="4" placeholder="SW1-..."></textarea>
+      <textarea id="host-code" rows="4" placeholder="NR2-...（兼容旧版 SW2 / SW1）"></textarea>
       <button class="primary" id="gen-answer" style="margin-top:12px; width:100%">生成应答码</button>
       <div id="answer-wrap" style="display:none">
         <label>把这段应答码发回给房主（他粘贴后才连上）</label>
@@ -94,6 +94,7 @@
       <div>
         <div id="film">—</div>
         <div id="status"></div>
+        <div id="role-hint"></div>
       </div>
       <div id="peers"></div>
     </div>

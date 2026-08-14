@@ -6,7 +6,7 @@
       http-equiv="Content-Security-Policy"
       content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ws: wss:;"
     />
-    <title>SyncWatch</title>
+    <title>NoxReel</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -14,14 +14,14 @@
       <!-- 启动闸门：地区校验 + 依赖检查 -->
       <section id="view-boot" class="view active">
         <div class="boot">
-          <div class="logo">SyncWatch</div>
+          <div class="logo"><img src="assets/noxreel-icon.png" alt="" /><span>NoxReel</span></div>
           <div class="boot-status" id="boot-status">正在检查运行环境…</div>
           <div class="spinner" id="boot-spinner"></div>
         </div>
       </section>
 
       <header id="topbar" class="hidden">
-        <div class="brand">SyncWatch</div>
+        <div class="brand"><img src="assets/noxreel-icon.png" alt="" /><span>NoxReel</span></div>
         <div class="topbar-right">
           <span class="pill" id="pill-geo"></span>
           <span class="pill" id="pill-deps"></span>
@@ -41,10 +41,10 @@
             <button class="notice-x" id="geo-notice-x" title="知道了">×</button>
           </div>
 
-          <h1>和朋友一起看，片子只要一个人有</h1>
+          <h1>和朋友一起看，本地视频和视频链接都能同步</h1>
           <p class="sub">
-            拖一个视频进来生成邀请码，其他人不需要这个文件就能加入 ——
-            边下边播，谁的网卡了大家一起等他。
+            分享本地视频时边下边播；粘贴公开视频链接时，每个人从原网站播放，
+            播放、暂停和进度保持同步。
           </p>
 
           <div class="cards">
@@ -52,14 +52,24 @@
               <div class="card-icon">＋</div>
               <h3>发起放映</h3>
               <p>把 MP4 或 MKV 拖到这里，或者点击选择</p>
-              <p class="fine">最大 5GB · 只支持你自己合法拥有的内容</p>
+              <p class="fine">最大 10GB · 只支持你自己合法拥有的内容</p>
+            </div>
+
+            <div class="card link-card">
+              <div class="card-icon">↗</div>
+              <h3>解析视频链接</h3>
+              <p>粘贴单个视频页面或 MP4 / HLS 直链</p>
+              <input id="video-link" type="url" placeholder="https://…" spellcheck="false" />
+              <button class="primary" id="btn-link">解析并发起</button>
+              <div class="err" id="link-err"></div>
+              <p class="fine">支持范围由 yt-dlp 与原网站决定；不绕过登录、付费或 DRM。</p>
             </div>
 
             <div class="card">
               <div class="card-icon">→</div>
               <h3>加入放映</h3>
               <p>粘贴朋友给你的邀请码</p>
-              <textarea id="join-code" placeholder="SW1-…" spellcheck="false"></textarea>
+              <textarea id="join-code" placeholder="NR2-…（兼容旧版 SW2 / SW1）" spellcheck="false"></textarea>
               <button class="primary" id="btn-join">加入</button>
               <div class="err" id="join-err"></div>
             </div>
@@ -90,8 +100,12 @@
         <div class="room">
           <div class="room-main">
             <div class="film">
-              <div class="film-name" id="room-file"></div>
+              <div class="film-name">
+                <span id="room-file"></span>
+                <span class="role-badge" id="my-role"></span>
+              </div>
               <div class="film-meta" id="room-meta"></div>
+              <div class="role-hint hidden" id="role-hint"></div>
             </div>
 
             <!-- 核心可视化：连续水位线 vs 播放头 -->
@@ -115,6 +129,7 @@
             <div class="controls">
               <button class="primary big" id="btn-playpause" disabled>播放</button>
               <div class="time" id="time-display">0:00 / 0:00</div>
+              <button class="ghost hidden" id="btn-reopen">重新打开播放器</button>
               <button class="ghost" id="btn-reveal">打开文件位置</button>
             </div>
 
@@ -130,6 +145,14 @@
             <div class="side-block" id="invite-block">
               <h4>邀请</h4>
               <div id="invite-body"></div>
+            </div>
+
+            <div class="side-block hidden" id="media-switch-block">
+              <h4>增加 / 切换视频</h4>
+              <button class="ghost" id="btn-switch-file">选择本地视频</button>
+              <input id="room-video-link" type="url" placeholder="https://…" spellcheck="false" />
+              <button class="ghost" id="btn-switch-link">切换到视频链接</button>
+              <p class="fine">成员保持连接，房主换片后会自动同步到全房。</p>
             </div>
 
             <div class="side-block">

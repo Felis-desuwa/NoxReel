@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * SyncWatch 信令服务器。
+ * NoxReel 信令服务器。
  *
  * 只做一件事：在房间内转发 SDP / ICE 候选这类连接元数据。
  * 它看不到、也存不下任何视频内容 —— 内容全程只在 peer 之间的 DataChannel 里跑。
@@ -22,6 +22,7 @@
  *   TRUST_PROXY       =1 时信任 X-Forwarded-For / CF-IPCountry（放在 CDN/WAF 后面时开）
  *   BLOCKED_COUNTRIES 逗号分隔的 ISO 国家码，默认空 —— 即不拦任何人
  *   ALLOW_UNKNOWN     =0 时查不到地区就拒绝（默认 1，放行）
+ *   MAX_ROOM_SIZE     服务端允许的房间人数硬上限，默认 16（范围 2–64）
  */
 
 const http = require('http');
@@ -34,7 +35,7 @@ const BLOCKED = new Set(
   (process.env.BLOCKED_COUNTRIES || '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean)
 );
 
-const MAX_ROOM_SIZE = 8;
+const MAX_ROOM_SIZE = Math.max(2, Math.min(64, parseInt(process.env.MAX_ROOM_SIZE, 10) || 16));
 const MAX_MSG_BYTES = 64 * 1024; // SDP 撑死几 KB，超过这个数就是有人在乱来
 const JOIN_TIMEOUT_MS = 10000;
 
@@ -118,11 +119,22 @@ function gate(req) {
 
 /* ------------------------------- 房间管理 ------------------------------- */
 
-/** @type {Map<string, Map<string, {ws:WebSocket, name:string}>>} */
+/** @type {Map<string, {members:Map<string, {ws:WebSocket, name:string}>, hostId:string, maxMembers:number}>} */
 const rooms = new Map();
 
-function roomOf(id) {
-  if (!rooms.has(id)) rooms.set(id, new Map());
+function normalizeCapacity(value) {
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) ? Math.max(2, Math.min(MAX_ROOM_SIZE, n)) : Math.min(4, MAX_ROOM_SIZE);
+}
+
+function roomOf(id, creatorId, requestedCapacity) {
+  if (!rooms.has(id)) {
+    rooms.set(id, {
+      members: new Map(),
+      hostId: creatorId,
+      maxMembers: normalizeCapacity(requestedCapacity),
+    });
+  }
   return rooms.get(id);
 }
 
@@ -131,12 +143,12 @@ function leave(ws) {
   const room = rooms.get(ws.roomId);
   if (!room) return;
 
-  room.delete(ws.peerId);
-  for (const { ws: other } of room.values()) {
+  room.members.delete(ws.peerId);
+  for (const { ws: other } of room.members.values()) {
     sendJson(other, { t: 'peer-leave', peerId: ws.peerId });
   }
-  if (room.size === 0) rooms.delete(ws.roomId);
-  console.log(`[room] ${ws.peerId} 离开 ${ws.roomId}（剩 ${room.size} 人）`);
+  if (room.members.size === 0) rooms.delete(ws.roomId);
+  console.log(`[room] ${ws.peerId} 离开 ${ws.roomId}（剩 ${room.members.size} 人）`);
 }
 
 function sendJson(ws, obj) {
@@ -146,6 +158,10 @@ function sendJson(ws, obj) {
 function fail(ws, code, message) {
   sendJson(ws, { t: 'error', code, message });
   setTimeout(() => ws.close(4003, code), 50); // 给客户端一点时间收到再断
+}
+
+function report(ws, code, message) {
+  sendJson(ws, { t: 'error', code, message });
 }
 
 /* -------------------------------- 服务器 -------------------------------- */
@@ -187,9 +203,9 @@ wss.on('connection', (ws, req) => {
       if (ws.roomId) return fail(ws, 'ALREADY_JOINED', '这个连接已经在房间里了');
       if (!msg.roomId || !msg.peerId) return fail(ws, 'BAD_JOIN', 'join 需要 roomId 和 peerId');
 
-      const room = roomOf(String(msg.roomId));
-      if (room.size >= MAX_ROOM_SIZE) return fail(ws, 'ROOM_FULL', `房间已满（上限 ${MAX_ROOM_SIZE} 人）`);
-      if (room.has(msg.peerId)) return fail(ws, 'DUP_PEER', 'peerId 已被占用');
+      const room = roomOf(String(msg.roomId), String(msg.peerId), msg.maxMembers);
+      if (room.members.size >= room.maxMembers) return fail(ws, 'ROOM_FULL', `房间已满（上限 ${room.maxMembers} 人）`);
+      if (room.members.has(msg.peerId)) return fail(ws, 'DUP_PEER', 'peerId 已被占用');
 
       clearTimeout(joinTimer);
       ws.roomId = String(msg.roomId);
@@ -197,22 +213,46 @@ wss.on('connection', (ws, req) => {
       ws.name = String(msg.name || msg.peerId).slice(0, 40);
 
       // 先把现有成员告诉新人，再通知老成员 —— 顺序反了新人会漏掉自己
-      const existing = [...room.entries()].map(([peerId, v]) => ({ peerId, name: v.name }));
-      room.set(ws.peerId, { ws, name: ws.name });
+      const existing = [...room.members.entries()].map(([peerId, v]) => ({ peerId, name: v.name }));
+      room.members.set(ws.peerId, { ws, name: ws.name });
 
-      sendJson(ws, { t: 'joined', roomId: ws.roomId, peerId: ws.peerId, peers: existing, country: verdict.country });
-      for (const [peerId, v] of room) {
+      sendJson(ws, {
+        t: 'joined',
+        roomId: ws.roomId,
+        peerId: ws.peerId,
+        peers: existing,
+        country: verdict.country,
+        hostId: room.hostId,
+        maxMembers: room.maxMembers,
+      });
+      for (const [peerId, v] of room.members) {
         if (peerId !== ws.peerId) sendJson(v.ws, { t: 'peer-join', peerId: ws.peerId, name: ws.name });
       }
 
-      console.log(`[room] ${ws.peerId}(${ws.name}) 加入 ${ws.roomId}（共 ${room.size} 人）`);
+      console.log(`[room] ${ws.peerId}(${ws.name}) 加入 ${ws.roomId}（${room.members.size}/${room.maxMembers} 人）`);
+      return;
+    }
+
+    if (msg.t === 'room-config') {
+      if (!ws.roomId) return report(ws, 'NOT_JOINED', '还没加入房间');
+      const room = rooms.get(ws.roomId);
+      if (!room || room.hostId !== ws.peerId) return report(ws, 'NOT_HOST', '只有房主能修改房间人数');
+      const next = normalizeCapacity(msg.maxMembers);
+      if (next < room.members.size) {
+        return report(ws, 'CAPACITY_TOO_SMALL', `当前已有 ${room.members.size} 人，人数上限不能设得更小`);
+      }
+      room.maxMembers = next;
+      for (const { ws: member } of room.members.values()) {
+        sendJson(member, { t: 'room-config', maxMembers: next });
+      }
+      console.log(`[room] ${ws.roomId} 人数上限改为 ${next}`);
       return;
     }
 
     if (msg.t === 'signal') {
       if (!ws.roomId) return fail(ws, 'NOT_JOINED', '还没加入房间');
       const room = rooms.get(ws.roomId);
-      const target = room?.get(String(msg.to));
+      const target = room?.members.get(String(msg.to));
       if (!target) return; // 人已经走了，静默丢弃
 
       // 只转发，不看内容。from 用服务端记录的值，不信客户端自报。

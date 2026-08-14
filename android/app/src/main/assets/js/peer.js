@@ -36,7 +36,9 @@ export class Peer extends Emitter {
     this.bytesReceived = 0;
     this.bytesSent = 0;
     this._lastRecvSample = { t: performance.now(), bytes: 0 };
+    this._lastSendSample = { t: performance.now(), bytes: 0 };
     this.downRate = 0;
+    this.upRate = 0;
 
     this.pc = new RTCPeerConnection({
       iceServers,
@@ -113,6 +115,14 @@ export class Peer extends Emitter {
     this._lastRecvSample = { t: now, bytes: this.bytesReceived };
   }
 
+  _sampleUploadRate() {
+    const now = performance.now();
+    const dt = now - this._lastSendSample.t;
+    if (dt < 500) return;
+    this.upRate = ((this.bytesSent - this._lastSendSample.bytes) * 1000) / dt;
+    this._lastSendSample = { t: now, bytes: this.bytesSent };
+  }
+
   _onCtrl(msg) {
     if (msg.t === MSG.PING) {
       this.send({ t: MSG.PONG, ts: msg.ts });
@@ -187,6 +197,8 @@ export class Peer extends Emitter {
   }
 
   ping() {
+    this._sampleRate();
+    this._sampleUploadRate();
     this.send({ t: MSG.PING, ts: performance.now() });
   }
 
@@ -202,6 +214,7 @@ export class Peer extends Emitter {
       if (this.data.bufferedAmount > BUFFER_HIGH_WATER) await this._drain();
       this.data.send(frame);
       this.bytesSent += frame.byteLength;
+      this._sampleUploadRate();
     }
   }
 

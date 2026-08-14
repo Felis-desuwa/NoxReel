@@ -101,6 +101,6 @@ class NativeBridge(
 
     companion object {
         const val NAME = "Native"
-        private const val TAG = "SyncWatch"
+        private const val TAG = "NoxReel"
     }
 }

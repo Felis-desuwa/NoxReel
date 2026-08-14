@@ -11,7 +11,10 @@ import { Emitter } from './emitter.js';
  * 两者都不落地视频内容，符合「只接受零内容服务器」的原则。
  */
 
-const CODE_PREFIX = 'SW1-';
+const LEGACY_PREFIX = 'SW1-';
+const PREVIOUS_PREFIX = 'SW2-';
+const CODE_PREFIX = 'NR2-';
+const MAX_CODE_LENGTH = 256 * 1024;
 
 async function gzip(str) {
   const cs = new CompressionStream('gzip');
@@ -39,23 +42,72 @@ function fromBase64Url(s) {
   return bytes;
 }
 
-/** 把握手信息打包成一段可粘贴的码。 */
+function packFile(file) {
+  return file ? [String(file.name || ''), Number(file.size) || 0, file.kind === 'link' ? 'l' : 'f'] : 0;
+}
+
+/** SW2 用定长数组代替重复的 JSON 键；房间可切片后，信令短码不再绑定片名。 */
+function compactPayload(payload) {
+  if (payload?.k === 'room') return ['r', payload.url, payload.room, payload.from, Number(payload.maxMembers) || 0];
+  if (payload?.k === 'offer') {
+    return ['o', payload.from, payload.name || '', payload.sdp, packFile(payload.file), Number(payload.maxMembers) || 0];
+  }
+  if (payload?.k === 'answer') return ['a', payload.from, payload.name || '', payload.sdp];
+  return payload;
+}
+
+function expandPayload(value) {
+  if (!Array.isArray(value)) return value;
+  if (value[0] === 'r') {
+    return { k: 'room', url: value[1], room: value[2], from: value[3], maxMembers: Number(value[4]) || 0 };
+  }
+  if (value[0] === 'o') {
+    const f = value[4];
+    return {
+      k: 'offer',
+      from: value[1],
+      name: value[2],
+      sdp: value[3],
+      file: Array.isArray(f) ? { name: f[0], size: Number(f[1]) || 0, kind: f[2] === 'l' ? 'link' : 'file' } : null,
+      maxMembers: Number(value[5]) || 0,
+    };
+  }
+  if (value[0] === 'a') return { k: 'answer', from: value[1], name: value[2], sdp: value[3] };
+  return value;
+}
+
+/** 把握手信息打包成一段可粘贴的码；短数据不再强行加 gzip 头。 */
 export async function encodeCode(payload) {
-  return CODE_PREFIX + toBase64Url(await gzip(JSON.stringify(payload)));
+  const json = JSON.stringify(compactPayload(payload));
+  const raw = new TextEncoder().encode(json);
+  const zipped = await gzip(json);
+  const compressed = zipped.length < raw.length;
+  return CODE_PREFIX + (compressed ? 'G' : 'R') + toBase64Url(compressed ? zipped : raw);
 }
 
 export async function decodeCode(code) {
   const trimmed = String(code).trim().replace(/\s+/g, '');
-  if (!trimmed.startsWith(CODE_PREFIX)) throw new Error('这不像是一个 SyncWatch 邀请码');
-  const body = trimmed.slice(CODE_PREFIX.length);
+  if (trimmed.length > MAX_CODE_LENGTH) throw new Error('邀请码异常过长');
+  const legacy = trimmed.startsWith(LEGACY_PREFIX);
+  const previous = trimmed.startsWith(PREVIOUS_PREFIX);
+  if (!legacy && !previous && !trimmed.startsWith(CODE_PREFIX)) throw new Error('这不像是一个 NoxReel 邀请码');
+  const prefix = legacy ? LEGACY_PREFIX : previous ? PREVIOUS_PREFIX : CODE_PREFIX;
+  const body = trimmed.slice(prefix.length);
   let json;
   try {
-    json = await gunzip(fromBase64Url(body));
+    if (legacy) json = await gunzip(fromBase64Url(body));
+    else {
+      const mode = body[0];
+      const bytes = fromBase64Url(body.slice(1));
+      if (mode === 'G') json = await gunzip(bytes);
+      else if (mode === 'R') json = new TextDecoder().decode(bytes);
+      else throw new Error('unknown mode');
+    }
   } catch {
     throw new Error('邀请码损坏或不完整 —— 复制的时候可能漏了一截');
   }
   try {
-    return JSON.parse(json);
+    return expandPayload(JSON.parse(json));
   } catch {
     throw new Error('邀请码内容无法解析');
   }
@@ -66,12 +118,13 @@ export async function decodeCode(code) {
  * 服务器只做房间内的消息转发，看不到也存不下视频内容。
  */
 export class WsSignaling extends Emitter {
-  constructor({ url, roomId, peerId, name }) {
+  constructor({ url, roomId, peerId, name, maxMembers = 0 }) {
     super();
     this.url = url;
     this.roomId = roomId;
     this.peerId = peerId;
     this.name = name;
+    this.maxMembers = Number(maxMembers) || 0;
     this.ws = null;
     this.connected = false;
     this._retry = 0;
@@ -90,7 +143,13 @@ export class WsSignaling extends Emitter {
       this.ws.onopen = () => {
         this.connected = true;
         this._retry = 0;
-        this._send({ t: 'join', roomId: this.roomId, peerId: this.peerId, name: this.name });
+        this._send({
+          t: 'join',
+          roomId: this.roomId,
+          peerId: this.peerId,
+          name: this.name,
+          maxMembers: this.maxMembers,
+        });
       };
 
       this.ws.onmessage = (e) => {
@@ -152,6 +211,11 @@ export class WsSignaling extends Emitter {
 
   signal(to, payload) {
     this._send({ t: 'signal', to, from: this.peerId, payload });
+  }
+
+  setMaxMembers(maxMembers) {
+    this.maxMembers = Number(maxMembers) || this.maxMembers;
+    this._send({ t: 'room-config', maxMembers: this.maxMembers });
   }
 
   close() {

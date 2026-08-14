@@ -5,6 +5,7 @@ node_modules/
 dist/
 out/
 build/
+vendor/
 
 # 运行时下载与转封装的临时文件
 Downloads/

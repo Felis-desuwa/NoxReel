@@ -146,12 +146,12 @@ async function inspect(filePath) {
       reason: `只支持 MP4／MOV 和 MKV，当前是 ${ext || '(无扩展名)'}`,
     };
   }
-  if (stat.size > 5 * 1024 ** 3) {
+  if (stat.size > 10 * 1024 ** 3) {
     return {
       action: 'reject',
       ext,
       size: stat.size,
-      reason: `文件超过 5GB 上限（当前 ${(stat.size / 1024 ** 3).toFixed(2)}GB）`,
+      reason: `文件超过 10GB 上限（当前 ${(stat.size / 1024 ** 3).toFixed(2)}GB）`,
     };
   }
 

@@ -19,6 +19,7 @@ const HEAD_READY_BYTES = 8 * 1024 * 1024; // 片头下够才起播（同 PC：�
 const S = {
   peerId: randomPeerId(),
   name: '',
+  hostId: null, // 房主 peerId：极简模式从邀请码得来；信令模式手里没码，靠首个 ROLE 认定
   swarm: null,
   sync: null,
   signaling: null,
@@ -28,6 +29,7 @@ const S = {
   playerTimer: null,
   prog: { contiguousBytes: 0, complete: false },
   entered: false,
+  mediaRevision: 0,
 };
 
 /* ------------------------------ DOM 小工具 ------------------------------ */
@@ -77,7 +79,12 @@ function initSwarmAndSync() {
   S.name = ($('name').value.trim() || '观众') .slice(0, 20);
 
   S.swarm = new Swarm({ peerId: S.peerId, name: S.name });
-  S.sync = new SyncEngine({ peerId: S.peerId, name: S.name, isSeeder: false });
+  S.sync = new SyncEngine({
+    peerId: S.peerId,
+    name: S.name,
+    isSeeder: false,
+    hostId: S.hostId, // 极简模式=邀请码里的房主 id；信令模式=null，先当游客，等首个 ROLE 认定
+  });
 
   // 同步引擎驱动原生播放器（对应 PC 端驱动 mpv）
   S.sync.onSetPause = (paused) => window.swPlayer.setPause(paused);
@@ -91,6 +98,15 @@ function initSwarmAndSync() {
   S.sync.on('stall-change', renderWaiting);
   S.sync.on('state', renderWaiting);
   S.sync.on('duration', (d) => { S.swarm.setDuration(d); });
+  // 房主分配的角色变了 → 更新「我是游客还是管理员」的界面（游客禁用拖动条）
+  S.sync.on('roles', renderRole);
+  // 游客拖了进度被拦下：把滑块弹回、给个提示
+  S.sync.on('denied', ({ action }) => {
+    if (action === 'seek') {
+      log('你是游客，不能拖动进度', 'warn');
+      renderRole();
+    }
+  });
 
   // swarm 事件
   S.swarm.on('manifest-offer', onManifestOffer);
@@ -105,9 +121,24 @@ function initSwarmAndSync() {
 }
 
 /* ------------------------- 收到清单 → 开会话 ------------------------- */
-function onManifestOffer({ manifest }) {
-  if (S.manifest) return;
+function onManifestOffer({ manifest, from }) {
+  const knownHost = S.hostId || S.sync?.hostId;
+  if (knownHost && from !== knownHost) {
+    log('已忽略非房主发来的换片请求', 'warn');
+    return;
+  }
+  const revision = Number(manifest.roomRevision) || 0;
+  if (revision && revision <= S.mediaRevision) return;
+
+  if (S.playerTimer) clearInterval(S.playerTimer);
+  S.playerTimer = null;
+  S.playerStarted = false;
+  window.swPlayer.release();
+  S.swarm.clearSession();
+  if (S.sessionId) window.sw.store.close(S.sessionId);
+
   S.manifest = manifest;
+  S.mediaRevision = revision || S.mediaRevision + 1;
   try {
     S.sessionId = window.sw.store.openLeech(manifest);
   } catch (e) {
@@ -116,6 +147,7 @@ function onManifestOffer({ manifest }) {
   }
   const state = window.sw.store.sessionState(S.sessionId);
   S.swarm.setSession({ manifest, sessionId: S.sessionId, isSeeder: false, state });
+  S.sync.resetMedia({ isSeeder: false });
   S.sync.setMediaInfo({ duration: 0, size: manifest.size });
   S.sync.start();
 
@@ -237,6 +269,7 @@ async function joinManual(hostCode) {
     log('这不是一个房主邀请码', 'bad');
     return;
   }
+  S.hostId = payload.from; // 邀请码带着房主身份，认它做角色权威
   initSwarmAndSync();
 
   const peer = new Peer({
@@ -265,10 +298,30 @@ function enterStage() {
   S.entered = true;
   show($('lobby'), false);
   $('stage').style.display = 'block';
+  renderRole();
 }
 
 function renderFilmInfo() {
   if (S.manifest) $('film').textContent = S.manifest.name;
+}
+
+const ROLE_LABEL = { host: '房主', admin: '管理员', guest: '游客' };
+
+/** 反映房主分给我的角色：游客禁用进度条、给出说明；管理员/房主放开控制。 */
+function renderRole() {
+  if (!S.sync) return;
+  const canControl = S.sync.canIControl();
+  const seek = $('seek');
+  if (seek) {
+    seek.disabled = !canControl;
+    seek.style.opacity = canControl ? '' : '0.4';
+  }
+  const hint = $('role-hint');
+  if (hint) {
+    hint.textContent = canControl
+      ? `身份：${ROLE_LABEL[S.sync.myRole()]}`
+      : '身份：游客 · 播放/暂停仅对自己生效，不能拖动进度';
+  }
 }
 
 function renderStatus(p) {
@@ -279,7 +332,9 @@ function renderStatus(p) {
 }
 
 function renderPeers() {
-  const n = S.swarm ? S.swarm.peers.size : 0;
+  const n = S.swarm
+    ? S.swarm.peerList().filter((p) => p.state === 'connected' || p.state === 'completed').length
+    : 0;
   $('peers').textContent = n ? `${n} 人在线` : '等待连接…';
 }
 

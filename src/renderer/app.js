@@ -1,6 +1,7 @@
 import { Peer } from './lib/peer.js';
 import { Swarm } from './lib/swarm.js';
 import { SyncEngine } from './lib/syncEngine.js';
+import { MSG } from './lib/protocol.js';
 import { encodeCode, decodeCode, WsSignaling, randomRoomId, randomPeerId } from './lib/signaling.js';
 
 /**
@@ -16,17 +17,25 @@ const S = {
   peerId: randomPeerId(),
   name: localStorage.getItem('sw.name') || `观众-${Math.floor(Math.random() * 900 + 100)}`,
   mode: null, // 'manual' | 'server'
-  role: null, // 'host' | 'guest'
+  role: null, // 'host' | 'guest'（发起 or 加入，跟权限角色是两回事）
+  hostId: null, // 房主的 peerId —— 角色权威只认它，从邀请码得来
   env: null,
   geo: null,
   swarm: null,
   sync: null,
   signaling: null,
   manifest: null,
+  sourceType: null, // 'file' | 'link'
+  linkInfo: null,
+  syncStarted: false,
   sessionId: null,
   filePath: null,
   isSeeder: false,
   mpvRunning: false,
+  switchingMedia: false,
+  mediaRevision: 0,
+  roomCapacity: Math.max(2, Math.min(16, Number(localStorage.getItem('sw.roomCapacity')) || 4)),
+  pendingManualPeer: null,
   settings: {
     signalUrl: localStorage.getItem('sw.signalUrl') || 'ws://localhost:8080',
     stun: localStorage.getItem('sw.stun') || 'stun:stun.l.google.com:19302',
@@ -47,6 +56,22 @@ const fmtBytes = (b) => {
 };
 
 const fmtRate = (bps) => (bps > 0 ? `${fmtBytes(bps)}/s` : '—');
+const clampCapacity = (value) => Math.max(2, Math.min(16, Number.parseInt(value, 10) || 4));
+
+function connectedPeerCount() {
+  return (S.swarm?.peerList() || []).filter((p) => p.state === 'connected' || p.state === 'completed').length;
+}
+
+async function copyCode(code, button, idleLabel = '复制邀请码') {
+  try {
+    await Promise.resolve(window.sw.clipboard.writeText(code));
+    button.textContent = `已复制完整 ${code.length} 字符 ✓`;
+    setTimeout(() => (button.textContent = idleLabel), 1800);
+  } catch (e) {
+    button.textContent = '复制失败，请手动全选';
+    log(`复制邀请码失败：${e.message || e}`, 'bad');
+  }
+}
 
 const fmtTime = (s) => {
   if (!s || !isFinite(s) || s < 0) s = 0;
@@ -138,6 +163,7 @@ function updateDepsPill() {
   const missing = [];
   if (!S.env.mpv) missing.push('mpv');
   if (!S.env.ffmpeg) missing.push('ffmpeg');
+  if (!S.env.ytDlp) missing.push('yt-dlp');
 
   if (!missing.length) {
     pill.textContent = '依赖就绪';
@@ -154,7 +180,7 @@ function showDepsHelp() {
   openModal({
     title: '缺少外部依赖',
     body: `
-      <p class="fine">SyncWatch 不自研播放器和编解码器，靠这两个外部程序干活：</p>
+      <p class="fine">NoxReel 不自研播放器、编解码器和网站解析器，靠这些成熟组件干活：</p>
       <div class="field">
         <label>mpv —— 播放器（必需）</label>
         <p class="hint">
@@ -168,12 +194,18 @@ function showDepsHelp() {
         </p>
       </div>
       <div class="field">
+        <label>yt-dlp —— 视频网页解析（按需）</label>
+        <p class="hint">
+          ${S.env.ytDlp ? `已找到：<code>${esc(S.env.ytDlp)}</code>` : '未找到。MP4/HLS 直链仍可播放，视频网站页面链接不可用。'}
+        </p>
+      </div>
+      <div class="field">
         <label>安装方式（任选其一）</label>
         <p class="hint">
-          <code>winget install mpv ffmpeg</code><br />
-          <code>scoop install mpv ffmpeg</code><br />
+          <code>winget install shinchiro.mpv Gyan.FFmpeg yt-dlp.yt-dlp</code><br />
+          <code>scoop install mpv ffmpeg yt-dlp</code><br />
           或者手动下载后，把可执行文件路径写进环境变量
-          <code>SYNCWATCH_MPV_PATH</code> / <code>SYNCWATCH_FFMPEG_PATH</code>。
+          <code>SYNCWATCH_MPV_PATH</code> / <code>SYNCWATCH_FFMPEG_PATH</code> / <code>SYNCWATCH_YTDLP_PATH</code>。
         </p>
       </div>
     `,
@@ -195,6 +227,11 @@ const dz = $('dropzone');
 dz.addEventListener('click', async () => {
   const p = await window.sw.dialog.pickVideo();
   if (p) startHost(p);
+});
+
+$('btn-link').addEventListener('click', () => startHostLink($('video-link').value));
+$('video-link').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') startHostLink(e.currentTarget.value);
 });
 dz.addEventListener('dragover', (e) => {
   e.preventDefault();
@@ -227,9 +264,10 @@ function setSteps(steps) {
 }
 
 async function startHost(filePath) {
-  S.role = 'host';
-  S.isSeeder = true;
-  S.filePath = filePath;
+  if (!roomEntered) {
+    S.role = 'host';
+    S.hostId = S.peerId; // 房主就是自己，角色权威在我这
+  }
 
   show('view-prepare');
   $('prep-title').textContent = '正在准备文件';
@@ -276,7 +314,6 @@ async function startHost(filePath) {
       try {
         const { outPath } = await window.sw.media.remux(filePath);
         filePath = outPath;
-        S.filePath = outPath;
         $('prep-note').textContent = `已转封装到：${outPath}`;
       } finally {
         off();
@@ -308,17 +345,128 @@ async function startHost(filePath) {
     steps[3].state = 'active';
     setSteps(steps);
 
+    manifest = { ...manifest, roomRevision: S.mediaRevision + 1 };
     const state = await window.sw.store.openSeed(manifest, filePath);
-    S.manifest = manifest;
-    S.sessionId = state.sessionId;
 
     steps[3].state = 'done';
     setSteps(steps);
 
-    await enterRoom();
+    await activateFileSession({ manifest, state, filePath, isSeeder: true });
   } catch (e) {
     console.error(e);
     prepFail(e.message || String(e));
+  }
+}
+
+async function startHostLink(rawUrl) {
+  const url = String(rawUrl || '').trim();
+  $('link-err').textContent = '';
+  if (!url) return;
+
+  if (!roomEntered) {
+    S.role = 'host';
+    S.hostId = S.peerId;
+  }
+
+  show('view-prepare');
+  $('prep-title').textContent = '正在解析视频链接';
+  $('prep-file').textContent = url;
+  $('prep-bar').style.width = '35%';
+  $('prep-note').textContent = '只读取媒体信息，不下载视频。每位参与者会直接从原始网站播放。';
+  $('prep-actions').innerHTML = '';
+  setSteps([
+    { label: '验证链接', state: 'done' },
+    { label: '解析视频信息', state: 'active' },
+    { label: '创建同步房间', state: '' },
+  ]);
+
+  try {
+    const linkInfo = await window.sw.media.inspectLink(url);
+    $('prep-bar').style.width = '85%';
+    setSteps([
+      { label: '验证链接', state: 'done' },
+      { label: '解析视频信息', state: 'done' },
+      { label: '创建同步房间', state: 'active' },
+    ]);
+    await activateLinkSession(linkInfo, { revision: S.mediaRevision + 1, broadcast: true });
+  } catch (e) {
+    console.error(e);
+    prepFail(e.message || String(e));
+  }
+}
+
+async function stopCurrentMedia() {
+  const oldSessionId = S.sessionId;
+  S.switchingMedia = true;
+  S.mpvRunning = false;
+  $('btn-playpause').disabled = true;
+  $('btn-reopen')?.classList.add('hidden');
+  await window.sw.mpv.quit().catch(() => {});
+  S.swarm?.clearSession();
+  if (oldSessionId) await window.sw.store.close(oldSessionId).catch(() => {});
+}
+
+async function activateFileSession({ manifest, state, filePath, isSeeder }) {
+  await stopCurrentMedia();
+  S.mediaRevision = Number(manifest.roomRevision) > 0
+    ? Math.max(S.mediaRevision, Number(manifest.roomRevision))
+    : S.mediaRevision + 1;
+  manifest.roomRevision = S.mediaRevision;
+  S.sourceType = 'file';
+  S.linkInfo = null;
+  S.manifest = manifest;
+  S.sessionId = state.sessionId;
+  S.filePath = filePath;
+  S.isSeeder = !!isSeeder;
+
+  initSwarmAndSync();
+  S.sync.resetMedia({ isSeeder: S.isSeeder });
+  S.swarm.setSession({ manifest, sessionId: state.sessionId, isSeeder: S.isSeeder, state });
+  S.sync.sizeHint = manifest.size;
+  S.switchingMedia = false;
+
+  if (!roomEntered) await enterRoom();
+  else {
+    show('view-room');
+    refreshMediaUi();
+    onSessionReady();
+    maybeLaunchPlayer(S.swarm.progress());
+    log(`已切换到：${manifest.name}`, 'good');
+  }
+}
+
+async function activateLinkSession(linkInfo, { revision, broadcast = false } = {}) {
+  await stopCurrentMedia();
+  S.mediaRevision = Number(revision) > 0 ? Math.max(S.mediaRevision, Number(revision)) : S.mediaRevision + 1;
+  S.sourceType = 'link';
+  S.linkInfo = linkInfo;
+  S.manifest = null;
+  S.sessionId = null;
+  S.filePath = linkInfo.url;
+  S.isSeeder = true; // 链接由每台电脑直接读取，不需要 P2P 分片
+
+  initSwarmAndSync();
+  S.sync.resetMedia({ isSeeder: true });
+  S.switchingMedia = false;
+
+  if (!roomEntered) await enterRoom();
+  else {
+    show('view-room');
+    refreshMediaUi();
+    await onLinkSessionReady();
+    log(`已切换到链接：${linkInfo.title || linkInfo.url}`, 'good');
+  }
+
+  if (broadcast && S.role === 'host') {
+    for (const peer of S.swarm.peers.values()) {
+      peer.send({
+        t: MSG.MEDIA_LINK,
+        url: linkInfo.url,
+        title: linkInfo.title,
+        duration: linkInfo.duration || 0,
+        revision: S.mediaRevision,
+      });
+    }
   }
 }
 
@@ -359,7 +507,7 @@ function prepFail(msg) {
 }
 
 function backHome() {
-  show('view-home');
+  show(roomEntered ? 'view-room' : 'view-home');
 }
 
 /* ------------------------------ 加入放映 ------------------------------ */
@@ -387,8 +535,10 @@ $('btn-join').onclick = async () => {
 /** 极简模式：收到 offer，产出 answer 让对方粘回去。 */
 async function joinViaManual(payload) {
   S.role = 'guest';
+  S.hostId = payload.from; // 邀请码里带着房主身份，认它做角色权威
   S.mode = 'manual';
   S.isSeeder = false;
+  S.roomCapacity = clampCapacity(payload.maxMembers || S.roomCapacity);
 
   show('view-prepare');
   $('prep-title').textContent = '正在建立点对点连接';
@@ -431,11 +581,7 @@ async function joinViaManual(payload) {
   `;
   $('answer-code').value = code;
   $('answer-code').select();
-  $('copy-answer').onclick = () => {
-    navigator.clipboard.writeText(code);
-    $('copy-answer').textContent = '已复制 ✓';
-    setTimeout(() => ($('copy-answer').textContent = '复制应答码'), 1500);
-  };
+  $('copy-answer').onclick = () => copyCode(code, $('copy-answer'), '复制应答码');
 
   // 连上之后 swarm 会收到清单，那时才真正进房
   peer.once('open', () => enterRoom());
@@ -444,8 +590,10 @@ async function joinViaManual(payload) {
 /** 信令模式：连服务器，进房间，等对方发 offer 过来。 */
 async function joinViaServer(payload) {
   S.role = 'guest';
+  S.hostId = payload.from; // 邀请码里带着房主身份，认它做角色权威
   S.mode = 'server';
   S.isSeeder = false;
+  S.roomCapacity = clampCapacity(payload.maxMembers || S.roomCapacity);
 
   show('view-prepare');
   $('prep-title').textContent = '正在连接信令服务器';
@@ -480,7 +628,13 @@ async function joinViaServer(payload) {
 /* ------------------------------ 信令连接 ------------------------------ */
 
 async function connectSignaling(url, roomId) {
-  const sig = new WsSignaling({ url, roomId, peerId: S.peerId, name: S.name });
+  const sig = new WsSignaling({
+    url,
+    roomId,
+    peerId: S.peerId,
+    name: S.name,
+    maxMembers: S.role === 'host' ? S.roomCapacity : 0,
+  });
   S.signaling = sig;
 
   // 规则：房间里的老成员向新来的发起 offer。这样不会两边同时发 offer 撞车。
@@ -513,6 +667,15 @@ async function connectSignaling(url, roomId) {
   });
 
   sig.on('peer-leave', ({ peerId }) => S.swarm.removePeer(peerId));
+  sig.on('joined', ({ maxMembers }) => {
+    if (maxMembers) S.roomCapacity = clampCapacity(maxMembers);
+    renderCapacityStatus();
+  });
+  sig.on('room-config', ({ maxMembers }) => {
+    S.roomCapacity = clampCapacity(maxMembers);
+    renderCapacityStatus();
+    log(`房间人数上限已设为 ${S.roomCapacity}`, 'good');
+  });
   sig.on('reconnecting', ({ in: ms }) => log(`信令断开，${Math.round(ms / 1000)} 秒后重连（已建立的直连不受影响）`, 'warn'));
   sig.on('error', (e) => log(`信令错误：${e.message}`, 'bad'));
 
@@ -527,6 +690,15 @@ function wirePeer(peer, sig) {
   peer.on('open', () => {
     log(`已和 ${peer.name} 建立直连`, 'good');
     S.sync?.greet(peer);
+    if (S.role === 'host' && S.sourceType === 'link' && S.linkInfo) {
+      peer.send({
+        t: MSG.MEDIA_LINK,
+        url: S.linkInfo.url,
+        title: S.linkInfo.title,
+        duration: S.linkInfo.duration || 0,
+        revision: S.mediaRevision,
+      });
+    }
   });
   peer.on('statechange', (s) => {
     if (s === 'failed') {
@@ -540,7 +712,42 @@ function wirePeer(peer, sig) {
     log(`${peer.name} 断开了`, 'warn');
     S.sync?.peerGone(peer.peerId);
   });
-  peer.on('ctrl', (msg) => S.sync?.onCtrl(msg, peer));
+  peer.on('ctrl', (msg) => {
+    if (msg.t === MSG.MEDIA_LINK) handleMediaLink(msg, peer);
+    else S.sync?.onCtrl(msg, peer);
+  });
+}
+
+async function handleMediaLink(msg, peer) {
+  // 片源类型只能由邀请码中钉死的房主指定，防止普通成员替换全房媒体。
+  if (S.role === 'host' || !S.hostId || peer.peerId !== S.hostId) return;
+  if (typeof msg.url !== 'string') return;
+  if (Number(msg.revision) && Number(msg.revision) <= S.mediaRevision) return;
+
+  show('view-prepare');
+  $('prep-title').textContent = '正在本机解析房主的视频链接';
+  $('prep-file').textContent = msg.title || msg.url;
+  $('prep-bar').style.width = '45%';
+  $('prep-note').textContent = '视频由你的电脑直接从原网站读取；信令服务器和房主都不会中转内容。';
+  setSteps([
+    { label: '验证房主身份', state: 'done' },
+    { label: '解析视频链接', state: 'active' },
+    { label: '启动播放器', state: '' },
+  ]);
+
+  try {
+    const local = await window.sw.media.inspectLink(msg.url);
+    if (Number(msg.revision) && Number(msg.revision) <= S.mediaRevision) return;
+    const linkInfo = {
+      ...local,
+      title: msg.title || local.title,
+      duration: Number(msg.duration) || local.duration || 0,
+    };
+    $('prep-bar').style.width = '90%';
+    await activateLinkSession(linkInfo, { revision: Number(msg.revision) || S.mediaRevision + 1 });
+  } catch (e) {
+    prepFail(`这个视频链接在你的电脑上无法解析：${e.message || e}`);
+  }
 }
 
 /* ------------------------------ swarm/同步 ----------------------------- */
@@ -549,7 +756,12 @@ function initSwarmAndSync() {
   if (S.swarm) return;
 
   S.swarm = new Swarm({ peerId: S.peerId, name: S.name });
-  S.sync = new SyncEngine({ peerId: S.peerId, name: S.name, isSeeder: S.isSeeder });
+  S.sync = new SyncEngine({
+    peerId: S.peerId,
+    name: S.name,
+    isSeeder: S.isSeeder,
+    hostId: S.hostId, // 房主=自身 peerId；加入者=邀请码里的房主 id。两条路都已提前设好
+  });
 
   S.sync.onSetPause = (p) => window.sw.mpv.setPause(p).catch(() => {});
   S.sync.onSeek = (pos) => window.sw.mpv.seek(pos).catch(() => {});
@@ -561,8 +773,17 @@ function initSwarmAndSync() {
 
   S.sync.on('stall-change', ({ name, stalled, self }) => {
     const who = self ? '你' : name;
-    log(stalled ? `${who}的缓冲跟不上了，全员暂停等待` : `${who}缓冲够了`, stalled ? 'warn' : 'good');
-    if (stalled) window.sw.mpv.osd(`等待 ${who} 缓冲…`, 3000);
+    // 游客的缓冲不足只暂停自己，别喊「全员暂停」误导人。
+    const guestSelf = self && !S.sync.canIControl();
+    if (stalled) {
+      log(
+        guestSelf ? '你的缓冲不够，先暂停你自己（不影响他人）' : `${who}的缓冲跟不上了，全员暂停等待`,
+        'warn'
+      );
+      window.sw.mpv.osd(guestSelf ? '缓冲不足，暂停你自己…' : `等待 ${who} 缓冲…`, 3000);
+    } else {
+      log(`${who}缓冲够了`, 'good');
+    }
   });
 
   S.sync.on('remote-action', ({ kind, by, position }) => {
@@ -573,15 +794,36 @@ function initSwarmAndSync() {
   S.sync.on('state', renderStatus);
   S.sync.on('margin', renderStatus);
 
+  // 角色变化：重画成员列表（含标签/切换按钮）、更新我自己的身份提示。
+  S.sync.on('roles', () => {
+    renderPeers();
+    renderMyRole();
+  });
+
+  // 游客试图跳转被拦下的反馈。
+  S.sync.on('denied', ({ action }) => {
+    if (action === 'seek') {
+      log('你是游客，不能跳转进度', 'warn');
+      window.sw.mpv.osd('游客不能跳转进度', 2000);
+    }
+  });
+
   // 我这边还没有文件 → 对方把清单发来了 → 建接收会话
-  S.swarm.on('manifest-offer', async ({ manifest }) => {
-    if (S.manifest) return;
-    S.manifest = manifest;
+  S.swarm.on('manifest-offer', async ({ manifest, from }) => {
+    if (S.role === 'host') return;
+    if (S.hostId && from !== S.hostId) {
+      log('忽略了非房主发来的换片请求', 'warn');
+      return;
+    }
+    const revision = Number(manifest.roomRevision) || 0;
+    if (revision && revision <= S.mediaRevision) return;
+
     const state = await window.sw.store.openLeech(manifest, null);
-    S.sessionId = state.sessionId;
-    S.filePath = state.filePath;
-    S.swarm.setSession({ manifest, sessionId: state.sessionId, isSeeder: false, state });
-    S.sync.sizeHint = manifest.size;
+    if (revision && revision <= S.mediaRevision) {
+      await window.sw.store.close(state.sessionId).catch(() => {});
+      return;
+    }
+    await activateFileSession({ manifest, state, filePath: state.filePath, isSeeder: false });
 
     log(
       state.resumed
@@ -590,8 +832,6 @@ function initSwarmAndSync() {
       'good'
     );
 
-    await enterRoom();
-    onSessionReady();
     maybeLaunchPlayer(S.swarm.progress()); // 续传时片头可能早就有了，不必再等
   });
 
@@ -634,13 +874,23 @@ async function enterRoom() {
 
   show('view-room');
 
-  renderFilmInfo();
+  refreshMediaUi();
+  renderMyRole();
   renderInvite();
   renderPeers([]);
-  renderProgress(S.swarm.progress());
 
   // 片源进房时会话已经就绪；观众要等清单到了才由 manifest-offer 那边调
   if (S.isSeeder && S.manifest) onSessionReady();
+  else if (S.sourceType === 'link' && S.linkInfo) await onLinkSessionReady();
+}
+
+function refreshMediaUi() {
+  renderFilmInfo();
+  renderProgress(S.swarm?.progress());
+  $('btn-reveal').classList.toggle('hidden', S.sourceType === 'link');
+  $('buffer').classList.toggle('link-mode', S.sourceType === 'link');
+  $('media-switch-block')?.classList.toggle('hidden', S.role !== 'host');
+  $('btn-reopen')?.classList.toggle('hidden', S.mpvRunning || !S.filePath);
 }
 
 /**
@@ -651,6 +901,12 @@ async function enterRoom() {
  * 等清单到了又被守卫挡回去，结果房间头部永远是空的。
  */
 function renderFilmInfo() {
+  if (S.sourceType === 'link' && S.linkInfo) {
+    $('room-file').textContent = S.linkInfo.title || '在线视频';
+    const duration = S.linkInfo.duration ? ` · ${fmtTime(S.linkInfo.duration)}` : '';
+    $('room-meta').textContent = `视频链接 · ${S.linkInfo.extractor || 'direct'}${duration} · 每位成员从原网站播放`;
+    return;
+  }
   if (!S.manifest) return;
   $('room-file').textContent = S.manifest.name;
   $('room-meta').textContent = `${fmtBytes(S.manifest.size)} · ${S.manifest.chunkCount} 片 × ${fmtBytes(
@@ -671,8 +927,19 @@ const HEAD_READY_BYTES = 8 * 1024 * 1024;
 /** 会话就绪：同步引擎立刻开工（哪怕播放器还没起，也要参与 stall 计算）。 */
 function onSessionReady() {
   renderFilmInfo();
+  S.syncStarted = true;
   S.sync.start();
   if (S.isSeeder) launchPlayer(); // 片源本地就有完整文件，不用等
+}
+
+async function onLinkSessionReady() {
+  if (!S.linkInfo) return;
+  renderFilmInfo();
+  S.syncStarted = true;
+  if (S.linkInfo.duration) S.sync.setMediaInfo({ duration: S.linkInfo.duration, size: 0 });
+  S.sync.start();
+  await launchPlayer();
+  renderProgress(S.swarm.progress());
 }
 
 /** 接收方：片头够了才起播放器。在此之前我们会一直处于 stall，全员等着。 */
@@ -687,9 +954,11 @@ async function launchPlayer() {
   try {
     await window.sw.mpv.launch(S.filePath, true);
     $('btn-playpause').disabled = false;
+    $('btn-reopen')?.classList.add('hidden');
     log('mpv 已启动（先暂停着，等所有人就绪）', 'good');
   } catch (e) {
     S.mpvRunning = false; // 占位撤回，否则再也不会重试
+    $('btn-reopen')?.classList.remove('hidden');
     if (e.message.includes('mpv')) {
       log('没找到 mpv，无法播放。装好 mpv 后点右上角「重新检测」。', 'bad');
       showDepsHelp();
@@ -701,6 +970,13 @@ async function launchPlayer() {
 
 /* ------------------------------- 邀请区 ------------------------------- */
 
+function inviteMediaInfo() {
+  if (S.sourceType === 'link' && S.linkInfo) {
+    return { name: S.linkInfo.title || '在线视频', size: 0, kind: 'link' };
+  }
+  return { name: S.manifest?.name || '视频', size: S.manifest?.size || 0, kind: 'file' };
+}
+
 async function renderInvite() {
   const box = $('invite-body');
 
@@ -710,6 +986,12 @@ async function renderInvite() {
   }
 
   box.innerHTML = `
+    <div class="capacity-row">
+      <label for="room-capacity">房间人数上限</label>
+      <input type="number" id="room-capacity" min="2" max="16" value="${S.roomCapacity}" />
+      <button class="ghost" id="capacity-apply">应用</button>
+    </div>
+    <p class="fine" id="capacity-status"></p>
     <button class="primary" id="inv-server">用信令服务器邀请</button>
     <button class="ghost" id="inv-manual">极简模式（零服务器）</button>
     <p id="inv-hint">信令服务器只转发连接地址，不碰视频内容。极简模式连这个都不要，代价是要手动来回粘贴两次。</p>
@@ -718,6 +1000,28 @@ async function renderInvite() {
 
   $('inv-server').onclick = inviteViaServer;
   $('inv-manual').onclick = inviteViaManual;
+  $('capacity-apply').onclick = applyRoomCapacity;
+  renderCapacityStatus();
+}
+
+function renderCapacityStatus() {
+  const input = $('room-capacity');
+  const status = $('capacity-status');
+  if (input) input.value = String(S.roomCapacity);
+  if (status) status.textContent = `当前 ${connectedPeerCount() + 1} / ${S.roomCapacity} 人（包含房主）`;
+}
+
+function applyRoomCapacity() {
+  const next = clampCapacity($('room-capacity')?.value);
+  const current = connectedPeerCount() + 1;
+  if (next < current) {
+    $('capacity-status').textContent = `当前已有 ${current} 人，人数上限不能低于当前人数。`;
+    return;
+  }
+  S.roomCapacity = next;
+  localStorage.setItem('sw.roomCapacity', String(next));
+  S.signaling?.setMaxMembers(next);
+  renderCapacityStatus();
 }
 
 async function inviteViaServer() {
@@ -738,20 +1042,17 @@ async function inviteViaServer() {
       room: S.roomId,
       from: S.peerId,
       name: S.name,
-      file: { name: S.manifest.name, size: S.manifest.size },
+      file: inviteMediaInfo(),
+      maxMembers: S.roomCapacity,
     });
 
     out.innerHTML = `
-      <textarea readonly rows="3" id="inv-code"></textarea>
+      <textarea readonly rows="4" id="inv-code"></textarea>
       <button class="primary" id="inv-copy">复制邀请码</button>
-      <p>发给任何人，可以重复使用。房间会一直开着直到你离开。</p>
+      <p>完整短码共 ${code.length} 字符，可重复使用。房间会一直开着直到你离开。</p>
     `;
     $('inv-code').value = code;
-    $('inv-copy').onclick = () => {
-      navigator.clipboard.writeText(code);
-      $('inv-copy').textContent = '已复制 ✓';
-      setTimeout(() => ($('inv-copy').textContent = '复制邀请码'), 1500);
-    };
+    $('inv-copy').onclick = () => copyCode(code, $('inv-copy'));
     log(`房间已开：${S.roomId}`, 'good');
   } catch (e) {
     out.innerHTML = `
@@ -767,9 +1068,15 @@ async function inviteViaServer() {
  * 而且大家都只连到发起者（星型），彼此之间不互连。
  */
 async function inviteViaManual() {
+  if (connectedPeerCount() + 1 >= S.roomCapacity) {
+    $('inv-out').innerHTML = `<p style="color:var(--danger)">房间已满（${S.roomCapacity} 人）。请先调高人数上限。</p>`;
+    return;
+  }
   S.mode = 'manual';
   const out = $('inv-out');
   out.innerHTML = '<p>正在收集网络候选地址（几秒钟）…</p>';
+
+  S.pendingManualPeer?.close();
 
   const peer = new Peer({
     peerId: `pending-${Math.random().toString(36).slice(2, 8)}`,
@@ -778,8 +1085,7 @@ async function inviteViaManual() {
     iceServers: iceServers(),
     trickle: false,
   });
-  wirePeer(peer);
-  S.swarm.addPeer(peer);
+  S.pendingManualPeer = peer;
 
   const offer = await peer.createOffer();
   const code = await encodeCode({
@@ -787,41 +1093,44 @@ async function inviteViaManual() {
     from: S.peerId,
     name: S.name,
     sdp: offer,
-    file: { name: S.manifest.name, size: S.manifest.size },
+    file: inviteMediaInfo(),
+    maxMembers: S.roomCapacity,
   });
 
   out.innerHTML = `
-    <textarea readonly rows="3" id="inv-code"></textarea>
+    <textarea readonly rows="4" id="inv-code"></textarea>
     <button class="primary" id="inv-copy">复制邀请码</button>
+    <p>完整邀请码共 ${code.length} 字符；在对方真正连上前，不会计入成员列表。</p>
     <p><b>第 2 步：</b>对方会给你一段应答码，粘到这里：</p>
-    <textarea rows="3" id="inv-answer" placeholder="SW1-…"></textarea>
+    <textarea rows="3" id="inv-answer" placeholder="NR2-…（兼容 SW2 / SW1）"></textarea>
     <button class="ghost" id="inv-accept">完成连接</button>
     <p id="inv-status"></p>
   `;
   $('inv-code').value = code;
-  $('inv-copy').onclick = () => {
-    navigator.clipboard.writeText(code);
-    $('inv-copy').textContent = '已复制 ✓';
-    setTimeout(() => ($('inv-copy').textContent = '复制邀请码'), 1500);
-  };
+  $('inv-copy').onclick = () => copyCode(code, $('inv-copy'));
 
   $('inv-accept').onclick = async () => {
     const raw = $('inv-answer').value.trim();
     if (!raw) return;
+    let registered = false;
     try {
       const payload = await decodeCode(raw);
       if (payload.k !== 'answer') throw new Error('这不是应答码');
 
-      // 应答码里才带着对面的真实身份，把占位 id 换掉。
-      // 必须走 swarm.renamePeer —— 它维护着好几张按 peerId 索引的表。
-      S.swarm.renamePeer(peer.peerId, payload.from, payload.name || '观众');
-
+      // 只有拿到真实身份后才登记到 swarm，避免“点分享就多一个待加入用户”的幽灵成员。
+      peer.peerId = payload.from;
+      peer.name = payload.name || '观众';
+      wirePeer(peer);
+      S.swarm.addPeer(peer);
+      registered = true;
+      S.pendingManualPeer = null;
       await peer.acceptAnswer(payload.sdp);
       $('inv-status').textContent = '正在打洞…';
       peer.once('open', () => {
         $('inv-status').textContent = `${peer.name} 已连上 ✓`;
       });
     } catch (e) {
+      if (registered) S.swarm.removePeer(peer.peerId);
       $('inv-status').textContent = e.message;
     }
   };
@@ -830,7 +1139,29 @@ async function inviteViaManual() {
 /* ------------------------------- 渲染 ------------------------------- */
 
 function renderProgress(p) {
-  if (!p || !S.manifest) return;
+  if (!p) return;
+
+  if (S.sourceType === 'link') {
+    $('buf-have').style.width = '100%';
+    $('buf-safe').style.width = '100%';
+    const snap = S.sync?.lastTick;
+    const playRatio = snap && S.sync.duration ? Math.min(1, (snap.position || 0) / S.sync.duration) : 0;
+    $('buf-head').style.left = `${(playRatio * 100).toFixed(2)}%`;
+    $('buffer-stats').innerHTML = `
+      <span><b>来源</b> 原始视频网站</span>
+      <span><b>同步</b> 播放 / 暂停 / 跳转</span>
+      <span><b>缓冲</b> 由各自的 mpv 管理</span>
+    `;
+    $('transfer-stats').innerHTML = `
+      <div class="kv-row"><span>视频传输</span><span>原网站 → 每位成员</span></div>
+      <div class="kv-row"><span>房间消息</span><span>P2P 加密直连</span></div>
+      <div class="kv-row"><span>连接数</span><span>${S.swarm.peers.size}</span></div>
+      <div class="kv-row"><span>模式</span><span>${S.mode === 'manual' ? '极简（零服务器）' : '信令服务器'}</span></div>
+    `;
+    return;
+  }
+
+  if (!S.manifest) return;
 
   $('buf-have').style.width = `${(p.ratio * 100).toFixed(2)}%`;
   $('buf-safe').style.width = `${(p.contiguousRatio * 100).toFixed(2)}%`;
@@ -884,7 +1215,7 @@ function drawChunkMap() {
   const scale = w / n;
   let runStart = -1;
 
-  // 连续段合并成一条画，比一片一格快得多（5GB 有 2500 片）
+  // 连续段合并成一条画，比一片一格快得多（10GB 有 5120 片）
   for (let i = 0; i <= n; i++) {
     const on = i < n && have[i] === 1;
     if (on && runStart === -1) runStart = i;
@@ -895,39 +1226,85 @@ function drawChunkMap() {
   }
 }
 
+const ROLE_LABEL = { host: '房主', admin: '管理员', guest: '游客' };
+
 function renderPeers(list) {
   list = list || S.swarm?.peerList() || [];
+  list = list.filter((p) => p.state === 'connected' || p.state === 'completed');
   $('peer-count').textContent = list.length;
+  renderCapacityStatus();
 
   if (!list.length) {
     $('peer-list').innerHTML = `<p class="fine" style="padding:4px">还没有人加入。用右边的邀请码叫人。</p>`;
     return;
   }
 
+  const iAmHost = S.sync?.myRole() === 'host';
+
   $('peer-list').innerHTML = list
     .map((p) => {
       const stalled = S.sync?.stalledPeers.has(p.peerId);
+      const role = S.sync?.roleOf(p.peerId) || 'guest';
       const dotClass =
         p.state === 'connected' || p.state === 'completed'
           ? 'connected'
           : p.state === 'failed'
           ? 'failed'
           : 'checking';
+      // 房主可以给每个人（房主自己除外）在管理员/游客之间切换。
+      const roleCtl =
+        iAmHost && role !== 'host'
+          ? `<button class="role-toggle" data-peer="${esc(p.peerId)}" data-next="${
+              role === 'admin' ? 'guest' : 'admin'
+            }">${role === 'admin' ? '设为游客' : '设为管理员'}</button>`
+          : `<span class="role-badge ${role}">${ROLE_LABEL[role]}</span>`;
+      const mediaProgress =
+        S.sourceType === 'link'
+          ? `<div class="peer-sub">延迟 ${p.rtt != null ? `${p.rtt}ms` : '—'} · P2P 媒体速度 —（各自读取原网站）</div>`
+          : `<div class="peer-bar"><div style="width:${(p.remoteRatio * 100).toFixed(1)}%"></div></div>
+             <div class="peer-sub">
+               持有 ${(p.remoteRatio * 100).toFixed(0)}% ·
+               延迟 ${p.rtt != null ? `${p.rtt}ms` : '—'} ·
+               ↓ ${fmtRate(p.downRate)} · ↑ ${fmtRate(p.upRate)}
+             </div>`;
       return `
         <div class="peer">
           <div class="peer-top">
             <span class="peer-name ${stalled ? 'stalled' : ''}">${esc(p.name)}</span>
             <span class="dot ${dotClass}"></span>
           </div>
-          <div class="peer-bar"><div style="width:${(p.remoteRatio * 100).toFixed(1)}%"></div></div>
-          <div class="peer-sub">
-            持有 ${(p.remoteRatio * 100).toFixed(0)}% ·
-            ${p.rtt != null ? `${p.rtt}ms` : '—'} ·
-            ↓${fmtRate(p.downRate)}
-          </div>
+          <div class="peer-role">${roleCtl}</div>
+          ${mediaProgress}
         </div>`;
     })
     .join('');
+}
+
+// 房主点「设为管理员/游客」—— 事件委托，省得每次重画都重新接线。
+$('peer-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('.role-toggle');
+  if (!btn || S.sync?.myRole() !== 'host') return;
+  S.sync.setRole(btn.dataset.peer, btn.dataset.next);
+});
+
+/** 更新「我是谁」的身份提示：房主/管理员可控场，游客只能管自己、不能跳转。 */
+function renderMyRole() {
+  const badge = $('my-role');
+  const hint = $('role-hint');
+  if (!badge || !S.sync) return;
+
+  const role = S.sync.myRole();
+  badge.textContent = ROLE_LABEL[role];
+  badge.className = `role-badge ${role}`;
+
+  const canControl = S.sync.canIControl();
+  $('buffer').classList.toggle('locked', !canControl);
+  if (hint) {
+    hint.textContent = canControl
+      ? ''
+      : '你是游客：播放/暂停只对你自己生效，不影响其他人，也不能拖动进度条。';
+    hint.classList.toggle('hidden', canControl);
+  }
 }
 
 function renderStatus() {
@@ -935,15 +1312,21 @@ function renderStatus() {
   const st = S.sync.status();
   const banner = $('status-banner');
 
+  const guest = !S.sync.canIControl();
+
   if (st.stalled) {
     banner.className = 'status-banner waiting';
     banner.textContent = `全员暂停中 —— 在等 ${st.waitingFor.join('、')} 把缓冲攒够`;
   } else if (!st.paused) {
     banner.className = 'status-banner playing';
-    banner.textContent = '播放中，所有人同步';
+    banner.textContent = guest ? '播放中（你在独立观看，操作不影响他人）' : '播放中，所有人同步';
   } else {
     banner.className = 'status-banner';
-    banner.textContent = S.mpvRunning ? '已暂停' : '正在缓冲片头，马上就好…';
+    banner.textContent = S.mpvRunning
+      ? '已暂停'
+      : S.sourceType === 'link'
+      ? '正在解析并连接原始视频…'
+      : '正在缓冲片头，马上就好…';
   }
 
   $('btn-playpause').textContent = st.intendedPaused ? '播放' : '暂停';
@@ -955,14 +1338,14 @@ function renderStatus() {
 window.sw.mpv.onTick((snap) => {
   if (!S.sync || !S.swarm) return;
 
-  if (snap.duration && S.swarm.scheduler) {
-    S.swarm.setDuration(snap.duration);
-    S.sync.setMediaInfo({ duration: snap.duration, size: S.manifest?.size });
+  if (snap.duration) {
+    if (S.swarm.scheduler) S.swarm.setDuration(snap.duration);
+    S.sync.setMediaInfo({ duration: snap.duration, size: S.sourceType === 'link' ? 0 : S.manifest?.size });
   }
 
   S.sync.onMpvTick(snap, {
     contiguousBytes: S.swarm.contiguousBytes,
-    complete: S.swarm.complete,
+    complete: S.sourceType === 'link' || S.swarm.complete,
   });
 
   renderProgress(S.swarm.progress());
@@ -972,7 +1355,10 @@ window.sw.mpv.onTick((snap) => {
 window.sw.mpv.onExit(({ code }) => {
   S.mpvRunning = false;
   $('btn-playpause').disabled = true;
-  log(`mpv 退出了（code ${code}）`, 'warn');
+  if (!S.switchingMedia && S.filePath) {
+    $('btn-reopen')?.classList.remove('hidden');
+    log(`播放器已关闭（code ${code}），可在房间里重新打开`, 'warn');
+  }
   renderStatus();
 });
 
@@ -986,6 +1372,18 @@ $('btn-playpause').onclick = () => {
   renderStatus();
 };
 
+$('btn-reopen').onclick = launchPlayer;
+
+$('btn-switch-file').onclick = async () => {
+  const path = await window.sw.dialog.pickVideo();
+  if (path) startHost(path);
+};
+
+$('btn-switch-link').onclick = () => startHostLink($('room-video-link').value);
+$('room-video-link').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') startHostLink(e.currentTarget.value);
+});
+
 $('btn-reveal').onclick = () => {
   if (S.filePath) window.sw.store.reveal(S.filePath);
 };
@@ -998,9 +1396,13 @@ $('btn-leave').onclick = async () => {
   location.reload();
 };
 
-// 点进度条 seek —— 会同步给所有人
+// 点进度条 seek —— 会同步给所有人。游客不允许跳转。
 $('buffer').onclick = (e) => {
   if (!S.sync?.duration || !S.mpvRunning) return;
+  if (!S.sync.canIControl()) {
+    log('你是游客，不能跳转进度', 'warn');
+    return;
+  }
   const rect = e.currentTarget.getBoundingClientRect();
   const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
   S.sync.userSeek(ratio * S.sync.duration);
@@ -1020,6 +1422,11 @@ $('btn-settings').onclick = () => {
         <label>信令服务器</label>
         <input type="text" id="set-signal" value="${esc(S.settings.signalUrl)}" />
         <p class="hint">只转发连接地址，不接触视频内容。自己跑一个：<code>npm run signal</code></p>
+      </div>
+      <div class="field">
+        <label>新房间默认人数上限（2–16）</label>
+        <input type="number" id="set-capacity" min="2" max="16" value="${S.roomCapacity}" />
+        <p class="hint">进入房间后，房主也可以在邀请区实时调整。</p>
       </div>
       <div class="field">
         <label>STUN 服务器</label>
@@ -1050,6 +1457,7 @@ $('btn-settings').onclick = () => {
     onOk: () => {
       S.name = $('set-name').value.trim() || S.name;
       S.settings.signalUrl = $('set-signal').value.trim();
+      S.roomCapacity = clampCapacity($('set-capacity').value);
       S.settings.stun = $('set-stun').value.trim();
       S.settings.turnEnabled = $('set-turn-on').checked;
       S.settings.turnUrl = $('set-turn-url').value.trim();
@@ -1058,6 +1466,7 @@ $('btn-settings').onclick = () => {
 
       localStorage.setItem('sw.name', S.name);
       localStorage.setItem('sw.signalUrl', S.settings.signalUrl);
+      localStorage.setItem('sw.roomCapacity', String(S.roomCapacity));
       localStorage.setItem('sw.stun', S.settings.stun);
       localStorage.setItem('sw.turnEnabled', S.settings.turnEnabled ? '1' : '0');
       localStorage.setItem('sw.turnUrl', S.settings.turnUrl);

@@ -18,7 +18,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB，规格要求 2-4MB
-const MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024; // 5GB 上限
+const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024; // 10GB 上限；JS Number 和 Node 文件偏移都可安全表示
 const PART_SUFFIX = '.swpart'; // 断点续传的位图边车文件
 
 /** @type {Map<string, Session>} */
@@ -36,7 +36,7 @@ async function buildManifest(filePath, onProgress) {
   if (!stat.isFile()) throw new Error('不是一个文件');
   if (stat.size === 0) throw new Error('文件是空的');
   if (stat.size > MAX_FILE_SIZE) {
-    throw new Error(`文件超过 5GB 上限（当前 ${(stat.size / 1024 ** 3).toFixed(2)}GB）`);
+    throw new Error(`文件超过 10GB 上限（当前 ${(stat.size / 1024 ** 3).toFixed(2)}GB）`);
   }
 
   const chunkCount = Math.ceil(stat.size / CHUNK_SIZE);

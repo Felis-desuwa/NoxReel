@@ -11,7 +11,7 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
-        android:theme="@style/Theme.SyncWatch"
+        android:theme="@style/Theme.NoxReel"
         android:hardwareAccelerated="true"
         android:usesCleartextTraffic="true">
         <!-- usesCleartextTraffic：信令是 ws://（自建、常在局域网 IP），

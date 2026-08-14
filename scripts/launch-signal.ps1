@@ -8,7 +8,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 Write-Host ''
-Write-Host '   SyncWatch 信令服务器' -ForegroundColor Cyan
+Write-Host '   NoxReel 信令服务器' -ForegroundColor Cyan
 Write-Host '   ================================'
 Write-Host ''
 Write-Host '   它只转发连接地址，不接触任何视频内容。' -ForegroundColor Gray

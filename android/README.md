@@ -1,4 +1,4 @@
-# SyncWatch 安卓版（观众端）
+# NoxReel 安卓版（观众端）
 
 手机作为**观众**加入 PC 端发起的同步观影房间：边下边播、参与「全员暂停」联动。
 手机不做种、不当房主——只接收、只跟随。
@@ -64,7 +64,7 @@ powershell -ExecutionPolicy Bypass -File build-apk.ps1
 
 ```powershell
 adb install -r app\build\outputs\apk\debug\app-debug.apk
-adb logcat -s SyncWatch SyncWatch/web   # 看日志
+adb logcat -s NoxReel NoxReel/web   # 看日志
 ```
 
 也可以直接把 apk 拷进手机点击安装（需允许「未知来源」）。
