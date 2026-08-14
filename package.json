@@ -1,7 +1,7 @@
 {
-  "name": "syncwatch",
-  "version": "0.3.0",
-  "description": "P2P 同步观影分发软件 — 边下边播，播放位置优先调度，全员缓冲联动",
+  "name": "noxreel",
+  "version": "0.4.0",
+  "description": "多人同步观影工具：P2P 边传边播、视频链接解析与房间同步",
   "main": "src/main/main.js",
   "scripts": {
     "start": "electron .",
@@ -24,12 +24,13 @@
   },
   "build": {
     "compression": "maximum",
-    "appId": "com.syncwatch.app",
-    "productName": "SyncWatch",
+    "appId": "app.noxreel.desktop",
+    "productName": "NoxReel",
     "win": {
       "target": "nsis",
-      "artifactName": "SyncWatch-Setup-${version}.${ext}",
-      "signAndEditExecutable": false
+      "artifactName": "NoxReel-Setup-${version}.${ext}",
+      "icon": "assets/branding/noxreel-icon.ico",
+      "signAndEditExecutable": true
     },
     "nsis": {
       "oneClick": true,
@@ -37,17 +38,17 @@
       "allowElevation": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "SyncWatch"
+      "shortcutName": "NoxReel"
     },
     "nsisWeb": {
-      "artifactName": "SyncWatch-WebSetup-${version}.${ext}",
-      "appPackageUrl": "https://github.com/Felis-desuwa/SyncWatch/releases/download/v${version}",
+      "artifactName": "NoxReel-WebSetup-${version}.${ext}",
+      "appPackageUrl": "https://github.com/Felis-desuwa/NoxReel/releases/download/v${version}",
       "oneClick": true,
       "perMachine": false,
       "allowElevation": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "SyncWatch"
+      "shortcutName": "NoxReel"
     },
     "files": [
       "src/**/*",

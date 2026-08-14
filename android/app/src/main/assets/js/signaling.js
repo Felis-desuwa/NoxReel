@@ -12,7 +12,8 @@ import { Emitter } from './emitter.js';
  */
 
 const LEGACY_PREFIX = 'SW1-';
-const CODE_PREFIX = 'SW2-';
+const PREVIOUS_PREFIX = 'SW2-';
+const CODE_PREFIX = 'NR2-';
 const MAX_CODE_LENGTH = 256 * 1024;
 
 async function gzip(str) {
@@ -88,8 +89,10 @@ export async function decodeCode(code) {
   const trimmed = String(code).trim().replace(/\s+/g, '');
   if (trimmed.length > MAX_CODE_LENGTH) throw new Error('邀请码异常过长');
   const legacy = trimmed.startsWith(LEGACY_PREFIX);
-  if (!legacy && !trimmed.startsWith(CODE_PREFIX)) throw new Error('这不像是一个 SyncWatch 邀请码');
-  const body = trimmed.slice((legacy ? LEGACY_PREFIX : CODE_PREFIX).length);
+  const previous = trimmed.startsWith(PREVIOUS_PREFIX);
+  if (!legacy && !previous && !trimmed.startsWith(CODE_PREFIX)) throw new Error('这不像是一个 NoxReel 邀请码');
+  const prefix = legacy ? LEGACY_PREFIX : previous ? PREVIOUS_PREFIX : CODE_PREFIX;
+  const body = trimmed.slice(prefix.length);
   let json;
   try {
     if (legacy) json = await gunzip(fromBase64Url(body));

@@ -180,7 +180,7 @@ function showDepsHelp() {
   openModal({
     title: '缺少外部依赖',
     body: `
-      <p class="fine">SyncWatch 不自研播放器、编解码器和网站解析器，靠这些成熟组件干活：</p>
+      <p class="fine">NoxReel 不自研播放器、编解码器和网站解析器，靠这些成熟组件干活：</p>
       <div class="field">
         <label>mpv —— 播放器（必需）</label>
         <p class="hint">
@@ -1102,7 +1102,7 @@ async function inviteViaManual() {
     <button class="primary" id="inv-copy">复制邀请码</button>
     <p>完整邀请码共 ${code.length} 字符；在对方真正连上前，不会计入成员列表。</p>
     <p><b>第 2 步：</b>对方会给你一段应答码，粘到这里：</p>
-    <textarea rows="3" id="inv-answer" placeholder="SW2-…（也兼容 SW1）"></textarea>
+    <textarea rows="3" id="inv-answer" placeholder="NR2-…（兼容 SW2 / SW1）"></textarea>
     <button class="ghost" id="inv-accept">完成连接</button>
     <p id="inv-status"></p>
   `;

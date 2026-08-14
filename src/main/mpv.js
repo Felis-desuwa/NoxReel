@@ -60,8 +60,8 @@ class MpvController extends EventEmitter {
   _ipcPath() {
     const token = Math.random().toString(36).slice(2, 10);
     return process.platform === 'win32'
-      ? `\\\\.\\pipe\\syncwatch-${token}`
-      : path.join(os.tmpdir(), `syncwatch-${token}.sock`);
+      ? `\\\\.\\pipe\\noxreel-${token}`
+      : path.join(os.tmpdir(), `noxreel-${token}.sock`);
   }
 
   /**
@@ -93,7 +93,7 @@ class MpvController extends EventEmitter {
       '--cache=yes',
       '--osd-level=1',
       `--pause=${startPaused ? 'yes' : 'no'}`,
-      '--title=SyncWatch',
+      '--title=NoxReel',
       ...(isRemote ? ['--ytdl=yes', '--script-opts-append=ytdl_hook-try_ytdl_first=yes'] : []),
       ...(ytDlp ? [`--script-opts-append=ytdl_hook-ytdl_path=${ytDlp}`] : []),
       '--',

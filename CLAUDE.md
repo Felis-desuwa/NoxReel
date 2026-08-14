@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-SyncWatch 是一个 P2P 同步观影软件：一个人有片子，其他人不用先下完就能一起看（边下边播），谁的网跟不上全员自动暂停等他。Electron + WebRTC，不自研播放器/编解码器，靠外部的 mpv 和 ffmpeg。
+NoxReel 是一个 P2P 同步观影软件：一个人有片子，其他人不用先下完就能一起看（边下边播），谁的网跟不上全员自动暂停等他。Electron + WebRTC，不自研播放器/编解码器，靠外部的 mpv 和 ffmpeg。
 
 ## 常用命令
 

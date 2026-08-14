@@ -14,7 +14,7 @@ Set-Location $root
 function Say($msg, $color = 'Gray') { Write-Host "   $msg" -ForegroundColor $color }
 
 Write-Host ''
-Write-Host '   SyncWatch  —  P2P 同步观影' -ForegroundColor Cyan
+Write-Host '   NoxReel  —  P2P 同步观影' -ForegroundColor Cyan
 Write-Host '   ================================'
 Write-Host ''
 

@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * SyncWatch 信令服务器。
+ * NoxReel 信令服务器。
  *
  * 只做一件事：在房间内转发 SDP / ICE 候选这类连接元数据。
  * 它看不到、也存不下任何视频内容 —— 内容全程只在 peer 之间的 DataChannel 里跑。

@@ -28,8 +28,8 @@ let win = null;
 /** @type {MpvController|null} */
 let mpv = null;
 
-const DOWNLOAD_DIR = path.join(app.getPath('downloads'), 'SyncWatch');
-const WORK_DIR = path.join(os.tmpdir(), 'syncwatch');
+const DOWNLOAD_DIR = path.join(app.getPath('downloads'), 'NoxReel');
+const WORK_DIR = path.join(os.tmpdir(), 'noxreel');
 
 function createWindow() {
   win = new BrowserWindow({
@@ -38,7 +38,8 @@ function createWindow() {
     minWidth: 900,
     minHeight: 640,
     backgroundColor: '#0e1116',
-    title: 'SyncWatch',
+    title: 'NoxReel',
+    icon: path.join(__dirname, '..', 'renderer', 'assets', 'noxreel-icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
