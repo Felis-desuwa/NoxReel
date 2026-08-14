@@ -1,6 +1,7 @@
 import { Peer } from './lib/peer.js';
 import { Swarm } from './lib/swarm.js';
 import { SyncEngine } from './lib/syncEngine.js';
+import { MSG } from './lib/protocol.js';
 import { encodeCode, decodeCode, WsSignaling, randomRoomId, randomPeerId } from './lib/signaling.js';
 
 /**
@@ -16,13 +17,17 @@ const S = {
   peerId: randomPeerId(),
   name: localStorage.getItem('sw.name') || `观众-${Math.floor(Math.random() * 900 + 100)}`,
   mode: null, // 'manual' | 'server'
-  role: null, // 'host' | 'guest'
+  role: null, // 'host' | 'guest'（发起 or 加入，跟权限角色是两回事）
+  hostId: null, // 房主的 peerId —— 角色权威只认它，从邀请码得来
   env: null,
   geo: null,
   swarm: null,
   sync: null,
   signaling: null,
   manifest: null,
+  sourceType: null, // 'file' | 'link'
+  linkInfo: null,
+  syncStarted: false,
   sessionId: null,
   filePath: null,
   isSeeder: false,
@@ -138,6 +143,7 @@ function updateDepsPill() {
   const missing = [];
   if (!S.env.mpv) missing.push('mpv');
   if (!S.env.ffmpeg) missing.push('ffmpeg');
+  if (!S.env.ytDlp) missing.push('yt-dlp');
 
   if (!missing.length) {
     pill.textContent = '依赖就绪';
@@ -154,7 +160,7 @@ function showDepsHelp() {
   openModal({
     title: '缺少外部依赖',
     body: `
-      <p class="fine">SyncWatch 不自研播放器和编解码器，靠这两个外部程序干活：</p>
+      <p class="fine">SyncWatch 不自研播放器、编解码器和网站解析器，靠这些成熟组件干活：</p>
       <div class="field">
         <label>mpv —— 播放器（必需）</label>
         <p class="hint">
@@ -168,12 +174,18 @@ function showDepsHelp() {
         </p>
       </div>
       <div class="field">
+        <label>yt-dlp —— 视频网页解析（按需）</label>
+        <p class="hint">
+          ${S.env.ytDlp ? `已找到：<code>${esc(S.env.ytDlp)}</code>` : '未找到。MP4/HLS 直链仍可播放，视频网站页面链接不可用。'}
+        </p>
+      </div>
+      <div class="field">
         <label>安装方式（任选其一）</label>
         <p class="hint">
-          <code>winget install mpv ffmpeg</code><br />
-          <code>scoop install mpv ffmpeg</code><br />
+          <code>winget install shinchiro.mpv Gyan.FFmpeg yt-dlp.yt-dlp</code><br />
+          <code>scoop install mpv ffmpeg yt-dlp</code><br />
           或者手动下载后，把可执行文件路径写进环境变量
-          <code>SYNCWATCH_MPV_PATH</code> / <code>SYNCWATCH_FFMPEG_PATH</code>。
+          <code>SYNCWATCH_MPV_PATH</code> / <code>SYNCWATCH_FFMPEG_PATH</code> / <code>SYNCWATCH_YTDLP_PATH</code>。
         </p>
       </div>
     `,
@@ -195,6 +207,11 @@ const dz = $('dropzone');
 dz.addEventListener('click', async () => {
   const p = await window.sw.dialog.pickVideo();
   if (p) startHost(p);
+});
+
+$('btn-link').addEventListener('click', () => startHostLink($('video-link').value));
+$('video-link').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') startHostLink(e.currentTarget.value);
 });
 dz.addEventListener('dragover', (e) => {
   e.preventDefault();
@@ -228,7 +245,9 @@ function setSteps(steps) {
 
 async function startHost(filePath) {
   S.role = 'host';
+  S.hostId = S.peerId; // 房主就是自己，角色权威在我这
   S.isSeeder = true;
+  S.sourceType = 'file';
   S.filePath = filePath;
 
   show('view-prepare');
@@ -322,6 +341,44 @@ async function startHost(filePath) {
   }
 }
 
+async function startHostLink(rawUrl) {
+  const url = String(rawUrl || '').trim();
+  $('link-err').textContent = '';
+  if (!url) return;
+
+  S.role = 'host';
+  S.hostId = S.peerId;
+  S.isSeeder = true; // 链接模式没有 P2P 分片；视为媒体始终可用，避免触发文件缓冲联动
+  S.sourceType = 'link';
+
+  show('view-prepare');
+  $('prep-title').textContent = '正在解析视频链接';
+  $('prep-file').textContent = url;
+  $('prep-bar').style.width = '35%';
+  $('prep-note').textContent = '只读取媒体信息，不下载视频。每位参与者会直接从原始网站播放。';
+  $('prep-actions').innerHTML = '';
+  setSteps([
+    { label: '验证链接', state: 'done' },
+    { label: '解析视频信息', state: 'active' },
+    { label: '创建同步房间', state: '' },
+  ]);
+
+  try {
+    S.linkInfo = await window.sw.media.inspectLink(url);
+    S.filePath = S.linkInfo.url;
+    $('prep-bar').style.width = '85%';
+    setSteps([
+      { label: '验证链接', state: 'done' },
+      { label: '解析视频信息', state: 'done' },
+      { label: '创建同步房间', state: 'active' },
+    ]);
+    await enterRoom();
+  } catch (e) {
+    console.error(e);
+    prepFail(e.message || String(e));
+  }
+}
+
 function confirmRemux(info) {
   return new Promise((resolve) => {
     openModal({
@@ -387,6 +444,7 @@ $('btn-join').onclick = async () => {
 /** 极简模式：收到 offer，产出 answer 让对方粘回去。 */
 async function joinViaManual(payload) {
   S.role = 'guest';
+  S.hostId = payload.from; // 邀请码里带着房主身份，认它做角色权威
   S.mode = 'manual';
   S.isSeeder = false;
 
@@ -444,6 +502,7 @@ async function joinViaManual(payload) {
 /** 信令模式：连服务器，进房间，等对方发 offer 过来。 */
 async function joinViaServer(payload) {
   S.role = 'guest';
+  S.hostId = payload.from; // 邀请码里带着房主身份，认它做角色权威
   S.mode = 'server';
   S.isSeeder = false;
 
@@ -527,6 +586,14 @@ function wirePeer(peer, sig) {
   peer.on('open', () => {
     log(`已和 ${peer.name} 建立直连`, 'good');
     S.sync?.greet(peer);
+    if (S.role === 'host' && S.sourceType === 'link' && S.linkInfo) {
+      peer.send({
+        t: MSG.MEDIA_LINK,
+        url: S.linkInfo.url,
+        title: S.linkInfo.title,
+        duration: S.linkInfo.duration || 0,
+      });
+    }
   });
   peer.on('statechange', (s) => {
     if (s === 'failed') {
@@ -540,7 +607,44 @@ function wirePeer(peer, sig) {
     log(`${peer.name} 断开了`, 'warn');
     S.sync?.peerGone(peer.peerId);
   });
-  peer.on('ctrl', (msg) => S.sync?.onCtrl(msg, peer));
+  peer.on('ctrl', (msg) => {
+    if (msg.t === MSG.MEDIA_LINK) handleMediaLink(msg, peer);
+    else S.sync?.onCtrl(msg, peer);
+  });
+}
+
+async function handleMediaLink(msg, peer) {
+  // 片源类型只能由邀请码中钉死的房主指定，防止普通成员替换全房媒体。
+  if (S.role === 'host' || !S.hostId || peer.peerId !== S.hostId || S.linkInfo) return;
+  if (typeof msg.url !== 'string') return;
+
+  S.sourceType = 'link';
+  S.isSeeder = true;
+  show('view-prepare');
+  $('prep-title').textContent = '正在本机解析房主的视频链接';
+  $('prep-file').textContent = msg.title || msg.url;
+  $('prep-bar').style.width = '45%';
+  $('prep-note').textContent = '视频由你的电脑直接从原网站读取；信令服务器和房主都不会中转内容。';
+  setSteps([
+    { label: '验证房主身份', state: 'done' },
+    { label: '解析视频链接', state: 'active' },
+    { label: '启动播放器', state: '' },
+  ]);
+
+  try {
+    const local = await window.sw.media.inspectLink(msg.url);
+    S.linkInfo = {
+      ...local,
+      title: msg.title || local.title,
+      duration: Number(msg.duration) || local.duration || 0,
+    };
+    S.filePath = S.linkInfo.url;
+    $('prep-bar').style.width = '90%';
+    await enterRoom();
+    await onLinkSessionReady();
+  } catch (e) {
+    prepFail(`这个视频链接在你的电脑上无法解析：${e.message || e}`);
+  }
 }
 
 /* ------------------------------ swarm/同步 ----------------------------- */
@@ -549,7 +653,12 @@ function initSwarmAndSync() {
   if (S.swarm) return;
 
   S.swarm = new Swarm({ peerId: S.peerId, name: S.name });
-  S.sync = new SyncEngine({ peerId: S.peerId, name: S.name, isSeeder: S.isSeeder });
+  S.sync = new SyncEngine({
+    peerId: S.peerId,
+    name: S.name,
+    isSeeder: S.isSeeder,
+    hostId: S.hostId, // 房主=自身 peerId；加入者=邀请码里的房主 id。两条路都已提前设好
+  });
 
   S.sync.onSetPause = (p) => window.sw.mpv.setPause(p).catch(() => {});
   S.sync.onSeek = (pos) => window.sw.mpv.seek(pos).catch(() => {});
@@ -561,8 +670,17 @@ function initSwarmAndSync() {
 
   S.sync.on('stall-change', ({ name, stalled, self }) => {
     const who = self ? '你' : name;
-    log(stalled ? `${who}的缓冲跟不上了，全员暂停等待` : `${who}缓冲够了`, stalled ? 'warn' : 'good');
-    if (stalled) window.sw.mpv.osd(`等待 ${who} 缓冲…`, 3000);
+    // 游客的缓冲不足只暂停自己，别喊「全员暂停」误导人。
+    const guestSelf = self && !S.sync.canIControl();
+    if (stalled) {
+      log(
+        guestSelf ? '你的缓冲不够，先暂停你自己（不影响他人）' : `${who}的缓冲跟不上了，全员暂停等待`,
+        'warn'
+      );
+      window.sw.mpv.osd(guestSelf ? '缓冲不足，暂停你自己…' : `等待 ${who} 缓冲…`, 3000);
+    } else {
+      log(`${who}缓冲够了`, 'good');
+    }
   });
 
   S.sync.on('remote-action', ({ kind, by, position }) => {
@@ -572,6 +690,20 @@ function initSwarmAndSync() {
 
   S.sync.on('state', renderStatus);
   S.sync.on('margin', renderStatus);
+
+  // 角色变化：重画成员列表（含标签/切换按钮）、更新我自己的身份提示。
+  S.sync.on('roles', () => {
+    renderPeers();
+    renderMyRole();
+  });
+
+  // 游客试图跳转被拦下的反馈。
+  S.sync.on('denied', ({ action }) => {
+    if (action === 'seek') {
+      log('你是游客，不能跳转进度', 'warn');
+      window.sw.mpv.osd('游客不能跳转进度', 2000);
+    }
+  });
 
   // 我这边还没有文件 → 对方把清单发来了 → 建接收会话
   S.swarm.on('manifest-offer', async ({ manifest }) => {
@@ -635,12 +767,16 @@ async function enterRoom() {
   show('view-room');
 
   renderFilmInfo();
+  renderMyRole();
   renderInvite();
   renderPeers([]);
   renderProgress(S.swarm.progress());
+  $('btn-reveal').classList.toggle('hidden', S.sourceType === 'link');
+  $('buffer').classList.toggle('link-mode', S.sourceType === 'link');
 
   // 片源进房时会话已经就绪；观众要等清单到了才由 manifest-offer 那边调
   if (S.isSeeder && S.manifest) onSessionReady();
+  else if (S.sourceType === 'link' && S.linkInfo) await onLinkSessionReady();
 }
 
 /**
@@ -651,6 +787,12 @@ async function enterRoom() {
  * 等清单到了又被守卫挡回去，结果房间头部永远是空的。
  */
 function renderFilmInfo() {
+  if (S.sourceType === 'link' && S.linkInfo) {
+    $('room-file').textContent = S.linkInfo.title || '在线视频';
+    const duration = S.linkInfo.duration ? ` · ${fmtTime(S.linkInfo.duration)}` : '';
+    $('room-meta').textContent = `视频链接 · ${S.linkInfo.extractor || 'direct'}${duration} · 每位成员从原网站播放`;
+    return;
+  }
   if (!S.manifest) return;
   $('room-file').textContent = S.manifest.name;
   $('room-meta').textContent = `${fmtBytes(S.manifest.size)} · ${S.manifest.chunkCount} 片 × ${fmtBytes(
@@ -673,6 +815,18 @@ function onSessionReady() {
   renderFilmInfo();
   S.sync.start();
   if (S.isSeeder) launchPlayer(); // 片源本地就有完整文件，不用等
+}
+
+async function onLinkSessionReady() {
+  if (!S.linkInfo) return;
+  renderFilmInfo();
+  if (!S.syncStarted) {
+    S.syncStarted = true;
+    if (S.linkInfo.duration) S.sync.setMediaInfo({ duration: S.linkInfo.duration, size: 0 });
+    S.sync.start();
+  }
+  await launchPlayer();
+  renderProgress(S.swarm.progress());
 }
 
 /** 接收方：片头够了才起播放器。在此之前我们会一直处于 stall，全员等着。 */
@@ -700,6 +854,13 @@ async function launchPlayer() {
 }
 
 /* ------------------------------- 邀请区 ------------------------------- */
+
+function inviteMediaInfo() {
+  if (S.sourceType === 'link' && S.linkInfo) {
+    return { name: S.linkInfo.title || '在线视频', size: 0, kind: 'link' };
+  }
+  return { name: S.manifest?.name || '视频', size: S.manifest?.size || 0, kind: 'file' };
+}
 
 async function renderInvite() {
   const box = $('invite-body');
@@ -738,7 +899,7 @@ async function inviteViaServer() {
       room: S.roomId,
       from: S.peerId,
       name: S.name,
-      file: { name: S.manifest.name, size: S.manifest.size },
+      file: inviteMediaInfo(),
     });
 
     out.innerHTML = `
@@ -787,7 +948,7 @@ async function inviteViaManual() {
     from: S.peerId,
     name: S.name,
     sdp: offer,
-    file: { name: S.manifest.name, size: S.manifest.size },
+    file: inviteMediaInfo(),
   });
 
   out.innerHTML = `
@@ -830,7 +991,29 @@ async function inviteViaManual() {
 /* ------------------------------- 渲染 ------------------------------- */
 
 function renderProgress(p) {
-  if (!p || !S.manifest) return;
+  if (!p) return;
+
+  if (S.sourceType === 'link') {
+    $('buf-have').style.width = '100%';
+    $('buf-safe').style.width = '100%';
+    const snap = S.sync?.lastTick;
+    const playRatio = snap && S.sync.duration ? Math.min(1, (snap.position || 0) / S.sync.duration) : 0;
+    $('buf-head').style.left = `${(playRatio * 100).toFixed(2)}%`;
+    $('buffer-stats').innerHTML = `
+      <span><b>来源</b> 原始视频网站</span>
+      <span><b>同步</b> 播放 / 暂停 / 跳转</span>
+      <span><b>缓冲</b> 由各自的 mpv 管理</span>
+    `;
+    $('transfer-stats').innerHTML = `
+      <div class="kv-row"><span>视频传输</span><span>原网站 → 每位成员</span></div>
+      <div class="kv-row"><span>房间消息</span><span>P2P 加密直连</span></div>
+      <div class="kv-row"><span>连接数</span><span>${S.swarm.peers.size}</span></div>
+      <div class="kv-row"><span>模式</span><span>${S.mode === 'manual' ? '极简（零服务器）' : '信令服务器'}</span></div>
+    `;
+    return;
+  }
+
+  if (!S.manifest) return;
 
   $('buf-have').style.width = `${(p.ratio * 100).toFixed(2)}%`;
   $('buf-safe').style.width = `${(p.contiguousRatio * 100).toFixed(2)}%`;
@@ -895,6 +1078,8 @@ function drawChunkMap() {
   }
 }
 
+const ROLE_LABEL = { host: '房主', admin: '管理员', guest: '游客' };
+
 function renderPeers(list) {
   list = list || S.swarm?.peerList() || [];
   $('peer-count').textContent = list.length;
@@ -904,30 +1089,72 @@ function renderPeers(list) {
     return;
   }
 
+  const iAmHost = S.sync?.myRole() === 'host';
+
   $('peer-list').innerHTML = list
     .map((p) => {
       const stalled = S.sync?.stalledPeers.has(p.peerId);
+      const role = S.sync?.roleOf(p.peerId) || 'guest';
       const dotClass =
         p.state === 'connected' || p.state === 'completed'
           ? 'connected'
           : p.state === 'failed'
           ? 'failed'
           : 'checking';
+      // 房主可以给每个人（房主自己除外）在管理员/游客之间切换。
+      const roleCtl =
+        iAmHost && role !== 'host'
+          ? `<button class="role-toggle" data-peer="${esc(p.peerId)}" data-next="${
+              role === 'admin' ? 'guest' : 'admin'
+            }">${role === 'admin' ? '设为游客' : '设为管理员'}</button>`
+          : `<span class="role-badge ${role}">${ROLE_LABEL[role]}</span>`;
+      const mediaProgress =
+        S.sourceType === 'link'
+          ? `<div class="peer-sub">链接同步 · ${p.rtt != null ? `${p.rtt}ms` : '—'}</div>`
+          : `<div class="peer-bar"><div style="width:${(p.remoteRatio * 100).toFixed(1)}%"></div></div>
+             <div class="peer-sub">
+               持有 ${(p.remoteRatio * 100).toFixed(0)}% ·
+               ${p.rtt != null ? `${p.rtt}ms` : '—'} ·
+               ↓${fmtRate(p.downRate)}
+             </div>`;
       return `
         <div class="peer">
           <div class="peer-top">
             <span class="peer-name ${stalled ? 'stalled' : ''}">${esc(p.name)}</span>
             <span class="dot ${dotClass}"></span>
           </div>
-          <div class="peer-bar"><div style="width:${(p.remoteRatio * 100).toFixed(1)}%"></div></div>
-          <div class="peer-sub">
-            持有 ${(p.remoteRatio * 100).toFixed(0)}% ·
-            ${p.rtt != null ? `${p.rtt}ms` : '—'} ·
-            ↓${fmtRate(p.downRate)}
-          </div>
+          <div class="peer-role">${roleCtl}</div>
+          ${mediaProgress}
         </div>`;
     })
     .join('');
+}
+
+// 房主点「设为管理员/游客」—— 事件委托，省得每次重画都重新接线。
+$('peer-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('.role-toggle');
+  if (!btn || S.sync?.myRole() !== 'host') return;
+  S.sync.setRole(btn.dataset.peer, btn.dataset.next);
+});
+
+/** 更新「我是谁」的身份提示：房主/管理员可控场，游客只能管自己、不能跳转。 */
+function renderMyRole() {
+  const badge = $('my-role');
+  const hint = $('role-hint');
+  if (!badge || !S.sync) return;
+
+  const role = S.sync.myRole();
+  badge.textContent = ROLE_LABEL[role];
+  badge.className = `role-badge ${role}`;
+
+  const canControl = S.sync.canIControl();
+  $('buffer').classList.toggle('locked', !canControl);
+  if (hint) {
+    hint.textContent = canControl
+      ? ''
+      : '你是游客：播放/暂停只对你自己生效，不影响其他人，也不能拖动进度条。';
+    hint.classList.toggle('hidden', canControl);
+  }
 }
 
 function renderStatus() {
@@ -935,15 +1162,21 @@ function renderStatus() {
   const st = S.sync.status();
   const banner = $('status-banner');
 
+  const guest = !S.sync.canIControl();
+
   if (st.stalled) {
     banner.className = 'status-banner waiting';
     banner.textContent = `全员暂停中 —— 在等 ${st.waitingFor.join('、')} 把缓冲攒够`;
   } else if (!st.paused) {
     banner.className = 'status-banner playing';
-    banner.textContent = '播放中，所有人同步';
+    banner.textContent = guest ? '播放中（你在独立观看，操作不影响他人）' : '播放中，所有人同步';
   } else {
     banner.className = 'status-banner';
-    banner.textContent = S.mpvRunning ? '已暂停' : '正在缓冲片头，马上就好…';
+    banner.textContent = S.mpvRunning
+      ? '已暂停'
+      : S.sourceType === 'link'
+      ? '正在解析并连接原始视频…'
+      : '正在缓冲片头，马上就好…';
   }
 
   $('btn-playpause').textContent = st.intendedPaused ? '播放' : '暂停';
@@ -955,14 +1188,14 @@ function renderStatus() {
 window.sw.mpv.onTick((snap) => {
   if (!S.sync || !S.swarm) return;
 
-  if (snap.duration && S.swarm.scheduler) {
-    S.swarm.setDuration(snap.duration);
-    S.sync.setMediaInfo({ duration: snap.duration, size: S.manifest?.size });
+  if (snap.duration) {
+    if (S.swarm.scheduler) S.swarm.setDuration(snap.duration);
+    S.sync.setMediaInfo({ duration: snap.duration, size: S.sourceType === 'link' ? 0 : S.manifest?.size });
   }
 
   S.sync.onMpvTick(snap, {
     contiguousBytes: S.swarm.contiguousBytes,
-    complete: S.swarm.complete,
+    complete: S.sourceType === 'link' || S.swarm.complete,
   });
 
   renderProgress(S.swarm.progress());
@@ -998,9 +1231,13 @@ $('btn-leave').onclick = async () => {
   location.reload();
 };
 
-// 点进度条 seek —— 会同步给所有人
+// 点进度条 seek —— 会同步给所有人。游客不允许跳转。
 $('buffer').onclick = (e) => {
   if (!S.sync?.duration || !S.mpvRunning) return;
+  if (!S.sync.canIControl()) {
+    log('你是游客，不能跳转进度', 'warn');
+    return;
+  }
   const rect = e.currentTarget.getBoundingClientRect();
   const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
   S.sync.userSeek(ratio * S.sync.duration);

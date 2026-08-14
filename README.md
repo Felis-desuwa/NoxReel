@@ -2,6 +2,10 @@
 
 P2P 同步观影分发软件。一个人有片子，其他人不用先下载就能一起看 —— 边下边播，谁的网跟不上，全员自动停下来等他。
 
+现在也支持**视频链接同步观看**：房主粘贴单个公开视频页面、MP4 直链或 HLS 清单，
+SyncWatch 用 yt-dlp 解析媒体信息，每位成员直接从原网站播放，房间只同步播放、暂停和跳转。
+链接内容不会经过信令服务器或其他成员转发；付费、登录限制和 DRM 内容不会被绕过。
+
 ## 快速开始
 
 **最简单：双击 `启动.bat`。** 首次会自动装依赖、修复 Electron、检查 mpv，然后启动。
@@ -12,7 +16,12 @@ P2P 同步观影分发软件。一个人有片子，其他人不用先下载就�
 npm install
 npm start                # 启动客户端
 npm run signal           # （可选）本机跑一个信令服务器
+npm test                 # 单元测试
+npm run dist             # 生成 Windows 一键安装包 dist/SyncWatch-Setup-*.exe
 ```
+
+正式 Windows 安装包已内置 mpv 和 yt-dlp；从源码运行时，也可以自行安装它们，或通过
+`SYNCWATCH_MPV_PATH` / `SYNCWATCH_YTDLP_PATH` 指定路径。ffmpeg 仍是本地 MP4 按需转封装组件。
 
 需要信令服务器时，双击 `启动信令服务器.bat`。
 

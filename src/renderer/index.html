@@ -41,10 +41,10 @@
             <button class="notice-x" id="geo-notice-x" title="知道了">×</button>
           </div>
 
-          <h1>和朋友一起看，片子只要一个人有</h1>
+          <h1>和朋友一起看，本地视频和视频链接都能同步</h1>
           <p class="sub">
-            拖一个视频进来生成邀请码，其他人不需要这个文件就能加入 ——
-            边下边播，谁的网卡了大家一起等他。
+            分享本地视频时边下边播；粘贴公开视频链接时，每个人从原网站播放，
+            播放、暂停和进度保持同步。
           </p>
 
           <div class="cards">
@@ -53,6 +53,16 @@
               <h3>发起放映</h3>
               <p>把 MP4 或 MKV 拖到这里，或者点击选择</p>
               <p class="fine">最大 5GB · 只支持你自己合法拥有的内容</p>
+            </div>
+
+            <div class="card link-card">
+              <div class="card-icon">↗</div>
+              <h3>解析视频链接</h3>
+              <p>粘贴单个视频页面或 MP4 / HLS 直链</p>
+              <input id="video-link" type="url" placeholder="https://…" spellcheck="false" />
+              <button class="primary" id="btn-link">解析并发起</button>
+              <div class="err" id="link-err"></div>
+              <p class="fine">支持范围由 yt-dlp 与原网站决定；不绕过登录、付费或 DRM。</p>
             </div>
 
             <div class="card">
@@ -90,8 +100,12 @@
         <div class="room">
           <div class="room-main">
             <div class="film">
-              <div class="film-name" id="room-file"></div>
+              <div class="film-name">
+                <span id="room-file"></span>
+                <span class="role-badge" id="my-role"></span>
+              </div>
               <div class="film-meta" id="room-meta"></div>
+              <div class="role-hint hidden" id="role-hint"></div>
             </div>
 
             <!-- 核心可视化：连续水位线 vs 播放头 -->

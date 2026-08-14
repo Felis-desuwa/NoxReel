@@ -31,6 +31,8 @@ export const MSG = {
   DENY: 'deny',
   SYNC: 'sync',
   STALL: 'stall',
+  ROLE: 'role',
+  MEDIA_LINK: 'media-link',
   CHAT: 'chat',
   PING: 'ping',
   PONG: 'pong',

@@ -21,6 +21,16 @@ import { MSG } from './protocol.js';
  * ── 冲突处理 ──
  * 无主结构，谁都能发起。用 Lamport 逻辑时钟定序，时钟相同就比 peerId，
  * 保证所有人最终收敛到同一个状态，不会两边互相打架。
+ *
+ * ── 权限（房主 / 管理员 / 游客）──
+ * 「谁都能发起」只对控制者成立。房主（发起放映的人，peerId === hostId）是角色的
+ * 唯一权威：他给每个人分配「管理员」或「游客」，通过 ROLE 消息广播全场。
+ *  - 管理员 / 房主：可播放、暂停、跳转，且操作同步给所有人（原有行为）。
+ *  - 游客：只能播放/暂停「自己这一路」—— 不广播、不影响他人；不允许跳转。
+ * 强制点有两层：① 游客自己的客户端不广播控制指令；② 收到控制指令的一方，
+ * 若发送者已知是游客则直接忽略（纵深防御，改一版客户端也控不了场）。
+ * 角色权威只认 hostId：邀请码里带着房主的 peerId，人人都知道该信谁，
+ * 冒名顶替的 ROLE 一律不认。缓冲联动同理 —— 游客的缓冲不足只暂停自己，不拖累全员。
  */
 
 const STALL_THRESHOLD_SECONDS = 5; // 身前不足 5 秒的连续数据 → 喊停
@@ -31,11 +41,21 @@ const SEEK_TOLERANCE = 0.75; // 差这么多秒以内就不去动播放器了，
 const SEEK_DETECT_JUMP = 1.5; // 时间线跳变超过这个数，判定是用户拖了进度条
 
 export class SyncEngine extends Emitter {
-  constructor({ peerId, name, isSeeder }) {
+  constructor({ peerId, name, isSeeder, hostId }) {
     super();
     this.peerId = peerId;
     this.name = name;
     this.isSeeder = isSeeder;
+
+    // 权限。hostId 是「谁是房主」的锚点：房主自己传自身 peerId；加入者从邀请码拿到房主的
+    // peerId。都不知道时（安卓信令模式直接填房间号进来，手里没邀请码）传 null —— 此时
+    // 自己算游客（默认最保守），等第一条 ROLE 认定并钉死房主身份。**不要**默认成 peerId，
+    // 否则不知情的加入者会把自己错当成房主，短暂拿到控场权。
+    // roles 显式记录每一个已知 peer 的角色（peerId -> 'admin'|'guest'），房主不入表。
+    // 「显式记录游客」是必要的：靠它才能把「已知的游客」和「角色表还没同步到的陌生人」
+    // 区分开 —— 忽略前者的控制指令，放行后者（等房主的权威表来纠正）。
+    this.hostId = hostId || null;
+    this.roles = new Map();
 
     // 房间共识状态
     this.shared = { paused: true, position: 0, lamport: 0, by: peerId };
@@ -81,6 +101,84 @@ export class SyncEngine extends Emitter {
     return this.shared.lamport;
   }
 
+  /* ------------------------------ 权限 ------------------------------ */
+
+  /** 某个 peer 的角色：房主 / 管理员 / 游客。未显式分配的都是游客。 */
+  roleOf(peerId) {
+    if (this.hostId && peerId === this.hostId) return 'host';
+    return this.roles.get(peerId) || 'guest';
+  }
+
+  /** 控制者 = 房主或管理员，能左右全场；游客只能管自己。 */
+  isController(peerId) {
+    const r = this.roleOf(peerId);
+    return r === 'host' || r === 'admin';
+  }
+
+  /** 我自己现在有没有控场权。 */
+  canIControl() {
+    return this.isController(this.peerId);
+  }
+
+  /** 我自己的角色。 */
+  myRole() {
+    return this.roleOf(this.peerId);
+  }
+
+  /** 供 UI 展示：[{peerId, role}]，含房主自己。 */
+  roleSnapshot() {
+    const out = this.hostId ? [{ peerId: this.hostId, role: 'host' }] : [];
+    for (const [id, role] of this.roles) if (id !== this.hostId) out.push({ peerId: id, role });
+    return out;
+  }
+
+  /**
+   * 房主调用：peer 首次出现时登记为游客（默认角色）并广播，让全场都知道有这么个游客。
+   * 不广播的话，别人只把他当「陌生人」放行他的控制指令，纵深防御就漏了。
+   */
+  hostEnsureKnown(peerId) {
+    if (this.myRole() !== 'host' || peerId === this.hostId || this.roles.has(peerId)) return;
+    this.roles.set(peerId, 'guest');
+    this._broadcastRoles();
+    this.emit('roles', this.roleSnapshot());
+  }
+
+  /**
+   * 房主调用：把某人设为管理员或游客，落库并广播。别人调用无效。
+   * 降级为游客时，若他此刻正卡在缓冲里拖着全员，得把他从 stall 名单里摘掉。
+   */
+  setRole(peerId, role) {
+    if (this.myRole() !== 'host' || peerId === this.hostId) return;
+    this.roles.set(peerId, role === 'admin' ? 'admin' : 'guest');
+    if (!this.isController(peerId) && this.stalledPeers.delete(peerId)) this._reconcile();
+    this._broadcastRoles();
+    this.emit('roles', this.roleSnapshot());
+  }
+
+  _broadcastRoles() {
+    this.emit('outbound', {
+      t: MSG.ROLE,
+      hostId: this.hostId,
+      roles: [...this.roles.entries()],
+    });
+  }
+
+  /** 收到房主的角色表（onCtrl 里已校验来自 hostId 才会进来）。 */
+  applyRoles(entries, hostId) {
+    if (hostId) this.hostId = hostId;
+    this.roles = new Map(entries || []);
+    // 已被降级为游客的人不再拖累全员，从 stall 名单里清掉
+    let changed = false;
+    for (const id of [...this.stalledPeers.keys()]) {
+      if (!this.isController(id)) {
+        this.stalledPeers.delete(id);
+        changed = true;
+      }
+    }
+    this.emit('roles', this.roleSnapshot());
+    if (changed) this._reconcile();
+  }
+
   /* -------------------------- 本地播放器事件 -------------------------- */
 
   /**
@@ -105,8 +203,13 @@ export class SyncEngine extends Emitter {
       const shouldBePaused = this.effectivePaused;
       if (snap.paused !== shouldBePaused) {
         this.intendedPaused = snap.paused;
-        this._broadcastSync(snap.position);
-        this.emit('local-action', { kind: snap.paused ? 'pause' : 'play', position: snap.position });
+        // 游客的播放/暂停只作用于自己这一路，不广播、不动共识状态。
+        if (this.canIControl()) this._broadcastSync(snap.position);
+        this.emit('local-action', {
+          kind: snap.paused ? 'pause' : 'play',
+          position: snap.position,
+          local: !this.canIControl(),
+        });
       }
     }
 
@@ -115,8 +218,19 @@ export class SyncEngine extends Emitter {
       const elapsed = (this.lastTick.at - prev.at) / 1000;
       const expected = prev.paused ? prev.position : prev.position + elapsed;
       if (Math.abs(snap.position - expected) > SEEK_DETECT_JUMP) {
-        this._broadcastSync(snap.position);
-        this.emit('local-action', { kind: 'seek', position: snap.position });
+        if (this.canIControl()) {
+          this._broadcastSync(snap.position);
+          this.emit('local-action', { kind: 'seek', position: snap.position });
+        } else {
+          // 游客不允许跳转：把进度拉回原处。
+          this.emit('denied', { action: 'seek' });
+          this.applying = true;
+          Promise.resolve(this.emit_seek(expected)).finally(() => {
+            setTimeout(() => {
+              this.applying = false;
+            }, 250);
+          });
+        }
       }
     }
   }
@@ -170,14 +284,17 @@ export class SyncEngine extends Emitter {
   _setLocalStall(stalled, deficitSeconds, position = 0) {
     if (this.localStalled === stalled) return;
     this.localStalled = stalled;
-    this.emit('outbound', {
-      t: MSG.STALL,
-      stalled,
-      peerId: this.peerId,
-      name: this.name,
-      position,
-      deficitSeconds,
-    });
+    // 游客的缓冲不足只暂停自己，不广播、不拖累全员（他本就是「自己看自己的」）。
+    if (this.canIControl()) {
+      this.emit('outbound', {
+        t: MSG.STALL,
+        stalled,
+        peerId: this.peerId,
+        name: this.name,
+        position,
+        deficitSeconds,
+      });
+    }
     this.emit('stall-change', { who: this.peerId, name: this.name, stalled, self: true });
     this._reconcile();
   }
@@ -202,12 +319,37 @@ export class SyncEngine extends Emitter {
   /* ---------------------------- 远端消息 ---------------------------- */
 
   onCtrl(msg, fromPeer) {
-    if (msg.t === MSG.SYNC) return this._onRemoteSync(msg);
+    if (msg.t === MSG.SYNC) return this._onRemoteSync(msg, fromPeer);
     if (msg.t === MSG.STALL) return this._onRemoteStall(msg, fromPeer);
+    if (msg.t === MSG.ROLE) return this._onRole(msg, fromPeer);
     return false;
   }
 
-  _onRemoteSync(msg) {
+  /**
+   * 角色表只认房主。冒名的 ROLE 一律丢弃。
+   *
+   * 「谁是房主」的锚点很关键，不能让消息自己说了算 —— 否则任何人把 hostId 填成自己
+   * 就能篡夺角色权威。分两种情况：
+   *  - 已知房主（PC 端从邀请码拿到，或此前已认过）：只认这个 peer 发来的表。
+   *  - 尚不知道房主（安卓信令模式直接填房间号进来，手里没有邀请码）：首认为准 ——
+   *    认「自称房主、且确实以该身份发消息」的第一个人，之后钉死，不再改。
+   *    发送方 peerId 由 P2P 通道本身担保，冒不了别人的身份。
+   */
+  _onRole(msg, fromPeer) {
+    const from = fromPeer?.peerId;
+    if (!from) return true;
+    const known = this.hostId && this.hostId !== this.peerId;
+    if (known ? from !== this.hostId : from !== msg.hostId) return true;
+    this.applyRoles(msg.roles, msg.hostId);
+    return true;
+  }
+
+  _onRemoteSync(msg, fromPeer) {
+    // 游客无权控场：已知是游客的人发来的同步指令直接忽略（纵深防御）。
+    // 发送者身份未知时（角色表还没同步到）先放行，房主的问候会兜底纠正。
+    const by = msg.by || fromPeer?.peerId;
+    if (by && this.roles.has(by) && !this.isController(by)) return true;
+
     // Lamport 定序：时钟大的赢；一样大就比 peerId，保证各方判断一致。
     const newer =
       msg.lamport > this.shared.lamport ||
@@ -228,6 +370,10 @@ export class SyncEngine extends Emitter {
   _onRemoteStall(msg, fromPeer) {
     const id = msg.peerId || fromPeer?.peerId;
     if (!id) return true;
+
+    // 游客的缓冲不足不拖累全员：已知游客发来的「卡住了」直接忽略。
+    // 「缓冲好了」照收不误 —— 万一之前记过他，也能干净地清掉。
+    if (msg.stalled && this.roles.has(id) && !this.isController(id)) return true;
 
     if (msg.stalled) {
       this.stalledPeers.set(id, {
@@ -299,18 +445,28 @@ export class SyncEngine extends Emitter {
   /** 用户点了 UI 上的播放/暂停（不是在 mpv 窗口里点的）。 */
   userSetPaused(paused) {
     this.intendedPaused = paused;
-    const pos = this.lastTick?.position || 0;
-    this._broadcastSync(pos);
+    // 游客：只暂停/播放自己这一路，不广播、不动共识。
+    if (this.canIControl()) this._broadcastSync(this.lastTick?.position || 0);
     this._reconcile();
   }
 
   userSeek(position) {
+    // 游客不允许跳转。UI 那层已经拦了，这里再兜一道底。
+    if (!this.canIControl()) {
+      this.emit('denied', { action: 'seek' });
+      return;
+    }
     this._broadcastSync(position);
     this._reconcile({ seekTo: position });
   }
 
   /** 新 peer 接进来，得先告诉他现在房间是什么状态。 */
   greet(peer) {
+    // 房主：先把权威角色表发给新人，他才知道该信谁、自己是什么身份。
+    if (this.myRole() === 'host') {
+      this.hostEnsureKnown(peer.peerId);
+      peer.send({ t: MSG.ROLE, hostId: this.hostId, roles: [...this.roles.entries()] });
+    }
     peer.send({
       t: MSG.SYNC,
       paused: this.shared.paused,
@@ -319,7 +475,7 @@ export class SyncEngine extends Emitter {
       by: this.shared.by,
       name: this.name,
     });
-    if (this.localStalled) {
+    if (this.localStalled && this.canIControl()) {
       peer.send({
         t: MSG.STALL,
         stalled: true,

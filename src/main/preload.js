@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld('sw', {
 
   media: {
     inspect: (filePath) => ipcRenderer.invoke('media:inspect', filePath),
+    inspectLink: (url) => ipcRenderer.invoke('media:inspectLink', url),
     remux: (filePath) => ipcRenderer.invoke('media:remux', filePath),
     onRemuxProgress: on('media:remuxProgress'),
   },

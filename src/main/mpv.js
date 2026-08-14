@@ -16,6 +16,7 @@ const path = require('path');
 const os = require('os');
 const { EventEmitter } = require('events');
 const { findBin } = require('./findBin');
+const { findYtDlp } = require('./linkMedia');
 
 // 我们关心的属性。stream-pos 是字节位置 —— 这个比 time-pos 更适合跟连续水位线比，
 // 因为不用靠码率去猜时间和字节的换算。
@@ -24,6 +25,10 @@ const OBSERVED = ['time-pos', 'pause', 'duration', 'stream-pos', 'core-idle', 'e
 // mpv 特有的安装位置。'MPV Player' 是 winget 上 shinchiro.mpv（最主流的包）的落点，
 // 它既不进 PATH 也不叫 'mpv'，光靠通用规则找不到。
 const MPV_CANDIDATES = [
+  ...(process.resourcesPath
+    ? [path.join(process.resourcesPath, 'bin', process.platform === 'win32' ? 'mpv.exe' : 'mpv')]
+    : []),
+  path.join(__dirname, '..', '..', 'vendor', 'bin', process.platform === 'win32' ? 'mpv.exe' : 'mpv'),
   'C:\\Program Files\\MPV Player\\mpv.exe',
   'C:\\Program Files (x86)\\MPV Player\\mpv.exe',
   'C:\\Program Files\\mpv\\mpv.exe',
@@ -78,6 +83,8 @@ class MpvController extends EventEmitter {
     }
 
     const ipcPath = this._ipcPath();
+    const isRemote = /^https?:\/\//i.test(filePath);
+    const ytDlp = isRemote ? findYtDlp() : null;
     const args = [
       `--input-ipc-server=${ipcPath}`,
       '--idle=yes',
@@ -87,6 +94,9 @@ class MpvController extends EventEmitter {
       '--osd-level=1',
       `--pause=${startPaused ? 'yes' : 'no'}`,
       '--title=SyncWatch',
+      ...(isRemote ? ['--ytdl=yes', '--script-opts-append=ytdl_hook-try_ytdl_first=yes'] : []),
+      ...(ytDlp ? [`--script-opts-append=ytdl_hook-ytdl_path=${ytDlp}`] : []),
+      '--',
       filePath,
     ];
 

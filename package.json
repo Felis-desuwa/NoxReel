@@ -1,12 +1,15 @@
 {
   "name": "syncwatch",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "P2P 同步观影分发软件 — 边下边播，播放位置优先调度，全员缓冲联动",
   "main": "src/main/main.js",
   "scripts": {
     "start": "electron .",
     "signal": "node signaling-server/server.js",
-    "dist": "electron-builder"
+    "test": "node --test",
+    "prepare:runtime": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-runtime.ps1",
+    "predist": "npm run prepare:runtime",
+    "dist": "electron-builder --win nsis"
   },
   "author": "",
   "license": "MIT",
@@ -21,11 +24,28 @@
     "appId": "com.syncwatch.app",
     "productName": "SyncWatch",
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "artifactName": "SyncWatch-Setup-${version}.${ext}",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "SyncWatch"
     },
     "files": [
       "src/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/bin",
+        "to": "bin",
+        "filter": ["mpv.exe", "yt-dlp.exe"]
+      }
     ]
   },
   "allowScripts": {
