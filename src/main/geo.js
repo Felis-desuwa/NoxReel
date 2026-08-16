@@ -31,7 +31,7 @@ const PROVIDERS = [
 
 function fetchJson(url, timeoutMs = 4000) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers: { 'User-Agent': 'NoxReel/0.4.1' } }, (res) => {
+    const req = https.get(url, { headers: { 'User-Agent': 'NoxReel/0.4.2' } }, (res) => {
       if (res.statusCode !== 200) {
         res.resume();
         return reject(new Error(`HTTP ${res.statusCode}`));

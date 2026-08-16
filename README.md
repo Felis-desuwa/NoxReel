@@ -5,7 +5,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 边传边播，也支持视频链接解析与同步播放。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.4.1-7C5CFF?style=for-the-badge" alt="Version 0.4.1">
+    <img src="https://img.shields.io/badge/version-0.4.2-7C5CFF?style=for-the-badge" alt="Version 0.4.2">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -38,17 +38,18 @@
 - **缓冲联动**：任何成员可播余量不足时全员暂停，恢复后继续。
 - **真实成员状态**：只显示已建立连接的用户，并给出上传、下载速度和延迟。
 - **播放器可恢复**：播放器窗口关闭后，可从房间页面重新打开。
+- **缓存自动清理**：接收视频和转封装副本只进入系统临时缓存，换片、退房或关闭软件时自动删除；异常残留会在下次启动时回收。
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC 和安全 DOM 渲染，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!IMPORTANT]
-> `v0.4.1` 修复了旧版本安全扫描发现的弱随机数和直接 HTML 写入问题，并收紧了导航、外链与主进程 IPC 边界。建议旧版用户升级。
+> `v0.4.2` 将接收视频和转封装副本迁移到临时缓存，退出房间或软件时自动清理，并使用有上限的内存缓存减少磁盘读写；同时包含 `v0.4.1` 的全部安全修复。建议旧版用户升级。
 
 ## 下载
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，安装后即可使用 | [NoxReel-Setup-0.4.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.4.1.exe) |
-| Windows 联网版 | 安装器体积小，安装时下载应用组件 | [NoxReel-WebSetup-0.4.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.4.1.exe) |
+| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，安装后即可使用 | [NoxReel-Setup-0.4.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.4.2.exe) |
+| Windows 联网版 | 安装器体积小，安装时下载应用组件 | [NoxReel-WebSetup-0.4.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.4.2.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -84,6 +85,7 @@
 
 - 本地视频分片通过加密的 WebRTC 连接在成员之间传输。
 - 视频链接由每位成员直接从原始网站读取，不经过 NoxReel 信令服务器。
+- 用户选择的源视频始终保持原样；软件生成的接收缓存不会保留在“下载”文件夹，也不提供跨重启断点续传。
 - 桌面端启用 Chromium sandbox、上下文隔离和严格 CSP；所有特权操作均通过白名单 IPC 完成。
 - 昵称、成员信息和错误内容通过文本节点渲染，不作为 HTML 执行。
 - NoxReel 不绕过登录、付费墙、地区限制或 DRM。
@@ -102,7 +104,7 @@
 | WebSocket | 可选信令服务 |
 | yt-dlp | 公共视频链接解析 |
 
-本地文件采用分片校验与连续水位线机制：播放器只读取从文件开头起已经连续落盘的部分，避免读到未下载区域。
+本地文件采用分片校验与连续水位线机制：播放器只读取从文件开头起已经连续落盘的部分，避免读到未接收区域。热点分片使用有上限的内存缓存，相邻分片合并落盘，以减少多人传输时的重复磁盘读取和零碎写入。
 
 </details>
 

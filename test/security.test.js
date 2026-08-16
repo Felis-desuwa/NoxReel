@@ -52,6 +52,7 @@ test('Electron 安全配置和 DOM 渲染模式不会退化', () => {
   const preload = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'preload.js'), 'utf8');
   const renderer = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'app.js'), 'utf8');
   const mpv = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'mpv.js'), 'utf8');
+  const fileStore = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'fileStore.js'), 'utf8');
 
   assert.match(main, /app\.enableSandbox\(\)/);
   assert.match(main, /sandbox:\s*true/);
@@ -64,4 +65,7 @@ test('Electron 安全配置和 DOM 渲染模式不会退化', () => {
   assert.doesNotMatch(renderer, /(?:inner|outer)HTML|insertAdjacentHTML|Math\.random/);
   assert.doesNotMatch(mpv, /Math\.random/);
   assert.match(mpv, /randomBytes\(16\)/);
+  assert.match(mpv, /--cache-on-disk=no/);
+  assert.match(main, /disable-http-cache/);
+  assert.doesNotMatch(fileStore, /\.swpart|tryResume|PART_SUFFIX/);
 });
