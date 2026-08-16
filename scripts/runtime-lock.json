@@ -1,0 +1,11 @@
+{
+  "mpv": {
+    "version": "0.41.0-244-gaf9c81fa1",
+    "sha256": "1645e57569c0af58a70c61257f3716f2ee6eb31bb170edc51f3f25a0b8d0d99c"
+  },
+  "ytDlp": {
+    "version": "2026.07.04",
+    "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp.exe",
+    "sha256": "52fe3c26dcf71fbdc85b528589020bb0b8e383155cfa81b64dd447bbe35e24b8"
+  }
+}

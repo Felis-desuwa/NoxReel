@@ -15,12 +15,16 @@ const SERVE_CONCURRENCY = 2; // 每个 peer 同时最多给他发 2 片，多了
 const PING_MS = 3000;
 const MANIFEST_HASHES_PER_PART = 600; // 约 40KB/条，稳稳低于 DataChannel 常见 64KB 单消息上限
 const MAX_MANIFEST_PARTS = 32;
+const PEER_ID_RE = /^[A-Za-z0-9_-]{6,128}$/;
+const HASH_RE = /^[a-f0-9]{64}$/i;
+const MAX_MANIFEST_CHUNKS = 5120; // 10GB / 2MB
 
 export class Swarm extends Emitter {
-  constructor({ peerId, name }) {
+  constructor({ peerId, name, securityMode = 'safe' }) {
     super();
     this.peerId = peerId;
     this.name = name;
+    this.securityMode = securityMode === 'trusted' ? 'trusted' : 'safe';
     /** @type {Map<string, import('./peer.js').Peer>} */
     this.peers = new Map();
 
@@ -68,7 +72,9 @@ export class Swarm extends Emitter {
     }
 
     // 已经连上的人还不知道我有什么，补发一遍
-    for (const p of this.peers.values()) this._sendIntro(p);
+    for (const p of this.peers.values()) {
+      if (p.authenticated) this._sendIntro(p);
+    }
     this.emit('progress', this.progress());
   }
 
@@ -131,9 +137,8 @@ export class Swarm extends Emitter {
     this._serveQueue.set(peer.peerId, []);
 
     peer.on('open', () => {
-      peer.hello(this.peerId, this.name);
-      this._sendIntro(peer);
-      this.emit('peer-open', this._peerInfo(peer));
+      // 模式协商是数据通道上的第一步；通过前不发清单、控制消息或媒体数据。
+      peer.hello(this.peerId, this.name, this.securityMode);
       this.emit('peers', this.peerList());
     });
 
@@ -158,7 +163,9 @@ export class Swarm extends Emitter {
    */
   renamePeer(oldId, newId, name) {
     const p = this.peers.get(oldId);
-    if (!p || oldId === newId) return false;
+    if (!p || oldId === newId || !PEER_ID_RE.test(newId)) return false;
+    // 绝不能覆盖已有 peer；否则攻击者可以把自己改成房主 ID，接管角色权威。
+    if (this.peers.has(newId)) return false;
 
     this.peers.delete(oldId);
     this._serving.set(newId, this._serving.get(oldId) ?? 0);
@@ -201,7 +208,7 @@ export class Swarm extends Emitter {
   }
 
   _sendIntro(peer) {
-    if (!this.manifest) return;
+    if (!peer.authenticated || !this.manifest) return;
     this._sendManifest(peer, this.manifest);
     peer.send({ t: MSG.BITFIELD, bits: packBitfield(this.have) });
     peer.ready = true;
@@ -226,7 +233,15 @@ export class Swarm extends Emitter {
   }
 
   _handleManifest(peer, manifest) {
-    if (!manifest?.fileId || !Array.isArray(manifest.hashes) || manifest.hashes.length !== manifest.chunkCount) return;
+    if (
+      !manifest?.fileId ||
+      !Number.isInteger(manifest.chunkCount) ||
+      manifest.chunkCount < 1 ||
+      manifest.chunkCount > MAX_MANIFEST_CHUNKS ||
+      !Array.isArray(manifest.hashes) ||
+      manifest.hashes.length !== manifest.chunkCount ||
+      manifest.hashes.some((hash) => typeof hash !== 'string' || !HASH_RE.test(hash))
+    ) return;
     const previous = this.manifest;
     peer.remoteManifest = manifest;
     if (!previous || manifest.fileId !== previous.fileId) {
@@ -245,6 +260,7 @@ export class Swarm extends Emitter {
       upRate: peer.upRate || 0,
       bytesReceived: peer.bytesReceived,
       bytesSent: peer.bytesSent,
+      authenticated: peer.authenticated === true,
       remoteRatio: this.manifest?.chunkCount ? remoteCount / this.manifest.chunkCount : 0,
       inflight: peer.inflight.size,
     };
@@ -257,16 +273,41 @@ export class Swarm extends Emitter {
   /* --------------------------- 控制消息 --------------------------- */
 
   _onCtrl(peer, msg) {
+    // HELLO 必须是第一条业务消息。未认证连接不能触发任何房间行为。
+    if (!peer.authenticated && msg.t !== MSG.HELLO) return;
     switch (msg.t) {
       case MSG.HELLO:
-        // 对面自报家门。和占位 id 对不上就走正规改名，别裸改 peer.peerId ——
-        // 那样会让 peers/_serving/_serveQueue 三张表的键脱节。
+        if (peer.authenticated) break;
+        // HELLO 只用于确认身份，不能覆盖信令层已经绑定的 peerId。
         if (msg.peerId && msg.peerId !== peer.peerId) {
-          this.renamePeer(peer.peerId, msg.peerId, msg.name);
+          if (!peer.allowIdentityRename || !this.renamePeer(peer.peerId, msg.peerId, msg.name)) {
+            this.emit('identity-mismatch', { expected: peer.peerId, claimed: msg.peerId });
+            this.removePeer(peer.peerId);
+            return;
+          } else {
+            peer.allowIdentityRename = false;
+          }
         } else if (msg.name) {
-          peer.name = msg.name;
-          this.emit('peers', this.peerList());
+          peer.name = String(msg.name).slice(0, 40);
         }
+
+        // 旧客户端没有 securityMode，按安全模式处理。可信房间绝不允许缺省值。
+        const remoteMode = msg.securityMode === 'trusted' ? 'trusted' : 'safe';
+        if (remoteMode !== this.securityMode) {
+          this.emit('mode-mismatch', {
+            peerId: peer.peerId,
+            localMode: this.securityMode,
+            remoteMode,
+          });
+          this.removePeer(peer.peerId);
+          return;
+        }
+
+        peer.authenticated = true;
+        this._sendIntro(peer);
+        this.emit('peer-authenticated', peer);
+        this.emit('peer-open', this._peerInfo(peer));
+        this.emit('peers', this.peerList());
         break;
 
       case MSG.MANIFEST:
@@ -320,7 +361,7 @@ export class Swarm extends Emitter {
         break;
 
       case MSG.HAVE:
-        if (peer.remoteHave && msg.index < peer.remoteHave.length) {
+        if (peer.remoteHave && Number.isInteger(msg.index) && msg.index >= 0 && msg.index < peer.remoteHave.length) {
           peer.remoteHave[msg.index] = 1;
         }
         break;
@@ -396,7 +437,7 @@ export class Swarm extends Emitter {
   /* ---------------------------- 接收侧 ---------------------------- */
 
   _onFrame(peer, { chunkIndex, frameIndex, payload }) {
-    if (!this.manifest) return;
+    if (!peer.authenticated || !this.manifest) return;
     const full = this.assembler.push(chunkIndex, frameIndex, payload);
     if (!full) return;
     this._commitChunk(peer, chunkIndex, full);
@@ -426,7 +467,9 @@ export class Swarm extends Emitter {
         this.complete = !!res.complete;
 
         // 告诉所有人我有这片了，他们马上就能来找我要
-        for (const p of this.peers.values()) p.send({ t: MSG.HAVE, index });
+        for (const p of this.peers.values()) {
+          if (p.authenticated) p.send({ t: MSG.HAVE, index });
+        }
 
         this.emit('progress', this.progress());
         if (this.complete) this.emit('complete');

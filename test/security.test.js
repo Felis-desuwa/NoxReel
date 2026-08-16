@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const validate = require('../src/main/security');
+const mediaGuard = require('../src/main/mediaGuard');
 const { CHUNK_SIZE } = require('../src/main/fileStore');
 
 function validManifest() {
@@ -26,6 +27,14 @@ test('外部链接只允许无凭据的 HTTP(S) URL', () => {
   assert.throws(() => validate.externalUrl('https://user:pass@example.com/'), /无效/);
 });
 
+test('媒体链接拒绝本机和私有网络地址', async () => {
+  await assert.rejects(validate.publicHttpUrl('http://127.0.0.1/video.mp4'), /无效/);
+  await assert.rejects(validate.publicHttpUrl('http://10.0.0.8/video.mp4'), /无效/);
+  await assert.rejects(validate.publicHttpUrl('http://[::1]/video.mp4'), /无效/);
+  await assert.rejects(validate.publicHttpUrl('http://[::ffff:7f00:1]/video.mp4'), /无效/);
+  await assert.rejects(validate.publicHttpUrl('http://localhost/video.mp4'), /无效/);
+});
+
 test('文件路径必须是绝对路径且不能含 NUL', () => {
   assert.equal(validate.absolutePath(path.resolve('movie.mkv')), path.resolve('movie.mkv'));
   assert.throws(() => validate.absolutePath('movie.mkv'), /无效/);
@@ -37,6 +46,8 @@ test('媒体清单严格限制分片结构和 10GB 边界', () => {
   assert.throws(() => validate.manifest({ ...validManifest(), size: 10 * 1024 ** 3 + 1 }), /无效/);
   assert.throws(() => validate.manifest({ ...validManifest(), chunkCount: 2 }), /无效/);
   assert.throws(() => validate.manifest({ ...validManifest(), hashes: ['not-a-hash'] }), /无效/);
+  assert.throws(() => validate.manifest({ ...validManifest(), name: 'payload.exe' }), /只允许接收/);
+  assert.throws(() => validate.manifest({ ...validManifest(), name: '..\\movie.mkv' }), /无效/);
 });
 
 test('IPC 数值和分片数据拒绝越界输入', () => {
@@ -45,6 +56,22 @@ test('IPC 数值和分片数据拒绝越界输入', () => {
   assert.throws(() => validate.finiteNumber(Number.NaN, '播放位置'), /无效/);
   assert.equal(validate.binary(new ArrayBuffer(CHUNK_SIZE)).byteLength, CHUNK_SIZE);
   assert.throws(() => validate.binary(new ArrayBuffer(CHUNK_SIZE + 1)), /无效/);
+});
+
+test('媒体文件头必须与允许的容器类型一致', () => {
+  const mp4 = Buffer.alloc(32);
+  mp4.writeUInt32BE(24, 0);
+  mp4.write('ftyp', 4, 'ascii');
+  mp4.write('isom', 8, 'ascii');
+  assert.equal(mediaGuard.validateMediaHeader('movie.mp4', mp4).ok, true);
+
+  const mkv = Buffer.alloc(32);
+  mkv.writeUInt32BE(0x1a45dfa3, 0);
+  assert.equal(mediaGuard.validateMediaHeader('movie.mkv', mkv).ok, true);
+
+  const exe = Buffer.alloc(32);
+  exe.write('MZ', 0, 'ascii');
+  assert.equal(mediaGuard.validateMediaHeader('movie.mp4', exe).ok, false);
 });
 
 test('Electron 安全配置和 DOM 渲染模式不会退化', () => {
@@ -66,6 +93,10 @@ test('Electron 安全配置和 DOM 渲染模式不会退化', () => {
   assert.doesNotMatch(mpv, /Math\.random/);
   assert.match(mpv, /randomBytes\(16\)/);
   assert.match(mpv, /--cache-on-disk=no/);
+  assert.match(mpv, /--no-config/);
+  assert.match(mpv, /--load-scripts=no/);
   assert.match(main, /disable-http-cache/);
+  assert.match(main, /requireAllowedLocalPath/);
+  assert.match(main, /publicHttpUrl/);
   assert.doesNotMatch(fileStore, /\.swpart|tryResume|PART_SUFFIX/);
 });

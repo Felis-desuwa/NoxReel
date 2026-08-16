@@ -12,7 +12,7 @@
   button { font: inherit; cursor: pointer; border:none; border-radius:10px; padding:12px 16px; background:var(--panel); color:var(--text); }
   button.primary { background: var(--accent); color:#fff; font-weight:600; }
   button:active { opacity:.85; }
-  input, textarea { font: inherit; width:100%; padding:12px; border-radius:10px; border:1px solid #332f47; background:#17151f; color:var(--text); }
+  input, textarea, select { font: inherit; width:100%; padding:12px; border-radius:10px; border:1px solid #332f47; background:#17151f; color:var(--text); }
   textarea { resize: vertical; }
   label { display:block; font-size:13px; color:var(--dim); margin:14px 0 6px; }
 
@@ -54,8 +54,21 @@
     <h1>NoxReel</h1>
     <div class="sub">P2P 同步观影 · 手机作为观众加入（不做房主）</div>
 
+    <label>界面语言</label>
+    <select id="language">
+      <option value="zh-CN">中文（简体）</option>
+      <option value="en">English</option>
+    </select>
+
     <label>你的昵称</label>
     <input id="name" placeholder="比如：小明的手机" maxlength="20" />
+
+    <label>房间安全模式</label>
+    <select id="security-mode">
+      <option value="safe">安全模式（默认，完整接收后播放）</option>
+      <option value="trusted">可信房间（边下边播，风险较高）</option>
+    </select>
+    <div class="hint">房主和成员必须分别选择相同模式才能握手。Android 安全模式会等待完整接收与分片校验；可信房间在片头就绪后提前播放。</div>
 
     <div class="tabs">
       <button id="tab-server" class="on">信令服务器</button>

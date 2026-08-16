@@ -8,6 +8,7 @@
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
+const { validateMediaHeader } = require('./mediaGuard');
 
 const CHUNK_SIZE = 2 * 1024 * 1024;
 const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024;
@@ -438,6 +439,10 @@ async function writeChunk(sessionId, index, data) {
   const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const expectedLen = chunkLengthAt(index, session.manifest.size);
   if (buf.length !== expectedLen) return { ok: false, reason: 'length', expected: expectedLen, actual: buf.length };
+  if (index === 0) {
+    const header = validateMediaHeader(session.manifest.name, buf);
+    if (!header.ok) return { ok: false, reason: 'media-type', detail: header.reason };
+  }
   const digest = crypto.createHash('sha256').update(buf).digest('hex');
   if (digest !== session.manifest.hashes[index]) return { ok: false, reason: 'hash' };
   if (session.have[index] === 1) {
@@ -450,6 +455,13 @@ async function writeChunk(sessionId, index, data) {
     };
   }
   return session.queueWrite(index, buf);
+}
+
+async function scanTarget(sessionId) {
+  const session = get(sessionId);
+  if (session.mode !== 'leech' || !session.complete) throw new Error('接收文件尚未完整校验');
+  await session.flushAll();
+  return session.filePath;
 }
 
 function state(sessionId) {
@@ -515,6 +527,7 @@ module.exports = {
   readChunk,
   writeChunk,
   state,
+  scanTarget,
   close,
   closeAll,
   packBitfield,

@@ -67,8 +67,9 @@ export function encodeFrames(chunkIndex, buffer) {
 }
 
 export function decodeFrame(data) {
+  if (!(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) return null;
   const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-  if (bytes.length < FRAME_HEADER_BYTES) return null;
+  if (bytes.length < FRAME_HEADER_BYTES || bytes.length > FRAME_HEADER_BYTES + FRAME_PAYLOAD_BYTES) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   return {
     chunkIndex: view.getUint32(0, false),
@@ -99,6 +100,8 @@ export class ChunkAssembler {
     const st = this.pending.get(chunkIndex);
     if (!st) return null;
     if (frameIndex >= st.need || st.frames[frameIndex]) return null; // 越界或重复帧
+    const expected = Math.min(FRAME_PAYLOAD_BYTES, st.length - frameIndex * FRAME_PAYLOAD_BYTES);
+    if (payload.length !== expected) return null;
 
     st.frames[frameIndex] = payload;
     st.got++;
@@ -129,8 +132,15 @@ export class ChunkAssembler {
 }
 
 export function unpackBitfield(b64, chunkCount) {
-  const bin = atob(b64);
   const have = new Uint8Array(chunkCount);
+  const maxEncodedLength = Math.ceil(Math.ceil(chunkCount / 8) / 3) * 4 + 4;
+  if (typeof b64 !== 'string' || b64.length > maxEncodedLength) return have;
+  let bin;
+  try {
+    bin = atob(b64);
+  } catch {
+    return have;
+  }
   for (let i = 0; i < chunkCount; i++) {
     const byte = bin.charCodeAt(i >> 3) || 0;
     have[i] = (byte >> (7 - (i & 7))) & 1;

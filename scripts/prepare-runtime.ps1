@@ -5,7 +5,22 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
 $binDir = Join-Path $root 'vendor\bin'
+$lock = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'runtime-lock.json') -Raw | ConvertFrom-Json
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+
+function Assert-ToolHash($filePath, $expectedHash, $label) {
+  $sha256 = [System.Security.Cryptography.SHA256]::Create()
+  $stream = [System.IO.File]::OpenRead($filePath)
+  try {
+    $actual = ([System.BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+  } finally {
+    $stream.Dispose()
+    $sha256.Dispose()
+  }
+  if ($actual -ne $expectedHash.ToLowerInvariant()) {
+    throw "$label SHA-256 mismatch. Expected $expectedHash but got $actual."
+  }
+}
 
 function Resolve-ToolPath($envName, $commandName, $candidates) {
   $fromEnv = [Environment]::GetEnvironmentVariable($envName)
@@ -36,6 +51,7 @@ if (-not (Test-Path -LiteralPath $mpvTarget)) {
   Write-Host "Bundling mpv: $mpvSource"
   Copy-Item -LiteralPath $mpvSource -Destination $mpvTarget -Force
 }
+Assert-ToolHash $mpvTarget $lock.mpv.sha256 'mpv.exe'
 
 $ytDlpTarget = Join-Path $binDir 'yt-dlp.exe'
 if (-not (Test-Path -LiteralPath $ytDlpTarget)) {
@@ -47,12 +63,13 @@ if (-not (Test-Path -LiteralPath $ytDlpTarget)) {
     Write-Host "Bundling yt-dlp: $ytDlpSource"
     Copy-Item -LiteralPath $ytDlpSource -Destination $ytDlpTarget -Force
   } else {
-    Write-Host 'Downloading yt-dlp.exe from the official GitHub release...'
+    Write-Host "Downloading pinned yt-dlp $($lock.ytDlp.version) from the official GitHub release..."
     Invoke-WebRequest -UseBasicParsing `
-      -Uri 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe' `
+      -Uri $lock.ytDlp.url `
       -OutFile $ytDlpTarget
   }
 }
+Assert-ToolHash $ytDlpTarget $lock.ytDlp.sha256 'yt-dlp.exe'
 
 if ((Get-Item -LiteralPath $mpvTarget).Length -lt 1MB) { throw 'mpv.exe is unexpectedly small.' }
 if ((Get-Item -LiteralPath $ytDlpTarget).Length -lt 1MB) { throw 'yt-dlp.exe is unexpectedly small.' }

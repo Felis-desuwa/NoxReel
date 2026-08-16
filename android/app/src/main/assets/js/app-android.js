@@ -5,7 +5,7 @@
  * 只把「存储」和「播放器」换成原生实现（经 native-shim 的 window.sw / window.swPlayer）。
  * 信令握手规则与 PC 端 connectSignaling 保持一致，才能互相连上。
  *
- * 手机永远是加入者/观众：接清单、要片、边下边播、参与全员暂停联动，不做种、不当房主。
+ * 手机永远是加入者/观众：接清单、要片、参与全员暂停联动，不做种、不当房主。
  */
 
 import './native-shim.js';
@@ -13,8 +13,13 @@ import { Peer } from './peer.js';
 import { Swarm } from './swarm.js';
 import { SyncEngine } from './syncEngine.js';
 import { WsSignaling, encodeCode, decodeCode, randomPeerId } from './signaling.js';
+import { currentLocale, setLocale, startI18n } from './i18n.js';
+
+startI18n();
 
 const HEAD_READY_BYTES = 8 * 1024 * 1024; // 片头下够才起播（同 PC：全零稀疏文件起播拿不到 moov）
+const normalizeSecurityMode = (mode) => (mode === 'trusted' ? 'trusted' : 'safe');
+const securityModeLabel = (mode) => (normalizeSecurityMode(mode) === 'trusted' ? '可信房间' : '安全模式');
 
 const S = {
   peerId: randomPeerId(),
@@ -30,6 +35,7 @@ const S = {
   prog: { contiguousBytes: 0, complete: false },
   entered: false,
   mediaRevision: 0,
+  securityMode: localStorage.getItem('sw.securityMode') === 'trusted' ? 'trusted' : 'safe',
 };
 
 /* ------------------------------ DOM 小工具 ------------------------------ */
@@ -77,8 +83,11 @@ function iceServers() {
 function initSwarmAndSync() {
   if (S.swarm) return;
   S.name = ($('name').value.trim() || '观众') .slice(0, 20);
+  S.securityMode = normalizeSecurityMode($('security-mode').value);
+  localStorage.setItem('sw.securityMode', S.securityMode);
+  $('security-mode').disabled = true;
 
-  S.swarm = new Swarm({ peerId: S.peerId, name: S.name });
+  S.swarm = new Swarm({ peerId: S.peerId, name: S.name, securityMode: S.securityMode });
   S.sync = new SyncEngine({
     peerId: S.peerId,
     name: S.name,
@@ -92,7 +101,9 @@ function initSwarmAndSync() {
 
   // 同步引擎要广播的指令 → 发给所有已连 peer 的 ctrl 通道
   S.sync.on('outbound', (msg) => {
-    for (const p of S.swarm.peers.values()) p.send(msg);
+    for (const p of S.swarm.peers.values()) {
+      if (p.authenticated) p.send(msg);
+    }
   });
   S.sync.on('remote-action', ({ kind, by }) => log(`${by} ${kind === 'pause' ? '暂停了' : kind === 'play' ? '继续播放' : '跳转了'}`, 'good'));
   S.sync.on('stall-change', renderWaiting);
@@ -114,6 +125,17 @@ function initSwarmAndSync() {
   S.swarm.on('peers', renderPeers);
   S.swarm.on('peer-gone', (id) => S.sync.peerGone(id));
   S.swarm.on('complete', () => log('全部下载完成', 'good'));
+  S.swarm.on('peer-authenticated', (peer) => {
+    log(`已和 ${peer.name} 完成${securityModeLabel(S.securityMode)}握手`, 'good');
+    S.sync?.greet(peer);
+  });
+  S.swarm.on('mode-mismatch', ({ localMode, remoteMode }) => {
+    log(`模式不一致：本机是${securityModeLabel(localMode)}，对方是${securityModeLabel(remoteMode)}，已在传输媒体前断开。`, 'bad');
+    S.signaling?.close();
+  });
+  S.swarm.on('identity-mismatch', ({ expected }) => {
+    log(`已断开身份校验失败的成员：${expected}`, 'bad');
+  });
   // SYNC / STALL 这些同步消息 swarm 不认，走 default 抛到 'ctrl'，转给同步引擎
   S.swarm.on('ctrl', ({ msg, peer }) => S.sync.onCtrl(msg, peer));
 
@@ -167,10 +189,16 @@ function onProgress(p) {
 
 function maybeLaunchPlayer(p) {
   if (S.playerStarted) return;
-  if (p.contiguousBytes < HEAD_READY_BYTES && !p.complete) return;
+  if (S.securityMode === 'safe' && !p.complete) return;
+  if (S.securityMode === 'trusted' && p.contiguousBytes < HEAD_READY_BYTES && !p.complete) return;
   S.playerStarted = true;
   window.swPlayer.load(S.sessionId);
-  log('片头已就绪，开始播放', 'good');
+  log(
+    S.securityMode === 'trusted'
+      ? '可信房间片头已就绪，开始边接收边播放（风险较高）'
+      : '安全模式文件已完整接收并校验，开始播放',
+    S.securityMode === 'trusted' ? 'warn' : 'good'
+  );
   startPlayerTicks();
 }
 
@@ -248,8 +276,7 @@ async function connectSignaling(url, roomId) {
 function wirePeer(peer, sig) {
   if (sig) peer.on('icecandidate', (c) => sig.signal(peer.peerId, { kind: 'ice', candidate: c }));
   peer.on('open', () => {
-    log(`已和 ${peer.name} 建立直连`, 'good');
-    S.sync?.greet(peer);
+    log(`已和 ${peer.name} 建立数据通道，正在校验房间模式…`);
   });
   peer.on('statechange', (s) => {
     if (s === 'failed') log(`和 ${peer.name} 的直连失败了（双方都在严格 NAT 后面时会这样，需要 TURN 中继兜底）`, 'bad');
@@ -269,6 +296,10 @@ async function joinManual(hostCode) {
     log('这不是一个房主邀请码', 'bad');
     return;
   }
+  if (normalizeSecurityMode(payload.securityMode) !== S.securityMode) {
+    log(`房间使用${securityModeLabel(payload.securityMode)}，本机设置是${securityModeLabel(S.securityMode)}。请切换为相同模式后重试。`, 'bad');
+    return;
+  }
   S.hostId = payload.from; // 邀请码带着房主身份，认它做角色权威
   initSwarmAndSync();
 
@@ -284,7 +315,9 @@ async function joinManual(hostCode) {
 
   log('正在生成应答码，收集网络候选中…（几秒）', 'warn');
   const answer = await peer.acceptOffer(payload.sdp);
-  const code = await encodeCode({ k: 'answer', from: S.peerId, name: S.name, sdp: answer });
+  const code = await encodeCode({
+    k: 'answer', from: S.peerId, name: S.name, sdp: answer, securityMode: S.securityMode,
+  });
 
   $('answer-out').value = code;
   show($('answer-wrap'), true);
@@ -302,7 +335,7 @@ function enterStage() {
 }
 
 function renderFilmInfo() {
-  if (S.manifest) $('film').textContent = S.manifest.name;
+  if (S.manifest) $('film').textContent = `${S.manifest.name} · ${securityModeLabel(S.securityMode)}`;
 }
 
 const ROLE_LABEL = { host: '房主', admin: '管理员', guest: '游客' };
@@ -333,7 +366,7 @@ function renderStatus(p) {
 
 function renderPeers() {
   const n = S.swarm
-    ? S.swarm.peerList().filter((p) => p.state === 'connected' || p.state === 'completed').length
+    ? S.swarm.peerList().filter((p) => p.authenticated && (p.state === 'connected' || p.state === 'completed')).length
     : 0;
   $('peers').textContent = n ? `${n} 人在线` : '等待连接…';
 }
@@ -410,4 +443,14 @@ $('copy-answer').addEventListener('click', () => {
 
 // 默认昵称
 $('name').value = '观众' + Math.floor(Math.random() * 90 + 10);
+$('security-mode').value = S.securityMode;
+$('security-mode').addEventListener('change', () => {
+  S.securityMode = normalizeSecurityMode($('security-mode').value);
+  localStorage.setItem('sw.securityMode', S.securityMode);
+});
+$('language').value = currentLocale();
+$('language').addEventListener('change', () => {
+  setLocale($('language').value);
+  location.reload();
+});
 log('准备就绪。填写信令地址和房间号加入，或用极简粘贴。');

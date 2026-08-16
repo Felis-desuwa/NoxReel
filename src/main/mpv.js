@@ -87,6 +87,7 @@ class MpvController extends EventEmitter {
     const isRemote = /^https?:\/\//i.test(filePath);
     const ytDlp = isRemote ? findYtDlp() : null;
     const args = [
+      '--no-config',
       `--input-ipc-server=${ipcPath}`,
       '--idle=yes',
       '--force-window=yes',
@@ -96,6 +97,7 @@ class MpvController extends EventEmitter {
       '--osd-level=1',
       `--pause=${startPaused ? 'yes' : 'no'}`,
       '--title=NoxReel',
+      ...(!isRemote ? ['--load-scripts=no', '--ytdl=no'] : []),
       ...(isRemote ? ['--ytdl=yes', '--script-opts-append=ytdl_hook-try_ytdl_first=yes'] : []),
       ...(ytDlp ? [`--script-opts-append=ytdl_hook-ytdl_path=${ytDlp}`] : []),
       '--',

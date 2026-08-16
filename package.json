@@ -1,7 +1,7 @@
 {
   "name": "noxreel",
   "version": "0.4.2",
-  "description": "多人同步观影工具：P2P 边传边播、视频链接解析与房间同步",
+  "description": "多人同步观影工具：P2P 安全接收、视频链接解析与房间同步",
   "main": "src/main/main.js",
   "scripts": {
     "start": "electron .",
@@ -15,12 +15,15 @@
   },
   "author": "",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "devDependencies": {
-    "electron": "^31.0.0",
-    "electron-builder": "^24.13.3"
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "8.21.1"
   },
   "build": {
     "compression": "maximum",
@@ -58,11 +61,14 @@
       {
         "from": "vendor/bin",
         "to": "bin",
-        "filter": ["mpv.exe", "yt-dlp.exe"]
+        "filter": [
+          "mpv.exe",
+          "yt-dlp.exe"
+        ]
       }
     ]
   },
   "allowScripts": {
-    "electron@31.7.7": true
+    "electron@43.4.0": true
   }
 }

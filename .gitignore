@@ -6,6 +6,7 @@ dist/
 out/
 build/
 vendor/
+tmp/
 
 # 运行时下载与转封装的临时文件
 Downloads/

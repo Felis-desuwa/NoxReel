@@ -19,12 +19,14 @@ import {
  *    「一段文本复制粘贴就能连上」—— 这就是极简模式（零服务器）的实现基础。
  */
 export class Peer extends Emitter {
-  constructor({ peerId, name, initiator, iceServers, trickle = true }) {
+  constructor({ peerId, name, initiator, iceServers, trickle = true, allowIdentityRename = false }) {
     super();
     this.peerId = peerId;
     this.name = name || peerId;
     this.initiator = initiator;
     this.trickle = trickle;
+    this.allowIdentityRename = allowIdentityRename === true;
+    this.authenticated = false;
     this.closed = false;
 
     this.ctrl = null;
@@ -88,12 +90,14 @@ export class Peer extends Emitter {
 
     if (kind === 'ctrl') {
       ch.onmessage = (e) => {
+        if (typeof e.data !== 'string' || e.data.length > 256 * 1024) return;
         let msg;
         try {
           msg = JSON.parse(e.data);
         } catch {
           return;
         }
+        if (!msg || typeof msg !== 'object' || Array.isArray(msg) || typeof msg.t !== 'string') return;
         this._onCtrl(msg);
       };
     } else {
@@ -192,8 +196,8 @@ export class Peer extends Emitter {
     return true;
   }
 
-  hello(peerId, name) {
-    this.send({ t: MSG.HELLO, peerId, name, ver: PROTOCOL_VERSION });
+  hello(peerId, name, securityMode = 'safe') {
+    this.send({ t: MSG.HELLO, peerId, name, ver: PROTOCOL_VERSION, securityMode });
   }
 
   ping() {

@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-NoxReel 是一个 P2P 同步观影软件：一个人有片子，其他人不用先下完就能一起看（边下边播），谁的网跟不上全员自动暂停等他。Electron + WebRTC，不自研播放器/编解码器，靠外部的 mpv 和 ffmpeg。
+NoxReel 是一个 P2P 同步观影软件：一个人有片子，其他人通过 P2P 分片接收。安全模式默认完整接收、校验并通过本机安全扫描后播放；可信房间需双方分别启用，允许片头就绪后边接收边播放。Electron + WebRTC，不自研播放器/编解码器，靠外部的 mpv 和 ffmpeg。
 
 ## 常用命令
 
@@ -10,13 +10,14 @@ NoxReel 是一个 P2P 同步观影软件：一个人有片子，其他人不用�
 npm start          # 启动客户端（= electron .）
 npm run signal     # 启动信令服务器（node signaling-server/server.js，默认 :8080）
 npm run dist       # 打包 Windows 安装包（electron-builder → NSIS）
+npm test           # Node 自动测试（传输、安全、缓存、邀请码、房间容量）
 ```
 
 - Windows 上双击 `启动.bat`（客户端）/ `启动信令服务器.bat`（服务器）会自动装依赖、修复 Electron 本体、检查 mpv 再启动。
 - 信令服务器环境变量：`PORT`、`BLOCKED_COUNTRIES`、`ALLOW_UNKNOWN`、`MAXMIND_DB`、`TRUST_PROXY`。例：`BLOCKED_COUNTRIES=CN ALLOW_UNKNOWN=0 MAXMIND_DB=./GeoLite2-Country.mmdb npm run signal`。
 - 调试用环境变量：`SYNCWATCH_SKIP_GEO=1` 跳过地区探测；`SYNCWATCH_MPV_PATH` / `SYNCWATCH_FFMPEG_PATH` 手动指定外部程序路径。
 
-**没有测试套件在仓库里。** README 提到的 158 项检查是外部跑的，代码库内不含 `.test.js`。改动核心逻辑后需要手动验证（理想情况是起两个 Electron 实例做端到端）。
+仓库内的测试位于 `test/`。改动核心连接、播放器或原生桥接逻辑后，除运行 `npm test` 外仍需起两个实例做端到端验证；Android 端还需单独验证 WebView 与 ExoPlayer。
 
 ## 进程边界（改代码前必须先搞清楚东西该放哪）
 
@@ -32,7 +33,7 @@ npm run dist       # 打包 Windows 安装包（electron-builder → NSIS）
 
 这几条是整个产品的支点，改动前务必理解，否则很容易破坏不变量：
 
-1. **连续水位线 `contiguousBytes`，不是下载百分比**（`fileStore.js`）。接收方预分配等大稀疏文件，按偏移写分片。播放器只能安全读到「从文件头连续已落盘的字节数」为止，再往后是空洞（读出来是 0，解码器花屏/崩）。所以「下载 90%」对播放毫无意义——第 2 片缺着就一秒都播不了。缓冲条画的、stall 判断依据的都是这个水位线。
+1. **连续水位线 `contiguousBytes`，不是下载百分比**（`fileStore.js`）。接收方预分配等大稀疏文件，按偏移写分片。它用于传输进度、调度和完整性判断；安全模式不会在文件完整并通过扫描前把路径交给播放器，可信房间则以约 8 MB 连续片头作为提前起播门槛。
 
 2. **播放位置优先调度，不是 rarest-first**（`scheduler.js`）。标准 BT 优先下最稀有的片；这里反过来：当前播放位置 + 未来 30 秒的窗口最优先，窗口外顺序补齐，播放位置之前的片排最后（回拖才用）。牺牲 swarm 健康度换「点开就能看」。
 
@@ -59,12 +60,13 @@ npm run dist       # 打包 Windows 安装包（electron-builder → NSIS）
 ## 关键约定与陷阱
 
 - **manifest 是接收方唯一真相来源**：`fileId` 由所有分片哈希推导（同内容任何机器得同 id）。**渐进式校验**——每片收到即验 SHA-256，坏片当场丢弃重下，不污染水位线。
-- **接收方要等片头（8MB，`HEAD_READY_BYTES`）落地才起 mpv**：全零稀疏文件上启动 mpv 会拿不到 moov→时长判为未知且不再重探→进度永远 0:00、前瞻窗口和 stall 阈值全退化成兜底常量。这段等待期同步引擎已开工参与 stall 计算。
+- **房间安全模式必须双向一致**：`safe` 是默认值，旧邀请码和缺少模式的 HELLO 也只能解释为 `safe`。邀请码先做本地匹配，P2P 数据通道再以 HELLO 独立协商；双方模式一致前禁止清单、同步控制和媒体帧。`trusted` 允许约 8 MB 连续片头后边下边播，风险更高；文件完整后仍调用 `store:scanReceivedMedia`，扫描失败立即退出 mpv 并清理缓存。
 - **`enterRoom()` 有只跑一次的守卫**，但观众是先进房后收清单——片名渲染必须放在独立的 `renderFilmInfo()` 里，不能塞进 `enterRoom`，否则观众永远看不到片名。
-- **`fileStore.close()` 的顺序**：位图落盘（`_flushNow`）必须赶在标记 `closed` 之前，否则 leech 会话的断点续传进度永远写不出去。
+- **`fileStore.close()` 的顺序**：先阻止新分片、等待批量写入、关闭文件句柄，再删除软件拥有的会话缓存；不再生成 `.swpart`，也不提供跨重启断点续传。
 - **外部程序探测不能只查 PATH**（`findBin.js`）：Windows 上 PATH 是进程启动时的快照，winget 装完的新 PATH 对已开着的进程不生效。探测会额外扫各家包管理器落点 + winget Packages 目录。mpv 的 winget 落点 `MPV Player\mpv.exe` 既不进 PATH 也不叫 mpv，单列在 `mpv.js` 的 `MPV_CANDIDATES`。
 - **TURN 默认开但需用户自填地址/凭据**（设置里）——中继消耗真金白银带宽，不内置公共服务器。
 - **地区策略是「告知不拦截」**：客户端 `geo.js` 探测到不在设计范围（`OUT_OF_SCOPE`，仅 CN）只弹可关闭提示，任何地区都能正常用。强制拦截机制保留在信令服务器（默认关），且只对信令模式有效（极简模式绕过服务器）。
 - **`.bat` 必须纯 ASCII，逻辑放 `.ps1`**：cmd.exe 按 OEM 代码页解析批处理，UTF-8 中文会变乱码被当命令执行。`.ps1` 必须存成 **UTF-8 带 BOM**（Windows PowerShell 5.1 没 BOM 会按 ANSI 读）。
+- **界面文案以简体中文为源语言**：桌面端翻译集中在 `src/renderer/lib/i18n.js`，Android 翻译集中在对应 assets 的 `js/i18n.js`；语言保存为 `sw.language`。新增用户可见文案时必须补英文翻译和动态模板测试，协议字段、邀请码和用户输入不得翻译。
 - **限制**：仅支持 MP4/MOV/M4V/MKV，10GB 上限，分片 2MB。房主可在 2–16 人范围内设置房间人数。
 - 注释和用户可见文案一律用简体中文，与现有代码保持一致。
