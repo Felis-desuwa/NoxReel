@@ -14,6 +14,7 @@
  */
 
 const { app, BrowserWindow, ipcMain, dialog, shell, clipboard } = require('electron');
+const fsp = require('fs/promises');
 const path = require('path');
 const { pathToFileURL } = require('url');
 
@@ -24,6 +25,8 @@ const geo = require('./geo');
 const { MpvController, findMpv } = require('./mpv');
 const validate = require('./security');
 const { CacheManager, cleanupLegacySidecars } = require('./cacheManager');
+const malwareScan = require('./malwareScan');
+const { validateManifestName } = require('./mediaGuard');
 
 let win = null;
 /** @type {MpvController|null} */
@@ -33,6 +36,7 @@ const LEGACY_DOWNLOAD_DIR = path.join(app.getPath('downloads'), 'NoxReel');
 const CACHE_ROOT = path.join(app.getPath('temp'), 'NoxReel');
 const cache = new CacheManager({ rootDir: CACHE_ROOT });
 const remuxOutputs = new Map();
+const approvedSources = new Set();
 const MAIN_PAGE = path.join(__dirname, '..', 'renderer', 'index.html');
 const MAIN_PAGE_URL = pathToFileURL(MAIN_PAGE).href;
 
@@ -63,6 +67,26 @@ function safeExternalUrl(raw) {
   } catch {
     return null;
   }
+}
+
+const pathKey = (filePath) => path.resolve(filePath).toLowerCase();
+
+async function approveSource(filePath) {
+  const target = validate.absolutePath(filePath);
+  validateManifestName(path.basename(target));
+  const stat = await fsp.stat(target);
+  if (!stat.isFile()) throw new Error('选择的路径不是文件');
+  const realPath = await fsp.realpath(target);
+  approvedSources.add(pathKey(realPath));
+  return realPath;
+}
+
+async function requireAllowedLocalPath(filePath) {
+  const target = validate.absolutePath(filePath);
+  if (cache.owns(target)) return target;
+  const realPath = await fsp.realpath(target);
+  if (!approvedSources.has(pathKey(realPath))) throw new Error('文件未经用户选择，已拒绝访问');
+  return realPath;
 }
 
 function createWindow() {
@@ -133,6 +157,7 @@ async function cleanup() {
   cleanupPromise = (async () => {
     send('app:shutdownRequested');
     await delay(50);
+    malwareScan.cancelAll();
     if (mpv) await mpv.quit().catch(() => {});
     mpv = null;
     await store.closeAll().catch(() => {});
@@ -169,6 +194,7 @@ secureHandle('env:status', async () => {
     cacheDir: CACHE_ROOT,
     platform: process.platform,
     version: app.getVersion(),
+    defender: malwareScan.findDefender(),
   };
 });
 
@@ -184,17 +210,19 @@ secureHandle('dialog:pickVideo', async () => {
   const r = await dialog.showOpenDialog(win, {
     title: '选择要一起看的视频',
     properties: ['openFile'],
-    filters: [{ name: '视频', extensions: ['mp4', 'mkv'] }],
+    filters: [{ name: '视频', extensions: ['mp4', 'm4v', 'mov', 'mkv'] }],
   });
-  return r.canceled ? null : r.filePaths[0];
+  return r.canceled ? null : approveSource(r.filePaths[0]);
 });
 
-secureHandle('media:inspect', async (filePath) => media.inspect(validate.absolutePath(filePath)));
+secureHandle('dialog:approveDroppedVideo', async (filePath) => approveSource(filePath));
+
+secureHandle('media:inspect', async (filePath) => media.inspect(await requireAllowedLocalPath(filePath)));
 
 secureHandle('media:remux', async (filePath) => {
   const ownedDir = await cache.createOwnedDir('remux');
   try {
-    const { outPath } = await media.remux(validate.absolutePath(filePath), ownedDir, {
+    const { outPath } = await media.remux(await requireAllowedLocalPath(filePath), ownedDir, {
       onProgress: (p) => send('media:remuxProgress', { progress: p }),
     });
     remuxOutputs.set(outPath, ownedDir);
@@ -213,15 +241,15 @@ secureHandle('media:releaseTemp', async (filePath) => {
   return cache.removeOwned(ownedDir);
 });
 
-secureHandle('media:inspectLink', async (url) => linkMedia.inspectLink(validate.httpUrl(url, '视频链接')));
+secureHandle('media:inspectLink', async (url) => linkMedia.inspectLink(await validate.publicHttpUrl(url, '视频链接')));
 
 secureHandle('store:buildManifest', async (filePath) => {
-  return store.buildManifest(validate.absolutePath(filePath), (p) => send('store:hashProgress', p));
+  return store.buildManifest(await requireAllowedLocalPath(filePath), (p) => send('store:hashProgress', p));
 });
 
 secureHandle('store:openSeed', async (payload) => {
   const { manifest, filePath } = validate.plainObject(payload, '做种参数');
-  const sourcePath = validate.absolutePath(filePath);
+  const sourcePath = await requireAllowedLocalPath(filePath);
   const ownedDir = remuxOutputs.get(sourcePath) || null;
   const state = await store.openSeed(validate.manifest(manifest), sourcePath, { ownedDir });
   if (ownedDir) remuxOutputs.delete(sourcePath);
@@ -248,10 +276,16 @@ secureHandle('store:writeChunk', async (payload) => {
 
 secureHandle('store:state', async (sessionId) => store.state(validate.sessionId(sessionId)));
 
+secureHandle('store:scanReceivedMedia', async (sessionId) => {
+  const filePath = await store.scanTarget(validate.sessionId(sessionId));
+  if (!cache.owns(filePath)) throw new Error('拒绝扫描不属于当前会话的文件');
+  return malwareScan.scanFile(filePath);
+});
+
 secureHandle('store:close', async (sessionId) => store.close(validate.sessionId(sessionId)));
 
 secureHandle('store:reveal', async (filePath) => {
-  shell.showItemInFolder(validate.absolutePath(filePath));
+  shell.showItemInFolder(await requireAllowedLocalPath(filePath));
 });
 
 /* ---------------------------------- mpv ---------------------------------- */
@@ -259,8 +293,8 @@ secureHandle('store:reveal', async (filePath) => {
 secureHandle('mpv:launch', async (payload) => {
   const { filePath, startPaused } = validate.plainObject(payload, '播放器启动参数');
   const source = /^https?:\/\//i.test(filePath)
-    ? validate.httpUrl(filePath, '媒体链接')
-    : validate.absolutePath(filePath, '媒体路径');
+    ? await validate.publicHttpUrl(filePath, '媒体链接')
+    : await requireAllowedLocalPath(filePath);
   if (typeof startPaused !== 'boolean') throw new TypeError('无效的暂停参数');
   if (mpv) await mpv.quit().catch(() => {});
   mpv = new MpvController();

@@ -28,7 +28,7 @@ import { MSG } from './protocol.js';
  *  - 管理员 / 房主：可播放、暂停、跳转，且操作同步给所有人（原有行为）。
  *  - 游客：只能播放/暂停「自己这一路」—— 不广播、不影响他人；不允许跳转。
  * 强制点有两层：① 游客自己的客户端不广播控制指令；② 收到控制指令的一方，
- * 若发送者已知是游客则直接忽略（纵深防御，改一版客户端也控不了场）。
+ * 只接受实际 P2P 发送者身份已被房主授权为控制者的指令（纵深防御）。
  * 角色权威只认 hostId：邀请码里带着房主的 peerId，人人都知道该信谁，
  * 冒名顶替的 ROLE 一律不认。缓冲联动同理 —— 游客的缓冲不足只暂停自己，不拖累全员。
  */
@@ -52,8 +52,8 @@ export class SyncEngine extends Emitter {
     // 自己算游客（默认最保守），等第一条 ROLE 认定并钉死房主身份。**不要**默认成 peerId，
     // 否则不知情的加入者会把自己错当成房主，短暂拿到控场权。
     // roles 显式记录每一个已知 peer 的角色（peerId -> 'admin'|'guest'），房主不入表。
-    // 「显式记录游客」是必要的：靠它才能把「已知的游客」和「角色表还没同步到的陌生人」
-    // 区分开 —— 忽略前者的控制指令，放行后者（等房主的权威表来纠正）。
+    // 「显式记录游客」是必要的：角色表尚未同步的陌生人和游客都没有控场权，
+    // 只有房主或明确授予的管理员可以发出全房控制指令。
     this.hostId = hostId || null;
     this.roles = new Map();
 
@@ -186,7 +186,11 @@ export class SyncEngine extends Emitter {
   /** 收到房主的角色表（onCtrl 里已校验来自 hostId 才会进来）。 */
   applyRoles(entries, hostId) {
     if (hostId) this.hostId = hostId;
-    this.roles = new Map(entries || []);
+    this.roles = new Map(
+      (Array.isArray(entries) ? entries : []).filter(
+        (entry) => Array.isArray(entry) && typeof entry[0] === 'string' && ['admin', 'guest'].includes(entry[1])
+      )
+    );
     // 已被降级为游客的人不再拖累全员，从 stall 名单里清掉
     let changed = false;
     for (const id of [...this.stalledPeers.keys()]) {
@@ -365,22 +369,28 @@ export class SyncEngine extends Emitter {
   }
 
   _onRemoteSync(msg, fromPeer) {
-    // 游客无权控场：已知是游客的人发来的同步指令直接忽略（纵深防御）。
-    // 发送者身份未知时（角色表还没同步到）先放行，房主的问候会兜底纠正。
-    const by = msg.by || fromPeer?.peerId;
-    if (by && this.roles.has(by) && !this.isController(by)) return true;
+    // 权限只认承载这条消息的 P2P 连接，绝不信消息里可伪造的 by 字段。
+    const senderId = fromPeer?.peerId;
+    if (!senderId || !this.isController(senderId)) return true;
+    if (
+      typeof msg.paused !== 'boolean' ||
+      !Number.isFinite(msg.position) ||
+      msg.position < 0 ||
+      !Number.isSafeInteger(msg.lamport) ||
+      msg.lamport < 0
+    ) return true;
 
     // Lamport 定序：时钟大的赢；一样大就比 peerId，保证各方判断一致。
     const newer =
       msg.lamport > this.shared.lamport ||
-      (msg.lamport === this.shared.lamport && msg.by > this.shared.by);
+      (msg.lamport === this.shared.lamport && senderId > this.shared.by);
     if (!newer) return true;
 
-    this.shared = { paused: msg.paused, position: msg.position, lamport: msg.lamport, by: msg.by };
+    this.shared = { paused: msg.paused, position: msg.position, lamport: msg.lamport, by: senderId };
     this.intendedPaused = msg.paused;
     this.emit('remote-action', {
       kind: msg.paused ? 'pause' : 'play',
-      by: msg.name || msg.by,
+      by: fromPeer.name || senderId,
       position: msg.position,
     });
     this._reconcile({ seekTo: msg.position });
@@ -388,12 +398,10 @@ export class SyncEngine extends Emitter {
   }
 
   _onRemoteStall(msg, fromPeer) {
-    const id = msg.peerId || fromPeer?.peerId;
-    if (!id) return true;
-
-    // 游客的缓冲不足不拖累全员：已知游客发来的「卡住了」直接忽略。
-    // 「缓冲好了」照收不误 —— 万一之前记过他，也能干净地清掉。
-    if (msg.stalled && this.roles.has(id) && !this.isController(id)) return true;
+    const id = fromPeer?.peerId;
+    if (!id || !this.isController(id) || typeof msg.stalled !== 'boolean') return true;
+    if (msg.position !== undefined && (!Number.isFinite(msg.position) || msg.position < 0)) return true;
+    if (msg.deficitSeconds !== undefined && !Number.isFinite(msg.deficitSeconds)) return true;
 
     if (msg.stalled) {
       this.stalledPeers.set(id, {

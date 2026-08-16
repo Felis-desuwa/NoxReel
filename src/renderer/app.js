@@ -17,6 +17,9 @@ const randomInt = (min, max) => {
   const value = crypto.getRandomValues(new Uint32Array(1))[0];
   return min + (value % (max - min + 1));
 };
+const HEAD_READY_BYTES = 8 * 1024 * 1024;
+const normalizeSecurityMode = (mode) => (mode === 'trusted' ? 'trusted' : 'safe');
+const securityModeLabel = (mode) => (normalizeSecurityMode(mode) === 'trusted' ? '可信房间' : '安全模式');
 
 function make(tag, options = {}, children = []) {
   const node = document.createElement(tag);
@@ -68,10 +71,13 @@ const S = {
   isSeeder: false,
   mpvRunning: false,
   switchingMedia: false,
+  mediaSafety: { sessionId: null, status: 'idle' },
   mediaRevision: 0,
   roomCapacity: Math.max(2, Math.min(16, Number(localStorage.getItem('sw.roomCapacity')) || 4)),
+  roomSecurityMode: null,
   pendingManualPeer: null,
   settings: {
+    securityMode: localStorage.getItem('sw.securityMode') === 'trusted' ? 'trusted' : 'safe',
     signalUrl: localStorage.getItem('sw.signalUrl') || 'ws://localhost:8080',
     stun: localStorage.getItem('sw.stun') || 'stun:stun.l.google.com:19302',
     turnUrl: localStorage.getItem('sw.turnUrl') || '',
@@ -94,7 +100,9 @@ const fmtRate = (bps) => (bps > 0 ? `${fmtBytes(bps)}/s` : '—');
 const clampCapacity = (value) => Math.max(2, Math.min(16, Number.parseInt(value, 10) || 4));
 
 function connectedPeerCount() {
-  return (S.swarm?.peerList() || []).filter((p) => p.state === 'connected' || p.state === 'completed').length;
+  return (S.swarm?.peerList() || []).filter(
+    (p) => p.authenticated && (p.state === 'connected' || p.state === 'completed')
+  ).length;
 }
 
 async function copyCode(code, button, idleLabel = '复制邀请码') {
@@ -274,12 +282,12 @@ dz.addEventListener('dragover', (e) => {
   dz.classList.add('over');
 });
 dz.addEventListener('dragleave', () => dz.classList.remove('over'));
-dz.addEventListener('drop', (e) => {
+dz.addEventListener('drop', async (e) => {
   e.preventDefault();
   dz.classList.remove('over');
   const file = e.dataTransfer.files[0];
   if (!file) return;
-  const path = window.sw.pathForFile(file);
+  const path = await window.sw.pathForFile(file);
   if (!path) return alert('拿不到这个文件的路径，请改用点击选择。');
   startHost(path);
 });
@@ -309,6 +317,7 @@ async function startHost(filePath) {
   if (!roomEntered) {
     S.role = 'host';
     S.hostId = S.peerId; // 房主就是自己，角色权威在我这
+    S.roomSecurityMode = normalizeSecurityMode(S.settings.securityMode);
   }
 
   show('view-prepare');
@@ -422,6 +431,7 @@ async function startHostLink(rawUrl) {
   if (!roomEntered) {
     S.role = 'host';
     S.hostId = S.peerId;
+    S.roomSecurityMode = normalizeSecurityMode(S.settings.securityMode);
   }
 
   show('view-prepare');
@@ -474,6 +484,10 @@ async function activateFileSession({ manifest, state, filePath, isSeeder }) {
   S.sessionId = state.sessionId;
   S.filePath = filePath;
   S.isSeeder = !!isSeeder;
+  S.mediaSafety = {
+    sessionId: state.sessionId,
+    status: S.isSeeder ? 'trusted-local' : 'waiting-download',
+  };
 
   initSwarmAndSync();
   S.sync.resetMedia({ isSeeder: S.isSeeder });
@@ -515,6 +529,7 @@ async function activateLinkSession(linkInfo, { revision, broadcast = false } = {
 
   if (broadcast && S.role === 'host') {
     for (const peer of S.swarm.peers.values()) {
+      if (!peer.authenticated) continue;
       peer.send({
         t: MSG.MEDIA_LINK,
         url: linkInfo.url,
@@ -593,10 +608,16 @@ $('btn-join').onclick = async () => {
 
 /** 极简模式：收到 offer，产出 answer 让对方粘回去。 */
 async function joinViaManual(payload) {
+  const inviteMode = normalizeSecurityMode(payload.securityMode);
+  if (inviteMode !== normalizeSecurityMode(S.settings.securityMode)) {
+    $('join-err').textContent = `房间使用${securityModeLabel(inviteMode)}，你的本机设置是${securityModeLabel(S.settings.securityMode)}。请先在设置中切换为相同模式，再重新粘贴邀请码。`;
+    return;
+  }
   S.role = 'guest';
   S.hostId = payload.from; // 邀请码里带着房主身份，认它做角色权威
   S.mode = 'manual';
   S.isSeeder = false;
+  S.roomSecurityMode = inviteMode;
   S.roomCapacity = clampCapacity(payload.maxMembers || S.roomCapacity);
 
   show('view-prepare');
@@ -623,7 +644,13 @@ async function joinViaManual(payload) {
   S.swarm.addPeer(peer);
 
   const answer = await peer.acceptOffer(payload.sdp);
-  const code = await encodeCode({ k: 'answer', from: S.peerId, name: S.name, sdp: answer });
+  const code = await encodeCode({
+    k: 'answer',
+    from: S.peerId,
+    name: S.name,
+    sdp: answer,
+    securityMode: S.roomSecurityMode,
+  });
 
   setSteps([
     { label: '解析邀请码', state: 'done' },
@@ -648,16 +675,21 @@ async function joinViaManual(payload) {
   $('answer-code').select();
   $('copy-answer').onclick = () => copyCode(code, $('copy-answer'), '复制应答码');
 
-  // 连上之后 swarm 会收到清单，那时才真正进房
-  peer.once('open', () => enterRoom());
+  // 只有双方 HELLO 中的房间模式也一致，swarm 才会真正放行并进入房间。
 }
 
 /** 信令模式：连服务器，进房间，等对方发 offer 过来。 */
 async function joinViaServer(payload) {
+  const inviteMode = normalizeSecurityMode(payload.securityMode);
+  if (inviteMode !== normalizeSecurityMode(S.settings.securityMode)) {
+    $('join-err').textContent = `房间使用${securityModeLabel(inviteMode)}，你的本机设置是${securityModeLabel(S.settings.securityMode)}。请先在设置中切换为相同模式，再重新粘贴邀请码。`;
+    return;
+  }
   S.role = 'guest';
   S.hostId = payload.from; // 邀请码里带着房主身份，认它做角色权威
   S.mode = 'server';
   S.isSeeder = false;
+  S.roomSecurityMode = inviteMode;
   S.roomCapacity = clampCapacity(payload.maxMembers || S.roomCapacity);
 
   show('view-prepare');
@@ -744,7 +776,12 @@ async function connectSignaling(url, roomId) {
   sig.on('reconnecting', ({ in: ms }) => log(`信令断开，${Math.round(ms / 1000)} 秒后重连（已建立的直连不受影响）`, 'warn'));
   sig.on('error', (e) => log(`信令错误：${e.message}`, 'bad'));
 
-  return sig.connect();
+  const joined = await sig.connect();
+  if (!joined?.hostId || (S.hostId && joined.hostId !== S.hostId)) {
+    sig.close();
+    throw new Error('房主身份与邀请码不一致，已拒绝加入');
+  }
+  return joined;
 }
 
 /* ------------------------------ peer 接线 ------------------------------ */
@@ -753,17 +790,7 @@ function wirePeer(peer, sig) {
   if (sig) peer.on('icecandidate', (c) => sig.signal(peer.peerId, { kind: 'ice', candidate: c }));
 
   peer.on('open', () => {
-    log(`已和 ${peer.name} 建立直连`, 'good');
-    S.sync?.greet(peer);
-    if (S.role === 'host' && S.sourceType === 'link' && S.linkInfo) {
-      peer.send({
-        t: MSG.MEDIA_LINK,
-        url: S.linkInfo.url,
-        title: S.linkInfo.title,
-        duration: S.linkInfo.duration || 0,
-        revision: S.mediaRevision,
-      });
-    }
+    log(`已和 ${peer.name} 建立数据通道，正在校验房间模式…`);
   });
   peer.on('statechange', (s) => {
     if (s === 'failed') {
@@ -778,6 +805,7 @@ function wirePeer(peer, sig) {
     S.sync?.peerGone(peer.peerId);
   });
   peer.on('ctrl', (msg) => {
+    if (!peer.authenticated) return;
     if (msg.t === MSG.MEDIA_LINK) handleMediaLink(msg, peer);
     else S.sync?.onCtrl(msg, peer);
   });
@@ -788,6 +816,25 @@ async function handleMediaLink(msg, peer) {
   if (S.role === 'host' || !S.hostId || peer.peerId !== S.hostId) return;
   if (typeof msg.url !== 'string') return;
   if (Number(msg.revision) && Number(msg.revision) <= S.mediaRevision) return;
+
+  const approved = await new Promise((resolve) => {
+    let origin = '未知站点';
+    try { origin = new URL(msg.url).origin; } catch {}
+    openModal({
+      title: '房主请求打开在线视频',
+      body: [
+        make('p', { text: `来源：${origin}` }),
+        make('p', { text: '继续后，你的电脑会直接连接这个网站并解析视频。只在你信任房主和该站点时继续。' }),
+      ],
+      okText: '允许并继续',
+      onOk: () => { resolve(true); return true; },
+      onCancel: () => resolve(false),
+    });
+  });
+  if (!approved) {
+    log('你拒绝了房主发送的视频链接', 'warn');
+    return;
+  }
 
   show('view-prepare');
   $('prep-title').textContent = '正在本机解析房主的视频链接';
@@ -820,7 +867,11 @@ async function handleMediaLink(msg, peer) {
 function initSwarmAndSync() {
   if (S.swarm) return;
 
-  S.swarm = new Swarm({ peerId: S.peerId, name: S.name });
+  S.swarm = new Swarm({
+    peerId: S.peerId,
+    name: S.name,
+    securityMode: S.roomSecurityMode || S.settings.securityMode,
+  });
   S.sync = new SyncEngine({
     peerId: S.peerId,
     name: S.name,
@@ -833,7 +884,24 @@ function initSwarmAndSync() {
 
   // 同步引擎要发的消息，广播给所有 peer
   S.sync.on('outbound', (msg) => {
-    for (const p of S.swarm.peers.values()) p.send(msg);
+    for (const p of S.swarm.peers.values()) {
+      if (p.authenticated) p.send(msg);
+    }
+  });
+
+  S.swarm.on('peer-authenticated', async (peer) => {
+    log(`已和 ${peer.name} 完成${securityModeLabel(S.roomSecurityMode)}握手`, 'good');
+    S.sync?.greet(peer);
+    if (S.role === 'host' && S.sourceType === 'link' && S.linkInfo) {
+      peer.send({
+        t: MSG.MEDIA_LINK,
+        url: S.linkInfo.url,
+        title: S.linkInfo.title,
+        duration: S.linkInfo.duration || 0,
+        revision: S.mediaRevision,
+      });
+    }
+    if (S.role === 'guest' && !roomEntered) await enterRoom();
   });
 
   S.sync.on('stall-change', ({ name, stalled, self }) => {
@@ -883,7 +951,13 @@ function initSwarmAndSync() {
     const revision = Number(manifest.roomRevision) || 0;
     if (revision && revision <= S.mediaRevision) return;
 
-    const state = await window.sw.store.openLeech(manifest);
+    let state;
+    try {
+      state = await window.sw.store.openLeech(manifest);
+    } catch (error) {
+      log(`已拒绝不安全的媒体清单：${error.message || error}`, 'bad');
+      return;
+    }
     if (revision && revision <= S.mediaRevision) {
       await window.sw.store.close(state.sessionId).catch(() => {});
       return;
@@ -909,9 +983,20 @@ function initSwarmAndSync() {
     renderProgress(p);
   });
   S.swarm.on('peers', renderPeers);
-  S.swarm.on('complete', () => {
-    log('文件已全部接收并校验通过；退出房间后会自动删除缓存', 'good');
-    window.sw.mpv.osd('接收完成 · 退出房间后自动清理', 2500);
+  S.swarm.on('identity-mismatch', ({ expected }) => {
+    log(`已断开身份校验失败的成员：${expected}`, 'bad');
+  });
+  S.swarm.on('mode-mismatch', ({ peerId, localMode, remoteMode }) => {
+    const message = `${peerId} 的模式是${securityModeLabel(remoteMode)}，本房间是${securityModeLabel(localMode)}，已在传输媒体前断开。`;
+    log(message, 'bad');
+    if (!roomEntered && S.role === 'guest') {
+      S.signaling?.close();
+      prepFail(`${message}\n请双方分别在设置里选择相同模式后重试。`);
+    }
+  });
+  S.swarm.on('complete', async () => {
+    log('文件已全部接收并校验，正在执行本机安全扫描…');
+    await verifyReceivedMedia();
   });
 
   S.swarm.start();
@@ -962,28 +1047,19 @@ function refreshMediaUi() {
  * 等清单到了又被守卫挡回去，结果房间头部永远是空的。
  */
 function renderFilmInfo() {
+  const mode = S.roomSecurityMode === 'trusted' ? '可信房间 · 边下边播' : '安全模式 · 扫描后播放';
   if (S.sourceType === 'link' && S.linkInfo) {
     $('room-file').textContent = S.linkInfo.title || '在线视频';
     const duration = S.linkInfo.duration ? ` · ${fmtTime(S.linkInfo.duration)}` : '';
-    $('room-meta').textContent = `视频链接 · ${S.linkInfo.extractor || 'direct'}${duration} · 每位成员从原网站播放`;
+    $('room-meta').textContent = `视频链接 · ${S.linkInfo.extractor || 'direct'}${duration} · ${mode} · 每位成员从原网站播放`;
     return;
   }
   if (!S.manifest) return;
   $('room-file').textContent = S.manifest.name;
   $('room-meta').textContent = `${fmtBytes(S.manifest.size)} · ${S.manifest.chunkCount} 片 × ${fmtBytes(
     S.manifest.chunkSize
-  )} · ${S.isSeeder ? '你是片源' : '接收中'}`;
+  )} · ${mode} · ${S.isSeeder ? '你是片源' : '接收中'}`;
 }
-
-/**
- * mpv 要读到文件开头的 moov 索引才能解出时长、建立时间轴。
- * 接收方一开始拿到的是一个全零的稀疏文件 —— 这时候把 mpv 拉起来，它找不到索引，
- * 会把时长判成未知，而且之后不会再重新探测。表现是进度永远 0:00、
- * 前瞻窗口和 stall 阈值全部退化成兜底常量。所以必须等片头落地再起播放器。
- *
- * 8MB 对绝大多数文件都够装下 moov（16 分钟 1080p 的 moov 约几百 KB）。
- */
-const HEAD_READY_BYTES = 8 * 1024 * 1024;
 
 /** 会话就绪：同步引擎立刻开工（哪怕播放器还没起，也要参与 stall 计算）。 */
 function onSessionReady() {
@@ -1003,10 +1079,61 @@ async function onLinkSessionReady() {
   renderProgress(S.swarm.progress());
 }
 
-/** 接收方：片头够了才起播放器。在此之前我们会一直处于 stall，全员等着。 */
+/** 接收方：安全模式扫描后播放；可信房间达到片头水位即播放，完整后仍补做扫描。 */
 function maybeLaunchPlayer(p) {
   if (S.mpvRunning || S.isSeeder || !S.filePath) return;
-  if (p.contiguousBytes >= HEAD_READY_BYTES || p.complete) launchPlayer();
+  if (S.roomSecurityMode === 'trusted') {
+    if (S.mediaSafety.status === 'trusted-streaming') return;
+    const readyBytes = Math.min(HEAD_READY_BYTES, S.manifest?.size || HEAD_READY_BYTES);
+    if (p.contiguousBytes >= readyBytes) {
+      S.mediaSafety.status = 'trusted-streaming';
+      log('可信房间已达到片头缓冲，正在边接收边播放；完整接收后仍会执行安全扫描。', 'warn');
+      launchPlayer().then(() => window.sw.mpv.osd('可信房间 · 边下边播风险较高', 3500));
+    }
+    return;
+  }
+  if (p.complete && S.mediaSafety.status === 'clean') launchPlayer();
+}
+
+async function verifyReceivedMedia() {
+  const sessionId = S.sessionId;
+  if (!sessionId || S.isSeeder || S.mediaSafety.sessionId !== sessionId) return;
+  if (['scanning', 'clean', 'blocked'].includes(S.mediaSafety.status)) return;
+  S.mediaSafety.status = 'scanning';
+  renderStatus();
+  let result;
+  try {
+    result = await window.sw.store.scanReceivedMedia(sessionId);
+  } catch (error) {
+    result = { ok: false, status: 'error', message: error.message || String(error) };
+  }
+  if (S.sessionId !== sessionId || S.mediaSafety.sessionId !== sessionId) return;
+  if (result.ok && result.status === 'clean') {
+    S.mediaSafety.status = 'clean';
+    log(
+      S.mpvRunning
+        ? '完整文件安全扫描通过；退出房间后会自动删除缓存'
+        : '安全扫描通过，正在打开播放器；退出房间后会自动删除缓存',
+      'good'
+    );
+    if (!S.mpvRunning) await launchPlayer();
+    window.sw.mpv.osd('安全扫描通过 · 缓存退出后自动清理', 2500);
+    return;
+  }
+
+  S.mediaSafety.status = 'blocked';
+  const message = result.message || '安全扫描未通过';
+  log(`已阻止打开接收文件：${message}`, 'bad');
+  await window.sw.mpv.quit().catch(() => {});
+  S.swarm?.clearSession();
+  await window.sw.store.close(sessionId).catch(() => {});
+  S.sessionId = null;
+  S.filePath = null;
+  S.manifest = null;
+  $('btn-playpause').disabled = true;
+  $('btn-reopen')?.classList.add('hidden');
+  renderFilmInfo();
+  renderStatus();
 }
 
 async function launchPlayer() {
@@ -1053,6 +1180,12 @@ async function renderInvite() {
   });
   replace(
     box,
+    make('p', {
+      className: 'fine',
+      text: S.roomSecurityMode === 'trusted'
+        ? '当前：可信房间（边下边播，风险较高）。加入者也必须在本机选择可信房间。'
+        : '当前：安全模式（默认）。成员完整接收并扫描通过后才播放。',
+    }),
     make('div', { className: 'capacity-row' }, [
       make('label', { text: '房间人数上限', attrs: { for: 'room-capacity' } }),
       capacityInput,
@@ -1114,6 +1247,7 @@ async function inviteViaServer() {
       name: S.name,
       file: inviteMediaInfo(),
       maxMembers: S.roomCapacity,
+      securityMode: S.roomSecurityMode,
     });
 
     replace(
@@ -1174,6 +1308,7 @@ async function inviteViaManual() {
     sdp: offer,
     file: inviteMediaInfo(),
     maxMembers: S.roomCapacity,
+    securityMode: S.roomSecurityMode,
   });
 
   replace(
@@ -1199,6 +1334,11 @@ async function inviteViaManual() {
     try {
       const payload = await decodeCode(raw);
       if (payload.k !== 'answer') throw new Error('这不是应答码');
+      if (normalizeSecurityMode(payload.securityMode) !== normalizeSecurityMode(S.roomSecurityMode)) {
+        throw new Error(
+          `对方选择的是${securityModeLabel(payload.securityMode)}，本房间是${securityModeLabel(S.roomSecurityMode)}。双方需分别选择相同模式。`
+        );
+      }
 
       // 只有拿到真实身份后才登记到 swarm，避免“点分享就多一个待加入用户”的幽灵成员。
       peer.peerId = payload.from;
@@ -1207,11 +1347,13 @@ async function inviteViaManual() {
       S.swarm.addPeer(peer);
       registered = true;
       S.pendingManualPeer = null;
-      await peer.acceptAnswer(payload.sdp);
-      $('inv-status').textContent = '正在打洞…';
-      peer.once('open', () => {
+      const offAuthenticated = S.swarm.on('peer-authenticated', (authenticatedPeer) => {
+        if (authenticatedPeer !== peer) return;
+        offAuthenticated();
         $('inv-status').textContent = `${peer.name} 已连上 ✓`;
       });
+      await peer.acceptAnswer(payload.sdp);
+      $('inv-status').textContent = '正在打洞并校验房间模式…';
     } catch (e) {
       if (registered) S.swarm.removePeer(peer.peerId);
       $('inv-status').textContent = e.message;
@@ -1433,7 +1575,13 @@ function renderStatus() {
       ? '已暂停'
       : S.sourceType === 'link'
       ? '正在解析并连接原始视频…'
-      : '正在缓冲片头，马上就好…';
+      : S.mediaSafety.status === 'scanning'
+      ? '文件已接收，正在进行安全扫描…'
+      : S.mediaSafety.status === 'blocked'
+      ? '安全扫描未通过，已阻止播放并清理缓存'
+      : S.roomSecurityMode === 'trusted'
+      ? '可信房间：正在接收片头，达到约 8 MB 后将边下边播…'
+      : '正在完整接收并校验媒体，完成后会进行安全扫描…';
   }
 
   $('btn-playpause').textContent = st.intendedPaused ? '播放' : '暂停';
@@ -1521,6 +1669,7 @@ $('btn-settings').onclick = () => {
   openModal({
     title: '设置',
     body: () => {
+      const modeLocked = roomEntered || !!S.swarm;
       const turnPassword = make('input', {
         id: 'set-turn-pass',
         attrs: { type: 'text', placeholder: '密码' },
@@ -1531,6 +1680,33 @@ $('btn-settings').onclick = () => {
         field(
           '你的昵称',
           make('input', { id: 'set-name', attrs: { type: 'text' }, props: { value: S.name } })
+        ),
+        field(
+          '房间安全模式',
+          make(
+            'select',
+            {
+              id: 'set-security-mode',
+              props: { disabled: modeLocked },
+            },
+            [
+              make('option', {
+                attrs: { value: 'safe' },
+                props: { selected: S.settings.securityMode !== 'trusted' },
+                text: '安全模式（默认）',
+              }),
+              make('option', {
+                attrs: { value: 'trusted' },
+                props: { selected: S.settings.securityMode === 'trusted' },
+                text: '可信房间（边下边播，风险较高）',
+              }),
+            ]
+          ),
+          hint(
+            modeLocked
+              ? '房间进行中不能切换。退出后可更改。'
+              : '房主和每位加入者必须分别选择相同模式才能握手。安全模式完整接收并扫描后播放；可信房间约 8 MB 片头就绪后边下边播。'
+          )
         ),
         field(
           '信令服务器',
@@ -1595,6 +1771,10 @@ $('btn-settings').onclick = () => {
     okText: '保存',
     onOk: () => {
       S.name = $('set-name').value.trim() || S.name;
+      if (!roomEntered && !S.swarm) {
+        S.settings.securityMode = normalizeSecurityMode($('set-security-mode').value);
+        if (S.role === 'host') S.roomSecurityMode = S.settings.securityMode;
+      }
       S.settings.signalUrl = $('set-signal').value.trim();
       S.roomCapacity = clampCapacity($('set-capacity').value);
       S.settings.stun = $('set-stun').value.trim();
@@ -1604,6 +1784,7 @@ $('btn-settings').onclick = () => {
       S.settings.turnPass = $('set-turn-pass').value.trim();
 
       localStorage.setItem('sw.name', S.name);
+      localStorage.setItem('sw.securityMode', S.settings.securityMode);
       localStorage.setItem('sw.signalUrl', S.settings.signalUrl);
       localStorage.setItem('sw.roomCapacity', String(S.roomCapacity));
       localStorage.setItem('sw.stun', S.settings.stun);

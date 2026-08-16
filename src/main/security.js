@@ -1,7 +1,10 @@
 'use strict';
 
 const path = require('path');
+const net = require('net');
+const dns = require('dns/promises');
 const { CHUNK_SIZE, MAX_FILE_SIZE } = require('./fileStore');
+const { validateManifestName } = require('./mediaGuard');
 
 const MAX_TEXT = 4096;
 const HASH_RE = /^[a-f0-9]{64}$/i;
@@ -34,6 +37,61 @@ function httpUrl(value, label = '链接') {
   return parsed.href;
 }
 
+function isPrivateAddress(address) {
+  const ip = String(address || '').toLowerCase().split('%')[0];
+  if (net.isIPv4(ip)) {
+    const parts = ip.split('.').map(Number);
+    const [a, b, c] = parts;
+    return (
+      a === 0 || a === 10 || a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && ((b === 0 && c === 0) || b === 168 || (b === 0 && c === 2))) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      (a === 198 && b === 51 && c === 100) ||
+      (a === 203 && b === 0 && c === 113) ||
+      a >= 224
+    );
+  }
+  if (net.isIPv6(ip)) {
+    if (ip === '::' || ip === '::1') return true;
+    if (
+      ip.startsWith('fc') || ip.startsWith('fd') || /^fe[89ab]/.test(ip) ||
+      ip.startsWith('ff') || ip.startsWith('2001:db8:')
+    ) return true;
+    const mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mapped) return isPrivateAddress(mapped[1]);
+    const mappedHex = ip.match(/^::ffff:([a-f0-9]{1,4}):([a-f0-9]{1,4})$/);
+    if (mappedHex) {
+      const high = Number.parseInt(mappedHex[1], 16);
+      const low = Number.parseInt(mappedHex[2], 16);
+      return isPrivateAddress(`${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`);
+    }
+    return false;
+  }
+  return true;
+}
+
+async function publicHttpUrl(value, label = '链接') {
+  const safe = httpUrl(value, label);
+  const parsed = new URL(safe);
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) fail(label);
+  const literal = net.isIP(hostname);
+  if (literal && isPrivateAddress(hostname)) fail(label);
+  if (!literal) {
+    let addresses;
+    try {
+      addresses = await dns.lookup(hostname, { all: true, verbatim: true });
+    } catch {
+      fail(label);
+    }
+    if (!addresses.length || addresses.some(({ address }) => isPrivateAddress(address))) fail(label);
+  }
+  return safe;
+}
+
 function finiteNumber(value, label, { min = -Infinity, max = Infinity } = {}) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) fail(label);
   return value;
@@ -57,7 +115,7 @@ function manifest(value) {
   const chunkCount = integer(data.chunkCount, '分片数量', { min: 1, max: Math.ceil(MAX_FILE_SIZE / CHUNK_SIZE) });
   if (chunkCount !== Math.ceil(size / chunkSize)) fail('分片数量');
   if (!FILE_ID_RE.test(string(data.fileId, '文件标识', { max: 32 }))) fail('文件标识');
-  string(data.name, '文件名', { max: 1000 });
+  validateManifestName(string(data.name, '文件名', { max: 200 }));
   if (!Array.isArray(data.hashes) || data.hashes.length !== chunkCount) fail('分片哈希');
   for (const hash of data.hashes) {
     if (typeof hash !== 'string' || !HASH_RE.test(hash)) fail('分片哈希');
@@ -92,6 +150,7 @@ module.exports = {
   integer,
   manifest,
   plainObject,
+  publicHttpUrl,
   sessionId,
   string,
 };

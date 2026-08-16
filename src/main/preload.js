@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld('sw', {
 
   dialog: {
     pickVideo: () => ipcRenderer.invoke('dialog:pickVideo'),
+    approveDroppedVideo: (filePath) => ipcRenderer.invoke('dialog:approveDroppedVideo', filePath),
   },
 
   media: {
@@ -47,6 +48,7 @@ contextBridge.exposeInMainWorld('sw', {
     readChunk: (sessionId, index) => ipcRenderer.invoke('store:readChunk', { sessionId, index }),
     writeChunk: (sessionId, index, data) => ipcRenderer.invoke('store:writeChunk', { sessionId, index, data }),
     state: (sessionId) => ipcRenderer.invoke('store:state', sessionId),
+    scanReceivedMedia: (sessionId) => ipcRenderer.invoke('store:scanReceivedMedia', sessionId),
     close: (sessionId) => ipcRenderer.invoke('store:close', sessionId),
     reveal: (filePath) => ipcRenderer.invoke('store:reveal', filePath),
   },
@@ -69,9 +71,10 @@ contextBridge.exposeInMainWorld('sw', {
 
   // 拖拽进来的 File 对象在 Electron 里拿不到 .path 了（安全策略变更），
   // 得走 webUtils 这个官方替代品。
-  pathForFile: (file) => {
+  pathForFile: async (file) => {
     try {
-      return webUtils.getPathForFile(file);
+      const filePath = webUtils.getPathForFile(file);
+      return filePath ? ipcRenderer.invoke('dialog:approveDroppedVideo', filePath) : null;
     } catch {
       return null;
     }

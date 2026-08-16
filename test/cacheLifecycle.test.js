@@ -65,6 +65,7 @@ test('乱序分片批量写入正确，关闭接收会话后删除完整缓存',
     Buffer.alloc(store.CHUNK_SIZE, 0x22),
     Buffer.alloc(store.CHUNK_SIZE, 0x33),
   ];
+  chunks[0].writeUInt32BE(0x1a45dfa3, 0); // Matroska/EBML 文件头
   const manifest = manifestFor('movie.mkv', chunks);
   const state = await store.openLeech(manifest);
   const sessionDir = path.dirname(state.filePath);
@@ -76,6 +77,7 @@ test('乱序分片批量写入正确，关闭接收会话后删除完整缓存',
   ]);
   assert.equal(results.every((result) => result.ok), true);
   assert.equal(store.state(state.sessionId).complete, true);
+  assert.equal(await store.scanTarget(state.sessionId), state.filePath);
   assert.deepEqual(await fsp.readFile(state.filePath), Buffer.concat(chunks));
   assert.deepEqual(await store.readChunk(state.sessionId, 1), chunks[1]);
   assert.equal((await fsp.readdir(sessionDir)).some((name) => name.endsWith('.swpart')), false);
@@ -91,6 +93,23 @@ test('乱序分片批量写入正确，关闭接收会话后删除完整缓存',
   await Promise.all([pendingWrite, store.close(incomplete.sessionId)]);
   assert.equal(fs.existsSync(incompleteDir), false);
   await manager.cleanupRun();
+});
+
+test('伪装成视频的可执行文件在写入前被拒绝', async (t) => {
+  const root = await tempDir(t, 'noxreel-media-guard-');
+  const manager = new CacheManager({ rootDir: path.join(root, 'cache') });
+  await manager.initialize();
+  store.configureCache(manager);
+  const chunk = Buffer.alloc(store.CHUNK_SIZE);
+  chunk.write('MZ', 0, 'ascii');
+  const state = await store.openLeech(manifestFor('not-a-video.mp4', [chunk]));
+  const result = await store.writeChunk(state.sessionId, 0, chunk);
+  assert.deepEqual(
+    { ok: result.ok, reason: result.reason },
+    { ok: false, reason: 'media-type' }
+  );
+  assert.equal(store.state(state.sessionId).haveCount, 0);
+  await store.close(state.sessionId);
 });
 
 test('关闭片源时保留原视频，只删除软件拥有的转封装副本', async (t) => {

@@ -22,7 +22,7 @@ test('10GB 清单拆分后每条控制消息低于 64KB 并可完整重组', asy
   assert.ok(messages.every((msg) => Buffer.byteLength(JSON.stringify(msg)) < 64 * 1024));
 
   const receiver = new Swarm({ peerId: 'guest', name: 'guest' });
-  const peer = { peerId: 'host', pendingManifest: null };
+  const peer = { peerId: 'host', pendingManifest: null, authenticated: true };
   const received = new Promise((resolve) => receiver.once('manifest-offer', resolve));
   for (const msg of messages) receiver._onCtrl(peer, msg);
   const offer = await received;

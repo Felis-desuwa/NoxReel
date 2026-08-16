@@ -46,20 +46,53 @@ function packFile(file) {
   return file ? [String(file.name || ''), Number(file.size) || 0, file.kind === 'link' ? 'l' : 'f'] : 0;
 }
 
+function packSecurityMode(mode) {
+  return mode === 'trusted' ? 't' : 's';
+}
+
+function expandSecurityMode(mode) {
+  // 旧邀请码没有该字段，必须按安全模式处理，不能静默降级到可信模式。
+  return mode === 't' || mode === 'trusted' ? 'trusted' : 'safe';
+}
+
 /** SW2 用定长数组代替重复的 JSON 键；房间可切片后，信令短码不再绑定片名。 */
 function compactPayload(payload) {
-  if (payload?.k === 'room') return ['r', payload.url, payload.room, payload.from, Number(payload.maxMembers) || 0];
-  if (payload?.k === 'offer') {
-    return ['o', payload.from, payload.name || '', payload.sdp, packFile(payload.file), Number(payload.maxMembers) || 0];
+  if (payload?.k === 'room') {
+    return ['r', payload.url, payload.room, payload.from, Number(payload.maxMembers) || 0, packSecurityMode(payload.securityMode)];
   }
-  if (payload?.k === 'answer') return ['a', payload.from, payload.name || '', payload.sdp];
+  if (payload?.k === 'offer') {
+    return [
+      'o',
+      payload.from,
+      payload.name || '',
+      payload.sdp,
+      packFile(payload.file),
+      Number(payload.maxMembers) || 0,
+      packSecurityMode(payload.securityMode),
+    ];
+  }
+  if (payload?.k === 'answer') {
+    return ['a', payload.from, payload.name || '', payload.sdp, packSecurityMode(payload.securityMode)];
+  }
   return payload;
 }
 
 function expandPayload(value) {
-  if (!Array.isArray(value)) return value;
+  if (!Array.isArray(value)) {
+    if (value && ['room', 'offer', 'answer'].includes(value.k)) {
+      return { ...value, securityMode: expandSecurityMode(value.securityMode) };
+    }
+    return value;
+  }
   if (value[0] === 'r') {
-    return { k: 'room', url: value[1], room: value[2], from: value[3], maxMembers: Number(value[4]) || 0 };
+    return {
+      k: 'room',
+      url: value[1],
+      room: value[2],
+      from: value[3],
+      maxMembers: Number(value[4]) || 0,
+      securityMode: expandSecurityMode(value[5]),
+    };
   }
   if (value[0] === 'o') {
     const f = value[4];
@@ -70,9 +103,12 @@ function expandPayload(value) {
       sdp: value[3],
       file: Array.isArray(f) ? { name: f[0], size: Number(f[1]) || 0, kind: f[2] === 'l' ? 'link' : 'file' } : null,
       maxMembers: Number(value[5]) || 0,
+      securityMode: expandSecurityMode(value[6]),
     };
   }
-  if (value[0] === 'a') return { k: 'answer', from: value[1], name: value[2], sdp: value[3] };
+  if (value[0] === 'a') {
+    return { k: 'answer', from: value[1], name: value[2], sdp: value[3], securityMode: expandSecurityMode(value[4]) };
+  }
   return value;
 }
 
