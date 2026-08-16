@@ -3,6 +3,9 @@ import { Swarm } from './lib/swarm.js';
 import { SyncEngine } from './lib/syncEngine.js';
 import { MSG } from './lib/protocol.js';
 import { encodeCode, decodeCode, WsSignaling, randomRoomId, randomPeerId } from './lib/signaling.js';
+import { currentLocale, setLocale, startI18n, translate as t } from './lib/i18n.js';
+
+startI18n();
 
 /**
  * UI 与编排层。把存储、传输、调度、同步、播放器串起来。
@@ -19,27 +22,31 @@ const randomInt = (min, max) => {
 };
 const HEAD_READY_BYTES = 8 * 1024 * 1024;
 const normalizeSecurityMode = (mode) => (mode === 'trusted' ? 'trusted' : 'safe');
-const securityModeLabel = (mode) => (normalizeSecurityMode(mode) === 'trusted' ? '可信房间' : '安全模式');
+const securityModeLabel = (mode) => t(normalizeSecurityMode(mode) === 'trusted' ? '可信房间' : '安全模式');
 
 function make(tag, options = {}, children = []) {
   const node = document.createElement(tag);
   if (options.id) node.id = options.id;
   if (options.className) node.className = options.className;
-  if (options.text !== undefined) node.textContent = String(options.text);
+  if (options.text !== undefined) node.textContent = t(options.text);
   if (options.attrs) {
-    for (const [name, value] of Object.entries(options.attrs)) node.setAttribute(name, String(value));
+    for (const [name, value] of Object.entries(options.attrs)) {
+      node.setAttribute(name, ['placeholder', 'title', 'aria-label'].includes(name) ? t(value) : String(value));
+    }
   }
   if (options.props) Object.assign(node, options.props);
   for (const child of children.flat(Infinity)) {
     if (child == null) continue;
-    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+    node.append(child instanceof Node ? child : document.createTextNode(t(child)));
   }
   return node;
 }
 
 function replace(target, ...children) {
   const node = typeof target === 'string' ? $(target) : target;
-  node.replaceChildren(...children.flat(Infinity));
+  node.replaceChildren(
+    ...children.flat(Infinity).map((child) => (child instanceof Node ? child : document.createTextNode(t(child))))
+  );
   return node;
 }
 
@@ -53,7 +60,7 @@ function hint(...children) {
 
 const S = {
   peerId: randomPeerId(),
-  name: localStorage.getItem('sw.name') || `观众-${randomInt(100, 999)}`,
+  name: localStorage.getItem('sw.name') || t(`观众-${randomInt(100, 999)}`),
   mode: null, // 'manual' | 'server'
   role: null, // 'host' | 'guest'（发起 or 加入，跟权限角色是两回事）
   hostId: null, // 房主的 peerId —— 角色权威只认它，从邀请码得来
@@ -77,6 +84,7 @@ const S = {
   roomSecurityMode: null,
   pendingManualPeer: null,
   settings: {
+    language: currentLocale(),
     securityMode: localStorage.getItem('sw.securityMode') === 'trusted' ? 'trusted' : 'safe',
     signalUrl: localStorage.getItem('sw.signalUrl') || 'ws://localhost:8080',
     stun: localStorage.getItem('sw.stun') || 'stun:stun.l.google.com:19302',
@@ -192,8 +200,8 @@ function applyGeoNotice(geo) {
 
   if (geo.inScope || !geo.notice) return;
 
-  pill.title = geo.notice;
-  $('geo-notice-text').textContent = geo.notice;
+  pill.title = t(geo.notice);
+  $('geo-notice-text').textContent = t(geo.notice);
   $('geo-notice').classList.remove('hidden');
 }
 
@@ -288,7 +296,7 @@ dz.addEventListener('drop', async (e) => {
   const file = e.dataTransfer.files[0];
   if (!file) return;
   const path = await window.sw.pathForFile(file);
-  if (!path) return alert('拿不到这个文件的路径，请改用点击选择。');
+  if (!path) return alert(t('拿不到这个文件的路径，请改用点击选择。'));
   startHost(path);
 });
 
@@ -1670,6 +1678,7 @@ $('btn-settings').onclick = () => {
     title: '设置',
     body: () => {
       const modeLocked = roomEntered || !!S.swarm;
+      const languageLocked = roomEntered || S.role !== null;
       const turnPassword = make('input', {
         id: 'set-turn-pass',
         attrs: { type: 'text', placeholder: '密码' },
@@ -1677,6 +1686,30 @@ $('btn-settings').onclick = () => {
       });
       turnPassword.style.marginTop = '6px';
       return [
+        field(
+          '界面语言',
+          make(
+            'select',
+            { id: 'set-language', props: { disabled: languageLocked } },
+            [
+              make('option', {
+                attrs: { value: 'zh-CN' },
+                props: { selected: S.settings.language !== 'en' },
+                text: '中文（简体）',
+              }),
+              make('option', {
+                attrs: { value: 'en' },
+                props: { selected: S.settings.language === 'en' },
+                text: 'English',
+              }),
+            ]
+          ),
+          hint(
+            languageLocked
+              ? '切换语言会重新载入首页；房间进行中不可切换。'
+              : '切换语言会重新载入首页；房间进行中不可切换。'
+          )
+        ),
         field(
           '你的昵称',
           make('input', { id: 'set-name', attrs: { type: 'text' }, props: { value: S.name } })
@@ -1770,6 +1803,12 @@ $('btn-settings').onclick = () => {
     },
     okText: '保存',
     onOk: () => {
+      const languageLocked = roomEntered || S.role !== null;
+      const nextLanguage = languageLocked ? S.settings.language : $('set-language').value;
+      const languageChanged = nextLanguage !== S.settings.language;
+      if (!languageLocked) {
+        S.settings.language = setLocale(nextLanguage);
+      }
       S.name = $('set-name').value.trim() || S.name;
       if (!roomEntered && !S.swarm) {
         S.settings.securityMode = normalizeSecurityMode($('set-security-mode').value);
@@ -1792,6 +1831,7 @@ $('btn-settings').onclick = () => {
       localStorage.setItem('sw.turnUrl', S.settings.turnUrl);
       localStorage.setItem('sw.turnUser', S.settings.turnUser);
       localStorage.setItem('sw.turnPass', S.settings.turnPass);
+      if (languageChanged) setTimeout(() => location.reload(), 0);
       return true;
     },
   });

@@ -13,6 +13,9 @@ import { Peer } from './peer.js';
 import { Swarm } from './swarm.js';
 import { SyncEngine } from './syncEngine.js';
 import { WsSignaling, encodeCode, decodeCode, randomPeerId } from './signaling.js';
+import { currentLocale, setLocale, startI18n } from './i18n.js';
+
+startI18n();
 
 const HEAD_READY_BYTES = 8 * 1024 * 1024; // 片头下够才起播（同 PC：全零稀疏文件起播拿不到 moov）
 const normalizeSecurityMode = (mode) => (mode === 'trusted' ? 'trusted' : 'safe');
@@ -444,5 +447,10 @@ $('security-mode').value = S.securityMode;
 $('security-mode').addEventListener('change', () => {
   S.securityMode = normalizeSecurityMode($('security-mode').value);
   localStorage.setItem('sw.securityMode', S.securityMode);
+});
+$('language').value = currentLocale();
+$('language').addEventListener('change', () => {
+  setLocale($('language').value);
+  location.reload();
 });
 log('准备就绪。填写信令地址和房间号加入，或用极简粘贴。');
