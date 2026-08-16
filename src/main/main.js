@@ -15,8 +15,6 @@
 
 const { app, BrowserWindow, ipcMain, dialog, shell, clipboard } = require('electron');
 const path = require('path');
-const os = require('os');
-const fsp = require('fs/promises');
 const { pathToFileURL } = require('url');
 
 const store = require('./fileStore');
@@ -25,17 +23,22 @@ const linkMedia = require('./linkMedia');
 const geo = require('./geo');
 const { MpvController, findMpv } = require('./mpv');
 const validate = require('./security');
+const { CacheManager, cleanupLegacySidecars } = require('./cacheManager');
 
 let win = null;
 /** @type {MpvController|null} */
 let mpv = null;
 
-const DOWNLOAD_DIR = path.join(app.getPath('downloads'), 'NoxReel');
-const WORK_DIR = path.join(os.tmpdir(), 'noxreel');
+const LEGACY_DOWNLOAD_DIR = path.join(app.getPath('downloads'), 'NoxReel');
+const CACHE_ROOT = path.join(app.getPath('temp'), 'NoxReel');
+const cache = new CacheManager({ rootDir: CACHE_ROOT });
+const remuxOutputs = new Map();
 const MAIN_PAGE = path.join(__dirname, '..', 'renderer', 'index.html');
 const MAIN_PAGE_URL = pathToFileURL(MAIN_PAGE).href;
 
 app.enableSandbox();
+app.commandLine.appendSwitch('disable-http-cache');
+store.configureCache(cache);
 
 function isTrustedSender(event) {
   return Boolean(
@@ -108,27 +111,50 @@ function send(channel, payload) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  await cache.initialize();
+  await cleanupLegacySidecars(LEGACY_DOWNLOAD_DIR);
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 
-app.on('window-all-closed', async () => {
-  await cleanup();
+app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', cleanup);
-
-let cleanedUp = false;
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let cleanupPromise = null;
+let cleanupComplete = false;
+let quitRequested = false;
 async function cleanup() {
-  if (cleanedUp) return;
-  cleanedUp = true;
-  if (mpv) await mpv.quit().catch(() => {});
-  await store.closeAll().catch(() => {});
+  if (cleanupPromise) return cleanupPromise;
+  cleanupPromise = (async () => {
+    send('app:shutdownRequested');
+    await delay(50);
+    if (mpv) await mpv.quit().catch(() => {});
+    mpv = null;
+    await store.closeAll().catch(() => {});
+    await Promise.all(
+      [...remuxOutputs.values()].map((ownedDir) => cache.removeOwned(ownedDir).catch(() => false))
+    );
+    remuxOutputs.clear();
+    await cache.cleanupRun().catch(() => false);
+  })();
+  return cleanupPromise;
 }
+
+app.on('before-quit', (event) => {
+  if (cleanupComplete) return;
+  event.preventDefault();
+  if (quitRequested) return;
+  quitRequested = true;
+  Promise.race([cleanup(), delay(5000)]).finally(() => {
+    cleanupComplete = true;
+    app.quit();
+  });
+});
 
 /* ---------------------------------- 环境 ---------------------------------- */
 
@@ -140,7 +166,7 @@ secureHandle('env:status', async () => {
     ffmpeg: tools.ffmpeg,
     ffprobe: tools.ffprobe,
     ytDlp: linkTools.ytDlp,
-    downloadDir: DOWNLOAD_DIR,
+    cacheDir: CACHE_ROOT,
     platform: process.platform,
     version: app.getVersion(),
   };
@@ -166,10 +192,25 @@ secureHandle('dialog:pickVideo', async () => {
 secureHandle('media:inspect', async (filePath) => media.inspect(validate.absolutePath(filePath)));
 
 secureHandle('media:remux', async (filePath) => {
-  const { outPath } = await media.remux(validate.absolutePath(filePath), WORK_DIR, {
-    onProgress: (p) => send('media:remuxProgress', { progress: p }),
-  });
-  return { outPath };
+  const ownedDir = await cache.createOwnedDir('remux');
+  try {
+    const { outPath } = await media.remux(validate.absolutePath(filePath), ownedDir, {
+      onProgress: (p) => send('media:remuxProgress', { progress: p }),
+    });
+    remuxOutputs.set(outPath, ownedDir);
+    return { outPath };
+  } catch (error) {
+    await cache.removeOwned(ownedDir).catch(() => {});
+    throw error;
+  }
+});
+
+secureHandle('media:releaseTemp', async (filePath) => {
+  const target = validate.absolutePath(filePath, '临时媒体路径');
+  const ownedDir = remuxOutputs.get(target);
+  if (!ownedDir) return false;
+  remuxOutputs.delete(target);
+  return cache.removeOwned(ownedDir);
 });
 
 secureHandle('media:inspectLink', async (url) => linkMedia.inspectLink(validate.httpUrl(url, '视频链接')));
@@ -180,14 +221,14 @@ secureHandle('store:buildManifest', async (filePath) => {
 
 secureHandle('store:openSeed', async (payload) => {
   const { manifest, filePath } = validate.plainObject(payload, '做种参数');
-  return store.openSeed(validate.manifest(manifest), validate.absolutePath(filePath));
+  const sourcePath = validate.absolutePath(filePath);
+  const ownedDir = remuxOutputs.get(sourcePath) || null;
+  const state = await store.openSeed(validate.manifest(manifest), sourcePath, { ownedDir });
+  if (ownedDir) remuxOutputs.delete(sourcePath);
+  return state;
 });
 
-secureHandle('store:openLeech', async (payload) => {
-  const { manifest, destDir } = validate.plainObject(payload, '接收参数');
-  const outputDir = destDir == null ? DOWNLOAD_DIR : validate.absolutePath(destDir, '下载目录');
-  return store.openLeech(validate.manifest(manifest), outputDir);
-});
+secureHandle('store:openLeech', async (manifest) => store.openLeech(validate.manifest(manifest)));
 
 secureHandle('store:readChunk', async (payload) => {
   const { sessionId, index } = validate.plainObject(payload, '读取分片参数');
@@ -265,9 +306,8 @@ secureHandle('app:openExternal', async (url) => {
 });
 
 secureHandle('app:ensureDirs', async () => {
-  await fsp.mkdir(DOWNLOAD_DIR, { recursive: true });
-  await fsp.mkdir(WORK_DIR, { recursive: true });
-  return { downloadDir: DOWNLOAD_DIR, workDir: WORK_DIR };
+  const runDir = await cache.initialize();
+  return { cacheDir: CACHE_ROOT, runDir };
 });
 
 secureHandle('clipboard:writeText', async (text) => {

@@ -92,6 +92,7 @@ class MpvController extends EventEmitter {
       '--force-window=yes',
       '--keep-open=yes',
       '--cache=yes',
+      '--cache-on-disk=no',
       '--osd-level=1',
       `--pause=${startPaused ? 'yes' : 'no'}`,
       '--title=NoxReel',

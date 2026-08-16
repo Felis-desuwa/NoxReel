@@ -35,6 +35,7 @@ contextBridge.exposeInMainWorld('sw', {
     inspect: (filePath) => ipcRenderer.invoke('media:inspect', filePath),
     inspectLink: (url) => ipcRenderer.invoke('media:inspectLink', url),
     remux: (filePath) => ipcRenderer.invoke('media:remux', filePath),
+    releaseTemp: (filePath) => ipcRenderer.invoke('media:releaseTemp', filePath),
     onRemuxProgress: on('media:remuxProgress'),
   },
 
@@ -42,7 +43,7 @@ contextBridge.exposeInMainWorld('sw', {
     buildManifest: (filePath) => ipcRenderer.invoke('store:buildManifest', filePath),
     onHashProgress: on('store:hashProgress'),
     openSeed: (manifest, filePath) => ipcRenderer.invoke('store:openSeed', { manifest, filePath }),
-    openLeech: (manifest, destDir) => ipcRenderer.invoke('store:openLeech', { manifest, destDir }),
+    openLeech: (manifest) => ipcRenderer.invoke('store:openLeech', manifest),
     readChunk: (sessionId, index) => ipcRenderer.invoke('store:readChunk', { sessionId, index }),
     writeChunk: (sessionId, index, data) => ipcRenderer.invoke('store:writeChunk', { sessionId, index, data }),
     state: (sessionId) => ipcRenderer.invoke('store:state', sessionId),
@@ -60,6 +61,10 @@ contextBridge.exposeInMainWorld('sw', {
     onTick: on('mpv:tick'),
     onExit: on('mpv:exit'),
     onError: on('mpv:error'),
+  },
+
+  app: {
+    onShutdownRequested: on('app:shutdownRequested'),
   },
 
   // 拖拽进来的 File 对象在 Electron 里拿不到 .path 了（安全策略变更），

@@ -304,6 +304,8 @@ function setSteps(steps) {
 }
 
 async function startHost(filePath) {
+  let temporaryPath = null;
+  let preparedSessionId = null;
   if (!roomEntered) {
     S.role = 'host';
     S.hostId = S.peerId; // 房主就是自己，角色权威在我这
@@ -354,6 +356,7 @@ async function startHost(filePath) {
       try {
         const { outPath } = await window.sw.media.remux(filePath);
         filePath = outPath;
+        temporaryPath = outPath;
         $('prep-note').textContent = `已转封装到：${outPath}`;
       } finally {
         off();
@@ -387,12 +390,25 @@ async function startHost(filePath) {
 
     manifest = { ...manifest, roomRevision: S.mediaRevision + 1 };
     const state = await window.sw.store.openSeed(manifest, filePath);
+    preparedSessionId = state.sessionId;
 
     steps[3].state = 'done';
     setSteps(steps);
 
     await activateFileSession({ manifest, state, filePath, isSeeder: true });
+    preparedSessionId = null;
+    temporaryPath = null;
   } catch (e) {
+    if (preparedSessionId) {
+      await window.sw.store.close(preparedSessionId).catch(() => {});
+      if (S.sessionId === preparedSessionId) {
+        S.sessionId = null;
+        S.filePath = null;
+        S.manifest = null;
+      }
+    } else if (temporaryPath) {
+      await window.sw.media.releaseTemp(temporaryPath).catch(() => {});
+    }
     console.error(e);
     prepFail(e.message || String(e));
   }
@@ -441,8 +457,8 @@ async function stopCurrentMedia() {
   S.mpvRunning = false;
   $('btn-playpause').disabled = true;
   $('btn-reopen')?.classList.add('hidden');
-  await window.sw.mpv.quit().catch(() => {});
   S.swarm?.clearSession();
+  await window.sw.mpv.quit().catch(() => {});
   if (oldSessionId) await window.sw.store.close(oldSessionId).catch(() => {});
 }
 
@@ -867,21 +883,16 @@ function initSwarmAndSync() {
     const revision = Number(manifest.roomRevision) || 0;
     if (revision && revision <= S.mediaRevision) return;
 
-    const state = await window.sw.store.openLeech(manifest, null);
+    const state = await window.sw.store.openLeech(manifest);
     if (revision && revision <= S.mediaRevision) {
       await window.sw.store.close(state.sessionId).catch(() => {});
       return;
     }
     await activateFileSession({ manifest, state, filePath: state.filePath, isSeeder: false });
 
-    log(
-      state.resumed
-        ? `发现未下完的文件，从 ${(((state.haveCount || 0) / manifest.chunkCount) * 100).toFixed(0)}% 继续`
-        : `开始接收：${manifest.name}（${fmtBytes(manifest.size)}，${manifest.chunkCount} 片）`,
-      'good'
-    );
+    log(`开始接收：${manifest.name}（${fmtBytes(manifest.size)}，${manifest.chunkCount} 片）`, 'good');
 
-    maybeLaunchPlayer(S.swarm.progress()); // 续传时片头可能早就有了，不必再等
+    maybeLaunchPlayer(S.swarm.progress());
   });
 
   S.swarm.on('mismatch', ({ peerId }) => {
@@ -890,7 +901,7 @@ function initSwarmAndSync() {
   S.swarm.on('chunk-bad', ({ index, reason }) => {
     log(`分片 ${index} 校验未通过（${reason}），已丢弃重下`, 'warn');
   });
-  // 下载进度是 stall 评估的第二个驱动源。全员暂停后 mpv 不再发 tick，
+  // 接收进度是 stall 评估的第二个驱动源。全员暂停后 mpv 不再发 tick，
   // 只剩这条路能把「缓冲攒够了」告诉同步引擎。
   S.swarm.on('progress', (p) => {
     S.sync.onBufferProgress({ contiguousBytes: p.contiguousBytes, complete: p.complete });
@@ -899,8 +910,8 @@ function initSwarmAndSync() {
   });
   S.swarm.on('peers', renderPeers);
   S.swarm.on('complete', () => {
-    log('文件已全部接收完成并校验通过', 'good');
-    window.sw.mpv.osd('下载完成', 2000);
+    log('文件已全部接收并校验通过；退出房间后会自动删除缓存', 'good');
+    window.sw.mpv.osd('接收完成 · 退出房间后自动清理', 2500);
   });
 
   S.swarm.start();
@@ -937,6 +948,7 @@ function refreshMediaUi() {
   renderFilmInfo();
   renderProgress(S.swarm?.progress());
   $('btn-reveal').classList.toggle('hidden', S.sourceType === 'link');
+  $('btn-reveal').textContent = S.isSeeder ? '打开源文件位置' : '打开临时缓存位置';
   $('buffer').classList.toggle('link-mode', S.sourceType === 'link');
   $('media-switch-block')?.classList.toggle('hidden', S.role !== 'host');
   $('btn-reopen')?.classList.toggle('hidden', S.mpvRunning || !S.filePath);
@@ -1256,7 +1268,7 @@ function renderProgress(p) {
 
   replace(
     'buffer-stats',
-    stat('已下载', `${(p.ratio * 100).toFixed(1)}%（${p.haveCount}/${p.chunkCount} 片）`),
+    stat('已接收', `${(p.ratio * 100).toFixed(1)}%（${p.haveCount}/${p.chunkCount} 片）`),
     stat('可连续播放到', fmtBytes(p.contiguousBytes)),
     stat('在途', `${p.inflight} 片`),
     stat('速度', fmtRate(p.downRate))
@@ -1484,9 +1496,9 @@ $('btn-reveal').onclick = () => {
 };
 
 $('btn-leave').onclick = async () => {
-  await window.sw.mpv.quit().catch(() => {});
   S.signaling?.close();
   S.swarm?.destroy();
+  await window.sw.mpv.quit().catch(() => {});
   if (S.sessionId) await window.sw.store.close(S.sessionId).catch(() => {});
   location.reload();
 };
@@ -1634,6 +1646,12 @@ $('modal-cancel').onclick = () => {
 window.addEventListener('resize', drawChunkMap);
 window.addEventListener('beforeunload', () => {
   S.signaling?.close();
+  S.swarm?.destroy();
+});
+
+window.sw.app.onShutdownRequested(() => {
+  S.signaling?.close();
+  S.swarm?.destroy();
 });
 
 boot();
