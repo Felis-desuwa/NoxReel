@@ -543,6 +543,7 @@ async function activateLinkSession(linkInfo, { revision, broadcast = false } = {
         url: linkInfo.url,
         title: linkInfo.title,
         duration: linkInfo.duration || 0,
+        playback: linkInfo.playback || null,
         revision: S.mediaRevision,
       });
     }
@@ -866,6 +867,23 @@ async function handleMediaLink(msg, peer) {
     $('prep-bar').style.width = '90%';
     await activateLinkSession(linkInfo, { revision: Number(msg.revision) || S.mediaRevision + 1 });
   } catch (e) {
+    // 页面解析会受地区、站点限流和 yt-dlp 版本影响。房主可以附带一条短时效、
+    // 已去除 Cookie/Authorization 的播放地址作为兼容兜底，尤其供 Android 使用。
+    const playbackUrl = typeof msg.playback?.url === 'string' ? msg.playback.url : '';
+    if (/^https?:\/\//i.test(playbackUrl)) {
+      const fallback = {
+        url: playbackUrl,
+        title: typeof msg.title === 'string' ? msg.title.slice(0, 240) : '在线视频',
+        duration: Number(msg.duration) || 0,
+        extractor: 'host-resolved',
+        direct: true,
+        playback: msg.playback,
+        resolvedAt: Date.now(),
+      };
+      log(`本机解析失败，改用房主提供的临时播放地址：${e.message || e}`, 'warn');
+      await activateLinkSession(fallback, { revision: Number(msg.revision) || S.mediaRevision + 1 });
+      return;
+    }
     prepFail(`这个视频链接在你的电脑上无法解析：${e.message || e}`);
   }
 }
@@ -906,6 +924,7 @@ function initSwarmAndSync() {
         url: S.linkInfo.url,
         title: S.linkInfo.title,
         duration: S.linkInfo.duration || 0,
+        playback: S.linkInfo.playback || null,
         revision: S.mediaRevision,
       });
     }
@@ -1148,7 +1167,13 @@ async function launchPlayer() {
   if (S.mpvRunning || !S.filePath) return;
   S.mpvRunning = true; // 先占位，防止 progress 事件密集时重复拉起
   try {
-    await window.sw.mpv.launch(S.filePath, true);
+    await window.sw.mpv.launch(
+      S.filePath,
+      true,
+      S.sourceType === 'link' && S.filePath === S.linkInfo?.playback?.url
+        ? S.linkInfo.playback.headers || {}
+        : {}
+    );
     $('btn-playpause').disabled = false;
     $('btn-reopen')?.classList.add('hidden');
     log('mpv 已启动（先暂停着，等所有人就绪）', 'good');

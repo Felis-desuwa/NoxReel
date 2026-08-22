@@ -291,10 +291,11 @@ secureHandle('store:reveal', async (filePath) => {
 /* ---------------------------------- mpv ---------------------------------- */
 
 secureHandle('mpv:launch', async (payload) => {
-  const { filePath, startPaused } = validate.plainObject(payload, '播放器启动参数');
+  const { filePath, startPaused, headers } = validate.plainObject(payload, '播放器启动参数');
   const source = /^https?:\/\//i.test(filePath)
     ? await validate.publicHttpUrl(filePath, '媒体链接')
     : await requireAllowedLocalPath(filePath);
+  const safeHeaders = /^https?:\/\//i.test(source) ? validate.mediaHeaders(headers) : {};
   if (typeof startPaused !== 'boolean') throw new TypeError('无效的暂停参数');
   if (mpv) await mpv.quit().catch(() => {});
   mpv = new MpvController();
@@ -303,7 +304,7 @@ secureHandle('mpv:launch', async (payload) => {
   mpv.on('exit', (info) => send('mpv:exit', info));
   mpv.on('error', (err) => send('mpv:error', { message: err.message }));
 
-  return mpv.launch(source, { startPaused });
+  return mpv.launch(source, { startPaused, headers: safeHeaders });
 });
 
 secureHandle('mpv:setPause', async (paused) => {

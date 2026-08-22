@@ -13,7 +13,8 @@ import { Peer } from './peer.js';
 import { Swarm } from './swarm.js';
 import { SyncEngine } from './syncEngine.js';
 import { WsSignaling, encodeCode, decodeCode, randomPeerId } from './signaling.js';
-import { currentLocale, setLocale, startI18n } from './i18n.js';
+import { MSG } from './protocol.js';
+import { currentLocale, setLocale, startI18n, translate as t } from './i18n.js';
 
 startI18n();
 
@@ -30,6 +31,8 @@ const S = {
   signaling: null,
   sessionId: null,
   manifest: null,
+  sourceType: null,
+  linkInfo: null,
   playerStarted: false,
   playerTimer: null,
   prog: { contiguousBytes: 0, complete: false },
@@ -137,7 +140,10 @@ function initSwarmAndSync() {
     log(`已断开身份校验失败的成员：${expected}`, 'bad');
   });
   // SYNC / STALL 这些同步消息 swarm 不认，走 default 抛到 'ctrl'，转给同步引擎
-  S.swarm.on('ctrl', ({ msg, peer }) => S.sync.onCtrl(msg, peer));
+  S.swarm.on('ctrl', ({ msg, peer }) => {
+    if (msg.t === MSG.MEDIA_LINK) onMediaLink(msg, peer);
+    else S.sync.onCtrl(msg, peer);
+  });
 
   S.swarm.start();
 }
@@ -160,6 +166,8 @@ function onManifestOffer({ manifest, from }) {
   if (S.sessionId) window.sw.store.close(S.sessionId);
 
   S.manifest = manifest;
+  S.sourceType = 'file';
+  S.linkInfo = null;
   S.mediaRevision = revision || S.mediaRevision + 1;
   try {
     S.sessionId = window.sw.store.openLeech(manifest);
@@ -176,6 +184,85 @@ function onManifestOffer({ manifest, from }) {
   enterStage();
   renderFilmInfo();
   log(`开始接收《${manifest.name}》 · ${fmtBytes(manifest.size)}`, 'good');
+}
+
+/* ----------------------- 收到网页/直链媒体 ----------------------- */
+function safePlaybackFromMessage(msg) {
+  const playback = msg && msg.playback;
+  if (!playback || typeof playback.url !== 'string' || playback.url.length > 16384) return null;
+  try {
+    const parsed = new URL(playback.url);
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return null;
+  } catch {
+    return null;
+  }
+  const headers = {};
+  const allowed = new Set(['accept', 'accept-language', 'origin', 'referer', 'user-agent']);
+  if (playback.headers && typeof playback.headers === 'object' && !Array.isArray(playback.headers)) {
+    for (const [rawName, rawValue] of Object.entries(playback.headers)) {
+      const name = String(rawName).trim().toLowerCase();
+      if (!allowed.has(name) || typeof rawValue !== 'string' || !rawValue || rawValue.length > 2048) continue;
+      if (/\r|\n/.test(rawValue)) continue;
+      headers[name] = rawValue;
+    }
+  }
+  return { url: playback.url, headers };
+}
+
+function onMediaLink(msg, peer) {
+  const knownHost = S.hostId || S.sync?.hostId;
+  if (!knownHost || peer.peerId !== knownHost) {
+    log('已忽略非房主发来的视频链接', 'warn');
+    return;
+  }
+  const revision = Number(msg.revision) || 0;
+  if (revision && revision <= S.mediaRevision) return;
+  const playback = safePlaybackFromMessage(msg);
+  if (!playback) {
+    log('房主分享的是网页链接，但没有可供 Android 播放的安全直链', 'bad');
+    return;
+  }
+
+  let origin = '';
+  try { origin = new URL(playback.url).origin; } catch {}
+  const allowed = window.confirm(t(`房主请求手机连接 ${origin} 播放在线视频。是否允许？`));
+  if (!allowed) {
+    log('你拒绝了房主发送的视频链接', 'warn');
+    return;
+  }
+
+  if (S.playerTimer) clearInterval(S.playerTimer);
+  S.playerTimer = null;
+  S.playerStarted = false;
+  window.swPlayer.release();
+  S.swarm.clearSession();
+  if (S.sessionId) window.sw.store.close(S.sessionId);
+
+  S.sessionId = null;
+  S.manifest = null;
+  S.sourceType = 'link';
+  S.linkInfo = {
+    title: typeof msg.title === 'string' ? msg.title.slice(0, 240) : '在线视频',
+    duration: Number(msg.duration) || 0,
+    playback,
+  };
+  S.mediaRevision = revision || S.mediaRevision + 1;
+  S.prog = { contiguousBytes: 0, complete: true };
+  S.sync.resetMedia({ isSeeder: true });
+  S.sync.setMediaInfo({ duration: S.linkInfo.duration, size: 0 });
+  S.sync.start();
+
+  const started = window.swPlayer.loadUrl(playback.url, playback.headers);
+  if (!started) {
+    log('Android 拒绝或无法打开这个播放地址', 'bad');
+    return;
+  }
+  S.playerStarted = true;
+  enterStage();
+  renderFilmInfo();
+  renderStatus(S.prog);
+  startPlayerTicks();
+  log(`正在从原网站播放《${S.linkInfo.title}》`, 'good');
 }
 
 /* --------------------------- 下载进度回调 --------------------------- */
@@ -211,7 +298,7 @@ function startPlayerTicks() {
 
     // 首次拿到时长：喂给同步引擎和调度器（前瞻窗口、stall 阈值都要它）
     if (snap.duration > 0 && !S.sync.duration) {
-      S.sync.setMediaInfo({ duration: snap.duration, size: S.manifest.size });
+      S.sync.setMediaInfo({ duration: snap.duration, size: S.manifest?.size || 0 });
       S.swarm.setDuration(snap.duration);
     }
 
@@ -223,12 +310,17 @@ function startPlayerTicks() {
       duration: snap.duration,
       at: performance.now(),
     };
-    S.sync._evaluateStall(S.sync.lastTick, { contiguousBytes: S.prog.contiguousBytes, complete: S.prog.complete });
+    S.sync._evaluateStall(S.sync.lastTick, {
+      contiguousBytes: S.prog.contiguousBytes,
+      complete: S.sourceType === 'link' || S.prog.complete,
+    });
 
     // 播放位置告诉调度器，让它优先补「播放点 + 前瞻窗口」的片
-    const size = S.manifest.size;
-    const pb = snap.duration > 0 ? (snap.position / snap.duration) * size : 0;
-    S.swarm.setPlaybackByte(pb);
+    const size = S.manifest?.size || 0;
+    if (size > 0) {
+      const pb = snap.duration > 0 ? (snap.position / snap.duration) * size : 0;
+      S.swarm.setPlaybackByte(pb);
+    }
 
     renderPlayback(snap);
   }, 250);
@@ -335,7 +427,11 @@ function enterStage() {
 }
 
 function renderFilmInfo() {
-  if (S.manifest) $('film').textContent = `${S.manifest.name} · ${securityModeLabel(S.securityMode)}`;
+  if (S.sourceType === 'link' && S.linkInfo) {
+    $('film').textContent = `${S.linkInfo.title} · ${securityModeLabel(S.securityMode)} · 在线`;
+  } else if (S.manifest) {
+    $('film').textContent = `${S.manifest.name} · ${securityModeLabel(S.securityMode)}`;
+  }
 }
 
 const ROLE_LABEL = { host: '房主', admin: '管理员', guest: '游客' };
@@ -358,6 +454,11 @@ function renderRole() {
 }
 
 function renderStatus(p) {
+  if (S.sourceType === 'link') {
+    $('status').textContent = '视频直链 · 从原网站播放 · 房间同步中';
+    $('buf').firstElementChild.style.width = '100%';
+    return;
+  }
   const pct = Math.round((p.contiguousRatio || 0) * 100);
   const rate = fmtBytes(p.downRate || 0) + '/s';
   $('status').textContent = `可播 ${pct}% · 已有 ${p.haveCount}/${p.chunkCount} 片 · ↓${rate}`;

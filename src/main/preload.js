@@ -54,7 +54,8 @@ contextBridge.exposeInMainWorld('sw', {
   },
 
   mpv: {
-    launch: (filePath, startPaused = true) => ipcRenderer.invoke('mpv:launch', { filePath, startPaused }),
+    launch: (filePath, startPaused = true, headers = {}) =>
+      ipcRenderer.invoke('mpv:launch', { filePath, startPaused, headers }),
     setPause: (paused) => ipcRenderer.invoke('mpv:setPause', paused),
     seek: (seconds) => ipcRenderer.invoke('mpv:seek', seconds),
     osd: (text, duration = 2000) => ipcRenderer.invoke('mpv:osd', { text, duration }),

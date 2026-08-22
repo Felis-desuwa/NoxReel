@@ -42,7 +42,7 @@ class MainActivity : AppCompatActivity() {
         player.attachView(playerView)
         val bridge = NativeBridge(store, player)
 
-        WebView.setWebContentsDebuggingEnabled(true) // chrome://inspect 可调
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG) // 发布包不暴露 chrome://inspect
         web.setBackgroundColor(0x00000000) // 透明，露出底下视频
         web.settings.apply {
             javaScriptEnabled = true
@@ -73,9 +73,9 @@ class MainActivity : AppCompatActivity() {
                 Log.d("NoxReel/web", "${m.message()} @${m.sourceId()}:${m.lineNumber()}")
                 return true
             }
-            // 纯数据通道用不到摄像头/麦克风；万一请求了一律放行，别卡住 WebRTC
+            // DataChannel 不需要摄像头或麦克风，任何媒体权限请求都拒绝。
             override fun onPermissionRequest(request: PermissionRequest) {
-                request.grant(request.resources)
+                request.deny()
             }
         }
 

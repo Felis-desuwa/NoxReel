@@ -1,6 +1,7 @@
 # NoxReel 安卓版（观众端）
 
-手机作为**观众**加入 PC 端发起的同步观影房间：边下边播、参与「全员暂停」联动。
+手机作为**观众**加入 PC 端发起的同步观影房间：支持 P2P 文件、房主解析的视频直链、
+边下边播与「全员暂停」联动。
 手机不做种、不当房主——只接收、只跟随。
 
 ## 为什么这么做
@@ -13,13 +14,18 @@ WebRTC / DataChannel / WebSocket 实现——所以帧格式、控制消息、�
 | 能力 | PC 端 | 安卓端 |
 |---|---|---|
 | 分片存储 + 校验 + 水位线 | `fileStore.js`（Node） | `Store.kt` |
-| 播放器 | 外部 mpv | ExoPlayer + `GrowingDataSource` |
+| 播放器 | 外部 mpv | ExoPlayer + `GrowingDataSource` / HTTP、HLS、DASH |
 
 `GrowingDataSource` 只读到连续水位线为止，读到还没下的区域就阻塞等下载补齐——
 这就是「边下边播」不花屏的关键。HEVC 用原生 MediaCodec 解码（WebView 的
 `<video>`/MSE 放 HEVC 不可靠，才没走那条路）。
 
-数据流：`PC 做种 →DataChannel→ 手机 WebView(JS 协议) →bridge→ Store 写盘 →ExoPlayer 播`
+文件数据流：`PC 做种 →DataChannel→ 手机 WebView(JS 协议) →bridge→ Store 写盘 →ExoPlayer 播`
+
+链接数据流：`房主 yt-dlp 解析 →DataChannel 发送临时直链 →手机确认站点 →ExoPlayer 直连原网站`
+
+链接消息只接受通过房间握手认证的房主，并删除 Cookie、Authorization 等敏感请求头；
+手机仍会在连接外部站点前单独确认。登录、付费、DRM 内容不在支持范围内。
 
 ## 目录
 
@@ -76,10 +82,12 @@ adb logcat -s NoxReel NoxReel/web   # 看日志
 2. **手机端**：和电脑连同一 WiFi，打开 App：
    - **信令服务器**：填 `ws://192.168.1.20:8080` + 相同房间号 → 加入。
    - **极简粘贴**：把电脑生成的邀请码贴进去 → 生成应答码 → 发回电脑粘贴。
-3. 连上后自动接片，片头就绪即起播；谁缓冲跟不上，全员一起等。
+3. 连上后自动接片；房主切换到网页视频时，手机确认来源站点后直接播放。谁缓冲跟不上，
+   全员一起等。
 
 ## 已知边界
 
 - HEVC 靠设备硬件解码器；绝大多数安卓 12 机器都支持，个别老芯片可能不行。
+- 网站链接能否播放取决于 yt-dlp、原网站和 ExoPlayer；短时效链接过期后需房主重新切换。
 - 真实公网 NAT 打洞未在多机环境验证；同一 WiFi（局域网直连）最稳。
   连不上时在电脑端设置里配 TURN 中继兜底。

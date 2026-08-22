@@ -272,6 +272,7 @@ const EN_PATTERNS = [
   [/^(.+) 断开了$/, '$1 disconnected'],
   [/^来源：(.*)$/, 'Source: $1'],
   [/^这个视频链接在你的电脑上无法解析：(.*)$/, (_all, detail) => `This video link could not be parsed on your computer: ${translate(detail, 'en')}`],
+  [/^本机解析失败，改用房主提供的临时播放地址：(.*)$/, (_all, detail) => `Local parsing failed; using the host's temporary stream URL: ${translate(detail, 'en')}`],
   [/^已和 (.+) 完成(.+)握手$/, 'Completed $2 handshake with $1'],
   [/^(.+)的缓冲跟不上了，全员暂停等待$/, '$1 is buffering; pausing everyone'],
   [/^等待 (.+) 缓冲…$/, 'Waiting for $1 to buffer…'],

@@ -69,6 +69,9 @@ window.swPlayer = {
   load(sessionId) {
     return Native.playerLoad(sessionId);
   },
+  loadUrl(url, headers = {}) {
+    return Native.playerLoadUrl(url, JSON.stringify(headers));
+  },
   setPause(paused) {
     Native.playerSetPause(!!paused);
   },

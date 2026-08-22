@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.4.2-7C5CFF?style=for-the-badge" alt="Version 0.4.2">
+    <img src="https://img.shields.io/badge/version-0.5.0-7C5CFF?style=for-the-badge" alt="Version 0.5.0">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -39,6 +39,8 @@
 - **缓冲联动**：任何成员可播余量不足时全员暂停，恢复后继续。
 - **真实成员状态**：只显示已建立连接的用户，并给出上传、下载速度和延迟。
 - **播放器可恢复**：播放器窗口关闭后，可从房间页面重新打开。
+- **现代播放器界面**：mpv 使用 NoxReel 深色无边框外观、圆角窗口、底部控制栏与更清晰的进度反馈。
+- **Android 链接播放**：桌面房主解析网页后，Android 观众确认来源站点即可同步播放 HTTP、HLS 或 DASH 临时直链。
 - **中英双语**：桌面端与 Android 观众端均可在设置中切换简体中文或 English。
 - **缓存自动清理**：接收视频和转封装副本只进入系统临时缓存，换片、退房或关闭软件时自动删除；异常残留会在下次启动时回收。
 - **双模式安全门槛**：安全模式为默认，完整接收并通过 Microsoft Defender 扫描后才播放；可信房间需房主与成员分别启用，允许约 8 MB 片头就绪后边下边播，风险更高，完整后仍补做扫描。
@@ -46,14 +48,14 @@
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!IMPORTANT]
-> `v0.4.2` 将接收视频和转封装副本迁移到临时缓存，退出房间或软件时自动清理，并使用有上限的内存缓存减少磁盘读写；同时包含 `v0.4.1` 的全部安全修复。建议旧版用户升级。
+> `v0.5.0` 加强了网站视频解析，更新了现代化 mpv 界面，并让 Android 观众端支持房间内的视频链接与最新版协议。链接解析不会读取浏览器 Cookie，也不会绕过登录、付费或 DRM。
 
 ## 下载
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，安装后即可使用 | [NoxReel-Setup-0.4.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.4.2.exe) |
-| Windows 联网版 | 安装器体积小，安装时下载应用组件 | [NoxReel-WebSetup-0.4.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.4.2.exe) |
+| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，安装后即可使用 | [NoxReel-Setup-0.5.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.5.0.exe) |
+| Windows 联网版 | 安装器体积小，安装时下载应用组件 | [NoxReel-WebSetup-0.5.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.5.0.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -70,9 +72,8 @@
 6. 成员加入后，房主即可统一控制播放、暂停和跳转。
 
 ```text
-房主的视频 / 原网站
-        ↓
-   WebRTC P2P 直连
+本地视频 → WebRTC P2P 直连
+视频链接 → 每位成员直连原网站
         ↓
 安全模式：完整校验与扫描后播放
 可信房间：约 8 MB 片头后边下边播（完整后补扫）
@@ -92,7 +93,7 @@
 ## 隐私与内容边界
 
 - 本地视频分片通过加密的 WebRTC 连接在成员之间传输。
-- 视频链接由每位成员直接从原始网站读取，不经过 NoxReel 信令服务器。
+- 视频链接由每位成员直接从原始网站读取，不经过 NoxReel 信令服务器；Android 所需的短时效播放地址仅通过已认证的房间连接发送，并剔除 Cookie 与 Authorization。
 - 用户选择的源视频始终保持原样；软件生成的接收缓存不会保留在“下载”文件夹，也不提供跨重启断点续传。
 - 桌面端启用 Chromium sandbox、上下文隔离和严格 CSP；所有特权操作均通过白名单 IPC 完成。
 - 昵称、成员信息和错误内容通过文本节点渲染，不作为 HTML 执行。
@@ -130,7 +131,8 @@
 - 真实公网 NAT 穿透效果取决于双方网络，无法保证所有网络组合都能直连。
 - TURN 中继需要使用者自行提供服务器与凭据。
 - 10 GB 上限已覆盖清单拆分和稀疏文件逻辑；目前真实媒体端到端测试规模为 1.75 GB。
-- Android 版本仍处于测试阶段，桌面端是当前主要体验。
+- Android 版本仍处于测试阶段，可作为观众接收本地视频或房主解析的视频链接。
+- 网站支持范围会随 yt-dlp 和原网站变化；短时效播放地址过期后，需要房主重新切换该链接。
 - 安全模式需要可用的 Microsoft Defender 才能自动播放其他成员传来的本地视频；扫描不可用或未通过时会拒绝播放。可信房间会在完整扫描前开始播放，只适合双方都信任房主与内容来源的场景。
 
 </details>

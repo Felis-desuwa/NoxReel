@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.4.2-7C5CFF?style=for-the-badge" alt="Version 0.4.2">
+    <img src="https://img.shields.io/badge/version-0.5.0-7C5CFF?style=for-the-badge" alt="Version 0.5.0">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -39,6 +39,8 @@
 - **Buffer coordination:** playback pauses when a controlling member runs low on playable data and resumes after recovery.
 - **Real member status:** only established connections are listed, with upload rate, download rate, and latency.
 - **Recoverable player:** reopen the player from the room after its window is closed.
+- **Modern player UI:** mpv now uses NoxReel's dark borderless appearance, rounded Windows corners, a bottom control bar, and clearer seek feedback.
+- **Android link playback:** after the desktop host resolves a webpage, Android viewers can approve the source site and synchronously play its temporary HTTP, HLS, or DASH stream.
 - **Chinese and English UI:** switch between Simplified Chinese and English from Settings on both desktop and the Android viewer.
 - **Automatic cache cleanup:** received videos and remuxed copies stay in the system temporary directory and are deleted when switching media, leaving the room, or closing the app. Crash leftovers are reclaimed on the next launch.
 - **Two security modes:** Safe mode is the default and plays only after complete receipt and a Microsoft Defender scan. Trusted rooms require both the host and each member to opt in, allow progressive playback after about 8 MB of initial data, and still run a full scan after receipt.
@@ -46,14 +48,14 @@
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
 
 > [!IMPORTANT]
-> `v0.4.2` moved received media and remuxed copies into temporary cache storage, added automatic cleanup, and introduced a bounded memory cache to reduce disk I/O. It also includes every security fix from `v0.4.1`. Users of older versions should upgrade.
+> `v0.5.0` improves website video resolution, refreshes the mpv interface, and brings video-link rooms plus the latest protocol to Android viewers. Link parsing does not read browser cookies or bypass login, paywalls, or DRM.
 
 ## Downloads
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv and yt-dlp | [NoxReel-Setup-0.4.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.4.2.exe) |
-| Windows web installer | Smaller installer that downloads application components during setup | [NoxReel-WebSetup-0.4.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.4.2.exe) |
+| Windows full installer | Recommended. Bundles mpv and yt-dlp | [NoxReel-Setup-0.5.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.5.0.exe) |
+| Windows web installer | Smaller installer that downloads application components during setup | [NoxReel-WebSetup-0.5.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.5.0.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -70,9 +72,8 @@
 6. After they join, the host can synchronize play, pause, and seek operations.
 
 ```text
-Host video / original website
-             ↓
-      Direct WebRTC P2P
+Local video → Direct WebRTC P2P
+Video link → Each member connects to the source site
              ↓
 Safe mode: verify and scan the complete file before playback
 Trusted room: start near 8 MB and scan after full receipt
@@ -92,7 +93,7 @@ The signaling server exchanges SDP, ICE, and room state only. It never reads or 
 ## Privacy and content boundaries
 
 - Local video chunks travel over encrypted WebRTC connections between members.
-- Every member loads video links directly from the original website; the NoxReel signaling server does not relay them.
+- Every member loads video links directly from the original website; the NoxReel signaling server does not relay them. Short-lived Android playback URLs travel only through an authenticated room connection and exclude Cookie and Authorization headers.
 - User-selected source videos are never deleted. Generated receive caches do not remain in Downloads and do not support cross-restart resume.
 - The desktop app enables the Chromium sandbox, context isolation, strict CSP, and allowlisted privileged IPC.
 - Nicknames, member information, and errors are rendered as text rather than executable HTML.
@@ -130,7 +131,8 @@ Local files use per-chunk verification and a contiguous playback watermark. A bo
 - Public-internet NAT traversal depends on both networks and cannot be guaranteed.
 - Users must provide their own TURN relay and credentials.
 - The 10 GB limit is supported by manifest splitting and sparse-file logic; the largest current end-to-end real-media test is 1.75 GB.
-- Android remains a beta viewer; the desktop app is the primary experience.
+- Android remains a beta viewer and can receive local videos or host-resolved video links.
+- Website support changes with yt-dlp and the source site. If a short-lived stream expires, the host must switch to that link again.
 - Safe mode requires an available Microsoft Defender installation to automatically play local video received from another member. Trusted rooms start before the final scan and should be used only when every participant trusts the host and content source.
 
 </details>

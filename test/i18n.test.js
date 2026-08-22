@@ -13,6 +13,10 @@ test('桌面端固定文案和动态状态可翻译为英文', async () => {
   assert.equal(translate('Alice 播放 @ 1:23', 'en'), 'Alice played @ 1:23');
   assert.equal(translate('已复制完整 128 字符 ✓', 'en'), 'Copied all 128 characters ✓');
   assert.equal(
+    translate('本机解析失败，改用房主提供的临时播放地址：站点暂时不可用', 'en'),
+    "Local parsing failed; using the host's temporary stream URL: 站点暂时不可用"
+  );
+  assert.equal(
     translate('已阻止打开接收文件：安全扫描超时', 'en'),
     'Blocked the received file: The security scan timed out'
   );
@@ -24,6 +28,11 @@ test('Android 观众端提供相同的中英语言入口', async () => {
   assert.equal(translate('界面语言', 'en'), 'Interface language');
   assert.equal(translate('2 人在线', 'en'), '2 online');
   assert.equal(translate('安全模式', 'en'), 'Safe mode');
+  assert.equal(
+    translate('房主请求手机连接 https://cdn.example 播放在线视频。是否允许？', 'en'),
+    'The host wants your phone to connect to https://cdn.example for online playback. Allow it?'
+  );
+  assert.equal(translate('电影 · 安全模式 · 在线', 'en'), '电影 · Safe mode · Online');
   assert.equal(
     translate('邀请码无效：这不像是一个 NoxReel 邀请码', 'en'),
     'Invalid invite code: This does not look like a NoxReel invite code'

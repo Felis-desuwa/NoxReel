@@ -38,6 +38,68 @@ const MPV_CANDIDATES = [
   path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'mpv', 'mpv.exe'),
 ];
 
+function buildLaunchArgs({ ipcPath, source, startPaused = true, ytDlp = null, headers = {} } = {}) {
+  const isRemote = /^https?:\/\//i.test(source);
+  return [
+    '--no-config',
+    `--input-ipc-server=${ipcPath}`,
+    '--idle=yes',
+    '--force-window=yes',
+    '--keep-open=yes',
+    '--cache=yes',
+    '--cache-on-disk=no',
+    '--osd-level=1',
+    '--osd-on-seek=msg-bar',
+    '--osd-font=Segoe UI',
+    '--osd-font-size=28',
+    '--osd-color=#FFFFFFFF',
+    '--osd-outline-color=#B0000000',
+    '--osd-back-color=#66070C17',
+    '--osd-bar-marker-style=line',
+    '--background-color=#030711',
+    '--cursor-autohide=700',
+    '--input-default-bindings=yes',
+    '--osc=yes',
+    '--script-opt=osc-layout=bottombar',
+    '--script-opt=osc-seekbarstyle=bar',
+    '--script-opt=osc-hidetimeout=900',
+    '--script-opt=osc-fadeduration=180',
+    '--script-opt=osc-fadein=yes',
+    '--script-opt=osc-boxalpha=72',
+    '--script-opt=osc-barmargin=8',
+    '--script-opt=osc-scalewindowed=1.12',
+    '--script-opt=osc-scalefullscreen=1.12',
+    '--script-opt=osc-seekrangestyle=line',
+    '--script-opt=osc-seekrangealpha=92',
+    '--script-opt=osc-background_color=#070C17',
+    '--script-opt=osc-timecode_color=#E6EDF3',
+    '--script-opt=osc-title_color=#E6EDF3',
+    '--script-opt=osc-buttons_color=#E6EDF3',
+    '--script-opt=osc-top_buttons_color=#AEBBD0',
+    '--script-opt=osc-held_element_color=#4C8DFF',
+    '--script-opt=osc-time_pos_color=#4C8DFF',
+    '--script-opt=osc-windowcontrols=yes',
+    '--script-opt=osc-windowcontrols_alignment=right',
+    '--script-opt=osc-windowcontrols_title=NoxReel · ${media-title}',
+    '--script-opt=osc-title=NoxReel · ${media-title}',
+    '--autofit=960x540',
+    '--autofit-larger=92%x88%',
+    `--pause=${startPaused ? 'yes' : 'no'}`,
+    '--title=NoxReel · ${media-title}',
+    ...(process.platform === 'win32'
+      ? ['--border=no', '--window-corners=round', '--backdrop-type=mica']
+      : []),
+    ...(!isRemote ? ['--load-scripts=no', '--ytdl=no'] : []),
+    ...(isRemote ? ['--load-scripts=no', '--ytdl=yes', '--script-opt=ytdl_hook-try_ytdl_first=yes'] : []),
+    ...(ytDlp ? [`--script-opt=ytdl_hook-ytdl_path=${ytDlp}`] : []),
+    ...(isRemote
+      ? Object.entries(headers).map(([name, value]) => `--http-header-fields-append=${name}: ${value}`)
+      : []),
+    '--',
+    source,
+  ];
+}
+
 /** 返回 mpv 可执行文件路径，找不到返回 null。 */
 function findMpv() {
   return findBin('mpv', {
@@ -73,7 +135,7 @@ class MpvController extends EventEmitter {
    *  --cache=yes        让 mpv 自己也缓冲一层
    *  --pause=yes        先暂停，等同步引擎决定什么时候放
    */
-  async launch(filePath, { startPaused = true } = {}) {
+  async launch(filePath, { startPaused = true, headers = {} } = {}) {
     if (this.running) await this.quit();
 
     const bin = findMpv();
@@ -86,23 +148,7 @@ class MpvController extends EventEmitter {
     const ipcPath = this._ipcPath();
     const isRemote = /^https?:\/\//i.test(filePath);
     const ytDlp = isRemote ? findYtDlp() : null;
-    const args = [
-      '--no-config',
-      `--input-ipc-server=${ipcPath}`,
-      '--idle=yes',
-      '--force-window=yes',
-      '--keep-open=yes',
-      '--cache=yes',
-      '--cache-on-disk=no',
-      '--osd-level=1',
-      `--pause=${startPaused ? 'yes' : 'no'}`,
-      '--title=NoxReel',
-      ...(!isRemote ? ['--load-scripts=no', '--ytdl=no'] : []),
-      ...(isRemote ? ['--ytdl=yes', '--script-opts-append=ytdl_hook-try_ytdl_first=yes'] : []),
-      ...(ytDlp ? [`--script-opts-append=ytdl_hook-ytdl_path=${ytDlp}`] : []),
-      '--',
-      filePath,
-    ];
+    const args = buildLaunchArgs({ ipcPath, source: filePath, startPaused, ytDlp, headers });
 
     this.proc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: false });
     this.running = true;
@@ -278,4 +324,4 @@ class MpvController extends EventEmitter {
   }
 }
 
-module.exports = { MpvController, findMpv, OBSERVED };
+module.exports = { MpvController, findMpv, OBSERVED, buildLaunchArgs };

@@ -9,6 +9,7 @@ const { validateManifestName } = require('./mediaGuard');
 const MAX_TEXT = 4096;
 const HASH_RE = /^[a-f0-9]{64}$/i;
 const FILE_ID_RE = /^[a-f0-9]{32}$/i;
+const SAFE_MEDIA_HEADERS = new Set(['accept', 'accept-language', 'origin', 'referer', 'user-agent']);
 
 function fail(label) {
   throw new TypeError(`无效的 ${label}`);
@@ -141,6 +142,19 @@ function externalUrl(value) {
   return httpUrl(value, '外部链接');
 }
 
+function mediaHeaders(value) {
+  if (value === undefined || value === null) return {};
+  const source = plainObject(value, '媒体请求头');
+  const result = {};
+  for (const [rawName, rawValue] of Object.entries(source)) {
+    const name = String(rawName).trim().toLowerCase();
+    if (!SAFE_MEDIA_HEADERS.has(name) || typeof rawValue !== 'string') fail('媒体请求头');
+    if (!rawValue || rawValue.length > 2048 || /[\r\n]/.test(rawValue)) fail('媒体请求头');
+    result[name] = rawValue;
+  }
+  return result;
+}
+
 module.exports = {
   absolutePath,
   binary,
@@ -149,6 +163,7 @@ module.exports = {
   httpUrl,
   integer,
   manifest,
+  mediaHeaders,
   plainObject,
   publicHttpUrl,
   sessionId,

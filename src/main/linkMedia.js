@@ -15,6 +15,7 @@ const { findBin } = require('./findBin');
 const DIRECT_MEDIA_RE = /\.(?:mp4|m4v|mov|mkv|webm|m3u8|mpd)(?:$|[?#])/i;
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const PARSE_TIMEOUT_MS = 60_000;
+const SAFE_PLAYBACK_HEADERS = new Set(['accept', 'accept-language', 'origin', 'referer', 'user-agent']);
 
 function bundledYtDlp() {
   if (!process.resourcesPath) return [];
@@ -54,6 +55,34 @@ function normalizeHttpUrl(raw) {
 
 function looksLikeDirectMedia(url) {
   return DIRECT_MEDIA_RE.test(url);
+}
+
+function sanitizePlaybackHeaders(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const safe = {};
+  for (const [rawName, rawValue] of Object.entries(value)) {
+    const name = String(rawName).trim().toLowerCase();
+    if (!SAFE_PLAYBACK_HEADERS.has(name) || typeof rawValue !== 'string') continue;
+    if (/[\r\n]/.test(rawValue)) continue;
+    const text = rawValue.slice(0, 2048);
+    if (text) safe[name] = text;
+  }
+  return safe;
+}
+
+function playbackFromInfo(info, fallbackUrl) {
+  const candidate = typeof info?.url === 'string' ? info.url : fallbackUrl;
+  let playbackUrl;
+  try {
+    playbackUrl = normalizeHttpUrl(candidate);
+  } catch {
+    return null;
+  }
+  return {
+    url: playbackUrl,
+    headers: sanitizePlaybackHeaders(info?.http_headers),
+    protocol: String(info?.protocol || new URL(playbackUrl).protocol.replace(':', '')).slice(0, 40),
+  };
 }
 
 function runJson(bin, args) {
@@ -115,6 +144,8 @@ async function inspectLink(rawUrl) {
       duration: 0,
       extractor: 'direct',
       direct: true,
+      playback: { url, headers: {}, protocol: new URL(url).protocol.replace(':', '') },
+      resolvedAt: Date.now(),
     };
   }
   if (!ytDlp) {
@@ -124,12 +155,18 @@ async function inspectLink(rawUrl) {
   }
 
   const info = await runJson(ytDlp, [
+    '--ignore-config',
     '--dump-single-json',
     '--skip-download',
     '--no-playlist',
+    '--no-cache-dir',
     '--no-warnings',
     '--socket-timeout',
     '20',
+    // Android 端不能像 mpv 一样把独立音视频流现场合并，因此优先选择同时含
+    // 音频和视频的 HTTP/HLS 格式。桌面端仍使用原始页面地址在本机解析。
+    '--format',
+    'best[protocol^=http][vcodec!=none][acodec!=none]/best[protocol^=m3u8][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]',
     '--',
     url,
   ]);
@@ -138,12 +175,15 @@ async function inspectLink(rawUrl) {
     throw new Error('当前只支持单个视频链接，不支持播放列表或频道页面');
   }
 
+  const playback = playbackFromInfo(info, looksLikeDirectMedia(url) ? url : null);
   return {
     url,
     title: String(info?.title || info?.fulltitle || new URL(url).hostname).slice(0, 240),
     duration: Number.isFinite(Number(info?.duration)) ? Number(info.duration) : 0,
     extractor: String(info?.extractor_key || info?.extractor || 'generic').slice(0, 80),
     direct: looksLikeDirectMedia(url) || info?.extractor === 'generic',
+    playback,
+    resolvedAt: Date.now(),
   };
 }
 
@@ -151,4 +191,12 @@ function toolStatus() {
   return { ytDlp: findYtDlp() };
 }
 
-module.exports = { inspectLink, findYtDlp, normalizeHttpUrl, looksLikeDirectMedia, toolStatus };
+module.exports = {
+  inspectLink,
+  findYtDlp,
+  normalizeHttpUrl,
+  looksLikeDirectMedia,
+  sanitizePlaybackHeaders,
+  playbackFromInfo,
+  toolStatus,
+};
