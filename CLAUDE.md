@@ -13,7 +13,7 @@ npm run dist       # 打包 Windows 安装包（electron-builder → NSIS）
 npm test           # Node 自动测试（传输、安全、缓存、邀请码、房间容量）
 ```
 
-- Windows 上双击 `启动.bat`（客户端）/ `启动信令服务器.bat`（服务器）会自动装依赖、修复 Electron 本体、检查 mpv 再启动。
+- Windows 上双击 `NoxReel.exe`（客户端）/ `NoxReel-Signal.exe`（服务器）会自动装依赖、修复 Electron 本体、检查 mpv 再启动；启动器由 `npm run build:launcher` 生成并嵌入品牌图标，不再使用 BAT。
 - 信令服务器环境变量：`PORT`、`BLOCKED_COUNTRIES`、`ALLOW_UNKNOWN`、`MAXMIND_DB`、`TRUST_PROXY`。例：`BLOCKED_COUNTRIES=CN ALLOW_UNKNOWN=0 MAXMIND_DB=./GeoLite2-Country.mmdb npm run signal`。
 - 调试用环境变量：`SYNCWATCH_SKIP_GEO=1` 跳过地区探测；`SYNCWATCH_MPV_PATH` / `SYNCWATCH_FFMPEG_PATH` 手动指定外部程序路径。
 

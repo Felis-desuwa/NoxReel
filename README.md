@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.5.0-7C5CFF?style=for-the-badge" alt="Version 0.5.0">
+    <img src="https://img.shields.io/badge/version-0.5.1-7C5CFF?style=for-the-badge" alt="Version 0.5.1">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -40,6 +40,7 @@
 - **真实成员状态**：只显示已建立连接的用户，并给出上传、下载速度和延迟。
 - **播放器可恢复**：播放器窗口关闭后，可从房间页面重新打开。
 - **现代播放器界面**：mpv 使用 NoxReel 深色无边框外观、圆角窗口、底部控制栏与更清晰的进度反馈。
+- **原生 EXE 入口**：源码目录直接双击带品牌图标的 `NoxReel.exe`，不再使用 BAT；信令服务对应 `NoxReel-Signal.exe`。
 - **Android 链接播放**：桌面房主解析网页后，Android 观众确认来源站点即可同步播放 HTTP、HLS 或 DASH 临时直链。
 - **中英双语**：桌面端与 Android 观众端均可在设置中切换简体中文或 English。
 - **缓存自动清理**：接收视频和转封装副本只进入系统临时缓存，换片、退房或关闭软件时自动删除；异常残留会在下次启动时回收。
@@ -48,14 +49,14 @@
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!IMPORTANT]
-> `v0.5.0` 加强了网站视频解析，更新了现代化 mpv 界面，并让 Android 观众端支持房间内的视频链接与最新版协议。链接解析不会读取浏览器 Cookie，也不会绕过登录、付费或 DRM。
+> `v0.5.1` 用带 NoxReel 图标的原生 Windows EXE 替换了源码目录中的 BAT 启动入口；同时包含 `v0.5.0` 的网站视频解析、现代化 mpv 界面和 Android 链接播放更新。
 
 ## 下载
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，安装后即可使用 | [NoxReel-Setup-0.5.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.5.0.exe) |
-| Windows 联网版 | 安装器体积小，安装时下载应用组件 | [NoxReel-WebSetup-0.5.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.5.0.exe) |
+| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，安装后即可使用 | [NoxReel-Setup-0.5.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.5.1.exe) |
+| Windows 联网版 | 安装器体积小，安装时下载应用组件 | [NoxReel-WebSetup-0.5.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.5.1.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -148,11 +149,14 @@ npm install
 npm start
 ```
 
+Windows 也可以在源码目录直接双击 `NoxReel.exe`。它会自动检查 Node.js、安装缺失依赖并启动桌面端；需要本地信令服务时双击 `NoxReel-Signal.exe`。这两个启动器都使用项目的 NoxReel 图标，不依赖 BAT 文件。
+
 ### 常用命令
 
 ```powershell
 npm test              # 运行测试
 npm run signal        # 启动本地信令服务器
+npm run build:launcher # 重新生成带图标的 EXE 启动器
 npm run dist:offline  # 构建 Windows 完整安装包
 npm run dist:web      # 构建 Windows 联网安装器
 ```

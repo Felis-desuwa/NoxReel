@@ -1,7 +1,6 @@
-﻿# SyncWatch 启动脚本。由 启动.bat 调起。
+﻿# NoxReel 源码启动逻辑。由根目录 NoxReel.exe 调起。
 #
-# 逻辑放这儿而不是放 .bat 里，是因为 cmd.exe 按 OEM 代码页解析批处理文件，
-# UTF-8 的中文会变成乱码并被当成命令执行。PowerShell 没这个问题。
+# EXE 只负责提供稳定的双击入口、图标和参数转发；依赖检查仍放在这里，便于维护。
 # 注意：本文件必须存成「UTF-8 带 BOM」—— Windows PowerShell 5.1 没有 BOM 时
 # 会按 ANSI 读，中文照样乱码。
 

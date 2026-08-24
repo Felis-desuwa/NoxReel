@@ -1,4 +1,4 @@
-﻿# SyncWatch 信令服务器启动脚本。由 启动信令服务器.bat 调起。
+﻿# NoxReel 信令服务器启动逻辑。由根目录 NoxReel-Signal.exe 调起。
 # 必须存成「UTF-8 带 BOM」，理由见 launch.ps1 的注释。
 
 $ErrorActionPreference = 'Stop'
