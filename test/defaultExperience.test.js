@@ -27,3 +27,11 @@ test('Windows 安装包和 Android 都声明 noxreel 邀请链接协议', () => 
   assert.match(read('src/main/main.js'), /setAsDefaultProtocolClient\('noxreel'/);
   assert.match(read('src/main/preload.js'), /app:deepLink/);
 });
+
+test('Windows 完整版和联网版安装器都允许选择安装目录', () => {
+  const pkg = JSON.parse(read('package.json'));
+  for (const installer of [pkg.build.nsis, pkg.build.nsisWeb]) {
+    assert.equal(installer.oneClick, false);
+    assert.equal(installer.allowToChangeInstallationDirectory, true);
+  }
+});

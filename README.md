@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.6.0-7C5CFF?style=for-the-badge" alt="Version 0.6.0">
+    <img src="https://img.shields.io/badge/version-0.6.1-7C5CFF?style=for-the-badge" alt="Version 0.6.1">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -42,6 +42,7 @@
 - **播放器可恢复**：播放器窗口关闭后，可从房间页面重新打开。
 - **现代播放器界面**：mpv 使用 NoxReel 深色无边框外观、圆角窗口、底部控制栏与更清晰的进度反馈。
 - **原生 EXE 入口**：源码目录直接双击带品牌图标的 `NoxReel.exe`，不再使用 BAT；信令服务对应 `NoxReel-Signal.exe`。
+- **自选安装位置**：Windows 完整版和联网版都使用向导式安装，可在安装前选择目标文件夹。
 - **Android 链接播放**：桌面房主解析网页后，Android 观众确认来源站点即可同步播放 HTTP、HLS 或 DASH 临时直链。
 - **中英双语**：桌面端与 Android 观众端均可在设置中切换简体中文或 English。
 - **缓存自动清理**：接收视频和转封装副本只进入系统临时缓存，换片、退房或关闭软件时自动删除；异常残留会在下次启动时回收。
@@ -50,14 +51,14 @@
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!IMPORTANT]
-> `v0.6.0` 默认使用可信房间和零服务器邀请链接，新增系统级 `noxreel://` 一键加入／应答，并修复 YouTube 格式筛选和 Cloudflare 视频页面解析失败。
+> `v0.6.1` 的 Windows 完整版和联网版安装器都可选择安装文件夹，并保留 `v0.6.0` 的可信房间、零服务器邀请链接及视频解析修复。
 
 ## 下载
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，安装后即可使用 | [NoxReel-Setup-0.6.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.0.exe) |
-| Windows 联网版 | 安装器体积小，安装时下载应用组件 | [NoxReel-WebSetup-0.6.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.0.exe) |
+| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，可选择安装文件夹 | [NoxReel-Setup-0.6.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.1.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.6.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.1.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 

@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.6.0-7C5CFF?style=for-the-badge" alt="Version 0.6.0">
+    <img src="https://img.shields.io/badge/version-0.6.1-7C5CFF?style=for-the-badge" alt="Version 0.6.1">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -42,6 +42,7 @@
 - **Recoverable player:** reopen the player from the room after its window is closed.
 - **Modern player UI:** mpv now uses NoxReel's dark borderless appearance, rounded Windows corners, a bottom control bar, and clearer seek feedback.
 - **Native EXE entry points:** double-click the branded `NoxReel.exe` from a source checkout instead of using a BAT file; `NoxReel-Signal.exe` starts the signaling service.
+- **Selectable install location:** both Windows installers use a guided setup and let you choose the destination folder before installation.
 - **Android link playback:** after the desktop host resolves a webpage, Android viewers can approve the source site and synchronously play its temporary HTTP, HLS, or DASH stream.
 - **Chinese and English UI:** switch between Simplified Chinese and English from Settings on both desktop and the Android viewer.
 - **Automatic cache cleanup:** received videos and remuxed copies stay in the system temporary directory and are deleted when switching media, leaving the room, or closing the app. Crash leftovers are reclaimed on the next launch.
@@ -50,14 +51,14 @@
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
 
 > [!IMPORTANT]
-> `v0.6.0` defaults to Trusted room and serverless invite links, adds system-level `noxreel://` join/answer handling, and fixes YouTube format selection plus Cloudflare-protected video pages.
+> `v0.6.1` lets both Windows installers choose the destination folder while retaining the Trusted-room defaults, serverless invite links, and link-parser fixes from `v0.6.0`.
 
 ## Downloads
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv and yt-dlp | [NoxReel-Setup-0.6.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.0.exe) |
-| Windows web installer | Smaller installer that downloads application components during setup | [NoxReel-WebSetup-0.6.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.0.exe) |
+| Windows full installer | Recommended. Bundles mpv and yt-dlp and lets you choose the install folder | [NoxReel-Setup-0.6.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.1.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.6.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.1.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
