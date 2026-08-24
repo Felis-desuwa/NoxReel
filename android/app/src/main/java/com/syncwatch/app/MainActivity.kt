@@ -1,6 +1,7 @@
 package com.syncwatch.app
 
 import android.annotation.SuppressLint
+import android.content.Intent
 import android.os.Bundle
 import android.view.WindowManager
 import android.webkit.ConsoleMessage
@@ -11,6 +12,7 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.util.Log
+import org.json.JSONObject
 import androidx.appcompat.app.AppCompatActivity
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
@@ -27,6 +29,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var web: WebView
     private lateinit var player: SyncPlayer
+    private var pendingInviteLink: String? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -41,6 +44,7 @@ class MainActivity : AppCompatActivity() {
         player = SyncPlayer(applicationContext)
         player.attachView(playerView)
         val bridge = NativeBridge(store, player)
+        pendingInviteLink = intent?.dataString?.takeIf { it.startsWith("noxreel://", ignoreCase = true) }
 
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG) // 发布包不暴露 chrome://inspect
         web.setBackgroundColor(0x00000000) // 透明，露出底下视频
@@ -66,6 +70,11 @@ class MainActivity : AppCompatActivity() {
                 view: WebView,
                 request: WebResourceRequest,
             ): WebResourceResponse? = assetLoader.shouldInterceptRequest(request.url)
+
+            override fun onPageFinished(view: WebView, url: String) {
+                super.onPageFinished(view, url)
+                deliverInviteLink()
+            }
         }
 
         web.webChromeClient = object : WebChromeClient() {
@@ -80,6 +89,20 @@ class MainActivity : AppCompatActivity() {
         }
 
         web.loadUrl("https://appassets.androidplatform.net/assets/index.html")
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        pendingInviteLink = intent.dataString?.takeIf { it.startsWith("noxreel://", ignoreCase = true) }
+        deliverInviteLink()
+    }
+
+    private fun deliverInviteLink() {
+        val link = pendingInviteLink ?: return
+        if (!::web.isInitialized) return
+        pendingInviteLink = null
+        web.evaluateJavascript("window.noxreelOpenInvite?.(${JSONObject.quote(link)})", null)
     }
 
     override fun onBackPressed() {

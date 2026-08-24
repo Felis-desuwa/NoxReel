@@ -27,10 +27,10 @@ test('源码目录只提供带图标的 EXE 启动入口，不再保留 BAT', ()
   }
 });
 
-test('启动器构建脚本嵌入 NoxReel 图标和 0.5.1 版本信息', () => {
+test('启动器构建脚本嵌入 NoxReel 图标和 0.6.0 版本信息', () => {
   const source = fs.readFileSync(path.join(root, 'src/launcher/NoxReelLauncher.cs'), 'utf8');
   const build = fs.readFileSync(path.join(root, 'scripts/build-launcher.ps1'), 'utf8');
-  assert.match(source, /AssemblyFileVersion\("0\.5\.1\.0"\)/);
+  assert.match(source, /AssemblyFileVersion\("0\.6\.0\.0"\)/);
   assert.match(source, /WindowsPowerShell/);
   assert.match(source, /--self-test/);
   assert.match(build, /noxreel-icon\.ico/);

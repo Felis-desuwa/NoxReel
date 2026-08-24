@@ -12,7 +12,7 @@ import './native-shim.js';
 import { Peer } from './peer.js';
 import { Swarm } from './swarm.js';
 import { SyncEngine } from './syncEngine.js';
-import { WsSignaling, encodeCode, decodeCode, randomPeerId } from './signaling.js';
+import { WsSignaling, encodeCode, decodeCode, inviteLink, randomPeerId } from './signaling.js';
 import { MSG } from './protocol.js';
 import { currentLocale, setLocale, startI18n, translate as t } from './i18n.js';
 
@@ -38,7 +38,7 @@ const S = {
   prog: { contiguousBytes: 0, complete: false },
   entered: false,
   mediaRevision: 0,
-  securityMode: localStorage.getItem('sw.securityMode') === 'trusted' ? 'trusted' : 'safe',
+  securityMode: localStorage.getItem('sw.securityMode') === 'safe' ? 'safe' : 'trusted',
 };
 
 /* ------------------------------ DOM 小工具 ------------------------------ */
@@ -405,16 +405,16 @@ async function joinManual(hostCode) {
   wirePeer(peer, null);
   S.swarm.addPeer(peer);
 
-  log('正在生成应答码，收集网络候选中…（几秒）', 'warn');
+  log('正在生成应答链接，收集网络候选中…（几秒）', 'warn');
   const answer = await peer.acceptOffer(payload.sdp);
   const code = await encodeCode({
     k: 'answer', from: S.peerId, name: S.name, sdp: answer, securityMode: S.securityMode,
   });
 
-  $('answer-out').value = code;
+  $('answer-out').value = inviteLink(code, 'answer');
   show($('answer-wrap'), true);
   if (payload.file) log(`房主的片子：${payload.file.name} · ${fmtBytes(payload.file.size)}`);
-  log('应答码已生成，发回给房主', 'good');
+  log('应答链接已生成，发回给房主后对方点开即可', 'good');
 }
 
 /* ------------------------------ 界面渲染 ------------------------------ */
@@ -539,7 +539,7 @@ $('copy-answer').addEventListener('click', () => {
   $('answer-out').select();
   try { document.execCommand('copy'); } catch (e) {}
   navigator.clipboard?.writeText($('answer-out').value).catch(() => {});
-  log('应答码已复制', 'good');
+  log('应答链接已复制', 'good');
 });
 
 // 默认昵称
@@ -554,4 +554,10 @@ $('language').addEventListener('change', () => {
   setLocale($('language').value);
   location.reload();
 });
-log('准备就绪。填写信令地址和房间号加入，或用极简粘贴。');
+log('准备就绪。默认使用零服务器邀请链接，也可以切换到信令服务器。');
+
+window.noxreelOpenInvite = (link) => {
+  $('tab-manual').click();
+  $('host-code').value = String(link || '');
+  joinManual(link);
+};

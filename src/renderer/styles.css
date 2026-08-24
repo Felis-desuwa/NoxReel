@@ -789,6 +789,24 @@ select:disabled {
   color: var(--dim);
   line-height: 1.6;
 }
+.invite-link {
+  display: block;
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(86, 211, 255, 0.34);
+  border-radius: 10px;
+  background: rgba(30, 118, 176, 0.12);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+  text-decoration: none;
+  cursor: pointer;
+}
+.invite-link:hover {
+  border-color: rgba(86, 211, 255, 0.64);
+  background: rgba(30, 118, 176, 0.2);
+}
 .capacity-row {
   display: grid;
   grid-template-columns: 1fr 58px 58px;

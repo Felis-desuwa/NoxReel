@@ -65,18 +65,18 @@
 
     <label>房间安全模式</label>
     <select id="security-mode">
-      <option value="safe">安全模式（默认，完整接收后播放）</option>
-      <option value="trusted">可信房间（边下边播，风险较高）</option>
+      <option value="safe">安全模式（完整接收后播放）</option>
+      <option value="trusted" selected>可信房间（默认，边下边播，风险较高）</option>
     </select>
     <div class="hint">房主和成员必须分别选择相同模式才能握手。Android 安全模式会等待完整接收与分片校验；可信房间在片头就绪后提前播放。</div>
 
     <div class="tabs">
-      <button id="tab-server" class="on">信令服务器</button>
-      <button id="tab-manual">极简粘贴</button>
+      <button id="tab-manual" class="on">零服务器链接</button>
+      <button id="tab-server">信令服务器</button>
     </div>
 
     <!-- 信令服务器模式 -->
-    <div id="panel-server" class="panel on">
+    <div id="panel-server" class="panel">
       <label>信令服务器地址</label>
       <input id="url" placeholder="ws://电脑局域网IP:8080" />
       <label>房间号（和电脑端填一样的）</label>
@@ -86,16 +86,16 @@
     </div>
 
     <!-- 极简粘贴模式 -->
-    <div id="panel-manual" class="panel">
-      <label>粘贴房主给你的邀请码</label>
-      <textarea id="host-code" rows="4" placeholder="NR2-...（兼容旧版 SW2 / SW1）"></textarea>
-      <button class="primary" id="gen-answer" style="margin-top:12px; width:100%">生成应答码</button>
+    <div id="panel-manual" class="panel on">
+      <label>打开或粘贴房主给你的 NoxReel 邀请链接</label>
+      <textarea id="host-code" rows="4" placeholder="noxreel://j/… 或 NR3-…"></textarea>
+      <button class="primary" id="gen-answer" style="margin-top:12px; width:100%">生成应答链接</button>
       <div id="answer-wrap" style="display:none">
-        <label>把这段应答码发回给房主（他粘贴后才连上）</label>
+        <label>把应答链接发回给房主（对方点开后即可连接）</label>
         <textarea id="answer-out" rows="4" readonly></textarea>
-        <button id="copy-answer" style="margin-top:8px; width:100%">复制应答码</button>
+        <button id="copy-answer" style="margin-top:8px; width:100%">复制应答链接</button>
       </div>
-      <div class="hint">极简模式不需要服务器，但要你俩手动互传一次邀请码/应答码。适合没有信令服务器时用。</div>
+      <div class="hint">默认不使用信令服务器。点开邀请链接后，应答链接会自动生成；把它发回房主即可。</div>
     </div>
 
     <div id="log"></div>

@@ -21,6 +21,7 @@ const { pathToFileURL } = require('url');
 const store = require('./fileStore');
 const media = require('./media');
 const linkMedia = require('./linkMedia');
+const browserMediaResolver = require('./browserMediaResolver');
 const geo = require('./geo');
 const { MpvController, findMpv } = require('./mpv');
 const validate = require('./security');
@@ -39,10 +40,56 @@ const remuxOutputs = new Map();
 const approvedSources = new Set();
 const MAIN_PAGE = path.join(__dirname, '..', 'renderer', 'index.html');
 const MAIN_PAGE_URL = pathToFileURL(MAIN_PAGE).href;
+const DEEP_LINK_SCHEME = 'noxreel:';
+let pendingDeepLink = null;
 
 app.enableSandbox();
 app.commandLine.appendSwitch('disable-http-cache');
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 store.configureCache(cache);
+
+function normalizeDeepLink(raw) {
+  if (typeof raw !== 'string' || raw.length > 256 * 1024 || !raw.toLowerCase().startsWith(`${DEEP_LINK_SCHEME}//`)) return null;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== DEEP_LINK_SCHEME || !['j', 'a'].includes(parsed.hostname.toLowerCase()) || !parsed.pathname.slice(1)) return null;
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
+
+function deepLinkFromArgv(argv) {
+  for (const arg of argv || []) {
+    const link = normalizeDeepLink(arg);
+    if (link) return link;
+  }
+  return null;
+}
+
+function dispatchDeepLink(raw) {
+  const link = normalizeDeepLink(raw);
+  if (!link) return;
+  pendingDeepLink = link;
+  if (win && !win.isDestroyed() && !win.webContents.isLoadingMainFrame()) {
+    win.webContents.send('app:deepLink', link);
+    pendingDeepLink = null;
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+  }
+}
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) app.quit();
+else {
+  pendingDeepLink = deepLinkFromArgv(process.argv);
+  app.on('second-instance', (_event, argv) => dispatchDeepLink(deepLinkFromArgv(argv)));
+  app.on('open-url', (event, url) => {
+    event.preventDefault();
+    dispatchDeepLink(url);
+  });
+}
 
 function isTrustedSender(event) {
   return Boolean(
@@ -136,6 +183,11 @@ function send(channel, payload) {
 }
 
 app.whenReady().then(async () => {
+  if (process.defaultApp && process.argv[1]) {
+    app.setAsDefaultProtocolClient('noxreel', process.execPath, [path.resolve(process.argv[1])]);
+  } else {
+    app.setAsDefaultProtocolClient('noxreel');
+  }
   await cache.initialize();
   await cleanupLegacySidecars(LEGACY_DOWNLOAD_DIR);
   createWindow();
@@ -241,7 +293,15 @@ secureHandle('media:releaseTemp', async (filePath) => {
   return cache.removeOwned(ownedDir);
 });
 
-secureHandle('media:inspectLink', async (url) => linkMedia.inspectLink(await validate.publicHttpUrl(url, '视频链接')));
+secureHandle('media:inspectLink', async (url) => {
+  const safeUrl = await validate.publicHttpUrl(url, '视频链接');
+  const result = await linkMedia.inspectLink(safeUrl, { browserFallback: browserMediaResolver.resolveInBrowser });
+  if (result.playback?.url) {
+    result.playback.url = await validate.publicHttpUrl(result.playback.url, '播放地址');
+    result.playback.headers = validate.mediaHeaders(result.playback.headers);
+  }
+  return result;
+});
 
 secureHandle('store:buildManifest', async (filePath) => {
   return store.buildManifest(await requireAllowedLocalPath(filePath), (p) => send('store:hashProgress', p));
@@ -338,6 +398,12 @@ secureHandle('mpv:quit', async () => {
 
 secureHandle('app:openExternal', async (url) => {
   await shell.openExternal(validate.externalUrl(url));
+});
+
+secureHandle('app:takeDeepLink', async () => {
+  const link = pendingDeepLink;
+  pendingDeepLink = null;
+  return link;
 });
 
 secureHandle('app:ensureDirs', async () => {

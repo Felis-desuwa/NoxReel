@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.5.1-7C5CFF?style=for-the-badge" alt="Version 0.5.1">
+    <img src="https://img.shields.io/badge/version-0.6.0-7C5CFF?style=for-the-badge" alt="Version 0.6.0">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -29,12 +29,13 @@
 
 | 🎞️ 安全接收 | 🔗 链接同步 | 👥 房间协作 |
 |:---|:---|:---|
-| 默认完整接收并通过本机安全扫描后播放；也可由双方明确选择可信房间，边接收边播放。 | 支持公开视频页面、MP4 直链和 HLS，房间只同步播放状态。 | 设置 2–16 人容量，显示成员连接速度与延迟，并自动等待缓冲最慢的人。 |
+| 默认使用可信房间边下边播；也可切换到安全模式，完整接收并扫描后播放。 | 支持 YouTube、常见视频页面、MP4/HLS；Cloudflare 页面会使用隔离浏览器解析。 | 设置 2–16 人容量，显示成员连接速度与延迟，并自动等待缓冲最慢的人。 |
 
 ### 核心体验
 
 - **最大 10 GB**：支持 MP4、MOV、M4V、MKV 本地视频。
-- **短邀请码**：使用紧凑的 `NR2` 房间码，同时兼容旧版 `SW2` / `SW1`。
+- **一键邀请链接**：默认生成可点击的 `noxreel://` 零服务器邀请／应答链接；底层 `NR3` 握手数据更短，并兼容 `NR2`、`SW2`、`SW1`。
+- **链接解析回退**：YouTube 使用专用匿名客户端策略；普通解析遇到 Cloudflare 403 时，自动在无权限、无持久化的隔离浏览器中捕获公开媒体流。
 - **随时换片**：房主可在房间内切换本地视频或视频链接，成员不用退出重进。
 - **缓冲联动**：任何成员可播余量不足时全员暂停，恢复后继续。
 - **真实成员状态**：只显示已建立连接的用户，并给出上传、下载速度和延迟。
@@ -44,19 +45,19 @@
 - **Android 链接播放**：桌面房主解析网页后，Android 观众确认来源站点即可同步播放 HTTP、HLS 或 DASH 临时直链。
 - **中英双语**：桌面端与 Android 观众端均可在设置中切换简体中文或 English。
 - **缓存自动清理**：接收视频和转封装副本只进入系统临时缓存，换片、退房或关闭软件时自动删除；异常残留会在下次启动时回收。
-- **双模式安全门槛**：安全模式为默认，完整接收并通过 Microsoft Defender 扫描后才播放；可信房间需房主与成员分别启用，允许约 8 MB 片头就绪后边下边播，风险更高，完整后仍补做扫描。
+- **双模式安全门槛**：可信房间为默认，约 8 MB 片头就绪后边下边播，完整后仍补做扫描；也可切换安全模式，完整接收并通过 Microsoft Defender 扫描后才播放。
 - **模式握手**：邀请码和 P2P 数据通道都会核对房间模式；双方设置不同会在媒体清单、控制消息和视频数据传输前断开。
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!IMPORTANT]
-> `v0.5.1` 用带 NoxReel 图标的原生 Windows EXE 替换了源码目录中的 BAT 启动入口；同时包含 `v0.5.0` 的网站视频解析、现代化 mpv 界面和 Android 链接播放更新。
+> `v0.6.0` 默认使用可信房间和零服务器邀请链接，新增系统级 `noxreel://` 一键加入／应答，并修复 YouTube 格式筛选和 Cloudflare 视频页面解析失败。
 
 ## 下载
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，安装后即可使用 | [NoxReel-Setup-0.5.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.5.1.exe) |
-| Windows 联网版 | 安装器体积小，安装时下载应用组件 | [NoxReel-WebSetup-0.5.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.5.1.exe) |
+| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，安装后即可使用 | [NoxReel-Setup-0.6.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.0.exe) |
+| Windows 联网版 | 安装器体积小，安装时下载应用组件 | [NoxReel-WebSetup-0.6.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.0.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -66,10 +67,10 @@
 ## 快速开始
 
 1. 安装并启动 NoxReel。
-2. 在设置中选择安全模式（默认）或可信房间；房主与每位成员必须分别选择相同模式。
+2. 默认是可信房间（边下边播）；需要先完整扫描时，可在设置中切换安全模式。房主与成员必须选择相同模式。
 3. 创建房间，设置人数上限。
 4. 选择本地视频，或粘贴受支持的视频链接。
-5. 把短邀请码发送给其他成员。
+5. 把自动生成的 NoxReel 邀请链接发给成员；成员点开后，再把应答链接发回房主点开。
 6. 成员加入后，房主即可统一控制播放、暂停和跳转。
 
 ```text
@@ -86,10 +87,10 @@
 
 | 模式 | 操作 | 是否需要服务器 | 适合场景 |
 |---|---|---:|---|
-| 短邀请码房间 | 粘贴一次邀请码 | 需要轻量信令服务 | 日常多人使用 |
-| 手动双码 | 交换邀请码与应答码 | 不需要 | 临时使用或不部署信令服务 |
+| 零服务器链接（默认） | 双方各点一次邀请／应答链接 | 不需要 | 默认使用；一次邀请连接一位成员 |
+| 信令房间（可选） | 成员点一次可复用房间邀请 | 需要轻量信令服务 | 多人频繁加入 |
 
-信令服务器只交换 SDP、ICE 和房间状态，不读取或保存视频内容。严格 NAT、CGNAT 或防火墙环境可能需要自行配置 TURN 中继。
+零服务器 WebRTC 必须交换 offer 和 answer，因此跨设备仍需要把应答链接发回一次；现在不再需要手动粘贴长码。信令服务器只交换 SDP、ICE 和房间状态，不读取或保存视频内容。严格 NAT、CGNAT 或防火墙环境可能需要自行配置 TURN 中继。
 
 ## 隐私与内容边界
 

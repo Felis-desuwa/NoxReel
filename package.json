@@ -1,6 +1,6 @@
 {
   "name": "noxreel",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "多人同步观影工具：P2P 安全接收、视频链接解析与房间同步",
   "main": "src/main/main.js",
   "scripts": {
@@ -30,6 +30,14 @@
     "compression": "maximum",
     "appId": "app.noxreel.desktop",
     "productName": "NoxReel",
+    "protocols": [
+      {
+        "name": "NoxReel Invite",
+        "schemes": [
+          "noxreel"
+        ]
+      }
+    ],
     "win": {
       "target": "nsis",
       "artifactName": "NoxReel-Setup-${version}.${ext}",

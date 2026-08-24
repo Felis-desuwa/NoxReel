@@ -2,7 +2,7 @@ import { Peer } from './lib/peer.js';
 import { Swarm } from './lib/swarm.js';
 import { SyncEngine } from './lib/syncEngine.js';
 import { MSG } from './lib/protocol.js';
-import { encodeCode, decodeCode, WsSignaling, randomRoomId, randomPeerId } from './lib/signaling.js';
+import { encodeCode, decodeCode, inviteLink, WsSignaling, randomRoomId, randomPeerId } from './lib/signaling.js';
 import { currentLocale, setLocale, startI18n, translate as t } from './lib/i18n.js';
 
 startI18n();
@@ -85,7 +85,7 @@ const S = {
   pendingManualPeer: null,
   settings: {
     language: currentLocale(),
-    securityMode: localStorage.getItem('sw.securityMode') === 'trusted' ? 'trusted' : 'safe',
+    securityMode: localStorage.getItem('sw.securityMode') === 'safe' ? 'safe' : 'trusted',
     signalUrl: localStorage.getItem('sw.signalUrl') || 'ws://localhost:8080',
     stun: localStorage.getItem('sw.stun') || 'stun:stun.l.google.com:19302',
     turnUrl: localStorage.getItem('sw.turnUrl') || '',
@@ -595,8 +595,8 @@ function backHome() {
 
 /* ------------------------------ 加入放映 ------------------------------ */
 
-$('btn-join').onclick = async () => {
-  const raw = $('join-code').value.trim();
+async function handleJoinInput(rawInput) {
+  const raw = String(rawInput || '').trim();
   $('join-err').textContent = '';
   if (!raw) return;
 
@@ -606,14 +606,17 @@ $('btn-join').onclick = async () => {
     if (payload.k === 'room') return joinViaServer(payload);
     if (payload.k === 'offer') return joinViaManual(payload);
     if (payload.k === 'answer') {
-      $('join-err').textContent = '这是一个应答码，应该由发起方粘贴，不是你。';
+      if (S.role === 'host' && S.pendingManualPeer) return acceptManualAnswer(raw);
+      $('join-err').textContent = '这是一个应答链接，应该由发起方打开。';
       return;
     }
     $('join-err').textContent = '无法识别的邀请码类型。';
   } catch (e) {
     $('join-err').textContent = e.message;
   }
-};
+}
+
+$('btn-join').onclick = () => handleJoinInput($('join-code').value);
 
 /** 极简模式：收到 offer，产出 answer 让对方粘回去。 */
 async function joinViaManual(payload) {
@@ -635,8 +638,8 @@ async function joinViaManual(payload) {
   $('prep-note').textContent = '正在收集网络候选地址，通常需要几秒钟…';
   setSteps([
     { label: '解析邀请码', state: 'done' },
-    { label: '生成应答码', state: 'active' },
-    { label: '等待对方粘贴应答码', state: '' },
+    { label: '生成应答链接', state: 'active' },
+    { label: '等待房主打开应答链接', state: '' },
   ]);
   $('prep-bar').style.width = '40%';
 
@@ -660,29 +663,34 @@ async function joinViaManual(payload) {
     sdp: answer,
     securityMode: S.roomSecurityMode,
   });
+  const answerLink = inviteLink(code, 'answer');
 
   setSteps([
     { label: '解析邀请码', state: 'done' },
-    { label: '生成应答码', state: 'done' },
-    { label: '等待对方粘贴应答码', state: 'active' },
+    { label: '生成应答链接', state: 'done' },
+    { label: '等待房主打开应答链接', state: 'active' },
   ]);
   $('prep-bar').style.width = '75%';
-  $('prep-title').textContent = '把这段应答码发回给发起者';
+  $('prep-title').textContent = '把应答链接发回给发起者';
   replace(
     'prep-note',
     make('b', { text: '还差最后一步：' }),
-    '把下面这段发回给对方，他粘贴之后连接才建立。这一来一回是「零服务器」的代价 —— 没有服务器帮你们交换地址，就只能你们自己传。'
+    '应答链接已经自动复制。把它发回给对方，对方点开即可完成连接；不需要再手动复制粘贴长码。零服务器的 WebRTC 仍必须交换一次应答。'
   );
   const answerArea = make('textarea', {
     id: 'answer-code',
     attrs: { readonly: '', rows: 4 },
   });
   answerArea.style.width = '100%';
-  const copyAnswer = make('button', { id: 'copy-answer', className: 'primary', text: '复制应答码' });
-  replace('prep-actions', answerArea, copyAnswer);
-  $('answer-code').value = code;
+  const answerAnchor = make('a', { id: 'answer-link', className: 'invite-link', text: 'NoxReel 应答链接' });
+  answerAnchor.href = answerLink;
+  answerAnchor.onclick = (event) => { event.preventDefault(); copyCode(answerLink, $('copy-answer'), '复制应答链接'); };
+  const copyAnswer = make('button', { id: 'copy-answer', className: 'primary', text: '复制应答链接' });
+  replace('prep-actions', answerAnchor, copyAnswer, answerArea);
+  $('answer-code').value = answerLink;
   $('answer-code').select();
-  $('copy-answer').onclick = () => copyCode(code, $('copy-answer'), '复制应答码');
+  $('copy-answer').onclick = () => copyCode(answerLink, $('copy-answer'), '复制应答链接');
+  window.sw.clipboard.writeText(answerLink).catch(() => {});
 
   // 只有双方 HELLO 中的房间模式也一致，swarm 才会真正放行并进入房间。
 }
@@ -1217,7 +1225,7 @@ async function renderInvite() {
       className: 'fine',
       text: S.roomSecurityMode === 'trusted'
         ? '当前：可信房间（边下边播，风险较高）。加入者也必须在本机选择可信房间。'
-        : '当前：安全模式（默认）。成员完整接收并扫描通过后才播放。',
+        : '当前：安全模式。成员完整接收并扫描通过后才播放。',
     }),
     make('div', { className: 'capacity-row' }, [
       make('label', { text: '房间人数上限', attrs: { for: 'room-capacity' } }),
@@ -1225,11 +1233,11 @@ async function renderInvite() {
       make('button', { className: 'ghost', id: 'capacity-apply', text: '应用' }),
     ]),
     make('p', { className: 'fine', id: 'capacity-status' }),
-    make('button', { className: 'primary', id: 'inv-server', text: '用信令服务器邀请' }),
-    make('button', { className: 'ghost', id: 'inv-manual', text: '极简模式（零服务器）' }),
+    make('button', { className: 'primary', id: 'inv-manual', text: '生成零服务器邀请链接' }),
+    make('button', { className: 'ghost', id: 'inv-server', text: '改用信令服务器' }),
     make('p', {
       id: 'inv-hint',
-      text: '信令服务器只转发连接地址，不碰视频内容。极简模式连这个都不要，代价是要手动来回粘贴两次。',
+      text: '默认使用零服务器直连。双方直接点开邀请／应答链接即可，不再手动粘贴长码；跨网络仍需交换一次应答。',
     }),
     make('div', { id: 'inv-out' })
   );
@@ -1238,6 +1246,10 @@ async function renderInvite() {
   $('inv-manual').onclick = inviteViaManual;
   $('capacity-apply').onclick = applyRoomCapacity;
   renderCapacityStatus();
+  // 默认直接生成零服务器邀请，用户进入房间后不必再选择连接方式。
+  inviteViaManual().catch((error) => {
+    replace('inv-out', make('p', { text: error.message || String(error) }));
+  });
 }
 
 function renderCapacityStatus() {
@@ -1343,55 +1355,62 @@ async function inviteViaManual() {
     maxMembers: S.roomCapacity,
     securityMode: S.roomSecurityMode,
   });
+  const link = inviteLink(code, 'join');
 
   replace(
     out,
-    make('textarea', { id: 'inv-code', attrs: { readonly: '', rows: 4 } }),
-    make('button', { className: 'primary', id: 'inv-copy', text: '复制邀请码' }),
-    make('p', { text: `完整邀请码共 ${code.length} 字符；在对方真正连上前，不会计入成员列表。` }),
-    make('p', {}, [make('b', { text: '第 2 步：' }), '对方会给你一段应答码，粘到这里：']),
+    make('a', { id: 'inv-link', className: 'invite-link', text: 'NoxReel 一键加入链接' }),
+    make('button', { className: 'primary', id: 'inv-copy', text: '复制邀请链接' }),
+    make('p', { text: `已生成可点击的邀请链接；压缩握手数据 ${code.length} 字符。在对方真正连上前，不会计入成员列表。` }),
+    make('p', {}, [make('b', { text: '第 2 步：' }), '对方发回应答链接后直接点开，或粘贴到这里：']),
     make('textarea', {
       id: 'inv-answer',
-      attrs: { rows: 3, placeholder: 'NR2-…（兼容 SW2 / SW1）' },
+      attrs: { rows: 3, placeholder: '点开对方发回的 NoxReel 应答链接，或粘贴 NR3-…' },
     }),
     make('button', { className: 'ghost', id: 'inv-accept', text: '完成连接' }),
     make('p', { id: 'inv-status' })
   );
-  $('inv-code').value = code;
-  $('inv-copy').onclick = () => copyCode(code, $('inv-copy'));
+  $('inv-link').href = link;
+  $('inv-link').onclick = (event) => { event.preventDefault(); copyCode(link, $('inv-copy'), '复制邀请链接'); };
+  $('inv-copy').onclick = () => copyCode(link, $('inv-copy'), '复制邀请链接');
 
-  $('inv-accept').onclick = async () => {
-    const raw = $('inv-answer').value.trim();
-    if (!raw) return;
-    let registered = false;
-    try {
-      const payload = await decodeCode(raw);
-      if (payload.k !== 'answer') throw new Error('这不是应答码');
-      if (normalizeSecurityMode(payload.securityMode) !== normalizeSecurityMode(S.roomSecurityMode)) {
-        throw new Error(
-          `对方选择的是${securityModeLabel(payload.securityMode)}，本房间是${securityModeLabel(S.roomSecurityMode)}。双方需分别选择相同模式。`
-        );
-      }
+  $('inv-accept').onclick = () => acceptManualAnswer($('inv-answer').value);
+}
 
-      // 只有拿到真实身份后才登记到 swarm，避免“点分享就多一个待加入用户”的幽灵成员。
-      peer.peerId = payload.from;
-      peer.name = payload.name || '观众';
-      wirePeer(peer);
-      S.swarm.addPeer(peer);
-      registered = true;
-      S.pendingManualPeer = null;
-      const offAuthenticated = S.swarm.on('peer-authenticated', (authenticatedPeer) => {
-        if (authenticatedPeer !== peer) return;
-        offAuthenticated();
-        $('inv-status').textContent = `${peer.name} 已连上 ✓`;
-      });
-      await peer.acceptAnswer(payload.sdp);
-      $('inv-status').textContent = '正在打洞并校验房间模式…';
-    } catch (e) {
-      if (registered) S.swarm.removePeer(peer.peerId);
-      $('inv-status').textContent = e.message;
+async function acceptManualAnswer(rawInput) {
+  const raw = String(rawInput || '').trim();
+  if (!raw) return;
+  const peer = S.pendingManualPeer;
+  if (!peer) throw new Error('当前没有等待应答的零服务器邀请');
+  let registered = false;
+  const status = $('inv-status');
+  try {
+    const payload = await decodeCode(raw);
+    if (payload.k !== 'answer') throw new Error('这不是应答码');
+    if (normalizeSecurityMode(payload.securityMode) !== normalizeSecurityMode(S.roomSecurityMode)) {
+      throw new Error(
+        `对方选择的是${securityModeLabel(payload.securityMode)}，本房间是${securityModeLabel(S.roomSecurityMode)}。双方需分别选择相同模式。`
+      );
     }
-  };
+    peer.peerId = payload.from;
+    peer.name = payload.name || '观众';
+    wirePeer(peer);
+    S.swarm.addPeer(peer);
+    registered = true;
+    S.pendingManualPeer = null;
+    const offAuthenticated = S.swarm.on('peer-authenticated', (authenticatedPeer) => {
+      if (authenticatedPeer !== peer) return;
+      offAuthenticated();
+      if (status) status.textContent = `${peer.name} 已连上 ✓`;
+    });
+    await peer.acceptAnswer(payload.sdp);
+    if (status) status.textContent = '正在打洞并校验房间模式…';
+    show('view-room');
+  } catch (error) {
+    if (registered) S.swarm.removePeer(peer.peerId);
+    if (status) status.textContent = error.message;
+    else $('join-err').textContent = error.message;
+  }
 }
 
 /* ------------------------------- 渲染 ------------------------------- */
@@ -1751,12 +1770,12 @@ $('btn-settings').onclick = () => {
               make('option', {
                 attrs: { value: 'safe' },
                 props: { selected: S.settings.securityMode !== 'trusted' },
-                text: '安全模式（默认）',
+                text: '安全模式（完整接收后播放）',
               }),
               make('option', {
                 attrs: { value: 'trusted' },
                 props: { selected: S.settings.securityMode === 'trusted' },
-                text: '可信房间（边下边播，风险较高）',
+                text: '可信房间（默认，边下边播）',
               }),
             ]
           ),
@@ -1900,4 +1919,30 @@ window.sw.app.onShutdownRequested(() => {
   S.swarm?.destroy();
 });
 
-boot();
+async function openInviteLink(raw) {
+  if (!raw) return;
+  try {
+    const payload = await decodeCode(raw);
+    if (payload.k === 'answer' && S.role === 'host' && S.pendingManualPeer) {
+      await acceptManualAnswer(raw);
+      return;
+    }
+    if (roomEntered) {
+      log('请先退出当前房间，再打开新的邀请链接。', 'warn');
+      return;
+    }
+    $('join-code').value = raw;
+    show('view-home');
+    await handleJoinInput(raw);
+  } catch (error) {
+    if (roomEntered) log(error.message || String(error), 'bad');
+    else $('join-err').textContent = error.message || String(error);
+  }
+}
+
+window.sw.app.onDeepLink(openInviteLink);
+
+boot().then(async () => {
+  const initialLink = await window.sw.app.takeDeepLink();
+  if (initialLink) await openInviteLink(initialLink);
+});

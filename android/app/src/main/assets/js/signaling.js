@@ -12,8 +12,9 @@ import { Emitter } from './emitter.js';
  */
 
 const LEGACY_PREFIX = 'SW1-';
-const PREVIOUS_PREFIX = 'SW2-';
-const CODE_PREFIX = 'NR2-';
+const SW2_PREFIX = 'SW2-';
+const NR2_PREFIX = 'NR2-';
+const CODE_PREFIX = 'NR3-';
 const MAX_CODE_LENGTH = 256 * 1024;
 
 async function gzip(str) {
@@ -55,16 +56,18 @@ function expandSecurityMode(mode) {
 }
 
 /** SW2 用定长数组代替重复的 JSON 键；房间可切片后，信令短码不再绑定片名。 */
+function sdpText(value) {
+  return typeof value === 'string' ? value : String(value?.sdp || '');
+}
+
 function compactPayload(payload) {
   if (payload?.k === 'room') return ['r', payload.url, payload.room, payload.from, Number(payload.maxMembers) || 0, packSecurityMode(payload.securityMode)];
-  if (payload?.k === 'offer') {
-    return ['o', payload.from, payload.name || '', payload.sdp, packFile(payload.file), Number(payload.maxMembers) || 0, packSecurityMode(payload.securityMode)];
-  }
-  if (payload?.k === 'answer') return ['a', payload.from, payload.name || '', payload.sdp, packSecurityMode(payload.securityMode)];
+  if (payload?.k === 'offer') return ['o', payload.from, sdpText(payload.sdp), Number(payload.maxMembers) || 0, packSecurityMode(payload.securityMode)];
+  if (payload?.k === 'answer') return ['a', payload.from, sdpText(payload.sdp), packSecurityMode(payload.securityMode)];
   return payload;
 }
 
-function expandPayload(value) {
+function expandPayload(value, version = 3) {
   if (!Array.isArray(value)) {
     if (value && ['room', 'offer', 'answer'].includes(value.k)) {
       return { ...value, securityMode: expandSecurityMode(value.securityMode) };
@@ -75,6 +78,12 @@ function expandPayload(value) {
     return { k: 'room', url: value[1], room: value[2], from: value[3], maxMembers: Number(value[4]) || 0, securityMode: expandSecurityMode(value[5]) };
   }
   if (value[0] === 'o') {
+    if (version >= 3) {
+      return {
+        k: 'offer', from: value[1], name: '', sdp: { type: 'offer', sdp: value[2] }, file: null,
+        maxMembers: Number(value[3]) || 0, securityMode: expandSecurityMode(value[4]),
+      };
+    }
     const f = value[4];
     return {
       k: 'offer',
@@ -86,7 +95,10 @@ function expandPayload(value) {
       securityMode: expandSecurityMode(value[6]),
     };
   }
-  if (value[0] === 'a') return { k: 'answer', from: value[1], name: value[2], sdp: value[3], securityMode: expandSecurityMode(value[4]) };
+  if (value[0] === 'a') {
+    if (version >= 3) return { k: 'answer', from: value[1], name: '', sdp: { type: 'answer', sdp: value[2] }, securityMode: expandSecurityMode(value[3]) };
+    return { k: 'answer', from: value[1], name: value[2], sdp: value[3], securityMode: expandSecurityMode(value[4]) };
+  }
   return value;
 }
 
@@ -99,13 +111,33 @@ export async function encodeCode(payload) {
   return CODE_PREFIX + (compressed ? 'G' : 'R') + toBase64Url(compressed ? zipped : raw);
 }
 
+export function inviteLink(code, action = 'join') {
+  const kind = action === 'answer' ? 'a' : 'j';
+  const compact = String(code).trim().replace(/^NR3-/, '');
+  return `noxreel://${kind}/${compact}`;
+}
+
+export function unwrapInviteInput(input) {
+  let value = String(input || '').trim();
+  const markdown = value.match(/\((noxreel:\/\/[^)\s]+)\)/i);
+  if (markdown) value = markdown[1];
+  if (!/^noxreel:\/\//i.test(value)) return value;
+  let parsed;
+  try { parsed = new URL(value); } catch { throw new Error('NoxReel 邀请链接无效'); }
+  if (!['j', 'a'].includes(parsed.hostname.toLowerCase())) throw new Error('NoxReel 邀请链接类型无效');
+  const body = decodeURIComponent(parsed.pathname.replace(/^\/+/, ''));
+  if (!body) throw new Error('NoxReel 邀请链接不完整');
+  return /^(?:NR3-|NR2-|SW2-|SW1-)/.test(body) ? body : `${CODE_PREFIX}${body}`;
+}
+
 export async function decodeCode(code) {
-  const trimmed = String(code).trim().replace(/\s+/g, '');
+  const trimmed = unwrapInviteInput(code).replace(/\s+/g, '');
   if (trimmed.length > MAX_CODE_LENGTH) throw new Error('邀请码异常过长');
   const legacy = trimmed.startsWith(LEGACY_PREFIX);
-  const previous = trimmed.startsWith(PREVIOUS_PREFIX);
-  if (!legacy && !previous && !trimmed.startsWith(CODE_PREFIX)) throw new Error('这不像是一个 NoxReel 邀请码');
-  const prefix = legacy ? LEGACY_PREFIX : previous ? PREVIOUS_PREFIX : CODE_PREFIX;
+  const sw2 = trimmed.startsWith(SW2_PREFIX);
+  const nr2 = trimmed.startsWith(NR2_PREFIX);
+  if (!legacy && !sw2 && !nr2 && !trimmed.startsWith(CODE_PREFIX)) throw new Error('这不像是一个 NoxReel 邀请码');
+  const prefix = legacy ? LEGACY_PREFIX : sw2 ? SW2_PREFIX : nr2 ? NR2_PREFIX : CODE_PREFIX;
   const body = trimmed.slice(prefix.length);
   let json;
   try {
@@ -121,7 +153,7 @@ export async function decodeCode(code) {
     throw new Error('邀请码损坏或不完整 —— 复制的时候可能漏了一截');
   }
   try {
-    return expandPayload(JSON.parse(json));
+    return expandPayload(JSON.parse(json), prefix === CODE_PREFIX ? 3 : 2);
   } catch {
     throw new Error('邀请码内容无法解析');
   }

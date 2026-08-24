@@ -16,6 +16,7 @@ const DIRECT_MEDIA_RE = /\.(?:mp4|m4v|mov|mkv|webm|m3u8|mpd)(?:$|[?#])/i;
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const PARSE_TIMEOUT_MS = 60_000;
 const SAFE_PLAYBACK_HEADERS = new Set(['accept', 'accept-language', 'origin', 'referer', 'user-agent']);
+const YOUTUBE_HOST_RE = /(^|\.)(?:youtube\.com|youtube-nocookie\.com|youtu\.be)$/i;
 
 function bundledYtDlp() {
   if (!process.resourcesPath) return [];
@@ -120,7 +121,10 @@ function runJson(bin, args) {
       if (settled) return;
       if (code !== 0) {
         const detail = stderr.trim().split(/\r?\n/).slice(-3).join(' ');
-        finish(reject, new Error(`无法解析这个视频链接${detail ? `：${detail}` : ''}`));
+        const error = new Error(`无法解析这个视频链接${detail ? `：${detail}` : ''}`);
+        error.code = 'YTDLP_FAILED';
+        error.detail = detail;
+        finish(reject, error);
         return;
       }
       try {
@@ -132,7 +136,51 @@ function runJson(bin, args) {
   });
 }
 
-async function inspectLink(rawUrl) {
+function ytDlpArgs(url, extractorArgs = null) {
+  const args = [
+    '--ignore-config',
+    '--dump-single-json',
+    '--skip-download',
+    '--no-playlist',
+    '--no-cache-dir',
+    '--no-warnings',
+    '--socket-timeout',
+    '20',
+  ];
+  if (extractorArgs) args.push('--extractor-args', extractorArgs);
+  args.push(
+    // Android 端不能像 mpv 一样把独立音视频流现场合并，因此优先选择同时含
+    // 音频和视频的 HTTP/HLS 格式。桌面端仍可以把原始页面地址交给 mpv。
+    '--format',
+    'best[protocol^=http][vcodec!=none][acodec!=none]/best[protocol^=m3u8][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]',
+    '--',
+    url
+  );
+  return args;
+}
+
+function isYouTubeUrl(url) {
+  return YOUTUBE_HOST_RE.test(new URL(url).hostname);
+}
+
+function resultFromInfo(info, url) {
+  if (info?._type === 'playlist' || Array.isArray(info?.entries)) {
+    throw new Error('当前只支持单个视频链接，不支持播放列表或频道页面');
+  }
+
+  const playback = playbackFromInfo(info, looksLikeDirectMedia(url) ? url : null);
+  return {
+    url,
+    title: String(info?.title || info?.fulltitle || new URL(url).hostname).slice(0, 240),
+    duration: Number.isFinite(Number(info?.duration)) ? Number(info.duration) : 0,
+    extractor: String(info?.extractor_key || info?.extractor || 'generic').slice(0, 80),
+    direct: looksLikeDirectMedia(url) || info?.extractor === 'generic',
+    playback,
+    resolvedAt: Date.now(),
+  };
+}
+
+async function inspectLink(rawUrl, { browserFallback } = {}) {
   const url = normalizeHttpUrl(rawUrl);
   const ytDlp = findYtDlp();
 
@@ -154,37 +202,40 @@ async function inspectLink(rawUrl) {
     throw error;
   }
 
-  const info = await runJson(ytDlp, [
-    '--ignore-config',
-    '--dump-single-json',
-    '--skip-download',
-    '--no-playlist',
-    '--no-cache-dir',
-    '--no-warnings',
-    '--socket-timeout',
-    '20',
-    // Android 端不能像 mpv 一样把独立音视频流现场合并，因此优先选择同时含
-    // 音频和视频的 HTTP/HLS 格式。桌面端仍使用原始页面地址在本机解析。
-    '--format',
-    'best[protocol^=http][vcodec!=none][acodec!=none]/best[protocol^=m3u8][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]',
-    '--',
-    url,
-  ]);
-
-  if (info?._type === 'playlist' || Array.isArray(info?.entries)) {
-    throw new Error('当前只支持单个视频链接，不支持播放列表或频道页面');
+  const attempts = isYouTubeUrl(url)
+    // YouTube 当前逐步要求 PO Token。android_vr 客户端仍可匿名返回普通公开
+    // 视频的音画合一格式，失败时再保留默认客户端作为兼容回退。
+    ? ['youtube:player_client=android_vr', null]
+    : [null, 'generic:impersonate'];
+  let lastError;
+  for (const extractorArgs of attempts) {
+    try {
+      return resultFromInfo(await runJson(ytDlp, ytDlpArgs(url, extractorArgs)), url);
+    } catch (error) {
+      lastError = error;
+    }
   }
 
-  const playback = playbackFromInfo(info, looksLikeDirectMedia(url) ? url : null);
-  return {
-    url,
-    title: String(info?.title || info?.fulltitle || new URL(url).hostname).slice(0, 240),
-    duration: Number.isFinite(Number(info?.duration)) ? Number(info.duration) : 0,
-    extractor: String(info?.extractor_key || info?.extractor || 'generic').slice(0, 80),
-    direct: looksLikeDirectMedia(url) || info?.extractor === 'generic',
-    playback,
-    resolvedAt: Date.now(),
-  };
+  if (typeof browserFallback === 'function' && !isYouTubeUrl(url)) {
+    try {
+      const browserInfo = await browserFallback(url);
+      return {
+        url,
+        title: String(browserInfo.title || new URL(url).hostname).slice(0, 240),
+        duration: Number.isFinite(Number(browserInfo.duration)) ? Number(browserInfo.duration) : 0,
+        extractor: 'isolated-browser',
+        direct: false,
+        playback: playbackFromInfo(browserInfo.playback || browserInfo, null),
+        resolvedAt: Date.now(),
+      };
+    } catch (browserError) {
+      const error = new Error(`网站拒绝了自动解析，隔离浏览器也没有捕获到可播放媒体：${browserError.message || browserError}`);
+      error.code = 'BROWSER_RESOLVE_FAILED';
+      error.cause = lastError;
+      throw error;
+    }
+  }
+  throw lastError;
 }
 
 function toolStatus() {
@@ -198,5 +249,7 @@ module.exports = {
   looksLikeDirectMedia,
   sanitizePlaybackHeaders,
   playbackFromInfo,
+  isYouTubeUrl,
+  ytDlpArgs,
   toolStatus,
 };

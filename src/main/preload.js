@@ -68,6 +68,8 @@ contextBridge.exposeInMainWorld('sw', {
 
   app: {
     onShutdownRequested: on('app:shutdownRequested'),
+    onDeepLink: on('app:deepLink'),
+    takeDeepLink: () => ipcRenderer.invoke('app:takeDeepLink'),
   },
 
   // 拖拽进来的 File 对象在 Electron 里拿不到 .path 了（安全策略变更），
