@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.6.1-7C5CFF?style=for-the-badge" alt="Version 0.6.1">
+    <img src="https://img.shields.io/badge/version-0.6.2-7C5CFF?style=for-the-badge" alt="Version 0.6.2">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -51,14 +51,14 @@
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
 
 > [!IMPORTANT]
-> `v0.6.1` lets both Windows installers choose the destination folder while retaining the Trusted-room defaults, serverless invite links, and link-parser fixes from `v0.6.0`.
+> `v0.6.2` fixes receivers stalling at 0 bytes, the manual-mode handshake hanging on “connecting” forever, and dropped ICE candidates that caused intermittent connection failures, while keeping the selectable install folder from `v0.6.1`.
 
 ## Downloads
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv and yt-dlp and lets you choose the install folder | [NoxReel-Setup-0.6.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.1.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.6.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.1.exe) |
+| Windows full installer | Recommended. Bundles mpv and yt-dlp and lets you choose the install folder | [NoxReel-Setup-0.6.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.2.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.6.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.2.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
