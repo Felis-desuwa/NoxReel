@@ -645,6 +645,9 @@ async function joinViaManual(payload) {
 
   initSwarmAndSync();
 
+  // 重试时同一个房主 id 会再来一次，先把上一条死连接摘掉，别让它占着成员表。
+  S.swarm.removePeer(payload.from);
+
   const peer = new Peer({
     peerId: payload.from,
     name: payload.name || '发起者',
@@ -654,6 +657,22 @@ async function joinViaManual(payload) {
   });
   wirePeer(peer);
   S.swarm.addPeer(peer);
+
+  // 应答生成之后本机就开始探测对方的候选地址了，而房主可能过好几分钟才粘贴。
+  // 探测先失败的话，这条连接就废了 —— 房主那边再粘贴也连不上，界面却一直停在
+  // 「等待房主打开应答链接」。所以失败要说出来，并且允许用同一份邀请重开一条。
+  peer.on('failed', () => {
+    if (peer.authenticated || roomEntered) return;
+    $('prep-title').textContent = '直连没建立起来';
+    $('prep-note').textContent =
+      '和房主的直连探测失败了：可能是房主那边的邀请链接放太久、网络地址已经过期，也可能双方都在严格 NAT 后面。重新生成一条应答链接发回给房主再试一次；还是不行就双方在设置里配同一个 TURN 中继。';
+    $('prep-bar').style.width = '0%';
+    const retry = make('button', { className: 'primary', text: '重新生成应答链接' });
+    retry.onclick = () => joinViaManual(payload).catch((error) => prepFail(error.message || String(error)));
+    const back = make('button', { className: 'ghost', text: '返回' });
+    back.onclick = backHome;
+    replace('prep-actions', retry, back);
+  });
 
   const answer = await peer.acceptOffer(payload.sdp);
   const code = await encodeCode({
@@ -780,7 +799,18 @@ async function connectSignaling(url, roomId) {
     else if (payload.kind === 'ice') await peer.addIceCandidate(payload.candidate);
   });
 
-  sig.on('peer-leave', ({ peerId }) => S.swarm.removePeer(peerId));
+  // 信令断了不等于人走了 —— 直连不经过服务器。服务重启或网络抖一下，服务器就会
+  // 广播 peer-leave；这时候把健康的 P2P 拆掉，传输会白白中断到对方重连为止
+  // （重连退避最长 30 秒），而界面上还写着「已建立的直连不受影响」。
+  // 真正离开的人，数据通道自己会关，ICE 也会走到 failed，那两条路都会摘掉他。
+  sig.on('peer-leave', ({ peerId }) => {
+    const peer = S.swarm.peers.get(peerId);
+    if (peer?.ctrl?.readyState === 'open') {
+      log(`${peer.name} 的信令连接断了，但直连还在，传输继续`, 'warn');
+      return;
+    }
+    S.swarm.removePeer(peerId);
+  });
   sig.on('joined', ({ maxMembers }) => {
     if (maxMembers) S.roomCapacity = clampCapacity(maxMembers);
     renderCapacityStatus();
@@ -1323,7 +1353,7 @@ async function inviteViaServer() {
  * 极简模式邀请。一次只能拉一个人 —— 每个人都要单独走一遍 offer/answer。
  * 而且大家都只连到发起者（星型），彼此之间不互连。
  */
-async function inviteViaManual() {
+async function inviteViaManual(notice = '') {
   if (connectedPeerCount() + 1 >= S.roomCapacity) {
     const full = make('p', { text: `房间已满（${S.roomCapacity} 人）。请先调高人数上限。` });
     full.style.color = 'var(--danger)';
@@ -1357,11 +1387,21 @@ async function inviteViaManual() {
   });
   const link = inviteLink(code, 'join');
 
+  // 上一轮打洞失败时把原因带过来，别让用户对着一个「又生成了一条链接」发懵。
+  // replace() 不过滤 null，所以空的时候给一个空数组，flat 之后自然消失。
+  const noticeNode = notice ? make('p', { id: 'inv-notice', text: notice }) : [];
+  if (notice) noticeNode.style.color = 'var(--warn)';
+
   replace(
     out,
+    noticeNode,
     make('a', { id: 'inv-link', className: 'invite-link', text: 'NoxReel 一键加入链接' }),
     make('button', { className: 'primary', id: 'inv-copy', text: '复制邀请链接' }),
     make('p', { text: `已生成可点击的邀请链接；压缩握手数据 ${code.length} 字符。在对方真正连上前，不会计入成员列表。` }),
+    make('p', {
+      className: 'fine',
+      text: '链接里带着这台电脑当前的网络地址，放久了会失效 —— 尽量在几分钟内让对方点开。过期了重新生成一条即可。',
+    }),
     make('p', {}, [make('b', { text: '第 2 步：' }), '对方发回应答链接后直接点开，或粘贴到这里：']),
     make('textarea', {
       id: 'inv-answer',
@@ -1377,13 +1417,78 @@ async function inviteViaManual() {
   $('inv-accept').onclick = () => acceptManualAnswer($('inv-answer').value);
 }
 
+const MANUAL_HANDSHAKE_TIMEOUT_MS = 45_000;
+
+/**
+ * 盯住极简模式的最后一步，给它一个结局。
+ *
+ * 打洞可能一直连不上：对方在严格 NAT 后面，或者邀请链接放太久 —— 里面的候选地址
+ * 对应的 NAT 映射早就过期了。这两种情况 ICE 都会长时间停在 checking，而「正在打洞」
+ * 这行字以前只有 peer-authenticated 一条路能改，失败时没有任何人来收尾，
+ * 界面就永远停在那里。这里补上失败和超时两条路，并顺手备好新的邀请链接。
+ */
+function watchManualHandshake(peer, status) {
+  let settled = false;
+
+  const finish = (text, { retry = false } = {}) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    offAuthenticated();
+    offFailed();
+    offClosed();
+    if (!retry) {
+      if (status?.isConnected) status.textContent = text;
+      return;
+    }
+    // 失效的连接留在 swarm 里只会占着成员位；清掉再生成一条新链接，
+    // 原因写在新链接上方，用户可以立刻重发。
+    S.swarm.removePeer(peer.peerId);
+    log(text, 'warn');
+    inviteViaManual(text).catch((error) => {
+      if (status?.isConnected) status.textContent = error.message || String(error);
+    });
+  };
+
+  const timer = setTimeout(
+    () =>
+      finish(
+        '打洞一直没成功：对方可能在严格 NAT 后面，也可能是邀请链接放太久、里面的网络地址已经过期。已经给你备好一条新的邀请链接，重发一次试试；还是不行就在设置里配一个 TURN 中继。',
+        { retry: true }
+      ),
+    MANUAL_HANDSHAKE_TIMEOUT_MS
+  );
+
+  const offAuthenticated = S.swarm.on('peer-authenticated', (authenticatedPeer) => {
+    if (authenticatedPeer !== peer) return;
+    finish(`${peer.name} 已连上 ✓`);
+  });
+  const offFailed = peer.on('failed', () =>
+    finish('直连没建立起来。已经给你备好一条新的邀请链接，重发一次试试；双方都在严格 NAT 后面时需要在设置里配 TURN 中继。', {
+      retry: true,
+    })
+  );
+  const offClosed = peer.on('close', () => {
+    if (peer.authenticated) return; // 已经进过房间的人断开，走成员列表那套，不是握手失败
+    finish('连接在握手完成前就断了。已经给你备好一条新的邀请链接，重发一次试试。', { retry: true });
+  });
+}
+
 async function acceptManualAnswer(rawInput) {
   const raw = String(rawInput || '').trim();
   if (!raw) return;
-  const peer = S.pendingManualPeer;
-  if (!peer) throw new Error('当前没有等待应答的零服务器邀请');
-  let registered = false;
   const status = $('inv-status');
+  const peer = S.pendingManualPeer;
+  if (!peer) {
+    // 应答链接被点开两次，或者这条邀请已经作废（超时后重新生成过）。
+    // 以前这里直接 throw，落在没人接住的地方，界面上什么都不会发生。
+    const message = '这条邀请已经用过或已失效，请用当前这条邀请链接重新走一遍。';
+    if (status?.isConnected) status.textContent = message;
+    else if (roomEntered) log(message, 'warn');
+    else $('join-err').textContent = message;
+    return;
+  }
+  let registered = false;
   try {
     const payload = await decodeCode(raw);
     if (payload.k !== 'answer') throw new Error('这不是应答码');
@@ -1398,18 +1503,18 @@ async function acceptManualAnswer(rawInput) {
     S.swarm.addPeer(peer);
     registered = true;
     S.pendingManualPeer = null;
-    const offAuthenticated = S.swarm.on('peer-authenticated', (authenticatedPeer) => {
-      if (authenticatedPeer !== peer) return;
-      offAuthenticated();
-      if (status) status.textContent = `${peer.name} 已连上 ✓`;
-    });
+    watchManualHandshake(peer, status);
     await peer.acceptAnswer(payload.sdp);
-    if (status) status.textContent = '正在打洞并校验房间模式…';
+    if (status?.isConnected) status.textContent = '正在打洞并校验房间模式…';
     show('view-room');
   } catch (error) {
     if (registered) S.swarm.removePeer(peer.peerId);
-    if (status) status.textContent = error.message;
-    else $('join-err').textContent = error.message;
+    // 登记之后再出错的话，看门狗已经把邀请区重画了，原来那个状态节点是游离的，
+    // 写进去谁也看不见 —— 这种情况把原因落到房间日志里。
+    const message = error.message || String(error);
+    if (status?.isConnected) status.textContent = message;
+    else if (roomEntered) log(message, 'bad');
+    else $('join-err').textContent = message;
   }
 }
 

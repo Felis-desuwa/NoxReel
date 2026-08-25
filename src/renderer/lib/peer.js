@@ -8,6 +8,8 @@ import {
   PROTOCOL_VERSION,
 } from './protocol.js';
 
+const MAX_PENDING_CANDIDATES = 128; // 排队上限，别让对面用候选把内存灌爆
+
 /**
  * 单个 P2P 连接。
  *
@@ -36,6 +38,7 @@ export class Peer extends Emitter {
     this.remoteManifest = null;
     this.remoteHave = null; // Uint8Array
     this.inflight = new Set(); // 我方已向该 peer 请求、还没收齐的分片
+    this._pendingCandidates = []; // 远端描述落地前先攒着的 ICE 候选
     this.rtt = null;
     this.bytesReceived = 0;
     this.bytesSent = 0;
@@ -153,6 +156,7 @@ export class Peer extends Emitter {
 
   async acceptOffer(desc) {
     await this.pc.setRemoteDescription(desc);
+    await this._flushPendingCandidates();
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
     if (!this.trickle) await this._waitIceComplete();
@@ -161,13 +165,34 @@ export class Peer extends Emitter {
 
   async acceptAnswer(desc) {
     await this.pc.setRemoteDescription(desc);
+    await this._flushPendingCandidates();
   }
 
   async addIceCandidate(c) {
+    // 远端描述还没设进去时不能加候选 —— WebRTC 会抛错，候选就这么没了。
+    // trickle 模式下 SDP 和候选是并发到达的，而 setRemoteDescription 是异步的，
+    // 早到的那批（往往正是最有用的同网段主机候选）很容易撞进这个窗口，
+    // 丢掉就表现为「有时怎么都连不上」。先排队，等远端描述落地再补。
+    if (!this.pc.remoteDescription) {
+      if (this._pendingCandidates.length < MAX_PENDING_CANDIDATES) this._pendingCandidates.push(c);
+      return;
+    }
     try {
       await this.pc.addIceCandidate(c);
     } catch (e) {
       console.warn('[peer] 添加 ICE 候选失败', e);
+    }
+  }
+
+  async _flushPendingCandidates() {
+    const queued = this._pendingCandidates;
+    this._pendingCandidates = [];
+    for (const candidate of queued) {
+      try {
+        await this.pc.addIceCandidate(candidate);
+      } catch (e) {
+        console.warn('[peer] 补加排队的 ICE 候选失败', e);
+      }
     }
   }
 

@@ -71,8 +71,15 @@ export class Swarm extends Emitter {
       this.complete = !!state.complete;
     }
 
-    // 已经连上的人还不知道我有什么，补发一遍
+    // 已经连上的人还不知道我有什么，补发一遍。
+    // 顺带判定对方手里那份还算不算数：位图是按 fileId 对应的分片数解出来的，
+    // 对方拿的是另一个文件时长度对不上，必须丢掉、等他发来新清单再启用。
     for (const p of this.peers.values()) {
+      if (p.remoteManifest && p.remoteManifest.fileId !== manifest.fileId) {
+        p.remoteManifest = null;
+        p.remoteHave = null;
+        p.ready = false;
+      }
       if (p.authenticated) this._sendIntro(p);
     }
     this.emit('progress', this.progress());
@@ -95,12 +102,13 @@ export class Swarm extends Emitter {
     this.playbackByte = 0;
     this.inflight.clear();
     this.assembler.clear();
+    // 只清跟「本机会话」绑定的东西。remoteManifest / remoteHave 描述的是**对方**手里
+    // 有什么，跟我这边开不开会话无关；而接收方的顺序永远是「先收到清单和位图 →
+    // 再异步打开本地会话」，在这里一并清掉的话，对端只在握手时发一次位图、不会补发，
+    // 调度器就再也筛不出可用上游 —— 表现是连上了、清单也有了，却一个字节都不动。
+    // 换片后对方那份还算不算数，交给 setSession 按 fileId 判定。
     for (const peer of this.peers.values()) {
-      peer.remoteManifest = null;
-      peer.remoteHave = null;
-      peer.pendingManifest = null;
       peer.inflight.clear();
-      peer.ready = false;
     }
     if (notify) this.emit('progress', this.progress());
   }
@@ -132,6 +140,12 @@ export class Swarm extends Emitter {
   /* ----------------------------- peer ----------------------------- */
 
   addPeer(peer) {
+    // 同一个 peerId 可能再来一次（对方信令重连后老成员会重新发起 offer）。
+    // 直接覆盖的话，旧的 RTCPeerConnection 既没关、监听器也还挂着，
+    // 成了收得到消息却谁也管不着的幽灵，还占着一份内存和一条 ICE 连接。
+    const previous = this.peers.get(peer.peerId);
+    if (previous && previous !== peer) this.removePeer(peer.peerId);
+
     this.peers.set(peer.peerId, peer);
     this._serving.set(peer.peerId, 0);
     this._serveQueue.set(peer.peerId, []);
@@ -351,14 +365,17 @@ export class Swarm extends Emitter {
         break;
       }
 
-      case MSG.BITFIELD:
-        if (peer.remoteManifest || this.manifest) {
-          const count = (this.manifest || peer.remoteManifest).chunkCount;
-          peer.remoteHave = unpackBitfield(msg.bits, count);
+      case MSG.BITFIELD: {
+        // 位图是对方那个文件的，尺寸只能按他的清单算；本机会话可能还没打开
+        // （openLeech 是异步 IPC），更不能拿本机的 chunkCount 去解。
+        const source = peer.remoteManifest || this.manifest;
+        if (source) {
+          peer.remoteHave = unpackBitfield(msg.bits, source.chunkCount);
           peer.ready = true;
           this.emit('peers', this.peerList());
         }
         break;
+      }
 
       case MSG.HAVE:
         if (peer.remoteHave && Number.isInteger(msg.index) && msg.index >= 0 && msg.index < peer.remoteHave.length) {

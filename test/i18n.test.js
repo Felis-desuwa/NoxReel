@@ -20,6 +20,16 @@ test('桌面端固定文案和动态状态可翻译为英文', async () => {
     translate('已阻止打开接收文件：安全扫描超时', 'en'),
     'Blocked the received file: The security scan timed out'
   );
+  assert.equal(translate('重新生成应答链接', 'en'), 'Generate a new answer link');
+  assert.equal(
+    translate('Alice 的信令连接断了，但直连还在，传输继续', 'en'),
+    'Alice lost the signaling connection, but the direct connection is still up and the transfer continues'
+  );
+  assert.equal(translate('直连没建立起来', 'en'), 'The direct connection failed');
+  assert.equal(
+    translate('这条邀请已经用过或已失效，请用当前这条邀请链接重新走一遍。', 'en'),
+    'That invite was already used or has expired. Start again with the current invite link.'
+  );
   assert.equal(translate('设置', 'zh-CN'), '设置');
 });
 

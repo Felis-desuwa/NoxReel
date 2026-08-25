@@ -162,6 +162,20 @@ const EN = new Map(Object.entries({
   '完成连接': 'Complete connection',
   '这不是应答码': 'This is not an answer code',
   '正在打洞并校验房间模式…': 'Establishing the direct connection and verifying room mode…',
+  '链接里带着这台电脑当前的网络地址，放久了会失效 —— 尽量在几分钟内让对方点开。过期了重新生成一条即可。':
+    'The link carries this computer’s current network addresses and goes stale over time—try to have the other side open it within a few minutes. Just generate a new one if it expires.',
+  '这条邀请已经用过或已失效，请用当前这条邀请链接重新走一遍。':
+    'That invite was already used or has expired. Start again with the current invite link.',
+  '打洞一直没成功：对方可能在严格 NAT 后面，也可能是邀请链接放太久、里面的网络地址已经过期。已经给你备好一条新的邀请链接，重发一次试试；还是不行就在设置里配一个 TURN 中继。':
+    'The direct connection never came up: the other side may be behind a strict NAT, or the invite link sat too long and its network addresses expired. A fresh invite link is ready—send it again; if it still fails, configure a TURN relay in Settings.',
+  '直连没建立起来。已经给你备好一条新的邀请链接，重发一次试试；双方都在严格 NAT 后面时需要在设置里配 TURN 中继。':
+    'The direct connection failed. A fresh invite link is ready—send it again; when both sides are behind strict NAT you need a TURN relay configured in Settings.',
+  '连接在握手完成前就断了。已经给你备好一条新的邀请链接，重发一次试试。':
+    'The connection dropped before the handshake finished. A fresh invite link is ready—send it again.',
+  '直连没建立起来': 'The direct connection failed',
+  '和房主的直连探测失败了：可能是房主那边的邀请链接放太久、网络地址已经过期，也可能双方都在严格 NAT 后面。重新生成一条应答链接发回给房主再试一次；还是不行就双方在设置里配同一个 TURN 中继。':
+    'Connectivity checks with the host failed: the host’s invite link may have sat too long and its network addresses expired, or both sides are behind strict NAT. Generate a new answer link, send it back to the host, and try again; if it still fails, both sides should configure the same TURN relay in Settings.',
+  '重新生成应答链接': 'Generate a new answer link',
   '来源': 'Source',
   '原始视频网站': 'Original video website',
   '同步': 'Sync',
@@ -293,6 +307,10 @@ const EN_PATTERNS = [
   [/^已和 (.+) 建立数据通道，正在校验房间模式…$/, 'Data channel established with $1; verifying room mode…'],
   [/^和 (.+) 的直连失败了。.*$/, 'Direct connection to $1 failed. Configure a TURN relay in Settings when both sides are behind strict NAT.'],
   [/^(.+) 断开了$/, '$1 disconnected'],
+  [
+    /^(.+) 的信令连接断了，但直连还在，传输继续$/,
+    '$1 lost the signaling connection, but the direct connection is still up and the transfer continues',
+  ],
   [/^来源：(.*)$/, 'Source: $1'],
   [/^这个视频链接在你的电脑上无法解析：(.*)$/, (_all, detail) => `This video link could not be parsed on your computer: ${translate(detail, 'en')}`],
   [/^本机解析失败，改用房主提供的临时播放地址：(.*)$/, (_all, detail) => `Local parsing failed; using the host's temporary stream URL: ${translate(detail, 'en')}`],
