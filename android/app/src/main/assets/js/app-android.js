@@ -358,7 +358,17 @@ async function connectSignaling(url, roomId) {
     else if (payload.kind === 'ice') await peer.addIceCandidate(payload.candidate);
   });
 
-  sig.on('peer-leave', ({ peerId }) => S.swarm.removePeer(peerId));
+  // 信令断了不等于人走了 —— 直连不经过服务器。服务重启或网络抖一下，服务器就会
+  // 广播 peer-leave；这时候把健康的 P2P 拆掉，传输会白白中断到对方重连为止，
+  // 而下一行的提示还写着「已建立的直连不受影响」。真正离开的人，数据通道自己会关。
+  sig.on('peer-leave', ({ peerId }) => {
+    const peer = S.swarm.peers.get(peerId);
+    if (peer?.ctrl?.readyState === 'open') {
+      log(peer.name + ' 的信令连接断了，但直连还在，传输继续', 'warn');
+      return;
+    }
+    S.swarm.removePeer(peerId);
+  });
   sig.on('reconnecting', ({ in: ms }) => log(`信令断开，${Math.round(ms / 1000)} 秒后重连（已建立的直连不受影响）`, 'warn'));
   sig.on('error', (e) => log('信令错误：' + e.message, 'bad'));
 

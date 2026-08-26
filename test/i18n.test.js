@@ -36,6 +36,10 @@ test('桌面端固定文案和动态状态可翻译为英文', async () => {
 test('Android 观众端提供相同的中英语言入口', async () => {
   const { translate } = await import('../android/app/src/main/assets/js/i18n.js');
   assert.equal(translate('界面语言', 'en'), 'Interface language');
+  assert.equal(
+    translate('Alice 的信令连接断了，但直连还在，传输继续', 'en'),
+    'Alice lost the signaling connection, but the direct connection is still up and the transfer continues'
+  );
   assert.equal(translate('2 人在线', 'en'), '2 online');
   assert.equal(translate('安全模式', 'en'), 'Safe mode');
   assert.equal(

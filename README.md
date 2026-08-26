@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.6.2-7C5CFF?style=for-the-badge" alt="Version 0.6.2">
+    <img src="https://img.shields.io/badge/version-0.6.3-7C5CFF?style=for-the-badge" alt="Version 0.6.3">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -51,14 +51,14 @@
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!IMPORTANT]
-> `v0.6.2` 修复了成员接收永远停在 0 字节、极简模式「正在打洞」卡死、ICE 候选被丢弃导致间歇性连不上等问题，并保留 `v0.6.1` 的可选安装目录。
+> `v0.6.3` 把 `v0.6.2` 的连接层修复补齐到 Android 观众端：ICE 候选不再被丢弃、信令抖动不再拆掉健康的直连、同一成员重连不再留下幽灵连接。桌面端行为与 `v0.6.2` 相同。
 
 ## 下载
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，可选择安装文件夹 | [NoxReel-Setup-0.6.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.2.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.6.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.2.exe) |
+| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，可选择安装文件夹 | [NoxReel-Setup-0.6.3.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.3.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.6.3.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.3.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 

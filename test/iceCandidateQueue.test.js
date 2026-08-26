@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { IMPLS } = require('./helpers/impls');
 
 /** 够用的假 RTCPeerConnection：只关心远端描述和候选地址的先后关系。 */
 class FakePeerConnection {
@@ -41,18 +42,23 @@ class FakePeerConnection {
   close() {}
 }
 
-async function loadPeer() {
+async function loadPeer(dir) {
   globalThis.RTCPeerConnection = FakePeerConnection;
   globalThis.performance = globalThis.performance || { now: () => 0 };
-  return (await import('../src/renderer/lib/peer.js')).Peer;
+  return (await import(dir + 'peer.js')).Peer;
+}
+
+
+function impl(title, fn) {
+  for (const { name, dir } of IMPLS) test(`${name}：${title}`, () => fn(dir));
 }
 
 /**
  * trickle 模式下 offer 和候选地址是并发到达的，而 setRemoteDescription 是异步的。
  * 早到的候选（往往正是最有用的同网段主机候选）如果直接丢掉，就会间歇性连不上。
  */
-test('远端描述落地前到达的 ICE 候选会排队，不会被丢掉', async () => {
-  const Peer = await loadPeer();
+impl('远端描述落地前到达的 ICE 候选会排队，不会被丢掉', async (dir) => {
+  const Peer = await loadPeer(dir);
   const peer = new Peer({ peerId: 'other', name: 'other', initiator: true, iceServers: [] });
 
   await peer.addIceCandidate({ candidate: 'early-1' });
@@ -71,8 +77,8 @@ test('远端描述落地前到达的 ICE 候选会排队，不会被丢掉', asy
   assert.equal(peer.pc.added.length, 3, '之后到达的候选照常直接加');
 });
 
-test('应答方接收 offer 后同样会补上排队的候选', async () => {
-  const Peer = await loadPeer();
+impl('应答方接收 offer 后同样会补上排队的候选', async (dir) => {
+  const Peer = await loadPeer(dir);
   const peer = new Peer({ peerId: 'other', name: 'other', initiator: false, iceServers: [] });
 
   await peer.addIceCandidate({ candidate: 'early' });

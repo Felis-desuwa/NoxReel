@@ -73,6 +73,10 @@ const EN = new Map(Object.entries({
 const PATTERNS = [
   [/^观众(\d+)$/, 'Viewer $1'],
   [/^(.+) 加入了房间$/, '$1 joined the room'],
+  [
+    /^(.+) 的信令连接断了，但直连还在，传输继续$/,
+    '$1 lost the signaling connection, but the direct connection is still up and the transfer continues',
+  ],
   [/^已和 (.+) 建立数据通道，正在校验房间模式…$/, 'Data channel established with $1; verifying room mode…'],
   [/^已和 (.+) 完成(.+)握手$/, 'Completed $2 handshake with $1'],
   [/^模式不一致：本机是(.+)，对方是(.+)，已在传输媒体前断开。$/, 'Mode mismatch: this device uses $1 and the peer uses $2. Disconnected before media transfer.'],

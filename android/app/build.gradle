@@ -11,8 +11,8 @@ android {
         applicationId "app.noxreel.android"
         minSdk 26          // Android 8+；用户目标机是 12，向下多兼容几档
         targetSdk 31       // 适配安卓 12
-        versionCode 9
-        versionName "0.6.2"
+        versionCode 10
+        versionName "0.6.3"
     }
 
     buildTypes {

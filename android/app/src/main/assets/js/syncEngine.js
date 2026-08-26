@@ -358,7 +358,12 @@ export class SyncEngine extends Emitter {
   _onRole(msg, fromPeer) {
     const from = fromPeer?.peerId;
     if (!from) return true;
-    const known = this.hostId && this.hostId !== this.peerId;
+    // 我自己就是房主：角色表只由我发出，别人发来的一概不认。这一条必须排在最前面 ——
+    // 房主的 hostId 恰好等于自身 peerId，会落进下面「尚不知道房主」的分支，
+    // 任何成员只要把 hostId 填成自己发一条 ROLE，就能把房主挤下去、夺走角色权威。
+    // 安卓端目前是纯观众端、当不了房主，这里跟桌面端对齐，免得两边行为分叉。
+    if (this.hostId && this.hostId === this.peerId) return true;
+    const known = !!this.hostId;
     if (known ? from !== this.hostId : from !== msg.hostId) return true;
     this.applyRoles(msg.roles, msg.hostId);
     return true;

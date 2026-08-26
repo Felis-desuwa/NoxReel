@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { IMPLS } = require('./helpers/impls');
 
 function manifestFor(fileId, chunkCount) {
   return {
@@ -34,14 +35,19 @@ function fakePeer(peerId) {
   };
 }
 
+
+function impl(title, fn) {
+  for (const { name, dir } of IMPLS) test(`${name}：${title}`, () => fn(dir));
+}
+
 /**
  * 接收方的真实顺序是「先收到清单和位图 → 再异步打开本地会话」。
  * 位图只在对端握手时发一次，如果打开会话的过程把它清掉，调度器就永远筛不出上游，
  * 表现是连上了、清单也有了，却一个字节都收不到（传输面板恒显示 0 B）。
  */
-test('位图先于本机会话到达时不会被清掉，调度器仍能选出上游', async () => {
-  const { Swarm } = await import('../src/renderer/lib/swarm.js');
-  const { packBitfield } = await import('../src/renderer/lib/protocol.js');
+impl('位图先于本机会话到达时不会被清掉，调度器仍能选出上游', async (dir) => {
+  const { Swarm } = await import(dir + 'swarm.js');
+  const { packBitfield } = await import(dir + 'protocol.js');
 
   const manifest = manifestFor('a'.repeat(32), 4);
   const receiver = new Swarm({ peerId: 'guest', name: 'guest' });
@@ -74,9 +80,9 @@ test('位图先于本机会话到达时不会被清掉，调度器仍能选出�
   assert.equal(plan[0].peerId, 'host');
 });
 
-test('对方手里换成另一个文件时，旧位图会被判定失效', async () => {
-  const { Swarm } = await import('../src/renderer/lib/swarm.js');
-  const { packBitfield } = await import('../src/renderer/lib/protocol.js');
+impl('对方手里换成另一个文件时，旧位图会被判定失效', async (dir) => {
+  const { Swarm } = await import(dir + 'swarm.js');
+  const { packBitfield } = await import(dir + 'protocol.js');
 
   const oldManifest = manifestFor('a'.repeat(32), 4);
   const newManifest = manifestFor('b'.repeat(32), 6);
@@ -99,9 +105,9 @@ test('对方手里换成另一个文件时，旧位图会被判定失效', async
 });
 
 /** 位图属于发送方的文件，尺寸只能按他的清单算。 */
-test('本机正播另一个文件时，位图仍按对方的清单解码', async () => {
-  const { Swarm } = await import('../src/renderer/lib/swarm.js');
-  const { packBitfield } = await import('../src/renderer/lib/protocol.js');
+impl('本机正播另一个文件时，位图仍按对方的清单解码', async (dir) => {
+  const { Swarm } = await import(dir + 'swarm.js');
+  const { packBitfield } = await import(dir + 'protocol.js');
 
   const mine = manifestFor('c'.repeat(32), 3);
   const theirs = manifestFor('d'.repeat(32), 9);

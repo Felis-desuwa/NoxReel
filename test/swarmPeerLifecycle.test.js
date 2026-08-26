@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { IMPLS } = require('./helpers/impls');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -28,13 +29,18 @@ function fakePeer(peerId) {
   };
 }
 
+
+function impl(title, fn) {
+  for (const { name, dir } of IMPLS) test(`${name}：${title}`, () => fn(dir));
+}
+
 /**
  * 信令模式下同一个 peerId 可能再来一次（对方信令重连后，房间里的老成员会收到
  * peer-join 重新发起 offer）。直接覆盖 peers 表的话，旧的 RTCPeerConnection
  * 既没关也还挂着监听器，成了收得到消息却谁也管不着的幽灵。
  */
-test('同一个 peerId 再次接入时旧连接会被摘掉，不留幽灵', async () => {
-  const { Swarm } = await import('../src/renderer/lib/swarm.js');
+impl('同一个 peerId 再次接入时旧连接会被摘掉，不留幽灵', async (dir) => {
+  const { Swarm } = await import(dir + 'swarm.js');
   const swarm = new Swarm({ peerId: 'me', name: 'me' });
 
   const first = fakePeer('other');
@@ -49,8 +55,8 @@ test('同一个 peerId 再次接入时旧连接会被摘掉，不留幽灵', asy
   assert.deepEqual(swarm._serveQueue.get('other'), []);
 });
 
-test('重复登记同一个 peer 对象不会把它自己关掉', async () => {
-  const { Swarm } = await import('../src/renderer/lib/swarm.js');
+impl('重复登记同一个 peer 对象不会把它自己关掉', async (dir) => {
+  const { Swarm } = await import(dir + 'swarm.js');
   const swarm = new Swarm({ peerId: 'me', name: 'me' });
 
   const peer = fakePeer('other');
@@ -65,8 +71,11 @@ test('重复登记同一个 peer 对象不会把它自己关掉', async () => {
  * 信令断了不等于人走了：直连不经过服务器。服务重启或网络抖一下，服务器就会广播
  * peer-leave，这时候把健康的 P2P 拆掉，传输会白白中断到对方重连为止。
  */
-test('信令 peer-leave 不会拆掉控制通道还开着的直连', () => {
-  const app = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'app.js'), 'utf8');
+for (const [label, file] of [
+  ['桌面端', ['src', 'renderer', 'app.js']],
+  ['安卓端', ['android', 'app', 'src', 'main', 'assets', 'js', 'app-android.js']],
+]) test(`${label}：信令 peer-leave 不会拆掉控制通道还开着的直连`, () => {
+  const app = fs.readFileSync(path.join(__dirname, '..', ...file), 'utf8');
   const start = app.indexOf("sig.on('peer-leave'");
   assert.ok(start > 0, 'peer-leave 处理必须存在');
   const body = app.slice(start, start + 600);
