@@ -39,3 +39,22 @@ test('访客侧在房主粘贴前探测失败也能重新生成应答链接', ()
   assert.match(body, /joinViaManual\(payload\)/, '重试要能用同一份邀请重开一条连接');
   assert.match(body, /S\.swarm\.removePeer\(payload\.from\)/, '重试前要摘掉上一条死连接');
 });
+
+/**
+ * inviteViaManual 的第一个参数是要显示给用户的提示语。直接当 onclick 处理器挂上去，
+ * 实参就成了 PointerEvent，会被原样渲染成「[object PointerEvent]」贴在邀请区顶上。
+ */
+test('生成零服务器邀请的按钮不会把事件对象当提示语传进去', () => {
+  const app = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'app.js'), 'utf8');
+  assert.doesNotMatch(
+    app,
+    /\$\('inv-manual'\)\.onclick = inviteViaManual;/,
+    '不能把函数本身直接当处理器挂上去'
+  );
+  assert.match(app, /\$\('inv-manual'\)\.onclick = \(\) => inviteViaManual\(\);/);
+  assert.match(
+    app,
+    /if \(typeof notice !== 'string'\) notice = '';/,
+    '函数内也要挡一道，防止别处再犯'
+  );
+});

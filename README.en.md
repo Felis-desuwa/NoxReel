@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.6.3-7C5CFF?style=for-the-badge" alt="Version 0.6.3">
+    <img src="https://img.shields.io/badge/version-0.6.4-7C5CFF?style=for-the-badge" alt="Version 0.6.4">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -51,14 +51,14 @@
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
 
 > [!IMPORTANT]
-> `v0.6.3` ports the `v0.6.2` connection fixes to the Android viewer: ICE candidates are no longer dropped, a signaling hiccup no longer tears down a healthy direct connection, and a reconnecting member no longer leaves a ghost connection behind. Desktop behaviour is unchanged from `v0.6.2`.
+> `v0.6.4` fixes a bug that could stall a transfer for good: after a signaling restart or a brief network hiccup, the reconnect handshake landed on the previous connection's remains — ICE renegotiated over a channel that was already dead, both sides believed they were negotiating, and the transfer stopped for good. Fixed on desktop and Android alike, and verified on real devices: a signaling restart no longer interrupts an in-flight transfer.
 
 ## Downloads
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv and yt-dlp and lets you choose the install folder | [NoxReel-Setup-0.6.3.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.3.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.6.3.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.3.exe) |
+| Windows full installer | Recommended. Bundles mpv and yt-dlp and lets you choose the install folder | [NoxReel-Setup-0.6.4.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.4.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.6.4.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.4.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 

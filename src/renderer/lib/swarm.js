@@ -159,8 +159,14 @@ export class Swarm extends Emitter {
     peer.on('ctrl', (msg) => this._onCtrl(peer, msg));
     peer.on('frame', (f) => this._onFrame(peer, f));
 
-    peer.on('close', () => this.removePeer(peer.peerId));
-    peer.on('failed', () => this.removePeer(peer.peerId));
+    // 只摘自己，不摘同名的后来者。旧连接的 close/failed 是异步到达的：对端信令重连后
+    // 会重新发 offer，我方按同一个 peerId 换上新 Peer，紧接着旧连接的关闭事件才姗姗来迟
+    // —— 按 peerId 无差别删除的话，删掉的正是刚建好的新连接，之后谁也不会再发起协商。
+    const forgetSelf = () => {
+      if (this.peers.get(peer.peerId) === peer) this.removePeer(peer.peerId);
+    };
+    peer.on('close', forgetSelf);
+    peer.on('failed', forgetSelf);
     peer.on('rtt', () => this.emit('peers', this.peerList()));
 
     this.emit('peers', this.peerList());

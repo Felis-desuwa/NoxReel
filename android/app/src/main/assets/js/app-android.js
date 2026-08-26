@@ -344,16 +344,20 @@ async function connectSignaling(url, roomId) {
   sig.on('signal', async ({ from, name, payload }) => {
     let peer = S.swarm.peers.get(from);
     if (payload.kind === 'offer') {
-      if (!peer) {
-        peer = new Peer({ peerId: from, name, initiator: false, iceServers: iceServers(), trickle: true });
-        wirePeer(peer, sig);
-        S.swarm.addPeer(peer);
-      }
+      // 收到 offer 就等于对方那边已经另起了一条连接 —— 本产品没有重协商场景，老成员只在
+      // 新人进房时发一次 offer。此时手上那个同 id 的 Peer 必然是上一轮的残骸：它的
+      // 数据通道可能刚被对端 abort，close 事件还堵在事件队列里没轮到。拿它去
+      // setRemoteDescription，ICE 会在一条已经废掉的 pc 上重来一遍，双方都以为在协商，
+      // 实际再也连不上 —— 表现就是信令一抖，传输永久停在原地。
+      if (peer) S.swarm.removePeer(from);
+      peer = new Peer({ peerId: from, name, initiator: false, iceServers: iceServers(), trickle: true });
+      wirePeer(peer, sig);
+      S.swarm.addPeer(peer);
       const answer = await peer.acceptOffer(payload.sdp);
       sig.signal(from, { kind: 'answer', sdp: answer });
       return;
     }
-    if (!peer) return;
+    if (!peer || peer.closed) return;
     if (payload.kind === 'answer') await peer.acceptAnswer(payload.sdp);
     else if (payload.kind === 'ice') await peer.addIceCandidate(payload.candidate);
   });

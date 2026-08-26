@@ -784,17 +784,21 @@ async function connectSignaling(url, roomId) {
     let peer = S.swarm.peers.get(from);
 
     if (payload.kind === 'offer') {
-      if (!peer) {
-        peer = new Peer({ peerId: from, name, initiator: false, iceServers: iceServers(), trickle: true });
-        wirePeer(peer, sig);
-        S.swarm.addPeer(peer);
-      }
+      // 收到 offer 就等于对方那边已经另起了一条连接 —— 本产品没有重协商场景，老成员只在
+      // 新人进房时发一次 offer。此时手上那个同 id 的 Peer 必然是上一轮的残骸：它的
+      // 数据通道可能刚被对端 abort，close 事件还堵在事件队列里没轮到。拿它去
+      // setRemoteDescription，ICE 会在一条已经废掉的 pc 上重来一遍，双方都以为在协商，
+      // 实际再也连不上 —— 表现就是信令一抖，传输永久停在原地。
+      if (peer) S.swarm.removePeer(from);
+      peer = new Peer({ peerId: from, name, initiator: false, iceServers: iceServers(), trickle: true });
+      wirePeer(peer, sig);
+      S.swarm.addPeer(peer);
       const answer = await peer.acceptOffer(payload.sdp);
       sig.signal(from, { kind: 'answer', sdp: answer });
       return;
     }
 
-    if (!peer) return;
+    if (!peer || peer.closed) return;
     if (payload.kind === 'answer') await peer.acceptAnswer(payload.sdp);
     else if (payload.kind === 'ice') await peer.addIceCandidate(payload.candidate);
   });
@@ -1273,7 +1277,9 @@ async function renderInvite() {
   );
 
   $('inv-server').onclick = inviteViaServer;
-  $('inv-manual').onclick = inviteViaManual;
+  // 包一层再调：直接当处理器挂上去的话，第一个实参就是 PointerEvent，
+  // 会被当成 notice 原样渲染成「[object PointerEvent]」贴在邀请区顶上。
+  $('inv-manual').onclick = () => inviteViaManual();
   $('capacity-apply').onclick = applyRoomCapacity;
   renderCapacityStatus();
   // 默认直接生成零服务器邀请，用户进入房间后不必再选择连接方式。
@@ -1354,6 +1360,8 @@ async function inviteViaServer() {
  * 而且大家都只连到发起者（星型），彼此之间不互连。
  */
 async function inviteViaManual(notice = '') {
+  // 只有字符串才是提示语。挡住误当事件处理器挂上去的情况，别把对象渲染进界面。
+  if (typeof notice !== 'string') notice = '';
   if (connectedPeerCount() + 1 >= S.roomCapacity) {
     const full = make('p', { text: `房间已满（${S.roomCapacity} 人）。请先调高人数上限。` });
     full.style.color = 'var(--danger)';

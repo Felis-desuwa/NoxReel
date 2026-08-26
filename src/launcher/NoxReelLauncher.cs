@@ -9,8 +9,8 @@ using System.Windows.Forms;
 [assembly: AssemblyCompany("NoxReel")]
 [assembly: AssemblyProduct("NoxReel")]
 [assembly: AssemblyCopyright("Copyright © NoxReel contributors")]
-[assembly: AssemblyVersion("0.6.3.0")]
-[assembly: AssemblyFileVersion("0.6.3.0")]
+[assembly: AssemblyVersion("0.6.4.0")]
+[assembly: AssemblyFileVersion("0.6.4.0")]
 #if SIGNAL_SERVER
 [assembly: AssemblyTitle("NoxReel Signaling Server")]
 [assembly: AssemblyDescription("NoxReel signaling server launcher")]
