@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.6.4-7C5CFF?style=for-the-badge" alt="Version 0.6.4">
+    <img src="https://img.shields.io/badge/version-0.6.5-7C5CFF?style=for-the-badge" alt="Version 0.6.5">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -51,14 +51,14 @@
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
 
 > [!IMPORTANT]
-> `v0.6.4` fixes a bug that could stall a transfer for good: after a signaling restart or a brief network hiccup, the reconnect handshake landed on the previous connection's remains — ICE renegotiated over a channel that was already dead, both sides believed they were negotiating, and the transfer stopped for good. Fixed on desktop and Android alike, and verified on real devices: a signaling restart no longer interrupts an in-flight transfer.
+> `v0.6.5` does four things. **Transfers are 2.6× faster**: chunk requests were refilled only by a 250 ms timer, and Chromium throttles timers in hidden windows to once a second — while you are watching, mpv sits on top of the NoxReel window, which capped throughput at 8 MB/s. Requests are now refilled the moment a chunk lands (measured: 285.8 MB in 15 s, down from 39 s). **Invite codes survive chat apps**: the old alphabet contained `_`, which Discord's `__underline__` rule strips from the copyable text (measured: 15% of codes on a typical home machine, 75% on multi-NIC machines). The alphabet is now markdown-neutral, and a code can be picked out of surrounding chat text. **Lossless slim-down**: drop unused audio tracks and image-based subtitles before sharing — no re-encoding, no quality loss. **Scan false positive fixed**: when third-party antivirus software has taken over and disabled Defender, NoxReel no longer claims a threat was found.
 
 ## Downloads
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv and yt-dlp and lets you choose the install folder | [NoxReel-Setup-0.6.4.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.4.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.6.4.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.4.exe) |
+| Windows full installer | Recommended. Bundles mpv and yt-dlp and lets you choose the install folder | [NoxReel-Setup-0.6.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.5.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.6.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.5.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -136,7 +136,7 @@ Local files use per-chunk verification and a contiguous playback watermark. A bo
 - The 10 GB limit is supported by manifest splitting and sparse-file logic; the largest current end-to-end real-media test is 1.75 GB.
 - Android remains a beta viewer and can receive local videos or host-resolved video links.
 - Website support changes with yt-dlp and the source site. If a short-lived stream expires, the host must switch to that link again.
-- Safe mode requires an available Microsoft Defender installation to automatically play local video received from another member. Trusted rooms start before the final scan and should be used only when every participant trusts the host and content source.
+- Safe mode requires a **running** Microsoft Defender to automatically play local video received from another member; playback is refused when the scan is unavailable or does not pass. On machines with third-party antivirus software installed, Defender is often taken over and disabled, so Safe mode cannot release any received file — the dependency status shows “Missing Defender” at startup when this happens. Trusted rooms start before the final scan, and an unavailable scanner only produces a warning rather than interrupting playback; use them only when every participant trusts the host and content source.
 
 </details>
 

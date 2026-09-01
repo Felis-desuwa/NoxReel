@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * 媒体兼容性检测与转封装。
+ * 媒体兼容性检测、转封装与无损精简。
  *
  * 规格：默认只做 remux（无损、快），不默认全量转码。
  *
@@ -12,6 +12,11 @@
  * faststart 就是把 moov 挪到文件头，代价只是重写一遍容器，不碰编码数据。
  *
  * MKV 天生就是流式容器（Cluster 自带时间戳），没这个问题。
+ *
+ * 另一件能减少传输量的事是「无损精简」。视频码流本身已经是 H.264/H.265 的输出，
+ * 熵接近满，再套一层 gzip/zstd 是零收益（实测 zstd 一个字节都压不掉，gzip 还会涨）。
+ * 不牺牲画质还能减字节的办法只剩一个：把这一场放映用不上的轨道丢掉 ——
+ * 多余音轨和图形字幕。见 slimPlan()。
  */
 
 const { spawn } = require('child_process');
@@ -24,6 +29,15 @@ const { findBin } = require('./findBin');
 // 所以按 MP4 的规则一视同仁：查 moov 位置，在末尾就转封装。
 const ISOBMFF_EXT = new Set(['.mp4', '.mov', '.m4v']);
 const SUPPORTED_EXT = new Set([...ISOBMFF_EXT, '.mkv']);
+
+// 图形字幕是一帧帧位图，一集能占几十甚至上百 MB；文本字幕（ASS/SRT）只有几百 KB。
+// 所以只丢前者 —— 丢文本字幕省不下什么，观众却直接没字幕看了。
+const GRAPHIC_SUB_CODECS = new Set([
+  'hdmv_pgs_subtitle',
+  'dvd_subtitle',
+  'dvb_subtitle',
+  'xsub',
+]);
 
 const FFMPEG_CANDIDATES =
   process.platform === 'win32'
@@ -38,6 +52,14 @@ const findTool = (name) =>
 
 const findFfmpeg = () => findTool('ffmpeg');
 const findFfprobe = () => findTool('ffprobe');
+
+function requireFfmpeg() {
+  const bin = findFfmpeg();
+  if (bin) return bin;
+  const err = new Error('没找到 ffmpeg。请安装后重试（winget install ffmpeg 或 scoop install ffmpeg），或设置环境变量 SYNCWATCH_FFMPEG_PATH');
+  err.code = 'FFMPEG_NOT_FOUND';
+  throw err;
+}
 
 function run(bin, args, { onStderr } = {}) {
   return new Promise((resolve, reject) => {
@@ -57,6 +79,17 @@ function run(bin, args, { onStderr } = {}) {
       else reject(new Error(`${path.basename(bin)} 退出码 ${code}：${err.slice(-600)}`));
     });
   });
+}
+
+/** 从 ffmpeg 的 stderr 里解出 time=，换算成 0..1 的进度。拿不到总时长就不报进度。 */
+function progressWatcher(total, onProgress) {
+  if (!onProgress || !total) return undefined;
+  return (s) => {
+    const m = /time=(\d+):(\d+):(\d+\.\d+)/.exec(s);
+    if (!m) return;
+    const secs = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+    onProgress(Math.max(0, Math.min(1, secs / total)));
+  };
 }
 
 /**
@@ -102,6 +135,26 @@ async function inspectMp4Faststart(filePath) {
   }
 }
 
+/**
+ * 取单条轨道的码率。
+ *
+ * MP4 一般直接给 bit_rate；MKV 基本都缺，但 mkvmerge 会往每条轨写 BPS 标签
+ * （番剧压制组几乎都用 mkvmerge），键名可能带语言后缀，比如 BPS-eng。
+ * 两处都没有就返回 null —— 上层据此只报「丢掉几条轨」，不编一个省量百分比出来。
+ */
+function streamBitRate(stream) {
+  const direct = parseInt(stream.bit_rate, 10);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+
+  for (const [key, value] of Object.entries(stream.tags || {})) {
+    const upper = key.toUpperCase();
+    if (upper !== 'BPS' && !upper.startsWith('BPS-')) continue;
+    const bps = parseInt(value, 10);
+    if (Number.isFinite(bps) && bps > 0) return bps;
+  }
+  return null;
+}
+
 /** ffprobe 拿编码信息。没装 ffprobe 不算致命错误，返回 null 让上层降级。 */
 async function probeStreams(filePath) {
   const bin = findFfprobe();
@@ -114,8 +167,21 @@ async function probeStreams(filePath) {
     filePath,
   ]);
   const data = JSON.parse(stdout);
-  const video = (data.streams || []).find((s) => s.codec_type === 'video') || null;
-  const audio = (data.streams || []).find((s) => s.codec_type === 'audio') || null;
+  const raw = data.streams || [];
+  const video = raw.find((s) => s.codec_type === 'video') || null;
+  const audio = raw.find((s) => s.codec_type === 'audio') || null;
+
+  const streams = raw.map((s) => ({
+    index: s.index,
+    codecType: s.codec_type || '',
+    codecName: s.codec_name || '',
+    bitRate: streamBitRate(s),
+    language: s.tags?.language || null,
+    title: s.tags?.title || null,
+    channels: s.channels || null,
+    isDefault: s.disposition?.default === 1,
+  }));
+
   return {
     duration: parseFloat(data.format?.duration) || 0,
     bitrate: parseInt(data.format?.bit_rate, 10) || 0,
@@ -124,6 +190,76 @@ async function probeStreams(filePath) {
     audioCodec: audio?.codec_name || null,
     width: video?.width || null,
     height: video?.height || null,
+    streams,
+  };
+}
+
+const EMPTY_SLIM_PLAN = Object.freeze({
+  available: false,
+  savableBytes: 0,
+  estimateComplete: true,
+  keep: [],
+  drop: [],
+  keepAudioIndex: null,
+  dropAudio: 0,
+  dropSubs: 0,
+});
+
+/**
+ * 算一份「无损精简」方案：只重写容器、不重编码，靠丢掉这一场用不上的轨来省体积。
+ *
+ * 省下来的大头是多余音轨（一条两小时的 AC3 5.1 就有 300MB 上下）和图形字幕。
+ * 必须留下的：视频轨、一条音轨、全部文本字幕，以及 MKV 的内嵌字体附件 ——
+ * 字体丢了 ASS 字幕会掉字形，那就不叫无损了。
+ */
+function slimPlan(probe) {
+  const streams = probe?.streams;
+  if (!Array.isArray(streams) || !streams.length) return EMPTY_SLIM_PLAN;
+
+  const audio = streams.filter((s) => s.codecType === 'audio');
+  const graphicSubs = streams.filter(
+    (s) => s.codecType === 'subtitle' && GRAPHIC_SUB_CODECS.has(s.codecName)
+  );
+  // 只有一条音轨又没有图形字幕，就没什么可丢的了。
+  if (audio.length <= 1 && !graphicSubs.length) return EMPTY_SLIM_PLAN;
+
+  const keepAudio = audio.find((s) => s.isDefault) || audio[0] || null;
+  const dropped = new Set([
+    ...audio.filter((s) => s !== keepAudio).map((s) => s.index),
+    ...graphicSubs.map((s) => s.index),
+  ]);
+  const keep = streams.filter((s) => !dropped.has(s.index));
+
+  const duration = probe.duration || 0;
+  let savableBytes = 0;
+  let estimateComplete = true;
+  for (const s of streams) {
+    if (!dropped.has(s.index)) continue;
+    if (!s.bitRate || !duration) {
+      estimateComplete = false; // 这条轨估不出来，别把总数说得像确数
+      continue;
+    }
+    savableBytes += Math.round((s.bitRate / 8) * duration);
+  }
+
+  // 每轨码率的可信度自查：各轨之和不该明显超过容器整体码率。对不上就说明标签
+  // 是陈的（有些工具会把 BPS 原样抄进重新压过的文件），这时候宁可说「估不出来」，
+  // 也别报一个必定落空的数字。实测正常文件这个比值在 0.97~1.00。
+  const declared = streams.reduce((sum, s) => sum + (s.bitRate || 0), 0);
+  if (probe.bitrate > 0 && declared > probe.bitrate * 1.15) {
+    estimateComplete = false;
+    savableBytes = 0;
+  }
+
+  return {
+    available: true,
+    savableBytes,
+    estimateComplete,
+    keep: keep.map((s) => s.index),
+    drop: [...dropped].sort((a, b) => a - b),
+    keepAudioIndex: keepAudio ? keepAudio.index : null,
+    dropAudio: Math.max(0, audio.length - 1),
+    dropSubs: graphicSubs.length,
   };
 }
 
@@ -133,6 +269,7 @@ async function probeStreams(filePath) {
  *   'ok'      —— 直接用
  *   'remux'   —— 需要转封装（无损，几十秒内搞定）
  *   'reject'  —— 格式不支持
+ * 另外带一份 slim 方案，告诉上层「还能无损省掉多少」。
  */
 async function inspect(filePath) {
   const ext = path.extname(filePath).toLowerCase();
@@ -156,15 +293,16 @@ async function inspect(filePath) {
   }
 
   const probe = await probeStreams(filePath).catch(() => null);
+  const slim = slimPlan(probe);
 
   if (ext === '.mkv') {
-    return { action: 'ok', ext, size: stat.size, probe, reason: 'MKV 是流式容器，可直接边下边播' };
+    return { action: 'ok', ext, size: stat.size, probe, slim, reason: 'MKV 是流式容器，可直接边下边播' };
   }
 
   const label = ext === '.mov' ? 'MOV' : 'MP4';
   const fs4 = await inspectMp4Faststart(filePath);
   if (fs4.faststart) {
-    return { action: 'ok', ext, size: stat.size, probe, faststart: true, reason: `${label} 索引已在文件头，可直接边下边播` };
+    return { action: 'ok', ext, size: stat.size, probe, slim, faststart: true, reason: `${label} 索引已在文件头，可直接边下边播` };
   }
 
   return {
@@ -172,6 +310,7 @@ async function inspect(filePath) {
     ext,
     size: stat.size,
     probe,
+    slim,
     faststart: false,
     reason: `${label} 的 moov 索引在文件末尾，顺序下载时要等整个文件下完才能起播。转封装把索引挪到开头即可，无损且不重编码。`,
   };
@@ -182,35 +321,60 @@ async function inspect(filePath) {
  * onProgress 收到 0..1 的进度（从 ffmpeg stderr 的 time= 里解出来）。
  */
 async function remux(filePath, outDir, { onProgress } = {}) {
-  const bin = findFfmpeg();
-  if (!bin) {
-    const err = new Error('没找到 ffmpeg。请安装后重试（winget install ffmpeg 或 scoop install ffmpeg），或设置环境变量 SYNCWATCH_FFMPEG_PATH');
-    err.code = 'FFMPEG_NOT_FOUND';
-    throw err;
-  }
+  const bin = requireFfmpeg();
 
   await fsp.mkdir(outDir, { recursive: true });
   const base = path.basename(filePath, path.extname(filePath));
   const outPath = path.join(outDir, `${base}.faststart.mp4`);
 
   const probe = await probeStreams(filePath).catch(() => null);
-  const total = probe?.duration || 0;
 
   await run(
     bin,
     ['-y', '-i', filePath, '-c', 'copy', '-movflags', '+faststart', outPath],
-    {
-      onStderr: (s) => {
-        if (!onProgress || !total) return;
-        const m = /time=(\d+):(\d+):(\d+\.\d+)/.exec(s);
-        if (!m) return;
-        const secs = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
-        onProgress(Math.max(0, Math.min(1, secs / total)));
-      },
-    }
+    { onStderr: progressWatcher(probe?.duration || 0, onProgress) }
   );
 
   return { outPath };
+}
+
+/** 按精简方案拼 ffmpeg 参数。抽出来单独测，不用真跑一遍 ffmpeg。 */
+function slimArgs(filePath, outPath, keepIndexes) {
+  const args = ['-y', '-i', filePath];
+  for (const index of keepIndexes) args.push('-map', `0:${index}`);
+  args.push('-c', 'copy');
+  // faststart 只对 ISOBMFF 有效。MKV 天生流式不需要，硬加 ffmpeg 会直接报错。
+  if (path.extname(outPath).toLowerCase() !== '.mkv') args.push('-movflags', '+faststart');
+  args.push(outPath);
+  return args;
+}
+
+/**
+ * 无损精简：丢掉多余音轨和图形字幕，-c copy 把留下的轨原样搬运。
+ *
+ * 输入是 MP4／MOV／M4V 时输出 MP4 并顺手加 +faststart —— 也就是说这一步
+ * 同时把转封装做了，需要 remux 的文件选了精简就不必再单独跑一次。
+ * 输入是 MKV 时输出仍是 MKV（保住 ASS 字幕和内嵌字体）。
+ */
+async function slim(filePath, outDir, { keepIndexes, onProgress } = {}) {
+  const bin = requireFfmpeg();
+
+  const ext = path.extname(filePath).toLowerCase();
+  const isMkv = ext === '.mkv';
+  await fsp.mkdir(outDir, { recursive: true });
+  const base = path.basename(filePath, ext);
+  const outPath = path.join(outDir, `${base}.slim${isMkv ? '.mkv' : '.mp4'}`);
+
+  const probe = await probeStreams(filePath).catch(() => null);
+  const plan = slimPlan(probe);
+  const indexes = Array.isArray(keepIndexes) && keepIndexes.length ? keepIndexes : plan.keep;
+  if (!indexes.length) throw new Error('没有可保留的轨道，无法精简');
+
+  await run(bin, slimArgs(filePath, outPath, indexes), {
+    onStderr: progressWatcher(probe?.duration || 0, onProgress),
+  });
+
+  return { outPath, plan };
 }
 
 function toolStatus() {
@@ -223,10 +387,15 @@ function toolStatus() {
 module.exports = {
   inspect,
   remux,
+  slim,
+  slimArgs,
+  slimPlan,
   probeStreams,
+  streamBitRate,
   inspectMp4Faststart,
   findFfmpeg,
   findFfprobe,
   toolStatus,
   SUPPORTED_EXT,
+  GRAPHIC_SUB_CODECS,
 };

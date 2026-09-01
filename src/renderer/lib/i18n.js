@@ -80,6 +80,35 @@ const EN = new Map(Object.entries({
   '不重新编码': 'without re-encoding',
   '，画质无损，通常几十秒完成。': ', with no quality loss. This usually takes a few seconds.',
   '产物': 'Output',
+  '优化传输体积（按需）': 'Optimize transfer size (when needed)',
+  '正在无损精简': 'Slimming losslessly',
+  '这一场要传哪个版本': 'Which version to share',
+  '这一场传哪个版本': 'Version to share',
+  '无损精简（推荐）': 'Lossless slim-down (recommended)',
+  '仅转封装（保留全部轨道）': 'Remux only (keep every track)',
+  '原样传输': 'Share as is',
+  '无损精简会做什么': 'What the slim-down does',
+  '丢掉': 'Drops',
+  '，保留下来的轨': ', and every kept track is ',
+  '原样搬运、不重新编码': 'copied over untouched, never re-encoded',
+  '，画质音质都不变，几秒到几十秒完成。': ', so picture and sound are unchanged. It finishes in seconds.',
+  '预计省下': 'Saves about',
+  '预计至少省下': 'Saves at least about',
+  '这个文件没有可靠的每轨码率，省下多少估不出来': 'This file has no reliable per-track bitrates, so the saving cannot be estimated.',
+  '不会做的事': 'What it will not do',
+  '不降码率、不降分辨率。视频码流已经是编码器的输出，再套一层通用压缩是零收益，所以传输过程中不做任何额外压缩。':
+    'It never lowers the bitrate or resolution. The video stream is already an encoder’s output, so a general-purpose compressor gains nothing on it; nothing extra is compressed during transfer.',
+  '生成一个新文件放进临时缓存，原文件不动，退房时自动清理。':
+    'A new file is written to the temporary cache. The original is untouched, and the copy is removed when you leave the room.',
+  '按这个方案继续': 'Continue with this plan',
+  '距起播还差': 'Left before playback starts',
+  '预计还需': 'about',
+  '安全模式 · 完整接收后才播，还剩': 'Safe mode · plays only after full receipt; remaining',
+  '所需码率': 'Required rate',
+  '当前速度追不上这个码率，边下边播会反复卡住；建议房主改用无损精简后的文件':
+    'The current speed cannot keep up with this bitrate, so progressive playback will stall repeatedly. Ask the host to share a losslessly slimmed file.',
+  '余量很薄，网络一抖就会卡': 'The margin is thin; any network hiccup will stall playback',
+  '速度充足，可稳定边下边播': 'Fast enough for steady progressive playback',
   '生成一个新文件，原文件不动。': 'A new temporary file is created; the original remains unchanged.',
   '转封装并继续': 'Remux and continue',
   '没法用这个文件': 'This file cannot be used',
@@ -209,6 +238,13 @@ const EN = new Map(Object.entries({
   '已暂停': 'Paused',
   '正在解析并连接原始视频…': 'Resolving and connecting to the original video…',
   '文件已接收，正在进行安全扫描…': 'File received. Running a security scan…',
+  '文件已完整接收，但本机扫描器不可用 —— 这份文件没有经过扫描':
+    'The file is fully received, but no local scanner is available — it has not been scanned.',
+  'Microsoft Defender —— 安全模式的扫描器': 'Microsoft Defender — the scanner Safe mode relies on',
+  '装着但没在运行，多半是被第三方杀毒软件接管了。安全模式下收到的文件会因此一律拒播；可以重新启用 Defender，或改用可信房间（风险自负）。':
+    'Installed but not running, most likely because third-party antivirus software took over. Safe mode will refuse every received file; re-enable Defender, or switch to a Trusted room at your own risk.',
+  '未找到。安全模式需要它才能放行收到的文件；可信房间不受影响。':
+    'Not found. Safe mode needs it before a received file can play; Trusted rooms are unaffected.',
   '安全扫描未通过，已阻止播放并清理缓存': 'Security scan did not pass. Playback was blocked and the cache was cleared.',
   '可信房间：正在接收片头，达到约 8 MB 后将边下边播…': 'Trusted room: receiving initial data; progressive playback starts at about 8 MB…',
   '正在完整接收并校验媒体，完成后会进行安全扫描…': 'Receiving and verifying the full media file. A security scan will run when complete…',
@@ -218,8 +254,6 @@ const EN = new Map(Object.entries({
   '可信房间（默认，边下边播）': 'Trusted room (default, progressive playback)',
   '请先退出当前房间，再打开新的邀请链接。': 'Leave the current room before opening another invite link.',
   '当前没有等待应答的零服务器邀请': 'There is no serverless invite currently waiting for an answer.',
-  'NoxReel 邀请链接无效': 'Invalid NoxReel invite link',
-  'NoxReel 邀请链接类型无效': 'Invalid NoxReel invite link type',
   'NoxReel 邀请链接不完整': 'Incomplete NoxReel invite link',
   '网站拒绝了自动解析，隔离浏览器也没有捕获到可播放媒体': 'The website rejected automatic parsing, and the isolated browser did not detect playable media',
   '可信房间（边下边播，风险较高）': 'Trusted room (progressive playback, higher risk)',
@@ -243,7 +277,8 @@ const EN = new Map(Object.entries({
   '密码': 'Password',
   '邀请码异常过长': 'The invite code is unexpectedly long',
   '这不像是一个 NoxReel 邀请码': 'This does not look like a NoxReel invite code',
-  '邀请码损坏或不完整 —— 复制的时候可能漏了一截': 'The invite code is damaged or incomplete—part of it may be missing',
+  '邀请码损坏或不完整 —— 可能是复制时漏了一截，也可能是被聊天软件的格式化改掉了字符；把码放进反引号里再发一次通常能解决':
+    'The invite code is damaged or incomplete. Part of it may be missing, or a chat app\u2019s formatting may have altered some characters \u2014 wrapping the code in backticks before sending usually fixes it.',
   '邀请码内容无法解析': 'The invite code could not be parsed',
   '信令服务器拒绝了连接': 'The signaling server rejected the connection',
   '数据通道未打开': 'The data channel is not open',
@@ -257,7 +292,9 @@ const EN = new Map(Object.entries({
   '视频链接解析器返回了无法识别的数据': 'The video link parser returned unrecognized data',
   '当前只支持单个视频链接，不支持播放列表或频道页面': 'Only individual video URLs are supported; playlists and channel pages are not',
   '未找到可用的 Microsoft Defender 扫描器': 'No usable Microsoft Defender scanner was found',
-  '安全扫描发现威胁或无法安全完成扫描': 'The security scan found a threat or could not complete safely',
+  '安全扫描发现威胁': 'The security scan found a threat',
+  'Microsoft Defender 没能完成扫描，本机可能已把它关闭或交给第三方杀毒软件接管':
+    'Microsoft Defender could not finish the scan. It may be turned off on this computer, or handed over to third-party antivirus software.',
   '安全扫描超时': 'The security scan timed out',
   '接收文件尚未完整校验': 'The received file has not been fully verified',
   '不是一个文件': 'The selected path is not a file',
@@ -288,6 +325,8 @@ const EN = new Map(Object.entries({
   '拒绝删除缓存根目录之外的路径': 'Refused to delete a path outside the cache root'
 }));
 
+const trimEnd = (text) => String(text).replace(/[.。]+$/, '');
+
 const EN_PATTERNS = [
   [/^观众-(\d+)$/, 'Viewer-$1'],
   [/^已复制完整 (\d+) 字符 ✓$/, 'Copied all $1 characters ✓'],
@@ -296,6 +335,9 @@ const EN_PATTERNS = [
   [/^缺少 (.+)$/, 'Missing $1'],
   [/^已找到：$/, 'Found:'],
   [/^已转封装到：(.*)$/, 'Remuxed to: $1'],
+  [/^已精简到：(.*)$/, 'Slimmed to: $1'],
+  [/^(\d+) 条多余音轨$/, (_all, n) => `${n} extra audio track${n === '1' ? '' : 's'}`],
+  [/^(\d+) 条图形字幕$/, (_all, n) => `${n} image-based subtitle track${n === '1' ? '' : 's'}`],
   [/^已切换到：(.*)$/, 'Switched to: $1'],
   [/^已切换到链接：(.*)$/, 'Switched to link: $1'],
   [/^(.*)\n\n如果对方没有部署信令服务器，让他改用「极简模式」生成邀请码 —— 那个不需要服务器。$/, '$1\n\nIf the other person has no signaling server, ask them to use Manual mode, which requires no server.'],
@@ -357,6 +399,16 @@ const EN_PATTERNS = [
   [/^没找到 yt-dlp，无法解析视频网页。请重新安装完整版本，或设置 (.*)。$/, 'yt-dlp was not found, so video pages cannot be parsed. Reinstall the full build or set $1.'],
   [/^文件超过 10GB 上限（当前 (.+)GB）$/, 'File exceeds the 10 GB limit (current size: $1 GB)'],
   [/^安全扫描失败（代码 (.+)）$/, 'Security scan failed (code $1)'],
+  [
+    /^(.*)。可信房间不因此中断播放，但这份文件始终没有经过本机扫描 —— 请自行确认片源可信。$/,
+    (_all, detail) =>
+      `${trimEnd(translate(detail, 'en'))}. The trusted room keeps playing, but this file was never scanned on your computer — make sure you trust the source.`,
+  ],
+  [
+    /^(.*)。安全模式必须扫过才放行；你可以启用 Microsoft Defender，或改用可信房间（风险自负）。$/,
+    (_all, detail) =>
+      `${trimEnd(translate(detail, 'en'))}. Safe mode plays a file only after it is scanned; enable Microsoft Defender, or switch to a Trusted room at your own risk.`,
+  ],
   [/^连接 mpv IPC 超时：(.*)$/, 'Timed out connecting to mpv IPC: $1'],
   [/^mpv 命令超时：(.*)$/, 'mpv command timed out: $1'],
   [/^读取分片 (\d+) 失败：期望 (\d+) 字节，实际 (\d+)$/, 'Failed to read chunk $1: expected $2 bytes, got $3'],

@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.6.4-7C5CFF?style=for-the-badge" alt="Version 0.6.4">
+    <img src="https://img.shields.io/badge/version-0.6.5-7C5CFF?style=for-the-badge" alt="Version 0.6.5">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -51,14 +51,14 @@
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!IMPORTANT]
-> `v0.6.4` 修好一个会让传输永久卡死的问题：信令服务器重启或网络抖一下之后，双方重连时的握手会落在上一轮的残骸连接上 —— ICE 在一条已经废掉的通道里重来一遍，双方都以为在协商，传输就此停住再也不恢复。桌面端与 Android 端同时修复，实机验证过信令服务器重启后传输毫无中断。
+> `v0.6.5` 做了四件事。**传输快了 2.6 倍**：补片原本只靠 250ms 定时器驱动，而 Chromium 会把不可见窗口的定时器节流到 1 秒一次 —— 看片时 mpv 正压在 NoxReel 窗口上，于是吞吐被硬卡在 8 MB/s；现在改成分片一落地就立刻补请求（实测 285.8 MB 从 39 秒降到 15 秒）。**邀请码不再被聊天软件改坏**：旧字母表含 `_`，Discord 的 `__下划线__` 会把它从可复制文本里删掉（实测常见家用机 15%、多网卡机 75% 的码作废），现已换用 markdown 中性的字符集，并且改成能从一段聊天文本里把码提取出来。**新增无损精简**：发片前可丢掉多余音轨与图形字幕，不重编码、画质零损失。**修复安全扫描误报**：Defender 被第三方杀毒软件接管停用时，不再谎报「发现威胁」。
 
 ## 下载
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，可选择安装文件夹 | [NoxReel-Setup-0.6.4.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.4.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.6.4.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.4.exe) |
+| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，可选择安装文件夹 | [NoxReel-Setup-0.6.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.5.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.6.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.5.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -136,7 +136,7 @@
 - 10 GB 上限已覆盖清单拆分和稀疏文件逻辑；目前真实媒体端到端测试规模为 1.75 GB。
 - Android 版本仍处于测试阶段，可作为观众接收本地视频或房主解析的视频链接。
 - 网站支持范围会随 yt-dlp 和原网站变化；短时效播放地址过期后，需要房主重新切换该链接。
-- 安全模式需要可用的 Microsoft Defender 才能自动播放其他成员传来的本地视频；扫描不可用或未通过时会拒绝播放。可信房间会在完整扫描前开始播放，只适合双方都信任房主与内容来源的场景。
+- 安全模式需要**正在运行**的 Microsoft Defender 才能自动播放其他成员传来的本地视频；扫描不可用或未通过时会拒绝播放。装了 360、火绒等第三方杀毒软件的机器上 Defender 往往已被接管停用，这时安全模式无法放行任何接收到的文件——启动时依赖状态里会直接提示「缺少 Defender」。可信房间会在完整扫描前开始播放，扫描器不可用时只警告、不中断播放，只适合双方都信任房主与内容来源的场景。
 
 </details>
 

@@ -214,6 +214,12 @@ function updateDepsPill() {
   if (!S.env.mpv) missing.push('mpv');
   if (!S.env.ffmpeg) missing.push('ffmpeg');
   if (!S.env.ytDlp) missing.push('yt-dlp');
+  // 安全模式对用户的全部承诺就是「扫过才放行」。Defender 没在跑的话（最常见的原因
+  // 是被第三方杀毒软件接管），这个模式下收到的每份文件都会被拒播 —— 这话得在开传
+  // 之前说，而不是等人守着传完一整部片再报错。
+  if (normalizeSecurityMode(S.settings.securityMode) === 'safe' && S.env.defenderRunning === false) {
+    missing.push('Defender');
+  }
 
   if (!missing.length) {
     pill.textContent = '依赖就绪';
@@ -246,6 +252,13 @@ function showDepsHelp() {
         'yt-dlp —— 视频网页解析（按需）',
         S.env.ytDlp,
         '未找到。MP4/HLS 直链仍可播放，视频网站页面链接不可用。'
+      ),
+      dependency(
+        'Microsoft Defender —— 安全模式的扫描器',
+        S.env.defenderRunning ? S.env.defender : null,
+        S.env.defenderRunning === false
+          ? '装着但没在运行，多半是被第三方杀毒软件接管了。安全模式下收到的文件会因此一律拒播；可以重新启用 Defender，或改用可信房间（风险自负）。'
+          : '未找到。安全模式需要它才能放行收到的文件；可信房间不受影响。'
       ),
       field(
         '安装方式（任选其一）',
@@ -337,7 +350,7 @@ async function startHost(filePath) {
 
   const steps = [
     { label: '检查格式与兼容性', state: 'active' },
-    { label: '转封装（按需）', state: '' },
+    { label: '优化传输体积（按需）', state: '' },
     { label: '计算分片校验值', state: '' },
     { label: '创建房间', state: '' },
   ];
@@ -351,32 +364,46 @@ async function startHost(filePath) {
       return prepFail(info.reason);
     }
 
-    if (info.action === 'remux') {
+    // 两种情况需要房主拿主意：非转封装不可，或者还有可无损省下的体积。
+    // 都不沾边就别拿一个只有一个选项的弹窗去烦他。
+    const needsRemux = info.action === 'remux';
+    const canSlim = info.slim?.available === true;
+
+    if (needsRemux || canSlim) {
       steps[0].state = 'done';
       steps[1].state = 'active';
       setSteps(steps);
       $('prep-note').textContent = info.reason;
 
-      if (!S.env.ffmpeg) {
+      if (!S.env.ffmpeg && needsRemux) {
         return prepFail(
           '这个 MP4 需要转封装才能边下边播，但没找到 ffmpeg。装上 ffmpeg 后重试，或者换一个 MKV 文件。'
         );
       }
 
-      const ok = await confirmRemux(info);
-      if (!ok) return backHome();
+      // 没有 ffmpeg 时「本来还能再省一点」不该拦住放映，照原样走就是了。
+      const plan = S.env.ffmpeg ? await choosePrepPlan(info, { needsRemux, canSlim }) : 'as-is';
+      if (!plan) return backHome();
 
-      $('prep-title').textContent = '正在转封装';
-      const off = window.sw.media.onRemuxProgress(({ progress }) => {
-        $('prep-bar').style.width = `${(progress * 100).toFixed(1)}%`;
-      });
-      try {
-        const { outPath } = await window.sw.media.remux(filePath);
-        filePath = outPath;
-        temporaryPath = outPath;
-        $('prep-note').textContent = `已转封装到：${outPath}`;
-      } finally {
-        off();
+      if (plan !== 'as-is') {
+        const slimming = plan === 'slim';
+        $('prep-title').textContent = slimming ? '正在无损精简' : '正在转封装';
+        const onProgress = ({ progress }) => {
+          $('prep-bar').style.width = `${(progress * 100).toFixed(1)}%`;
+        };
+        const off = slimming
+          ? window.sw.media.onSlimProgress(onProgress)
+          : window.sw.media.onRemuxProgress(onProgress);
+        try {
+          const { outPath } = slimming
+            ? await window.sw.media.slim(filePath)
+            : await window.sw.media.remux(filePath);
+          filePath = outPath;
+          temporaryPath = outPath;
+          $('prep-note').textContent = slimming ? `已精简到：${outPath}` : `已转封装到：${outPath}`;
+        } finally {
+          off();
+        }
       }
     }
 
@@ -405,7 +432,13 @@ async function startHost(filePath) {
     steps[3].state = 'active';
     setSteps(steps);
 
-    manifest = { ...manifest, roomRevision: S.mediaRevision + 1 };
+    // 时长跟着清单一起过去 —— 接收方靠它在还没起播时就能算出「这个片子需要多少
+    // 码率」，进而判断当前速度追不追得上。转封装和精简都不改时长，用原始探测值即可。
+    manifest = {
+      ...manifest,
+      roomRevision: S.mediaRevision + 1,
+      ...(info.probe?.duration > 0 ? { durationSec: info.probe.duration } : {}),
+    };
     const state = await window.sw.store.openSeed(manifest, filePath);
     preparedSessionId = state.sessionId;
 
@@ -550,32 +583,91 @@ async function activateLinkSession(linkInfo, { revision, broadcast = false } = {
   }
 }
 
-function confirmRemux(info) {
+/**
+ * 选这一场到底传哪个版本的文件。
+ *
+ * 想少传字节，无损的路只有一条：把这一场用不上的轨丢掉（多余音轨、图形字幕）。
+ * 视频码流本身压不动 —— H.264/H.265 的输出熵接近满，再套一层通用压缩是零收益，
+ * 所以传输过程里不做任何额外压缩，这个面板里也只给无损选项。
+ */
+function choosePrepPlan(info, { needsRemux, canSlim }) {
+  const slim = info.slim || {};
+  // 每一段各自过一次翻译再拼 —— 拼完再翻的话，字典里得为每种轨道组合都写一条，
+  // 那是不可能穷举的。
+  const dropped = [
+    slim.dropAudio > 0 ? t(`${slim.dropAudio} 条多余音轨`) : null,
+    slim.dropSubs > 0 ? t(`${slim.dropSubs} 条图形字幕`) : null,
+  ]
+    .filter(Boolean)
+    .join(currentLocale() === 'en' ? ', ' : '、');
+  // 容器没写每轨码率时（MKV 常见）就别硬凑一个数字出来。
+  const saving =
+    slim.savableBytes > 0
+      ? `${t(slim.estimateComplete ? '预计省下' : '预计至少省下')} ${fmtBytes(slim.savableBytes)}`
+      : '这个文件没有可靠的每轨码率，省下多少估不出来';
+
   return new Promise((resolve) => {
+    let picked = canSlim ? 'slim' : needsRemux ? 'remux' : 'as-is';
     openModal({
-      title: '这个文件需要先转封装',
+      title: '这一场要传哪个版本',
       body: () => {
-        const action = field(
-          '会做什么',
-          hint(
-            '只重写容器外壳，把索引挪到文件开头。视频和音频数据原样搬运，',
-            make('b', { text: '不重新编码' }),
-            '，画质无损，通常几十秒完成。'
+        const options = [];
+        if (canSlim) {
+          options.push(
+            make('option', { attrs: { value: 'slim' }, props: { selected: true }, text: '无损精简（推荐）' })
+          );
+        }
+        options.push(
+          needsRemux
+            ? make('option', {
+                attrs: { value: 'remux' },
+                props: { selected: !canSlim },
+                text: '仅转封装（保留全部轨道）',
+              })
+            : make('option', { attrs: { value: 'as-is' }, props: { selected: !canSlim }, text: '原样传输' })
+        );
+
+        const select = make('select', { id: 'prep-plan' }, options);
+        select.value = picked;
+        select.onchange = () => {
+          picked = select.value;
+        };
+
+        const parts = [];
+        if (needsRemux) parts.push(make('p', { className: 'fine', text: info.reason }));
+        parts.push(field('这一场传哪个版本', select));
+        if (canSlim) {
+          parts.push(
+            field(
+              '无损精简会做什么',
+              hint(
+                '丢掉 ',
+                make('b', { props: { textContent: dropped } }),
+                '，保留下来的轨',
+                make('b', { text: '原样搬运、不重新编码' }),
+                '，画质音质都不变，几秒到几十秒完成。'
+              ),
+              hint(saving)
+            )
+          );
+        }
+        parts.push(
+          field(
+            '不会做的事',
+            hint(
+              '不降码率、不降分辨率。视频码流已经是编码器的输出，再套一层通用压缩是零收益，所以传输过程中不做任何额外压缩。'
+            )
           )
         );
-        action.style.marginTop = '14px';
-        return [
-          make('p', { className: 'fine', text: info.reason }),
-          action,
-          field('产物', hint('生成一个新文件，原文件不动。')),
-        ];
+        parts.push(field('产物', hint('生成一个新文件放进临时缓存，原文件不动，退房时自动清理。')));
+        return parts;
       },
-      okText: '转封装并继续',
+      okText: '按这个方案继续',
       onOk: () => {
-        resolve(true);
+        resolve(picked);
         return true;
       },
-      onCancel: () => resolve(false),
+      onCancel: () => resolve(null),
     });
   });
 }
@@ -1167,7 +1259,8 @@ function maybeLaunchPlayer(p) {
 async function verifyReceivedMedia() {
   const sessionId = S.sessionId;
   if (!sessionId || S.isSeeder || S.mediaSafety.sessionId !== sessionId) return;
-  if (['scanning', 'clean', 'blocked'].includes(S.mediaSafety.status)) return;
+  // unscanned 也要挡住：扫描器都确认不可用了，没必要每次进度事件再去启一遍 MpCmdRun。
+  if (['scanning', 'clean', 'blocked', 'unscanned'].includes(S.mediaSafety.status)) return;
   S.mediaSafety.status = 'scanning';
   renderStatus();
   let result;
@@ -1190,8 +1283,27 @@ async function verifyReceivedMedia() {
     return;
   }
 
+  // 「扫描器没跑起来」和「发现威胁」是两回事，不能一样处理。
+  //
+  // 可信房间从 8MB 片头就开始播了，整场本来就没经过扫描 —— 到最后一刻才发现
+  // 扫描器根本没运行，等于什么新信息都没拿到。这时候杀掉 mpv、删掉刚收完的缓存
+  // 是纯损失（装了第三方杀软的机器每一场都会这样）。所以只警告，不打断。
+  //
+  // 安全模式恰恰相反：它对用户的全部承诺就是「扫过才放行」，扫不成就只能拒绝，
+  // 否则这个模式本身就没有意义了。
+  if (result.status === 'unavailable' && S.roomSecurityMode === 'trusted') {
+    S.mediaSafety.status = 'unscanned';
+    log(`${result.message}。可信房间不因此中断播放，但这份文件始终没有经过本机扫描 —— 请自行确认片源可信。`, 'warn');
+    window.sw.mpv.osd('未经本机扫描 · 请自行确认片源', 4000);
+    renderStatus();
+    return;
+  }
+
   S.mediaSafety.status = 'blocked';
-  const message = result.message || '安全扫描未通过';
+  const message =
+    result.status === 'unavailable'
+      ? `${result.message || '本机没有可用的安全扫描器'}。安全模式必须扫过才放行；你可以启用 Microsoft Defender，或改用可信房间（风险自负）。`
+      : result.message || '安全扫描未通过';
   log(`已阻止打开接收文件：${message}`, 'bad');
   await window.sw.mpv.quit().catch(() => {});
   S.swarm?.clearSession();
@@ -1581,6 +1693,8 @@ function renderProgress(p) {
     stat('速度', fmtRate(p.downRate))
   );
 
+  renderTransferVerdict(p);
+
   replace(
     'transfer-stats',
     kv('已收', fmtBytes(p.received)),
@@ -1595,6 +1709,63 @@ function renderProgress(p) {
     const byte = S.swarm.scheduler?.positionToByte(snap.position || 0, snap.streamPos) || 0;
     S.swarm.setPlaybackByte(byte);
   }
+}
+
+/**
+ * 传输诊断：把「这个片子需要多少码率」和「实际收多快」摆在一起。
+ *
+ * 所需码率 = 文件大小 ÷ 时长，也就是 scheduler.bytesPerSecond —— 直接复用它，
+ * 不重写第二遍同一个公式。起播后 mpv 报真时长，起播前用清单里房主带来的 durationSec。
+ * 追不上就早点说，别让人对着一个反复卡住的进度条猜原因。
+ */
+function renderTransferVerdict(p) {
+  const node = $('buf-verdict');
+  if (!node) return;
+  node.className = 'buffer-verdict';
+
+  if (S.isSeeder || p.complete || !S.manifest || S.sourceType === 'link') {
+    node.classList.add('hidden');
+    return;
+  }
+
+  const need = S.swarm?.scheduler?.bytesPerSecond || 0;
+  const rate = p.downRate || 0;
+  const parts = [];
+
+  if (S.roomSecurityMode === 'trusted') {
+    if (!S.mpvRunning) {
+      const left = Math.max(0, Math.min(HEAD_READY_BYTES, S.manifest.size) - p.contiguousBytes);
+      parts.push(stat('距起播还差', fmtBytes(left)));
+      if (rate > 0) parts.push(stat('预计还需', fmtTime(left / rate)));
+    }
+  } else {
+    // 安全模式要等整片收完再扫描，这件事得说在前面，不然只会觉得「怎么一直不播」。
+    const remaining = Math.max(0, Math.round((1 - p.ratio) * S.manifest.size));
+    parts.push(stat('安全模式 · 完整接收后才播，还剩', fmtBytes(remaining)));
+    if (rate > 0) parts.push(stat('预计还需', fmtTime(remaining / rate)));
+  }
+
+  if (need > 0) {
+    parts.push(stat('所需码率', fmtRate(need)));
+    if (rate > 0) {
+      const margin = rate / need;
+      if (margin < 1) {
+        node.classList.add('bad');
+        parts.push(make('span', { text: '当前速度追不上这个码率，边下边播会反复卡住；建议房主改用无损精简后的文件' }));
+      } else if (margin < 1.2) {
+        node.classList.add('warn');
+        parts.push(make('span', { text: '余量很薄，网络一抖就会卡' }));
+      } else {
+        parts.push(make('span', { text: '速度充足，可稳定边下边播' }));
+      }
+    }
+  }
+
+  if (!parts.length) {
+    node.classList.add('hidden');
+    return;
+  }
+  replace(node, ...parts);
 }
 
 /** 画分片位图。空洞在这里一眼可见 —— 「下了 90% 却播不了」就是这么来的。 */
@@ -1744,6 +1915,8 @@ function renderStatus() {
       ? '文件已接收，正在进行安全扫描…'
       : S.mediaSafety.status === 'blocked'
       ? '安全扫描未通过，已阻止播放并清理缓存'
+      : S.mediaSafety.status === 'unscanned'
+      ? '文件已完整接收，但本机扫描器不可用 —— 这份文件没有经过扫描'
       : S.roomSecurityMode === 'trusted'
       ? '可信房间：正在接收片头，达到约 8 MB 后将边下边播…'
       : '正在完整接收并校验媒体，完成后会进行安全扫描…';
@@ -1988,6 +2161,8 @@ $('btn-settings').onclick = () => {
       localStorage.setItem('sw.turnUrl', S.settings.turnUrl);
       localStorage.setItem('sw.turnUser', S.settings.turnUser);
       localStorage.setItem('sw.turnPass', S.settings.turnPass);
+      // 切到安全模式时依赖胶囊要重算 —— Defender 没在跑这件事只在安全模式下算缺件。
+      updateDepsPill();
       if (languageChanged) setTimeout(() => location.reload(), 0);
       return true;
     },

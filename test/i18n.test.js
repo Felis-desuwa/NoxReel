@@ -33,6 +33,46 @@ test('桌面端固定文案和动态状态可翻译为英文', async () => {
   assert.equal(translate('设置', 'zh-CN'), '设置');
 });
 
+test('无损精简与传输诊断的新文案都有英文', async () => {
+  const { translate } = await import('../src/renderer/lib/i18n.js');
+  assert.equal(translate('这一场要传哪个版本', 'en'), 'Which version to share');
+  assert.equal(translate('无损精简（推荐）', 'en'), 'Lossless slim-down (recommended)');
+  assert.equal(translate('仅转封装（保留全部轨道）', 'en'), 'Remux only (keep every track)');
+  assert.equal(translate('原样传输', 'en'), 'Share as is');
+  assert.equal(translate('优化传输体积（按需）', 'en'), 'Optimize transfer size (when needed)');
+  assert.equal(translate('所需码率', 'en'), 'Required rate');
+  // 中文不需要空格，英文需要 —— 这里丢了空格会渲染成「track iscopied over」
+  assert.equal(translate('，保留下来的轨', 'en'), ', and every kept track is ');
+  assert.equal(translate('速度充足，可稳定边下边播', 'en'), 'Fast enough for steady progressive playback');
+  assert.equal(translate('已精简到：C:/tmp/film.slim.mkv', 'en'), 'Slimmed to: C:/tmp/film.slim.mkv');
+  // 轨道数量是动态的，单复数得跟着变
+  assert.equal(translate('1 条多余音轨', 'en'), '1 extra audio track');
+  assert.equal(translate('2 条多余音轨', 'en'), '2 extra audio tracks');
+  assert.equal(translate('1 条图形字幕', 'en'), '1 image-based subtitle track');
+  assert.equal(translate('3 条图形字幕', 'en'), '3 image-based subtitle tracks');
+  assert.equal(
+    translate('这个文件没有可靠的每轨码率，省下多少估不出来', 'en'),
+    'This file has no reliable per-track bitrates, so the saving cannot be estimated.'
+  );
+  assert.equal(translate('这一场要传哪个版本', 'zh-CN'), '这一场要传哪个版本');
+});
+
+test('扫描器不可用的提示有英文，且拼接后不会出现双句点', async () => {
+  const { translate } = await import('../src/renderer/lib/i18n.js');
+  const base = 'Microsoft Defender 没能完成扫描，本机可能已把它关闭或交给第三方杀毒软件接管';
+  assert.equal(translate('安全扫描发现威胁', 'en'), 'The security scan found a threat');
+  assert.match(translate(base, 'en'), /^Microsoft Defender could not finish the scan\./);
+
+  const trusted = translate(`${base}。可信房间不因此中断播放，但这份文件始终没有经过本机扫描 —— 请自行确认片源可信。`, 'en');
+  assert.match(trusted, /software\. The trusted room keeps playing/, '前半句的句号要削掉，别拼成 software..');
+  assert.doesNotMatch(trusted, /\.\./);
+
+  const safe = translate(`已阻止打开接收文件：${base}。安全模式必须扫过才放行；你可以启用 Microsoft Defender，或改用可信房间（风险自负）。`, 'en');
+  assert.match(safe, /^Blocked the received file: /);
+  assert.match(safe, /Safe mode plays a file only after it is scanned/);
+  assert.doesNotMatch(safe, /\.\./);
+});
+
 test('Android 观众端提供相同的中英语言入口', async () => {
   const { translate } = await import('../android/app/src/main/assets/js/i18n.js');
   assert.equal(translate('界面语言', 'en'), 'Interface language');

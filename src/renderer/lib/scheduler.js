@@ -19,7 +19,9 @@ export class Scheduler {
     this.manifest = manifest;
     this.lookaheadSeconds = lookaheadSeconds;
     this.maxInflightPerPeer = maxInflightPerPeer;
-    this.duration = 0; // 由 mpv 报上来
+    // 起播之后由 mpv 报真值。起播之前先用清单里房主带来的时长兜底 ——
+    // 接收端要在还没开播时就能回答「这个片子需要多少码率、我现在的速度追不追得上」。
+    this.duration = manifest?.durationSec > 0 ? manifest.durationSec : 0;
   }
 
   setDuration(d) {

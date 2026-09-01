@@ -247,6 +247,9 @@ secureHandle('env:status', async () => {
     platform: process.platform,
     version: app.getVersion(),
     defender: malwareScan.findDefender(),
+    // 光有 MpCmdRun.exe 不代表它能扫 —— 被第三方杀软接管停用时文件照样在。
+    // true/false/null（问不出来），安全模式靠它提前把话说清楚。
+    defenderRunning: await malwareScan.isDefenderRunning().catch(() => null),
   };
 });
 
@@ -279,6 +282,26 @@ secureHandle('media:remux', async (filePath) => {
     });
     remuxOutputs.set(outPath, ownedDir);
     return { outPath };
+  } catch (error) {
+    await cache.removeOwned(ownedDir).catch(() => {});
+    throw error;
+  }
+});
+
+// 精简产物和转封装产物走同一套生命周期：写进 remuxOutputs，之后由 media:releaseTemp
+// 回收，或者被 store:openSeed 接管成会话自有目录。别再开第二张表。
+secureHandle('media:slim', async (payload) => {
+  const { filePath, keepIndexes } = validate.plainObject(payload, '精简参数');
+  const source = await requireAllowedLocalPath(filePath);
+  const opts = validate.slimOptions({ keepIndexes });
+  const ownedDir = await cache.createOwnedDir('slim');
+  try {
+    const { outPath, plan } = await media.slim(source, ownedDir, {
+      keepIndexes: opts.keepIndexes,
+      onProgress: (p) => send('media:slimProgress', { progress: p }),
+    });
+    remuxOutputs.set(outPath, ownedDir);
+    return { outPath, plan };
   } catch (error) {
     await cache.removeOwned(ownedDir).catch(() => {});
     throw error;

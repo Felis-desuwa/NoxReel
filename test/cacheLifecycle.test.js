@@ -154,3 +154,38 @@ test('清单缓存命中未修改文件，并在文件变化后失效', async (t
   const changed = await store.buildManifest(file);
   assert.notEqual(changed.fileId, first.fileId);
 });
+
+test('精简产物走的是和转封装同一条回收路径', async (t) => {
+  const root = await tempDir(t, 'noxreel-slim-');
+  const manager = new CacheManager({ rootDir: path.join(root, 'cache') });
+  await manager.initialize();
+  store.configureCache(manager);
+  store._testing.reset();
+
+  const source = path.join(root, 'original.mkv');
+  const chunk = Buffer.from('original-video');
+  await fsp.writeFile(source, chunk);
+  const manifest = manifestFor('original.mkv', [chunk]);
+
+  const slimDir = await manager.createOwnedDir('slim');
+  const slimPath = path.join(slimDir, 'original.slim.mkv');
+  await fsp.writeFile(slimPath, chunk);
+  const state = await store.openSeed(manifest, slimPath, { ownedDir: slimDir });
+  await store.close(state.sessionId);
+
+  assert.equal(fs.existsSync(slimDir), false, '精简副本应当随会话一起回收');
+  assert.equal(fs.existsSync(source), true, '用户自己的源文件永远不动');
+  await manager.cleanupRun();
+});
+
+test('media:slim 复用 remuxOutputs，不另开第二张临时文件表', () => {
+  const main = fs.readFileSync(path.join(__dirname, '..', 'src/main/main.js'), 'utf8');
+  assert.match(main, /secureHandle\('media:slim'/);
+  // 精简产物必须登记进这张表：media:releaseTemp 和 store:openSeed 的 ownedDir
+  // 交接都只认它。另起一张表就等于把临时文件的回收路径断在半路。
+  const handler = main.slice(main.indexOf("secureHandle('media:slim'"));
+  const body = handler.slice(0, handler.indexOf('\n});'));
+  assert.match(body, /remuxOutputs\.set\(outPath, ownedDir\)/);
+  assert.match(body, /cache\.removeOwned\(ownedDir\)/, '精简失败时必须把已建的目录删掉');
+  assert.match(body, /validate\.slimOptions/, '要保留的轨道下标来自渲染进程，必须过校验');
+});

@@ -487,6 +487,16 @@ export class Swarm extends Emitter {
     } catch (e) {
       console.error(`[swarm] 写入分片 ${index} 出错:`, e);
       this.emit('error', e);
+    } finally {
+      // 一片落地就立刻把空出来的名额补上，别干等下一个 tick。
+      //
+      // 这条不是锦上添花：Chromium 会把不可见窗口的定时器节流到 1 秒一次，
+      // 而「正在看片」恰恰就是 NoxReel 窗口不可见的时候 —— mpv 是另一个窗口，
+      // 就压在它上面。于是 TICK_MS 的 250ms 变成 1000ms，每秒最多补
+      // MAX_INFLIGHT_PER_PEER 片，吞吐被硬卡在 4 × 2MB = 8 MB/s，
+      // 网络再快也没用（实测回环链路正好停在 7.7 MB/s）。
+      // 数据通道的消息事件不受节流，把补片挂在它上面，定时器退回兜底角色。
+      this._tick();
     }
   }
 

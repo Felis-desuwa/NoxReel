@@ -65,7 +65,8 @@ const EN = new Map(Object.entries({
   '游客': 'Guest',
   '邀请码异常过长': 'The invite code is unexpectedly long',
   '这不像是一个 NoxReel 邀请码': 'This does not look like a NoxReel invite code',
-  '邀请码损坏或不完整 —— 复制的时候可能漏了一截': 'The invite code is damaged or incomplete—part of it may be missing',
+  '邀请码损坏或不完整 —— 可能是复制时漏了一截，也可能是被聊天软件的格式化改掉了字符；把码放进反引号里再发一次通常能解决':
+    'The invite code is damaged or incomplete. Part of it may be missing, or a chat app\u2019s formatting may have altered some characters \u2014 wrapping the code in backticks before sending usually fixes it.',
   '邀请码内容无法解析': 'The invite code could not be parsed',
   '信令服务器拒绝了连接': 'The signaling server rejected the connection'
 }));

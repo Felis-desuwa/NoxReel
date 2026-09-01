@@ -122,7 +122,21 @@ function manifest(value) {
     if (typeof hash !== 'string' || !HASH_RE.test(hash)) fail('分片哈希');
   }
   if (data.roomRevision !== undefined) integer(data.roomRevision, '房间版本', { min: 0 });
+  // 时长是可选的诊断信息（房主的 ffprobe 给的）。接收端靠它在起播之前就能算出
+  // 「这个片子需要多少码率」，从而判断当前速度追不追得上。缺了不影响传输。
+  if (data.durationSec !== undefined) finiteNumber(data.durationSec, '媒体时长', { min: 0, max: 86400 });
   return data;
+}
+
+/** 无损精简参数：要保留的轨道下标。轨道数不会多到哪去，给个宽松上限挡住畸形输入。 */
+function slimOptions(value) {
+  const data = plainObject(value, '精简参数');
+  const raw = data.keepIndexes;
+  if (raw === undefined || raw === null) return { keepIndexes: null };
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 64) fail('精简参数');
+  const keepIndexes = raw.map((i) => integer(i, '轨道下标', { min: 0, max: 1023 }));
+  if (new Set(keepIndexes).size !== keepIndexes.length) fail('精简参数');
+  return { keepIndexes };
 }
 
 function sessionId(value) {
@@ -167,5 +181,6 @@ module.exports = {
   plainObject,
   publicHttpUrl,
   sessionId,
+  slimOptions,
   string,
 };

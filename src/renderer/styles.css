@@ -556,6 +556,27 @@ select:disabled {
   font-weight: 500;
 }
 
+.buffer-verdict {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.buffer-verdict b {
+  color: var(--muted);
+  font-weight: 500;
+}
+.buffer-verdict.warn {
+  color: #e3b341;
+}
+.buffer-verdict.bad {
+  color: #f0883e;
+}
+
 .status-banner {
   padding: 11px 14px;
   border-radius: 6px;

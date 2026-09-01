@@ -60,7 +60,7 @@ npm test           # Node 自动测试（传输、安全、缓存、邀请码、
 ## 关键约定与陷阱
 
 - **manifest 是接收方唯一真相来源**：`fileId` 由所有分片哈希推导（同内容任何机器得同 id）。**渐进式校验**——每片收到即验 SHA-256，坏片当场丢弃重下，不污染水位线。
-- **房间安全模式必须双向一致**：`safe` 是默认值，旧邀请码和缺少模式的 HELLO 也只能解释为 `safe`。邀请码先做本地匹配，P2P 数据通道再以 HELLO 独立协商；双方模式一致前禁止清单、同步控制和媒体帧。`trusted` 允许约 8 MB 连续片头后边下边播，风险更高；文件完整后仍调用 `store:scanReceivedMedia`，扫描失败立即退出 mpv 并清理缓存。
+- **房间安全模式必须双向一致**：`safe` 是默认值，旧邀请码和缺少模式的 HELLO 也只能解释为 `safe`。邀请码先做本地匹配，P2P 数据通道再以 HELLO 独立协商；双方模式一致前禁止清单、同步控制和媒体帧。`trusted` 允许约 8 MB 连续片头后边下边播，风险更高；文件完整后仍调用 `store:scanReceivedMedia`。**扫描结果分三类，别混为一谈**（`malwareScan.classifyScanResult`）：`blocked`（真发现威胁）一律退出 mpv 并清理缓存；`unavailable`（扫描器根本没跑起来）在安全模式下同样拒播，但在可信房间只警告不中断——那一场本来就是全程无扫描播过来的，扫不成没带来任何新信息，此时杀播放器加删缓存是纯损失。MpCmdRun 的退出码 2 同时表示这两种情况，只能靠输出里的 `CmdTool: Failed with hr = 0x…` 区分；最常见的诱因是 Defender 被第三方杀毒软件（360、火绒之类）接管停用，`env:status` 的 `defenderRunning` 会在启动时就把这件事说出来。
 - **`enterRoom()` 有只跑一次的守卫**，但观众是先进房后收清单——片名渲染必须放在独立的 `renderFilmInfo()` 里，不能塞进 `enterRoom`，否则观众永远看不到片名。
 - **`fileStore.close()` 的顺序**：先阻止新分片、等待批量写入、关闭文件句柄，再删除软件拥有的会话缓存；不再生成 `.swpart`，也不提供跨重启断点续传。
 - **外部程序探测不能只查 PATH**（`findBin.js`）：Windows 上 PATH 是进程启动时的快照，winget 装完的新 PATH 对已开着的进程不生效。探测会额外扫各家包管理器落点 + winget Packages 目录。mpv 的 winget 落点 `MPV Player\mpv.exe` 既不进 PATH 也不叫 mpv，单列在 `mpv.js` 的 `MPV_CANDIDATES`。
