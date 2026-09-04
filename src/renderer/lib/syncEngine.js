@@ -67,6 +67,7 @@ export class SyncEngine extends Emitter {
 
     this.applying = false; // 正在把远端状态落到 mpv，别把它当成用户操作
     this.lastTick = null;
+    this.pendingSeek = null; // 播放器还没起来时收到的房间位置，起来后补放
     this.duration = 0;
     this.bytesPerSecond = 0;
     this.started = false;
@@ -86,17 +87,23 @@ export class SyncEngine extends Emitter {
     this.bytesPerSecond = 0;
     this.sizeHint = 0;
     this.lastTick = null;
+    this.pendingSeek = null;
     this.localStalled = false;
     this.stalledPeers.clear();
     this.intendedPaused = true;
+    // Lamport 只有在这次自增会被广播出去时才能加。
+    // 观众也走 resetMedia，但它们不广播；本地时钟就这么静默领先房主 1，
+    // 于是房主换片后的第一条 SYNC 和观众的时钟撞平，平局按 peerId 比大小时
+    // 约一半观众会判「自己更新」而把房主的指令丢掉。
+    const willBroadcast = this.started && this.canIControl();
     this.shared = {
       paused: true,
       position: 0,
-      lamport: this.shared.lamport + 1,
+      lamport: willBroadcast ? this.shared.lamport + 1 : this.shared.lamport,
       by: this.peerId,
     };
     this.emit('state', this.status());
-    if (this.started && this.canIControl()) this._broadcastSync(0);
+    if (willBroadcast) this._broadcastSync(0);
   }
 
   get stallThresholdBytes() {
@@ -226,6 +233,16 @@ export class SyncEngine extends Emitter {
     if (prev && snap.paused !== prev.paused) {
       const shouldBePaused = this.effectivePaused;
       if (snap.paused !== shouldBePaused) {
+        // 缓冲不够时的暂停不是「用户的意图」，是系统强制的 —— 这时候用户在 mpv
+        // 窗口里按空格，不该被当成「他想改变房间状态」，而要把暂停压回去。
+        // 原来只更新 intendedPaused 就完事，于是全员暂停期间自己按一下空格，
+        // 本机就一路播下去、播到没数据为止，而且没有任何人会来纠正。
+        const forced = this.localStalled || this.stalledPeers.size > 0;
+        if (forced && !snap.paused) {
+          this.emit('denied', { action: 'play' });
+          this._reconcile();
+          return;
+        }
         this.intendedPaused = snap.paused;
         // 游客的播放/暂停只作用于自己这一路，不广播、不动共识状态。
         if (this.canIControl()) this._broadcastSync(snap.position);
@@ -446,6 +463,12 @@ export class SyncEngine extends Emitter {
       if (typeof seekTo === 'number' && this.lastTick) {
         const drift = Math.abs((this.lastTick.position || 0) - seekTo);
         if (drift > SEEK_TOLERANCE) await this.emit_seek(seekTo);
+      } else if (typeof seekTo === 'number') {
+        // 播放器还没起来（lastTick 为空）。以前这里直接放弃，而 shared.position
+        // 之后再没有任何路径会补下发 —— 观众的 mpv 是在收到房间位置之后才启动的，
+        // 于是必然从 0:00 开始播，和房间里其他人差着半部片子。
+        // 记下来，等 resyncToShared() 在播放器起来后重放。
+        this.pendingSeek = seekTo;
       }
       await this.emit_pause(targetPaused);
     } finally {
@@ -456,6 +479,30 @@ export class SyncEngine extends Emitter {
     }
 
     this.emit('state', this.status());
+  }
+
+  /**
+   * 播放器（重新）起来之后，把房间共识状态重放给它。
+   *
+   * mpv 没启动时 setPause/seek 在主进程直接抛「mpv 未启动」，注入的回调又把异常
+   * 全吞了，所以这段时间收到的 SYNC 等于没收。新进程从 0:00 起，必须补这一次。
+   */
+  async resyncToShared() {
+    if (!this.started) return;
+    const target = typeof this.pendingSeek === 'number' ? this.pendingSeek : this.shared.position;
+    this.pendingSeek = null;
+    if (!(target >= 0)) return;
+    await this._reconcile({ seekTo: target });
+  }
+
+  /**
+   * 播放器退出了，忘掉它最后的状态。
+   *
+   * 留着的话，下一个 mpv 的第一条 tick（position=0、paused=true）会和旧 tick 一比，
+   * 被判成「用户拖了进度条 / 按了暂停」—— 房主据此广播 SYNC(0)，全房被拉回片头。
+   */
+  forgetPlayerState() {
+    this.lastTick = null;
   }
 
   // 实际的 mpv 调用由 app.js 注入，引擎本身不直接碰 IPC
@@ -520,7 +567,7 @@ export class SyncEngine extends Emitter {
 
   status() {
     const waiting = [...this.stalledPeers.values()].map((v) => v.name);
-    if (this.localStalled) waiting.unshift('你');
+    if (this.localStalled) waiting.unshift('你'); // 由 app.js 的 t() 统一翻译
     return {
       paused: this.effectivePaused,
       intendedPaused: this.intendedPaused,

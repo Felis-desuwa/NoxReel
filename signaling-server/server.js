@@ -58,10 +58,21 @@ let lookup = null;
   }
 })();
 
+/**
+ * 取客户端 IP。
+ *
+ * X-Forwarded-For 是**追加**的：Cloudflare、nginx 的 $proxy_add_x_forwarded_for
+ * 都是把自己看到的对端 IP 接在已有值后面。所以链条里唯一不可伪造的是**最后一段**
+ * （由紧挨着我们的那层反代写入），而第一段是客户端自己带来的，随便填。
+ * 原来取第一段，等于让任何人自称 127.0.0.1 —— 而 isLoopback() 会据此直接放行。
+ */
 function clientIp(req) {
   if (TRUST_PROXY) {
     const xff = req.headers['x-forwarded-for'];
-    if (xff) return String(xff).split(',')[0].trim();
+    if (xff) {
+      const hops = String(xff).split(',').map((s) => s.trim()).filter(Boolean);
+      if (hops.length) return hops[hops.length - 1];
+    }
     const real = req.headers['x-real-ip'];
     if (real) return String(real).trim();
   }
@@ -88,8 +99,16 @@ function countryOf(req) {
   return { country: null, source: 'unknown' };
 }
 
+/**
+ * 本机／局域网豁免。
+ *
+ * 这里刻意**不用** clientIp()：豁免是一道放行门，只能凭真正的 TCP 对端地址来判。
+ * 一旦掺进任何请求头，攻击者自称内网地址就能直接跳过地区拦截 ——
+ * 而反代场景下真实对端本来就是反代自己（多半就是 127.0.0.1），
+ * 用它做豁免判据也不会误伤正常部署。
+ */
 function isLoopback(req) {
-  const ip = clientIp(req).replace(/^::ffff:/, '');
+  const ip = String(req.socket.remoteAddress || '').replace(/^::ffff:/, '');
   return ip === '127.0.0.1' || ip === '::1' || ip.startsWith('192.168.') || ip.startsWith('10.');
 }
 
@@ -121,12 +140,32 @@ function gate(req) {
 
 /** @type {Map<string, {members:Map<string, {ws:WebSocket, name:string}>, hostId:string, maxMembers:number}>} */
 const rooms = new Map();
+// 和客户端 randomPeerId / randomRoomId 的字母表对齐（chat-safe base64 用了 '-' 和 '.'）。
+// 只限上界和字符集：要防的是「超长标识符被存进房间表并按人数广播出去」这种
+// 内存放大，以及奇怪字符混进日志。下界没有意义，短 id 是合法的。
+const ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 
+/**
+ * 房间容量。
+ *
+ * 0 的语义是「我没有意见，用默认值」—— 非房主的客户端 join 时发的正是 maxMembers: 0。
+ * 原来 Math.max(2, …) 把它压成 2，于是只要房间碰巧是由游客先建起来的
+ * （房主还没连上、或断线后房间被重建），容量就被永久钉死在 2 人，
+ * 后面所有人都会撞上 ROOM_FULL，而房主根本不知道发生了什么。
+ */
 function normalizeCapacity(value) {
   const n = Number.parseInt(value, 10);
-  return Number.isFinite(n) ? Math.max(2, Math.min(MAX_ROOM_SIZE, n)) : Math.min(4, MAX_ROOM_SIZE);
+  if (!Number.isFinite(n) || n <= 0) return Math.min(4, MAX_ROOM_SIZE);
+  return Math.max(2, Math.min(MAX_ROOM_SIZE, n));
 }
 
+/**
+ * 房间是内存态的，空了即删，所以 hostId 只能认「第一个加入的人」——
+ * 房主断线后房间被重建时，这个答案就是错的。服务端没有能绑定房主身份的凭据，
+ * 真正的锚点在客户端：加入者拿邀请码里的 hostId 和 joined.hostId 比对，
+ * 对不上就拒绝进房（见 app.js 的「房主身份与邀请码不一致」）。
+ * 这里再加一道 HOST_ID_RESERVED，房间存续期间不许别人顶替房主的 peerId。
+ */
 function roomOf(id, creatorId, requestedCapacity) {
   if (!rooms.has(id)) {
     rooms.set(id, {
@@ -151,8 +190,21 @@ function leave(ws) {
   console.log(`[room] ${ws.peerId} 离开 ${ws.roomId}（剩 ${room.members.size} 人）`);
 }
 
+// 一条连接允许积压多少待发字节。ws 的 maxPayload 只限单条消息大小，不限条数，
+// 而 Node 的 socket 写缓冲是无界增长的 —— 一个收得慢（或干脆不收）的客户端，
+// 配上一个猛发的同伴，就能把服务器的堆写爆。
+const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
+
 function sendJson(ws, obj) {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+  if (ws.readyState !== ws.OPEN) return;
+  if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+    // 这条连接已经堵死了，再往里灌只会耗内存。直接断开，客户端会自己重连。
+    try {
+      ws.close(4008, 'SLOW_CONSUMER');
+    } catch {}
+    return;
+  }
+  ws.send(JSON.stringify(obj));
 }
 
 function fail(ws, code, message) {
@@ -202,10 +254,21 @@ wss.on('connection', (ws, req) => {
     if (msg.t === 'join') {
       if (ws.roomId) return fail(ws, 'ALREADY_JOINED', '这个连接已经在房间里了');
       if (!msg.roomId || !msg.peerId) return fail(ws, 'BAD_JOIN', 'join 需要 roomId 和 peerId');
+      // name 一直是截断的，roomId / peerId 却完全不限长 —— 它们会被存进房间表
+      // 并广播给全房，等于一个按人数放大的内存写入口。
+      if (!ID_RE.test(String(msg.roomId)) || !ID_RE.test(String(msg.peerId))) {
+        return fail(ws, 'BAD_JOIN', 'roomId 和 peerId 只能是 1-128 位的字母、数字、点、横线或下划线');
+      }
 
       const room = roomOf(String(msg.roomId), String(msg.peerId), msg.maxMembers);
       if (room.members.size >= room.maxMembers) return fail(ws, 'ROOM_FULL', `房间已满（上限 ${room.maxMembers} 人）`);
       if (room.members.has(msg.peerId)) return fail(ws, 'DUP_PEER', 'peerId 已被占用');
+      // 房主的 peerId 会随 joined.peers 广播给全房，而客户端把「peerId === hostId」
+      // 当成房主身份的唯一凭据。房主的信令连接一掉线，房内任何人都能顶着他的
+      // peerId 重新 join，接管全场控制权。房间还在、位置空着，也不能让别人补位。
+      if (msg.peerId === room.hostId && room.members.size > 0) {
+        return fail(ws, 'HOST_ID_RESERVED', '这个身份是房主的，房间存续期间不能被顶替');
+      }
 
       clearTimeout(joinTimer);
       ws.roomId = String(msg.roomId);

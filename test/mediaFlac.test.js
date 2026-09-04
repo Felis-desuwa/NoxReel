@@ -252,34 +252,101 @@ test('端到端：压不动的内容不会被提议转码', { skip: ffmpeg ? fal
   }
 });
 
+// 这条测试原来用 AC3 素材，而 ffprobe 能从 AC3 帧头推出 bit_rate，于是
+// 「不采样时这一栏是空的」这个前提不成立，整块断言被 if 挡在外面从没执行过 ——
+// sampleBitRates 取错 CSV 列、永远返回空 Map 的 bug 就是这么溜过去的。
+// 改用 AAC（ffprobe 确实不给 bit_rate，ffmpeg 也不写 BPS 标签），并且去掉那层 if：
+// 前提不成立就该让测试失败，而不是静悄悄跳过。
 test('采样估码率：容器不写每轨码率时也能给出量级', { skip: ffmpeg ? false : '本机没装 ffmpeg' }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noxreel-bps-'));
   const src = path.join(dir, 'a.mkv');
   try {
     execFileSync(ffmpeg, [
       '-y', '-hide_banner', '-loglevel', 'error',
-      '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=15:duration=8',
-      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=8',
+      '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=15:duration=10',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=10',
       '-map', '0:v', '-map', '1:a',
       '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '35',
-      '-c:a', 'ac3', '-b:a', '192k',
+      '-c:a', 'aac', '-b:a', '192k',
       src,
     ]);
 
     const plain = await media.probeStreams(src);
     const audioPlain = plain.streams.find((s) => s.codecType === 'audio');
+    assert.equal(audioPlain.bitRate, null, '素材选错了：这条轨本来就有码率，采样路径根本不会被走到');
+
     const sampled = await media.probeStreams(src, { sample: true });
     const audioSampled = sampled.streams.find((s) => s.codecType === 'audio');
+    assert.equal(typeof audioSampled.bitRate, 'number', '采样之后应该有数了');
+    assert.equal(audioSampled.bitRateEstimated, true, '估出来的必须标记成估算值');
+    assert.ok(
+      audioSampled.bitRate > 150e3 && audioSampled.bitRate < 280e3,
+      `192kbps 的轨估成了 ${audioSampled.bitRate}`
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
-    // MKV 不写每轨 bit_rate，所以不采样时这一栏是空的
-    if (audioPlain.bitRate === null) {
-      assert.equal(typeof audioSampled.bitRate, 'number', '采样之后应该有数了');
-      assert.equal(audioSampled.bitRateEstimated, true, '估出来的必须标记成估算值');
-      assert.ok(
-        audioSampled.bitRate > 150e3 && audioSampled.bitRate < 260e3,
-        `192kbps 的轨估成了 ${audioSampled.bitRate}`
-      );
-    }
+test('采样估码率：文件比采样区间短时不会把码率算低', { skip: ffmpeg ? false : '本机没装 ffmpeg' }, async () => {
+  // 原实现无条件除以固定的 120 秒，10 秒的素材会被算成真实码率的十二分之一。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noxreel-bps2-'));
+  const src = path.join(dir, 'short.mkv');
+  try {
+    execFileSync(ffmpeg, [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=10',
+      '-c:a', 'aac', '-b:a', '128k',
+      src,
+    ]);
+    const rates = await media.sampleBitRates(src);
+    const [, bps] = [...rates][0] || [];
+    assert.ok(bps > 90e3 && bps < 190e3, `128kbps 的 10 秒素材估成了 ${bps}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('无损精简的参数校验：toFlac 空数组必须放行', async () => {
+  // 只有源文件恰好带一条够格的未压缩 PCM 轨时 toFlac 才非空，也就是说绝大多数
+  // 片子走精简传的都是空数组。这里拒了，整个无损精简功能就等于没有。
+  const security = require('../src/main/security.js');
+  assert.deepEqual(security.slimOptions({ keepIndexes: [0, 1], toFlac: [] }), {
+    keepIndexes: [0, 1],
+    toFlac: [],
+  });
+  // 空数组和 null 语义不同，不能归一：null 会让主进程回落到自己重算的默认方案，
+  // 用户在面板里换过音轨时那是错的。
+  assert.deepEqual(security.slimOptions({ keepIndexes: [0, 1], toFlac: null }).toFlac, null);
+  // 一条轨都不保留仍然是畸形输入
+  assert.throws(() => security.slimOptions({ keepIndexes: [], toFlac: [] }));
+  // 子集约束不受影响
+  assert.throws(() => security.slimOptions({ keepIndexes: [0, 1], toFlac: [7] }));
+});
+
+test('MP4/MOV 输出时 slim() 自己会把 FLAC 转码挡掉', { skip: ffmpeg ? false : '本机没装 ffmpeg' }, async () => {
+  // 渲染进程曾漏掉容器判断，会对 .mov 源提议转 FLAC。产物不可逆，
+  // 所以主进程这一侧必须独立复查一遍，不能只信调用方传来的 toFlac。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noxreel-mov-'));
+  const src = path.join(dir, 'a.mov');
+  try {
+    execFileSync(ffmpeg, [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=15:duration=5',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=5',
+      '-f', 'lavfi', '-i', 'sine=frequency=660:sample_rate=48000:duration=5',
+      '-map', '0:v', '-map', '1:a', '-map', '2:a',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '35',
+      '-c:a', 'pcm_s24le',
+      src,
+    ]);
+
+    // 明知故犯地传一个 toFlac，模拟渲染进程漏了容器判断
+    const res = await media.slim(src, path.join(dir, 'out'), { keepIndexes: [0, 1], toFlac: [1] });
+    assert.deepEqual(res.plan.toFlac, [], '非 MKV 输出必须把转码请求丢掉');
+    assert.equal(res.plan.reencodesAudio, false, '返回的方案要和实际做的事一致');
+    const out = await media.probeStreams(res.outPath);
+    assert.notEqual(out.streams.find((s) => s.codecType === 'audio').codecName, 'flac');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

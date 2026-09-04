@@ -362,15 +362,28 @@ async function connectSignaling(url, roomId) {
       sig.signal(from, { kind: 'answer', sdp: answer });
       return;
     }
+    if (payload.kind === 'renegotiate') {
+      // 桌面端 v0.6.6 起的断线重连协议：非 initiator 一侧发这条请求，
+      // 由 initiator 重发 offer。手机端不认它的话，凡是「手机当 initiator」的
+      // 那条链路断了就永远回不来 —— 桌面之间能自愈，一牵扯到手机就永久卡住。
+      cancelRecovery(from);
+      await reconnectPeer(from, name, sig).catch((e) => log('重连 ' + (name || from) + ' 失败：' + e.message, 'bad'));
+      return;
+    }
+
     if (!peer || peer.closed) return;
-    if (payload.kind === 'answer') await peer.acceptAnswer(payload.sdp);
-    else if (payload.kind === 'ice') await peer.addIceCandidate(payload.candidate);
+    if (payload.kind === 'answer') {
+      // 重协商期间可能收到上一轮的 answer，此时 pc 已是 stable，
+      // setRemoteDescription 会抛 InvalidStateError。这条本来就该丢掉。
+      await peer.acceptAnswer(payload.sdp).catch((e) => console.warn('[android] 丢弃对不上的应答：', e.message));
+    } else if (payload.kind === 'ice') await peer.addIceCandidate(payload.candidate);
   });
 
   // 信令断了不等于人走了 —— 直连不经过服务器。服务重启或网络抖一下，服务器就会
   // 广播 peer-leave；这时候把健康的 P2P 拆掉，传输会白白中断到对方重连为止，
   // 而下一行的提示还写着「已建立的直连不受影响」。真正离开的人，数据通道自己会关。
   sig.on('peer-leave', ({ peerId }) => {
+    cancelRecovery(peerId); // 人是真走了，不是链路断了
     const peer = S.swarm.peers.get(peerId);
     if (peer?.ctrl?.readyState === 'open') {
       log(peer.name + ' 的信令连接断了，但直连还在，传输继续', 'warn');
@@ -384,13 +397,113 @@ async function connectSignaling(url, roomId) {
   return sig.connect();
 }
 
+/* --------------------------- 直连断线恢复 --------------------------- */
+// 和桌面端同一套节奏。手机换基站、切 Wi-Fi 的频率比桌面高得多，
+// 这条链路上没有自动重连，用户只能退房重来。
+const RECONNECT_BACKOFF_MS = [1500, 4000, 10000];
+const DISCONNECT_GRACE_MS = 6000;
+const RECOVERY = new Map(); // peerId -> {attempts, timer}
+const RENEGOTIATING = new Map(); // peerId -> 正在跑的重协商 Promise
+
+function cancelRecovery(peerId) {
+  const st = RECOVERY.get(peerId);
+  if (st?.timer) clearTimeout(st.timer);
+  RECOVERY.delete(peerId);
+}
+
+function scheduleReconnect(peer, sig) {
+  if (!sig || !S.swarm || peer.closed) return;
+  const peerId = peer.peerId;
+  const st = RECOVERY.get(peerId) || { attempts: 0, timer: null };
+  if (st.timer) return;
+  if (st.attempts >= RECONNECT_BACKOFF_MS.length) {
+    log('和 ' + peer.name + ' 的直连试了 ' + st.attempts + ' 次都没恢复。双方都在严格 NAT 后面时需要 TURN 中继兜底。', 'bad');
+    return;
+  }
+  const wait = RECONNECT_BACKOFF_MS[st.attempts];
+  st.attempts += 1;
+  const name = peer.name;
+  const initiator = peer.initiator;
+  log('和 ' + name + ' 的直连断了，' + Math.round(wait / 1000) + ' 秒后自动重连（第 ' + st.attempts + ' 次）', 'warn');
+
+  st.timer = setTimeout(() => {
+    st.timer = null;
+    if (!sig.connected) {
+      log('信令还没恢复，暂时没法重连 ' + name, 'warn');
+      return;
+    }
+    if (initiator) {
+      reconnectPeer(peerId, name, sig).catch((e) => log('重连 ' + name + ' 失败：' + e.message, 'bad'));
+    } else {
+      sig.signal(peerId, { kind: 'renegotiate' });
+    }
+  }, wait);
+
+  RECOVERY.set(peerId, st);
+}
+
+/** 以 initiator 身份重建一条到 peerId 的连接。同一个人同时只允许一次。 */
+async function reconnectPeer(peerId, name, sig) {
+  if (!S.swarm || !sig?.connected) return;
+  if (RENEGOTIATING.has(peerId)) return RENEGOTIATING.get(peerId);
+
+  const run = (async () => {
+    if (S.swarm.peers.has(peerId)) S.swarm.removePeer(peerId);
+    const peer = new Peer({
+      peerId,
+      name: name || peerId,
+      initiator: true,
+      iceServers: iceServers(),
+      trickle: true,
+    });
+    wirePeer(peer, sig);
+    S.swarm.addPeer(peer);
+    const offer = await peer.createOffer();
+    if (S.swarm.peers.get(peerId) !== peer) return; // 等 ICE 的这几秒里被顶替了
+    sig.signal(peerId, { kind: 'offer', sdp: offer });
+  })();
+
+  RENEGOTIATING.set(peerId, run);
+  try {
+    await run;
+  } finally {
+    RENEGOTIATING.delete(peerId);
+  }
+}
+
 function wirePeer(peer, sig) {
   if (sig) peer.on('icecandidate', (c) => sig.signal(peer.peerId, { kind: 'ice', candidate: c }));
+
+  let graceTimer = null;
+  const clearGrace = () => {
+    clearTimeout(graceTimer);
+    graceTimer = null;
+  };
+
   peer.on('open', () => {
+    clearGrace();
+    cancelRecovery(peer.peerId);
     log(`已和 ${peer.name} 建立数据通道，正在校验房间模式…`);
   });
   peer.on('statechange', (s) => {
-    if (s === 'failed') log(`和 ${peer.name} 的直连失败了（双方都在严格 NAT 后面时会这样，需要 TURN 中继兜底）`, 'bad');
+    if (s === 'connected' || s === 'completed') {
+      clearGrace();
+      cancelRecovery(peer.peerId); // ICE 自己缓过来了，撤掉排着的重连
+      return;
+    }
+    if (s === 'disconnected' && sig && !graceTimer) {
+      // 先给 ICE 一点时间自己恢复，网络抖一下就重建反而更慢。
+      graceTimer = setTimeout(() => {
+        graceTimer = null;
+        if (peer.pc.iceConnectionState === 'disconnected') scheduleReconnect(peer, sig);
+      }, DISCONNECT_GRACE_MS);
+      return;
+    }
+    if (s === 'failed') {
+      clearGrace();
+      log(`和 ${peer.name} 的直连失败了（双方都在严格 NAT 后面时会这样，需要 TURN 中继兜底）`, 'bad');
+      if (sig) scheduleReconnect(peer, sig);
+    }
   });
 }
 

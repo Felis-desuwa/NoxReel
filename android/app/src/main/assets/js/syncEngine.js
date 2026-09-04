@@ -370,22 +370,30 @@ export class SyncEngine extends Emitter {
   }
 
   _onRemoteSync(msg, fromPeer) {
-    // 游客无权控场：已知是游客的人发来的同步指令直接忽略（纵深防御）。
-    // 发送者身份未知时（角色表还没同步到）先放行，房主的问候会兜底纠正。
-    const by = msg.by || fromPeer?.peerId;
-    if (by && this.roles.has(by) && !this.isController(by)) return true;
+    // 权限只认承载这条消息的 P2P 连接，绝不信消息里可伪造的 by 字段。
+    // 旧版取 msg.by，而且「不在 roles 表里的人」一律放行 —— 游客只要把 by 填成
+    // 房主的 peerId（或一个谁也不认识的 id），就能在手机上控场。
+    const senderId = fromPeer?.peerId;
+    if (!senderId || !this.isController(senderId)) return true;
+    if (
+      typeof msg.paused !== 'boolean' ||
+      !Number.isFinite(msg.position) ||
+      msg.position < 0 ||
+      !Number.isSafeInteger(msg.lamport) ||
+      msg.lamport < 0
+    ) return true;
 
     // Lamport 定序：时钟大的赢；一样大就比 peerId，保证各方判断一致。
     const newer =
       msg.lamport > this.shared.lamport ||
-      (msg.lamport === this.shared.lamport && msg.by > this.shared.by);
+      (msg.lamport === this.shared.lamport && senderId > this.shared.by);
     if (!newer) return true;
 
-    this.shared = { paused: msg.paused, position: msg.position, lamport: msg.lamport, by: msg.by };
+    this.shared = { paused: msg.paused, position: msg.position, lamport: msg.lamport, by: senderId };
     this.intendedPaused = msg.paused;
     this.emit('remote-action', {
       kind: msg.paused ? 'pause' : 'play',
-      by: msg.name || msg.by,
+      by: fromPeer.name || senderId,
       position: msg.position,
     });
     this._reconcile({ seekTo: msg.position });
@@ -393,12 +401,12 @@ export class SyncEngine extends Emitter {
   }
 
   _onRemoteStall(msg, fromPeer) {
-    const id = msg.peerId || fromPeer?.peerId;
-    if (!id) return true;
-
-    // 游客的缓冲不足不拖累全员：已知游客发来的「卡住了」直接忽略。
-    // 「缓冲好了」照收不误 —— 万一之前记过他，也能干净地清掉。
-    if (msg.stalled && this.roles.has(id) && !this.isController(id)) return true;
+    // 和 SYNC 同理：身份只认 P2P 连接。旧版是 msg.peerId 优先（可任意伪造），
+    // 而且角色检查只加在「卡住了」这一支上 —— 于是任何人都能替别人解除全员暂停。
+    const id = fromPeer?.peerId;
+    if (!id || !this.isController(id) || typeof msg.stalled !== 'boolean') return true;
+    if (msg.position !== undefined && (!Number.isFinite(msg.position) || msg.position < 0)) return true;
+    if (msg.deficitSeconds !== undefined && !Number.isFinite(msg.deficitSeconds)) return true;
 
     if (msg.stalled) {
       this.stalledPeers.set(id, {

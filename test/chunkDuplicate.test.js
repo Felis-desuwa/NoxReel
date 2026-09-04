@@ -184,3 +184,76 @@ test('两端都有「正在落盘」这道守卫', () => {
     );
   }
 });
+
+/* ------------------- 在途名额必须按登记的请求者销账 ------------------- */
+
+for (const [label, modulePath] of [
+  ['桌面端', '../src/renderer/lib/swarm.js'],
+  ['安卓端', '../android/app/src/main/assets/js/swarm.js'],
+]) {
+  test(`${label}：分片由「非派发方」送达时，派发方的在途名额也要销掉`, async () => {
+    const { swarm, peer, requested, release } = await makeSwarm(modulePath);
+    swarm._tick();
+    const target = requested[0];
+
+    // 模拟「超时改派」：这片现在登记在 B 名下，而帧却是 A 送来的
+    const other = {
+      peerId: 'other',
+      name: 'other',
+      ready: true,
+      authenticated: true,
+      remoteHave: new Uint8Array(CHUNKS).fill(1),
+      inflight: new Set([target]),
+      downRate: 5e6,
+      rtt: 10,
+      ctrl: { readyState: 'open' },
+      send: () => {},
+    };
+    swarm.peers.set('other', other);
+    swarm.inflight.set(target, { peerId: 'other', at: 0 });
+
+    const commit = swarm._commitChunk(peer, target, new Uint8Array(CHUNK));
+    await new Promise((r) => setImmediate(r));
+    release(target);
+    await commit;
+
+    assert.ok(
+      !other.inflight.has(target),
+      `登记方的在途名额没被销掉，剩下 ${[...other.inflight].join(',')} —— 攒够窗口数这个上游就再也不会被派片`
+    );
+  });
+
+  test(`${label}：正常情况下（送达方就是派发方）行为不变`, async () => {
+    const { swarm, peer, requested, release } = await makeSwarm(modulePath);
+    swarm._tick();
+    const target = requested[0];
+    assert.ok(peer.inflight.has(target));
+
+    const commit = swarm._commitChunk(peer, target, new Uint8Array(CHUNK));
+    await new Promise((r) => setImmediate(r));
+    release(target);
+    await commit;
+
+    assert.ok(!peer.inflight.has(target));
+  });
+}
+
+test('对端换片之后，不再拿他的位图向他要片', async () => {
+  const { swarm, peer } = await makeSwarm('../src/renderer/lib/swarm.js');
+  swarm.manifest.fileId = 'a'.repeat(32);
+
+  peer.remoteManifest = { fileId: 'a'.repeat(32) };
+  swarm._tick();
+  assert.ok(swarm.inflight.size > 0, '同一个文件时该正常派片');
+
+  swarm.inflight.clear();
+  swarm._writing.clear();
+  peer.inflight.clear();
+  peer.remoteManifest = { fileId: 'b'.repeat(32) }; // 他换片了
+  swarm._tick();
+  assert.equal(
+    swarm.inflight.size,
+    0,
+    '对方手里已经是另一个文件，再向他要片只会拿回哈希对不上的分片，白占在途名额'
+  );
+});

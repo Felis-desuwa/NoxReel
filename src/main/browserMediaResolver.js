@@ -116,6 +116,10 @@ async function resolveInBrowser(rawUrl, { timeoutMs = DEFAULT_TIMEOUT_MS } = {})
       allowRunningInsecureContent: false,
     },
   });
+  // 这个窗口 show:false，用户看不见也关不掉，但它的音频照样走系统输出 ——
+  // 而轮询脚本每 700ms 就对页面上所有 video/audio 调一次 play()，
+  // 于是解析一个带贴片广告的播放页时，会有一段最长 35 秒、来路不明的声音。
+  browser.webContents.setAudioMuted(true);
   browser.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   isolated.on('will-download', (event) => event.preventDefault());
 

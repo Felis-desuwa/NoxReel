@@ -128,10 +128,21 @@ function manifest(value) {
   return data;
 }
 
-/** 轨道下标数组。轨道数不会多到哪去，给个宽松上限挡住畸形输入。 */
-function trackIndexes(raw, label) {
+/**
+ * 轨道下标数组。轨道数不会多到哪去，给个宽松上限挡住畸形输入。
+ *
+ * allowEmpty 区分两种「空」，它们的语义完全不同，不能混：
+ *  - null / undefined  = 「没指定，主进程自己算」
+ *  - 空数组            = 「明确一条都不要」
+ * keepIndexes 一条不留是畸形输入，照旧拒绝；toFlac 一条不转是最常见的正常情况。
+ */
+function trackIndexes(raw, label, { allowEmpty = false } = {}) {
   if (raw === undefined || raw === null) return null;
-  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 64) fail(label);
+  if (!Array.isArray(raw) || raw.length > 64) fail(label);
+  if (!raw.length) {
+    if (!allowEmpty) fail(label);
+    return [];
+  }
   const list = raw.map((i) => integer(i, '轨道下标', { min: 0, max: 1023 }));
   if (new Set(list).size !== list.length) fail(label);
   return list;
@@ -140,11 +151,14 @@ function trackIndexes(raw, label) {
 /**
  * 无损精简参数：要保留的轨道下标，以及其中哪几条要转成 FLAC。
  * toFlac 必须是 keepIndexes 的子集 —— 去转一条根本没保留的轨，ffmpeg 会直接报错。
+ *
+ * toFlac 传空数组必须放行：只有源文件恰好带一条够格的未压缩 PCM 轨时它才非空，
+ * 也就是说绝大多数片子走精简都是空数组。这里拒了，整个无损精简功能就等于没有。
  */
 function slimOptions(value) {
   const data = plainObject(value, '精简参数');
   const keepIndexes = trackIndexes(data.keepIndexes, '精简参数');
-  const toFlac = trackIndexes(data.toFlac, '精简参数');
+  const toFlac = trackIndexes(data.toFlac, '精简参数', { allowEmpty: true });
   if (toFlac && keepIndexes && toFlac.some((i) => !keepIndexes.includes(i))) fail('精简参数');
   return { keepIndexes, toFlac };
 }

@@ -282,7 +282,7 @@ function showDepsHelp() {
           make('br'),
           make('code', { text: 'scoop install mpv ffmpeg yt-dlp' }),
           make('br'),
-          '或者手动下载后，把可执行文件路径写进环境变量 ',
+          '或者手动下载后，把可执行文件路径写进环境变量',
           make('code', { text: 'SYNCWATCH_MPV_PATH' }),
           ' / ',
           make('code', { text: 'SYNCWATCH_FFMPEG_PATH' }),
@@ -648,6 +648,8 @@ function choosePrepPlan(info, { needsRemux, canSlim }) {
   const audioTracks = streams.filter((s) => s.codecType === 'audio');
   // 门槛由主进程定（省不到这个数就不值得让用户等重编码），别在这边另写一个。
   const minFlacSaving = typeof slim.minFlacSaving === 'number' ? slim.minFlacSaving : 0.08;
+  // 精简的输出容器跟着输入走：MKV 进 MKV 出，其余一律出 MP4（顺带加 +faststart）。
+  const toMkv = String(info.ext || '').toLowerCase() === '.mkv';
   let keepAudioIndex = slim.keepAudioIndex;
 
   // 换了要保留的音轨，丢掉的那批和能不能转 FLAC 都得跟着重算。
@@ -666,8 +668,12 @@ function choosePrepPlan(info, { needsRemux, canSlim }) {
     const chosen = audioTracks.find((a) => a.index === keepAudioIndex);
     // flacRatio 是主进程对每条轨单独实测出来的（只有未压缩的 PCM 轨才有），
     // 换一条轨就得看那条自己的数字，不能沿用默认轨的结论。
+    //
+    // 容器这一条也必须判：FLAC-in-MP4 的播放器支持面太窄（安卓的 ExoPlayer 尤其），
+    // 主进程的 canTranscodeToFlac 第一道判据就是它。这边漏掉的话，
+    // MP4/MOV 源也会被提议转 FLAC，而产物是不可逆的。
     const flacOk = Boolean(
-      chosen && typeof chosen.flacRatio === 'number' && chosen.flacRatio <= 1 - minFlacSaving
+      toMkv && chosen && typeof chosen.flacRatio === 'number' && chosen.flacRatio <= 1 - minFlacSaving
     );
     const toFlac = flacOk ? [chosen.index] : [];
     let saved = 0;
@@ -788,9 +794,9 @@ function choosePrepPlan(info, { needsRemux, canSlim }) {
                 hint(
                   '这条轨是',
                   make('b', { text: '未压缩的 PCM' }),
-                  '，转成 FLAC 是数学无损的 —— 解码出来的采样逐字节相同。已经拿这个文件实测过：能压掉 ',
+                  '，转成 FLAC 是数学无损的 —— 解码出来的采样逐字节相同。已经拿这个文件实测过：能压掉',
                   make('b', { props: { textContent: `${pct}%` } }),
-                  `，约 ${fmtBytes(current.flacSaved)}。`
+                  t(`，约 ${fmtBytes(current.flacSaved)}。`)
                 ),
                 hint('这一步要重新编码音频，比单纯丢轨慢，长片可能要几分钟。')
               )
@@ -1002,6 +1008,11 @@ async function joinViaServer(payload) {
     $('prep-bar').style.width = '70%';
     $('prep-note').textContent = '已进入房间，正在和其他成员打洞…';
   } catch (e) {
+    // 不关的话这条连接会一直按退避重连下去（WsSignaling 的 onclose 只看
+    // _closedByUs），而 hostId 校验只在首次 connect() 的返回值上做过一次 ——
+    // 重连成功后没人再校验，用户可能被静默拖进一个他已经放弃的房间。
+    S.signaling?.close();
+    S.signaling = null;
     return prepFail(
       e.code === 'REGION_BLOCKED'
         ? e.message
@@ -1020,6 +1031,10 @@ async function connectSignaling(url, roomId) {
     name: S.name,
     maxMembers: S.role === 'host' ? S.roomCapacity : 0,
   });
+  // 这里就赋值是为了让事件处理器能拿到它；但连接失败时必须置回 null，
+  // 否则 inviteViaServer 的 if (!S.signaling) 守卫会短路跳过重连，
+  // 而 S.roomId 只在连接成功后才写 —— 结果是拿一个 undefined 的房间号去编码，
+  // 发出去一条根本没人能加入的坏邀请码。
   S.signaling = sig;
 
   // 规则：房间里的老成员向新来的发起 offer。这样不会两边同时发 offer 撞车。
@@ -1053,6 +1068,11 @@ async function connectSignaling(url, roomId) {
     if (payload.kind === 'renegotiate') {
       // 对面的直连断了，而按「老成员向新来的发起 offer」的约定该由我发 offer。
       // 两边同时发会撞车，所以断线的一方只发这条请求过来。
+      //
+      // 先撤掉自己这边排着的退避定时器：对面已经明确要求重协商了，
+      // 我这边再自发一次就是两份 offer。reconnectPeer 里的 RENEGOTIATING 是
+      // 第二道保险，这里是第一道 —— 少一次没必要的连接重建。
+      cancelRecovery(from);
       await reconnectPeer(from, name, sig).catch((e) =>
         log(`重连 ${name || from} 失败：${e.message}`, 'bad')
       );
@@ -1060,8 +1080,14 @@ async function connectSignaling(url, roomId) {
     }
 
     if (!peer || peer.closed) return;
-    if (payload.kind === 'answer') await peer.acceptAnswer(payload.sdp);
-    else if (payload.kind === 'ice') await peer.addIceCandidate(payload.candidate);
+    if (payload.kind === 'answer') {
+      // 重协商期间可能收到上一轮的 answer。此时 pc 已经是 stable，
+      // setRemoteDescription 会抛 InvalidStateError —— 不接住就是一个
+      // 未处理的 Promise 拒绝，而这条 answer 本来就该丢掉。
+      await peer.acceptAnswer(payload.sdp).catch((e) => {
+        console.warn('[app] 丢弃对不上的应答：', e.message);
+      });
+    } else if (payload.kind === 'ice') await peer.addIceCandidate(payload.candidate);
   });
 
   // 信令断了不等于人走了 —— 直连不经过服务器。服务重启或网络抖一下，服务器就会
@@ -1106,6 +1132,8 @@ const RECONNECT_BACKOFF_MS = [1500, 4000, 10000];
 const DISCONNECT_GRACE_MS = 6000;
 /** peerId -> {attempts, timer} */
 const RECOVERY = new Map();
+/** peerId -> 正在跑的重协商 Promise。同一个人同时只允许一次。 */
+const RENEGOTIATING = new Map();
 
 function cancelRecovery(peerId) {
   const st = RECOVERY.get(peerId);
@@ -1167,18 +1195,41 @@ function scheduleReconnect(peer, sig) {
 /** 以 initiator 身份重建一条到 peerId 的连接，并把新的 offer 发过去。 */
 async function reconnectPeer(peerId, name, sig) {
   if (!S.swarm || !sig?.connected) return;
-  if (S.swarm.peers.has(peerId)) S.swarm.removePeer(peerId);
-  const peer = new Peer({
-    peerId,
-    name: name || peerId,
-    initiator: true,
-    iceServers: iceServers(),
-    trickle: true,
-  });
-  wirePeer(peer, sig);
-  S.swarm.addPeer(peer);
-  const offer = await peer.createOffer();
-  sig.signal(peerId, { kind: 'offer', sdp: offer });
+
+  // 同一个 peerId 同时只能有一次重协商在跑。
+  //
+  // 断链是对称的：initiator 侧自己的退避定时器会发 offer，而非 initiator 侧
+  // 会发一条 renegotiate 请求过来 —— 两者几乎同时到达，于是 initiator 连发两份
+  // offer，各自建了一个 RTCPeerConnection。对面按第一份回的 answer 会被套到
+  // 第二个 pc 上（ufrag 对不上，STUN 绑定请求全被丢弃，这条连接必死），
+  // 第二份 answer 又撞上 InvalidStateError 变成未处理的 Promise 拒绝。
+  // 原来的注释只防住了「两边同时发 offer」，没防住「同一侧发两次」。
+  if (RENEGOTIATING.has(peerId)) return RENEGOTIATING.get(peerId);
+
+  const run = (async () => {
+    if (S.swarm.peers.has(peerId)) S.swarm.removePeer(peerId);
+    const peer = new Peer({
+      peerId,
+      name: name || peerId,
+      initiator: true,
+      iceServers: iceServers(),
+      trickle: true,
+    });
+    wirePeer(peer, sig);
+    S.swarm.addPeer(peer);
+    const offer = await peer.createOffer();
+    // 走到这里可能已经过了几秒（要等 ICE 收集）。期间这条 peer 可能被顶替或摘掉，
+    // 那就别再把这份过期的 offer 发出去。
+    if (S.swarm.peers.get(peerId) !== peer) return;
+    sig.signal(peerId, { kind: 'offer', sdp: offer });
+  })();
+
+  RENEGOTIATING.set(peerId, run);
+  try {
+    await run;
+  } finally {
+    RENEGOTIATING.delete(peerId);
+  }
 }
 
 /* ------------------------------ peer 接线 ------------------------------ */
@@ -1200,6 +1251,11 @@ function wirePeer(peer, sig) {
   peer.on('statechange', (s) => {
     if (s === 'connected' || s === 'completed') {
       clearGrace();
+      // ICE 自己缓过来了，把已经排上的重连撤掉。
+      // cancelRecovery 原来只在 'open'（数据通道首次打开）和 peer-leave 时调，
+      // 而 ICE 自愈不会再触发 open —— 于是 grace 到期排上的定时器照常执行，
+      // 把一条刚刚恢复好的连接又拆掉重建一遍。
+      cancelRecovery(peer.peerId);
       return;
     }
     if (s === 'disconnected' && sig && !graceTimer) {
@@ -1340,7 +1396,7 @@ function initSwarmAndSync() {
   });
 
   S.sync.on('stall-change', ({ name, stalled, self }) => {
-    const who = self ? '你' : name;
+    const who = self ? t('你') : name;
     // 游客的缓冲不足只暂停自己，别喊「全员暂停」误导人。
     const guestSelf = self && !S.sync.canIControl();
     if (stalled) {
@@ -1348,7 +1404,10 @@ function initSwarmAndSync() {
         guestSelf ? '你的缓冲不够，先暂停你自己（不影响他人）' : `${who}的缓冲跟不上了，全员暂停等待`,
         'warn'
       );
-      window.sw.mpv.osd(guestSelf ? '缓冲不足，暂停你自己…' : `等待 ${who} 缓冲…`, 3000);
+      // OSD 文本走 IPC 交给 mpv 渲染，不进 DOM —— 自动翻译的 MutationObserver
+      // 碰不到它，必须在这里显式过一遍 t()。字典里本来就为这几条写了英文，
+      // 只是调用点漏了，那些词条一直是死的。
+      window.sw.mpv.osd(guestSelf ? t('缓冲不足，暂停你自己…') : t(`等待 ${who} 缓冲…`), 3000);
     } else {
       log(`${who}缓冲够了`, 'good');
     }
@@ -1372,7 +1431,7 @@ function initSwarmAndSync() {
   S.sync.on('denied', ({ action }) => {
     if (action === 'seek') {
       log('你是游客，不能跳转进度', 'warn');
-      window.sw.mpv.osd('游客不能跳转进度', 2000);
+      window.sw.mpv.osd(t('游客不能跳转进度'), 2000);
     }
   });
 
@@ -1471,7 +1530,7 @@ function refreshMediaUi() {
   $('btn-reveal').textContent = S.isSeeder ? '打开源文件位置' : '打开临时缓存位置';
   $('buffer').classList.toggle('link-mode', S.sourceType === 'link');
   $('media-switch-block')?.classList.toggle('hidden', S.role !== 'host');
-  $('btn-reopen')?.classList.toggle('hidden', S.mpvRunning || !S.filePath);
+  $('btn-reopen')?.classList.toggle('hidden', S.mpvRunning || !S.filePath || !playbackAllowed());
 }
 
 /**
@@ -1523,7 +1582,7 @@ function maybeLaunchPlayer(p) {
     if (p.contiguousBytes >= readyBytes) {
       S.mediaSafety.status = 'trusted-streaming';
       log('可信房间已达到片头缓冲，正在边接收边播放；完整接收后仍会执行安全扫描。', 'warn');
-      launchPlayer().then(() => window.sw.mpv.osd('可信房间 · 边下边播风险较高', 3500));
+      launchPlayer().then(() => window.sw.mpv.osd(t('可信房间 · 边下边播风险较高'), 3500));
     }
     return;
   }
@@ -1553,7 +1612,7 @@ async function verifyReceivedMedia() {
       'good'
     );
     if (!S.mpvRunning) await launchPlayer();
-    window.sw.mpv.osd('安全扫描通过 · 缓存退出后自动清理', 2500);
+    window.sw.mpv.osd(t('安全扫描通过 · 缓存退出后自动清理'), 2500);
     return;
   }
 
@@ -1568,7 +1627,7 @@ async function verifyReceivedMedia() {
   if (result.status === 'unavailable' && S.roomSecurityMode === 'trusted') {
     S.mediaSafety.status = 'unscanned';
     log(`${result.message}。可信房间不因此中断播放，但这份文件始终没有经过本机扫描 —— 请自行确认片源可信。`, 'warn');
-    window.sw.mpv.osd('未经本机扫描 · 请自行确认片源', 4000);
+    window.sw.mpv.osd(t('未经本机扫描 · 请自行确认片源'), 4000);
     renderStatus();
     return;
   }
@@ -1591,8 +1650,37 @@ async function verifyReceivedMedia() {
   renderStatus();
 }
 
+/**
+ * 现在这个文件允不允许交给播放器。
+ *
+ * 这道门槛以前只长在各个调用方身上（onSessionReady / maybeLaunchPlayer /
+ * verifyReceivedMedia），而「重新打开播放器」按钮直接绑的是 launchPlayer ——
+ * 于是接收方一建好会话（S.filePath 立刻就有值）按钮就露出来了，点一下就把
+ * 还没收完、更没扫过的稀疏缓存交给 mpv，安全模式的全部承诺当场作废。
+ * 门槛必须长在函数里，调用方漏判也拦得住。
+ */
+function playbackAllowed() {
+  if (S.isSeeder) return true; // 片源本地就有完整文件
+  if (S.sourceType === 'link') return true; // 链接模式不经过接收缓存
+  if (S.roomSecurityMode === 'trusted') {
+    // 可信房间：达到片头水位或已扫描完成都算放行
+    return ['trusted-streaming', 'clean', 'unscanned'].includes(S.mediaSafety.status);
+  }
+  // 安全模式：只有完整接收且扫描通过才行
+  return S.mediaSafety.status === 'clean';
+}
+
 async function launchPlayer() {
   if (S.mpvRunning || !S.filePath) return;
+  if (!playbackAllowed()) {
+    log(
+      S.roomSecurityMode === 'trusted'
+        ? '还没收到足够的片头，再等一会儿就能开播。'
+        : '安全模式下要等文件完整接收并通过本机安全扫描后才能播放。',
+      'warn'
+    );
+    return;
+  }
   S.mpvRunning = true; // 先占位，防止 progress 事件密集时重复拉起
   try {
     await window.sw.mpv.launch(
@@ -1605,6 +1693,10 @@ async function launchPlayer() {
     $('btn-playpause').disabled = false;
     $('btn-reopen')?.classList.add('hidden');
     log('mpv 已启动（先暂停着，等所有人就绪）', 'good');
+    // 新进程从 0:00 起。播放器没起来时收到的 SYNC 全被「mpv 未启动」吞掉了，
+    // 这里必须把房间共识位置重放一遍，否则接收方和重开播放器的人都会
+    // 独自停在片头，而房间里其他人早就播到中间了。
+    S.sync?.resyncToShared?.();
   } catch (e) {
     S.mpvRunning = false; // 占位撤回，否则再也不会重试
     $('btn-reopen')?.classList.remove('hidden');
@@ -1702,7 +1794,13 @@ async function inviteViaServer() {
     if (!S.signaling) {
       S.mode = 'server';
       const room = randomRoomId();
-      await connectSignaling(S.settings.signalUrl, room);
+      try {
+        await connectSignaling(S.settings.signalUrl, room);
+      } catch (e) {
+        S.signaling?.close();
+        S.signaling = null;
+        throw e;
+      }
       S.roomId = room;
     }
 
@@ -1733,7 +1831,7 @@ async function inviteViaServer() {
       out,
       error,
       make('p', {}, [
-        '信令服务器没跑起来的话，可以在本机执行 ',
+        '信令服务器没跑起来的话，可以在本机执行',
         make('code', { text: 'npm run signal' }),
         '，或者直接用下面的极简模式。',
       ])
@@ -1891,7 +1989,15 @@ async function acceptManualAnswer(rawInput) {
         `对方选择的是${securityModeLabel(payload.securityMode)}，本房间是${securityModeLabel(S.roomSecurityMode)}。双方需分别选择相同模式。`
       );
     }
-    peer.peerId = payload.from;
+    // 应答码里的 from 是对面自称的身份，不能照单全收。
+    // syncEngine 的全部权限判断都以 peerId 为准，被邀请者只要把 from 填成房主的
+    // peerId，就会在房主这台机器上被判成 role='host'，直接拿走控场权。
+    const claimed = String(payload.from || '');
+    if (!/^[A-Za-z0-9._-]{6,128}$/.test(claimed)) throw new Error('应答码里的身份标识不合法');
+    if (claimed === S.peerId) throw new Error('应答码里的身份和你自己相同，已拒绝');
+    if (S.hostId && claimed === S.hostId) throw new Error('应答码冒用了房主的身份，已拒绝');
+    if (S.swarm?.peers?.has(claimed)) throw new Error('这个身份已经在房间里了，已拒绝');
+    peer.peerId = claimed;
     peer.name = payload.name || '观众';
     wirePeer(peer);
     S.swarm.addPeer(peer);
@@ -2220,7 +2326,19 @@ window.sw.mpv.onTick((snap) => {
 });
 
 window.sw.mpv.onExit(({ code }) => {
+  // 换片期间旧进程的 exit 常常晚到几百毫秒 —— mpv.quit() 只等命令回包，
+  // 不等进程真的落地。这段时间新播放器可能已经起来了，照单全收会把
+  // S.mpvRunning 永久打回 false：进度条拖不动、状态栏一直报错、
+  // 「重新打开」按钮常驻。换片窗口内的 exit 一律当成预期内的收尾。
+  if (S.switchingMedia) {
+    S.sync?.forgetPlayerState?.();
+    return;
+  }
   S.mpvRunning = false;
+  // 必须把上一条 tick 忘掉。留着的话，重开播放器后新 mpv 的第一条 tick
+  // （position=0、paused=true）会被 syncEngine 当成「用户拖了进度条 / 按了暂停」，
+  // 房主据此广播 SYNC(0)，整个房间被拉回片头并暂停。
+  S.sync?.forgetPlayerState?.();
   $('btn-playpause').disabled = true;
   if (!S.switchingMedia && S.filePath) {
     $('btn-reopen')?.classList.remove('hidden');

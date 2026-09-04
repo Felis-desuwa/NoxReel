@@ -59,7 +59,9 @@ const EN = new Map(Object.entries({
   '未找到。只有当片子需要转封装时才会用到。': 'Not found. It is only needed when a video must be remuxed.',
   '未找到。MP4/HLS 直链仍可播放，视频网站页面链接不可用。': 'Not found. Direct MP4/HLS links still work, but video page URLs do not.',
   '安装方式（任选其一）': 'Installation options',
-  '或者手动下载后，把可执行文件路径写进环境变量 ': 'Or download it manually and set the executable path in ',
+  // 注意：键不能带首尾空白 —— translate() 会先把它剥掉再查表，带空格的键永远命中不了。
+  // 需要空格的是英文那一侧，所以空格加在值上。
+  '或者手动下载后，把可执行文件路径写进环境变量': 'Or download it manually and set the executable path in ',
   '重新检测': 'Check again',
   '检查格式与兼容性': 'Check format and compatibility',
   '转封装（按需）': 'Remux (if needed)',
@@ -161,6 +163,7 @@ const EN = new Map(Object.entries({
   '可信房间 · 边下边播风险较高': 'Trusted room · Progressive playback has higher risk',
   '完整文件安全扫描通过；退出房间后会自动删除缓存': 'Full-file security scan passed. The cache will be deleted when you leave.',
   '安全扫描通过，正在打开播放器；退出房间后会自动删除缓存': 'Security scan passed. Opening the player; the cache will be deleted when you leave.',
+  '未经本机扫描 · 请自行确认片源': 'Not scanned locally · Verify the source yourself',
   '安全扫描通过 · 缓存退出后自动清理': 'Security scan passed · Cache is cleared on exit',
   '安全扫描未通过': 'Security scan did not pass',
   'mpv 已启动（先暂停着，等所有人就绪）': 'mpv started and is paused while everyone gets ready',
@@ -179,7 +182,7 @@ const EN = new Map(Object.entries({
   '默认使用零服务器直连。双方直接点开邀请／应答链接即可，不再手动粘贴长码；跨网络仍需交换一次应答。': 'Serverless direct connection is the default. Both sides click invite/answer links instead of pasting long codes; one answer exchange is still required across networks.',
   '信令服务器只转发连接地址，不碰视频内容。极简模式连这个都不要，代价是要手动来回粘贴两次。': 'The signaling server only relays connection metadata, never video. Manual mode needs no server but requires a two-way code exchange.',
   '正在连接信令服务器…': 'Connecting to the signaling server…',
-  '信令服务器没跑起来的话，可以在本机执行 ': 'If the signaling server is not running, execute ',
+  '信令服务器没跑起来的话，可以在本机执行': 'If the signaling server is not running, execute ',
   '，或者直接用下面的极简模式。': ', or use manual mode below.',
   '正在收集网络候选地址（几秒钟）…': 'Collecting network candidates (a few seconds)…',
   '待加入': 'Pending member',
@@ -345,7 +348,7 @@ const EN = new Map(Object.entries({
   '还会把这条音轨压一遍（无损）': 'This audio track also gets compressed (losslessly)',
   '这条轨是': 'This track is ',
   '未压缩的 PCM': 'uncompressed PCM',
-  '，转成 FLAC 是数学无损的 —— 解码出来的采样逐字节相同。已经拿这个文件实测过：能压掉 ':
+  '，转成 FLAC 是数学无损的 —— 解码出来的采样逐字节相同。已经拿这个文件实测过：能压掉':
     ', and converting it to FLAC is mathematically lossless—the decoded samples are byte-for-byte identical. Measured on this very file: it shrinks by ',
   '这一步要重新编码音频，比单纯丢轨慢，长片可能要几分钟。':
     'This step re-encodes the audio, so it is slower than simply dropping tracks—a long film can take a few minutes.',
@@ -367,6 +370,8 @@ const EN_PATTERNS = [
   [/^已精简到：(.*)，体积 (.*) → (.*)$/, 'Slimmed to: $1 — size $2 → $3'],
   [/^已精简到：(.*)$/, 'Slimmed to: $1'],
   [/^保留哪条音轨（共 (\d+) 条）$/, (_all, n) => `Which audio track to keep (${n} available)`],
+  [/^，约 (.+)。$/, ', about $1.'],
+  [/^你$/, 'you'],
   [
     /^和 (.+) 的直连断了，(\d+) 秒后自动重连（第 (\d+) 次）$/,
     'Lost the direct connection to $1. Reconnecting automatically in $2 seconds (attempt $3).',

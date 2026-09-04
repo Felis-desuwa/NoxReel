@@ -242,12 +242,30 @@ test('快链路上超时收紧，丢一条请求不用干等 20 秒', async () =
   assert.ok(t >= 6000, '也不能收得太狠，抖动一下就误判成超时');
 });
 
-test('慢链路上超时不会收得比原来还短', async () => {
+test('慢链路上超时永远不低于自己算出的期望送达时间', async () => {
   const { Swarm } = await import('../src/renderer/lib/swarm.js');
   const s = new Swarm({ peerId: 'me', name: 'me' });
   s.manifest = manifest();
-  const t = s._requestTimeout({ rtt: 200, downRate: 200e3, inflight: new Set([1, 2, 3, 4]) });
-  assert.equal(t, 20000, '一片要传十几秒的链路，超时必须留满');
+  // 200 KB/s、欠 4 片：光把队尾那片传完就要 40 秒出头。
+  // 原来这里被 Math.min(20000, …) 一刀切在 20 秒 —— 那片必然在能到达之前
+  // 就被判超时，无限重派、永远收不齐。
+  const rtt = 200;
+  const rate = 200e3;
+  const queued = 4;
+  const expected = rtt + ((queued * CHUNK) / rate) * 1000;
+  const t = s._requestTimeout({ rtt, downRate: rate, inflight: new Set([1, 2, 3, 4]) });
+  assert.ok(t > expected, `期望送达 ${Math.round(expected)}ms，超时却只给了 ${t}ms`);
+  assert.ok(t >= 20000, '不该比原来的固定上限还短');
+});
+
+test('窗口放深之后，深窗口的超时跟着放宽而不是被一刀切', async () => {
+  const { Swarm } = await import('../src/renderer/lib/swarm.js');
+  const s = new Swarm({ peerId: 'me', name: 'me' });
+  s.manifest = manifest();
+  const slow = { rtt: 150, downRate: 500e3 };
+  const shallow = s._requestTimeout({ ...slow, inflight: new Set([1, 2]) });
+  const deep = s._requestTimeout({ ...slow, inflight: new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]) });
+  assert.ok(deep > shallow, `欠 12 片 (${deep}ms) 不该和欠 2 片 (${shallow}ms) 一样早超时`);
 });
 
 test('欠得越多，允许等的时间越长 —— 排队是正常的，不是超时', async () => {

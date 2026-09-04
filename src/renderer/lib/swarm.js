@@ -469,8 +469,18 @@ export class Swarm extends Emitter {
   }
 
   async _commitChunk(peer, index, bytes) {
+    // 一定要按记账里登记的那个 peer 去销账，而不是「送来最后一帧的人」。
+    //
+    // 这两者会不一致：一片超时被回收后改派给了 B，原来的 A 随后从头重发并抢先
+    // 把它凑齐，_commitChunk 收到的 peer 就是 A。此时去删 A.inflight 是空操作，
+    // 而 B.inflight 里那个下标再也没人清 —— 全局记录已经删掉，_expireStale 扫不到，
+    // DENY 分支也会因为取不到 info 而跳过。每漏一个，B 的在途窗口就永久少一格，
+    // 攒够窗口数这个上游就被 plan() 的 usable 过滤器永久剔除：连接全都健康、
+    // 成员列表也正常，进度条却停住不动。
+    const owner = this.inflight.get(index);
     this.inflight.delete(index);
-    peer.inflight.delete(index);
+    if (owner) this.peers.get(owner.peerId)?.inflight.delete(index);
+    peer.inflight.delete(index); // 送达方那边也清一次，两者相同时等价
 
     // 从「在途」到「已有」中间隔着一整个写盘往返：2MB 过 IPC、算 SHA-256、落盘。
     // 这段时间里这片既不在 inflight 里、have 也还是 0，调度器只能判定它还缺，
@@ -550,7 +560,10 @@ export class Swarm extends Emitter {
       playbackByte: this.playbackByte,
       // 正在落盘的那几片也算「已经安排上了」，否则它们会在写盘的空档里被重复请求。
       inflight: new Set([...this.inflight.keys(), ...this._writing]),
-      peers: [...this.peers.values()],
+      // 只跟手里是同一个文件的人要片。对方换片之后会发来新清单和新位图，
+      // 那张位图描述的是另一个文件 —— 照着它要片，要回来的分片哈希必然对不上，
+      // 白白占着在途名额反复重下。setSession 只处理了「我换片」这个方向。
+      peers: [...this.peers.values()].filter((p) => this._sameFile(p)),
     });
 
     for (const { peerId, index } of assignments) {
@@ -580,7 +593,18 @@ export class Swarm extends Emitter {
     // 他手上欠我的片是排队发的，最后一片要等前面都发完。
     const queued = Math.max(1, peer.inflight?.size || 1);
     const expected = rtt + ((queued * this.manifest.chunkSize) / rate) * 1000;
-    return Math.max(6000, Math.min(20000, expected * 3 + 2000));
+    // 上限不能一刀切在 20 秒：窗口放深之后（跨境链路会涨到 12 片），慢链路上
+    // expected 本身就可能超过 20 秒，那样队尾那片必然在能到达之前就被判超时，
+    // 于是无限重派、永远收不齐。上限至少要给到期望送达时间本身留出余量。
+    const ceiling = Math.max(20000, expected * 1.5 + 2000);
+    return Math.max(6000, Math.min(ceiling, expected * 3 + 2000));
+  }
+
+  /** 这个 peer 手里是不是同一个文件。fileId 由所有分片哈希推导，同内容必然同 id。 */
+  _sameFile(peer) {
+    const theirs = peer?.remoteManifest?.fileId;
+    if (!theirs || !this.manifest?.fileId) return true; // 还没交换清单时不拦，握手流程自己会处理
+    return theirs === this.manifest.fileId;
   }
 
   /** 要了半天不给的片，超时收回重新分配。对面可能网卡了或者悄悄挂了。 */

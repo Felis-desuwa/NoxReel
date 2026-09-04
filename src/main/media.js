@@ -103,9 +103,26 @@ function requireFfmpeg() {
   throw err;
 }
 
+// 正在跑的 ffmpeg/ffprobe。转封装和精简都是分钟级的，用户在中途关掉软件时
+// 必须把它们一起收掉 —— 否则 Electron 退出了，ffmpeg 还在满速往 %TEMP% 里写几个 GB，
+// 用户界面上已经「关掉了」，既看不见也停不掉；顺带还会让缓存目录当次删不掉
+// （Windows 上被持有写句柄的文件删不了，要等下次启动才回收）。
+const activeProcesses = new Set();
+
+/** 退出前调用：终止所有还在跑的 ffmpeg/ffprobe。 */
+function cancelAll() {
+  for (const p of [...activeProcesses]) {
+    try {
+      p.kill();
+    } catch {}
+  }
+  activeProcesses.clear();
+}
+
 function run(bin, args, { onStderr } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    activeProcesses.add(p);
     let out = '';
     let err = '';
     p.stdout.on('data', (d) => (out += d.toString()));
@@ -115,8 +132,12 @@ function run(bin, args, { onStderr } = {}) {
       if (err.length > 65536) err = err.slice(-32768);
       if (onStderr) onStderr(s);
     });
-    p.on('error', reject);
+    p.on('error', (e) => {
+      activeProcesses.delete(p);
+      reject(e);
+    });
     p.on('close', (code) => {
+      activeProcesses.delete(p);
       if (code === 0) resolve({ stdout: out, stderr: err });
       else reject(new Error(`${path.basename(bin)} 退出码 ${code}：${err.slice(-600)}`));
     });
@@ -215,25 +236,43 @@ async function sampleBitRates(filePath, { seconds = 120 } = {}) {
   const out = new Map();
   if (!bin) return out;
 
+  // 一定要用 json 按字段名取值。csv 的列序由 ffprobe 自己定，**不是** -show_entries
+  // 里写的顺序 —— 实测它输出的是 stream_index, duration_time, size，按位置解构会把
+  // 包时长当成包大小，parseInt('0.021000') 得 0，累加恒为 0，整个函数永远返回空 Map。
   const { stdout } = await run(bin, [
     '-v', 'error',
     '-read_intervals', `%+${seconds}`,
     '-select_streams', 'a',
     '-show_entries', 'packet=stream_index,size,duration_time',
-    '-of', 'csv=p=0',
+    '-of', 'json',
     filePath,
   ]).catch(() => ({ stdout: '' }));
 
-  const bytes = new Map();
-  for (const line of stdout.split(/\r?\n/)) {
-    const [idx, size] = line.split(',');
-    const i = parseInt(idx, 10);
-    const n = parseInt(size, 10);
-    if (!Number.isFinite(i) || !Number.isFinite(n)) continue;
-    bytes.set(i, (bytes.get(i) || 0) + n);
+  let packets;
+  try {
+    packets = JSON.parse(stdout).packets;
+  } catch {
+    return out;
   }
+  if (!Array.isArray(packets)) return out;
+
+  const bytes = new Map();
+  const span = new Map(); // 每轨实际采到多长，别拿固定的 seconds 当分母
+  for (const p of packets) {
+    const i = parseInt(p.stream_index, 10);
+    const n = parseInt(p.size, 10);
+    if (!Number.isFinite(i) || !Number.isFinite(n) || n <= 0) continue;
+    bytes.set(i, (bytes.get(i) || 0) + n);
+    const dt = parseFloat(p.duration_time);
+    if (Number.isFinite(dt) && dt > 0) span.set(i, (span.get(i) || 0) + dt);
+  }
+
   for (const [i, total] of bytes) {
-    if (total > 0) out.set(i, Math.round((total * 8) / seconds));
+    // 文件比采样区间短时，用固定的 seconds 当分母会把码率成比例算低。
+    // 拿这一轨实际采到的时长当分母；时长信息缺失才退回 seconds。
+    const dur = span.get(i);
+    const divisor = Number.isFinite(dur) && dur > 0.5 ? dur : seconds;
+    if (total > 0) out.set(i, Math.round((total * 8) / divisor));
   }
   return out;
 }
@@ -587,7 +626,14 @@ async function slim(filePath, outDir, { keepIndexes, toFlac: toFlacIn, onProgres
   // 调用方换了要保留的音轨时，转 FLAC 的目标要跟着换 —— 否则会去转一条
   // 根本没保留的轨，ffmpeg 直接报错。留下的那条也得重新判一次能不能转。
   const requested = Array.isArray(toFlacIn) ? toFlacIn : plan.toFlac || [];
-  const toFlac = requested.filter((i) => indexes.includes(i));
+  // 除了「这条轨还在不在保留列表里」，还得自己复查一遍能不能转。
+  // canTranscodeToFlac 的第一道判据就是输出容器必须是 MKV（FLAC-in-MP4 的播放器
+  // 支持面太窄，安卓的 ExoPlayer 尤其），而调用方传来的 toFlac 是渲染进程算的、
+  // 那边漏掉了容器判断。守卫写在两处都不算冗余：这一步的产物是不可逆的。
+  const byIndex = new Map((probe?.streams || []).map((s) => [s.index, s]));
+  const toFlac = requested.filter(
+    (i) => indexes.includes(i) && canTranscodeToFlac(byIndex.get(i), { toMkv: isMkv })
+  );
 
   await run(bin, slimArgs(filePath, outPath, indexes, { toFlac }), {
     onStderr: progressWatcher(probe?.duration || 0, onProgress),
@@ -598,7 +644,12 @@ async function slim(filePath, outDir, { keepIndexes, toFlac: toFlacIn, onProgres
     fsp.stat(outPath).then((s) => s.size, () => 0),
   ]);
 
-  return { outPath, plan: { ...plan, toFlac }, inputSize, outputSize };
+  return {
+    outPath,
+    plan: { ...plan, toFlac, reencodesAudio: toFlac.length > 0 },
+    inputSize,
+    outputSize,
+  };
 }
 
 function toolStatus() {
@@ -614,6 +665,7 @@ module.exports = {
   slim,
   slimArgs,
   slimPlan,
+  cancelAll,
   canTranscodeToFlac,
   isFlacConvertible,
   measureFlacRatio,

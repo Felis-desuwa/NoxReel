@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.6.6-7C5CFF?style=for-the-badge" alt="Version 0.6.6">
+    <img src="https://img.shields.io/badge/version-0.6.7-7C5CFF?style=for-the-badge" alt="Version 0.6.7">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -53,14 +53,14 @@
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!IMPORTANT]
-> `v0.6.6` 做了四件事。**一半的传输流量是重复的，现在归零**：分片收齐后要先落盘，而落盘那一整个往返里它既不算在途、也还没进已有位图，调度器只能判定它还缺、于是再要一遍 —— 实测一个 25.9 MB 的文件，发送端总共发出 59.8 MB（2.31 倍），多出来的那份最后被校验认出是重复丢掉，带宽却已经花掉。**邀请码生成从 9 秒降到 1.3 秒**：极简模式要等 ICE 候选集齐，而 `iceGatheringState` 在 Electron 里从来不会走到 `complete`，于是每次都把 8 秒硬超时耗满；现在拿到公网地址后再静 1.2 秒没有新候选就收工，候选一条不少。**连接更容易建起来**：STUN 从 1 台增加到 3 台冗余，TURN 地址自动同时尝试 UDP 与 TCP（酒店和公司网络常常只放行 TCP），断线后自动重连而不是让人退房重来，连不上时会说清是 STUN 不通、中继凭据不对还是对称 NAT 对撞。**无损精简能真的压缩了**：未压缩的 PCM 音轨转成 FLAC，解码出来逐字节相同；压缩比对每个文件实测而不是照系数猜，省不到 8% 就不提议。发片前还可以自己选保留哪条音轨。
+> `v0.6.7` 是一次修 bug 的版本：一轮全仓库审查（17 个维度分头找、每条结论再由三个不同视角的验证者试图证伪）确认了 **47 处缺陷**，全部修掉，其中约十处是 `v0.6.6` 自己引入的。**最要紧的一条是安全模式被绕过**：房间里的「重新打开播放器」按钮直接调用启动函数，而扫描门槛只长在其他几个调用方身上 —— 接收方一建好会话按钮就露出来，点一下就把还没收完、更没扫过的文件交给了播放器。门槛现在长在启动函数内部，调用方漏判也拦得住。**无损精简此前对绝大多数片子直接报错**：没有可转 FLAC 的 PCM 轨时渲染进程会传一个空数组，而主进程的参数校验把空数组当成畸形输入拒了 —— 也就是说这个功能只在源文件恰好带未压缩 PCM 轨时才能用。**采样估码率一次都没生效过**：ffprobe 不按请求顺序输出字段，代码把包时长当成了包大小，函数永远返回空。**断线自动重连会自己撞自己**：两端同时重连时，发起方既跑自己的定时器又响应对面的请求，连发两份 offer，过期的应答被套到新连接上，反而永远连不上；安卓端则根本不认这个协议，手机侧的链路断了就再也回不来。另外还修了传输记账的在途名额泄漏（会让上游被永久剔除、进度条停住）、全员暂停期间按空格能永久解除本机暂停、重开播放器把全房拉回 00:00、信令服务器的 XFF 伪造与房主身份顶替、安卓端接收缓存永不删除，以及一批漏翻的界面文案。测试从 205 条增加到 252 条。
 
 ## 下载
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，可选择安装文件夹 | [NoxReel-Setup-0.6.6.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.6.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.6.6.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.6.exe) |
+| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，可选择安装文件夹 | [NoxReel-Setup-0.6.7.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.7.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.6.7.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.7.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 

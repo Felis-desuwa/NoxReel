@@ -29,6 +29,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var web: WebView
     private lateinit var player: SyncPlayer
+    private lateinit var store: Store
     private var pendingInviteLink: String? = null
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -40,7 +41,10 @@ class MainActivity : AppCompatActivity() {
         val playerView = findViewById<StyledPlayerView>(R.id.player_view)
         web = findViewById(R.id.web)
 
-        val store = Store(applicationContext)
+        store = Store(applicationContext)
+        // 上次进程被系统杀掉时 close() 根本没机会跑，那批接收缓存会一直留着。
+        // 冷启动时会话表是空的，正是回收它们的时机。
+        store.cleanupStale()
         player = SyncPlayer(applicationContext)
         player.attachView(playerView)
         val bridge = NativeBridge(store, player)
@@ -111,6 +115,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         player.release()
+        // 关掉所有会话，接收缓存跟着删。原来只 release 播放器，
+        // 缓存留在 filesDir 里既看不到也删不掉，只能去系统设置清数据。
+        if (::store.isInitialized) runCatching { store.closeAll() }
         super.onDestroy()
     }
 }

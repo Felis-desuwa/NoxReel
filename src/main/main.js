@@ -210,6 +210,9 @@ async function cleanup() {
     send('app:shutdownRequested');
     await delay(50);
     malwareScan.cancelAll();
+    // 转封装／精简的 ffmpeg 也要收，否则它会变成孤儿进程继续满速写盘，
+    // 而且持着输出文件的句柄让 cleanupRun() 当次删不掉缓存目录。
+    media.cancelAll();
     if (mpv) await mpv.quit().catch(() => {});
     mpv = null;
     await store.closeAll().catch(() => {});
@@ -381,12 +384,24 @@ secureHandle('mpv:launch', async (payload) => {
     : await requireAllowedLocalPath(filePath);
   const safeHeaders = /^https?:\/\//i.test(source) ? validate.mediaHeaders(headers) : {};
   if (typeof startPaused !== 'boolean') throw new TypeError('无效的暂停参数');
-  if (mpv) await mpv.quit().catch(() => {});
+  // 先摘监听器再退，否则旧进程几百毫秒后才真的 exit（quit() 只等命令回包，
+  // 不等进程落地），那条迟到的 exit 会被转发给渲染进程，把刚起来的新播放器
+  // 标记成「已关闭」—— S.mpvRunning 永久停在 false，进度条拖不动、状态栏一直报错。
+  if (mpv) {
+    mpv.removeAllListeners();
+    await mpv.quit().catch(() => {});
+  }
   mpv = new MpvController();
 
-  mpv.on('tick', (snap) => send('mpv:tick', snap));
-  mpv.on('exit', (info) => send('mpv:exit', info));
-  mpv.on('error', (err) => send('mpv:error', { message: err.message }));
+  // 闭包捕获当前这个控制器，晚到的事件如果不是它发的就丢掉 —— 双保险，
+  // 免得将来有人在别处忘了 removeAllListeners 又把这个 bug 放回来。
+  const controller = mpv;
+  const fromCurrent = (fn) => (arg) => {
+    if (mpv === controller) fn(arg);
+  };
+  mpv.on('tick', fromCurrent((snap) => send('mpv:tick', snap)));
+  mpv.on('exit', fromCurrent((info) => send('mpv:exit', info)));
+  mpv.on('error', fromCurrent((err) => send('mpv:error', { message: err.message })));
 
   return mpv.launch(source, { startPaused, headers: safeHeaders });
 });

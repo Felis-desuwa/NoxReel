@@ -24,6 +24,9 @@ class Store(private val context: Context) {
     private val sessions = ConcurrentHashMap<String, Session>()
     private var seq = 0
 
+    // 和桌面端主进程的 FILE_ID_RE 对齐：fileId 由所有分片哈希推导，只可能是 32 位十六进制。
+    private val FILE_ID_RE = Regex("^[a-f0-9]{8,64}$")
+
     private fun mediaDir(): File = File(context.filesDir, "media").apply { mkdirs() }
 
     /**
@@ -41,8 +44,15 @@ class Store(private val context: Context) {
         val hashes = JSONArray(hashesJson).let { arr ->
             Array(arr.length()) { arr.getString(it) }
         }
+        // fileId 来自对端的 MANIFEST 控制消息，直接拼进文件名等于把路径交给对方。
+        // 含 ".." 的 fileId 会让接收缓存落到 media 目录之外，既不受清理管辖，
+        // 内容还完全由对方决定。桌面端主进程有 FILE_ID_RE 挡这一层，这边一直没有。
+        require(FILE_ID_RE.matches(fileId)) { "非法的 fileId" }
         val dataFile = File(mediaDir(), "$fileId.dat")
         val partFile = File(mediaDir(), "$fileId.swpart")
+        require(dataFile.canonicalPath.startsWith(mediaDir().canonicalPath + File.separator)) {
+            "接收缓存路径越界"
+        }
 
         val raf = RandomAccessFile(dataFile, "rw")
         if (raf.length() != size) raf.setLength(size) // 预分配等大稀疏文件
@@ -86,8 +96,43 @@ class Store(private val context: Context) {
         return Base64.encodeToString(bytes, Base64.NO_WRAP)
     }
 
+    /**
+     * 关闭会话。
+     *
+     * 接收缓存必须在这里删掉：换片、退房走的都是这一条路，而 Android 侧
+     * 此前没有任何地方删过它们。文件在 filesDir（不是 cacheDir），系统的
+     * 存储压力回收也永远不会碰 —— 连看三部 4GB 的片就是 12GB 躺在内部存储里，
+     * 用户在应用里看不到也删不掉，只能去系统设置「清除应用数据」。
+     * 而界面上一直在向用户承诺「退出房间后会自动删除缓存」。
+     *
+     * 做种会话（本机自有文件）不删：那是用户自己的片子，不是我们生成的缓存。
+     */
     fun close(sessionId: String) {
-        sessions.remove(sessionId)?.close()
+        val session = sessions.remove(sessionId) ?: return
+        session.close()
+        // 手机端是纯观众，会话产物一律是我们自己生成的接收缓存，删干净即可。
+        runCatching { session.dataFile.delete() }
+        runCatching { session.partFile.delete() }
+    }
+
+    /**
+     * 启动时回收上次异常退出留下的缓存。
+     *
+     * 进程被系统杀掉时 close() 根本不会被调用，那批文件会一直留着。
+     * 这里只清 media 目录下我们自己生成的 .dat/.swpart，且只清当前没有会话
+     * 正在用的 —— 冷启动时 sessions 本来就是空的。
+     */
+    /** 关掉所有会话（应用退出时）。每个会话的接收缓存跟着删。 */
+    fun closeAll() {
+        for (id in sessions.keys.toList()) close(id)
+    }
+
+    fun cleanupStale() {
+        val inUse = sessions.values.mapNotNull { it.dataFile.name }.toSet()
+        mediaDir().listFiles()?.forEach { f ->
+            if (f.name in inUse) return@forEach
+            if (f.name.endsWith(".dat") || f.name.endsWith(".swpart")) runCatching { f.delete() }
+        }
     }
 
     private fun err(reason: String): String =

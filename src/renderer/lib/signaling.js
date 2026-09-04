@@ -179,9 +179,16 @@ const BARE_RE = new RegExp(`(?:NR3|NR2|SW2|SW1)-${BODY_CHARS}+`);
  * 靠这一步救回来），最后才在剩下的文本里找码。
  */
 export function unwrapInviteInput(input) {
-  const text = String(input || '')
+  const cleaned = String(input || '')
     .replace(INVISIBLE_RE, '')
-    .replace(/\s+/g, '');
+    // 邮件/聊天软件的引用前缀。'>' 不在码的字母表里，留着会把折行的码从中间截断。
+    .replace(/^[ 	]*>+[ 	]?/gm, '');
+  // 空白必须先在**每一段之内**剥掉（对付邮件的 78 列折行），而不是把整段输入
+  // 拼成一条长串再搜 —— BARE_RE 是贪婪的、字母数字又都在码的字母表里，
+  // 「NR3-xxxx thanks」拼起来之后 thanks 会被整个吞进码体，解不开。
+  // 中文闲话不受影响（汉字不在字母表里），所以原来的测试没发现。
+  const text = cleaned.replace(/\s+/g, '');
+  const segments = cleaned.split(/\s+/).filter(Boolean);
 
   const link = LINK_RE.exec(text);
   if (link) {
@@ -199,7 +206,25 @@ export function unwrapInviteInput(input) {
   }
 
   const bare = BARE_RE.exec(text);
-  if (bare) return bare[0];
+  if (bare) {
+    // 「折行的续段」和「码后面跟的一个英文单词」在结构上一模一样，
+    // 都是「码样的一段 + 空白 + 另一段」，纯语法分不开。只能按词形区分：
+    // 续段是 gzip 后的均匀随机字节，一段十几个字符全是小写字母的概率约百万分之一；
+    // 而 thanks / ok / cheers 这类尾巴恰恰就是那个样子。
+    let perSegment = null;
+    for (const seg of segments) {
+      const hit = BARE_RE.exec(seg);
+      if (hit) {
+        perSegment = hit[0];
+        break;
+      }
+    }
+    if (perSegment && bare[0].length > perSegment.length) {
+      const tail = bare[0].slice(perSegment.length);
+      if (/^(?:[a-z]{1,16}|[A-Z][a-z]{0,15})$/.test(tail)) return perSegment;
+    }
+    return bare[0];
+  }
 
   // 找不到就把清洗过的整串交回去，让 decodeCode 给出原来那句「这不像是一个 NoxReel 邀请码」。
   return text;
@@ -263,6 +288,7 @@ export class WsSignaling extends Emitter {
     this.ws = null;
     this.connected = false;
     this._retry = 0;
+    this._joinedOnce = false; // 曾经真的进过房吗。只有进过才值得自动重连
     this._closedByUs = false;
   }
 
@@ -277,7 +303,9 @@ export class WsSignaling extends Emitter {
 
       this.ws.onopen = () => {
         this.connected = true;
-        this._retry = 0;
+        // 退避计数不能在这里清零。WS 握手成功不代表加入成功 —— 「连得上但 join 被拒」
+        // （房间满、peerId 被占、地区拦截）每一轮都会把退避重置回 1 秒，
+        // 指数退避形同虚设，变成每秒一次的重连风暴。真正加入成功才算数，见 joined 分支。
         this._send({
           t: 'join',
           roomId: this.roomId,
@@ -296,6 +324,8 @@ export class WsSignaling extends Emitter {
         }
 
         if (msg.t === 'joined') {
+          this._retry = 0; // 真正进房了，退避才该归零
+          this._joinedOnce = true;
           if (!settled) {
             settled = true;
             resolve(msg);
@@ -326,7 +356,17 @@ export class WsSignaling extends Emitter {
       this.ws.onclose = () => {
         this.connected = false;
         this.emit('disconnected');
-        if (!this._closedByUs && settled) this._scheduleReconnect();
+        // open 之后、joined 之前被对端正常关闭时，浏览器只触发 close 不触发 error，
+        // connect() 返回的 Promise 会永远悬着 —— 调用方停在「正在连接信令服务器…」。
+        if (!settled) {
+          settled = true;
+          reject(new Error(`信令服务器关闭了连接：${this.url}`));
+          return; // 首连就没成，别自作主张开始后台重连
+        }
+        // 只有「曾经真的进过房」才自动重连。原来用 settled 判断，而 reject 路径
+        // 也会把它置真，于是首连失败（调用方已经放弃）之后照样进入无限重连，
+        // 留下一条谁也不知道的僵尸连接。
+        if (!this._closedByUs && this._joinedOnce) this._scheduleReconnect();
       };
     });
   }
