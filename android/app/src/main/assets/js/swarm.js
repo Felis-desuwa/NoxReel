@@ -39,6 +39,7 @@ export class Swarm extends Emitter {
     this.scheduler = null;
     this.assembler = new ChunkAssembler();
     this.inflight = new Map(); // chunkIndex -> {peerId, at}
+    this._writing = new Set(); // 已经收齐、正在落盘的分片。见 _commitChunk() 里的说明
     this.playbackByte = 0;
 
     this._serving = new Map(); // peerId -> 正在发的片数
@@ -101,6 +102,7 @@ export class Swarm extends Emitter {
     this.scheduler = null;
     this.playbackByte = 0;
     this.inflight.clear();
+    this._writing.clear();
     this.assembler.clear();
     // 只清跟「本机会话」绑定的东西。remoteManifest / remoteHave 描述的是**对方**手里
     // 有什么，跟我这边开不开会话无关；接收方一旦变成「先收到清单和位图 → 再异步打开
@@ -457,6 +459,13 @@ export class Swarm extends Emitter {
     this.inflight.delete(index);
     peer.inflight.delete(index);
 
+    // 从「在途」到「已有」中间隔着一整个写盘往返：2MB 过 IPC、算 SHA-256、落盘。
+    // 这段时间里这片既不在 inflight 里、have 也还是 0，调度器只能判定它还缺，
+    // 于是再去要一遍 —— 而 v0.6.5 起每片落地都会触发一次 _tick，等于把这个窗口
+    // 撞得更频繁。实测一个 25.9 MB 的文件，发送端总共发出 59.8 MB（2.3 倍）。
+    // 重复的那份最后被 fileStore 认出来丢掉（res.duplicate），带宽却已经花掉了。
+    this._writing.add(index);
+
     try {
       const res = await window.sw.store.writeChunk(this.sessionId, index, bytes.buffer);
 
@@ -488,6 +497,7 @@ export class Swarm extends Emitter {
       console.error(`[swarm] 写入分片 ${index} 出错:`, e);
       this.emit('error', e);
     } finally {
+      this._writing.delete(index);
       // 一片落地就立刻把空出来的名额补上，别干等下一个 tick。
       //
       // 这条不是锦上添花：Chromium 会把不可见窗口的定时器节流到 1 秒一次，
@@ -525,7 +535,8 @@ export class Swarm extends Emitter {
     const assignments = this.scheduler.plan({
       have: this.have,
       playbackByte: this.playbackByte,
-      inflight: new Set(this.inflight.keys()),
+      // 正在落盘的那几片也算「已经安排上了」，否则它们会在写盘的空档里被重复请求。
+      inflight: new Set([...this.inflight.keys(), ...this._writing]),
       peers: [...this.peers.values()],
     });
 
@@ -541,11 +552,29 @@ export class Swarm extends Emitter {
     }
   }
 
+  /**
+   * 一个请求等多久才算废。
+   *
+   * 固定 20 秒对跨境链路太长了：丢掉一条 REQUEST，这个槽位就空转 20 秒 ——
+   * 四选一的窗口等于凭空少了四分之一吞吐，而且关键窗口里的那一片迟到 20 秒
+   * 足够让全员暂停触发一次。按对方的往返延迟和实测速率估「这片本来该多久到」，
+   * 再留三倍余量。测不出速率（刚连上、或者对方一直没吐东西）就退回 20 秒。
+   */
+  _requestTimeout(peer) {
+    const rtt = peer?.rtt > 0 ? peer.rtt : 0;
+    const rate = peer?.downRate > 0 ? peer.downRate : 0;
+    if (!rtt || !rate || !this.manifest) return 20000;
+    // 他手上欠我的片是排队发的，最后一片要等前面都发完。
+    const queued = Math.max(1, peer.inflight?.size || 1);
+    const expected = rtt + ((queued * this.manifest.chunkSize) / rate) * 1000;
+    return Math.max(6000, Math.min(20000, expected * 3 + 2000));
+  }
+
   /** 要了半天不给的片，超时收回重新分配。对面可能网卡了或者悄悄挂了。 */
-  _expireStale(timeoutMs = 20000) {
+  _expireStale() {
     const now = performance.now();
     for (const [index, info] of this.inflight) {
-      if (now - info.at < timeoutMs) continue;
+      if (now - info.at < this._requestTimeout(this.peers.get(info.peerId))) continue;
       this.inflight.delete(index);
       this.assembler.drop(index);
       this.peers.get(info.peerId)?.inflight.delete(index);
@@ -558,6 +587,7 @@ export class Swarm extends Emitter {
     this.peers.clear();
     this.assembler.clear();
     this.inflight.clear();
+    this._writing.clear();
     this.removeAll();
   }
 }

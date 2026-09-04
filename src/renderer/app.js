@@ -4,6 +4,7 @@ import { SyncEngine } from './lib/syncEngine.js';
 import { MSG } from './lib/protocol.js';
 import { encodeCode, decodeCode, inviteLink, WsSignaling, randomRoomId, randomPeerId } from './lib/signaling.js';
 import { currentLocale, setLocale, startI18n, translate as t } from './lib/i18n.js';
+import { buildIceServers, diagnoseCandidates, summarizeCandidates } from './lib/ice.js';
 
 startI18n();
 
@@ -152,18 +153,32 @@ function log(text, kind = '') {
   while (el.children.length > 300) el.removeChild(el.firstChild);
 }
 
+/**
+ * ICE 配置。细节都在 lib/ice.js：
+ *  - 只填一台 STUN 时自动补两台兜底。一台服务器不通就完全拿不到公网地址，
+ *    跨 NAT 必然失败，而用户看到的只是「连不上」。填多台就完全按用户写的来。
+ *  - TURN 地址自动展开成 UDP + TCP 两条。酒店和公司网络常常只放行 TCP，
+ *    那里只声明 UDP 的中继等于没配。
+ *
+ * TURN 依旧需要用户自己填服务器 —— 中继要花真金白银的带宽，我们不代运营。
+ */
 function iceServers() {
-  const list = [{ urls: S.settings.stun }];
-  // TURN 是打洞失败时的兜底（CGNAT、卫星网络这类场景）。默认开着，
-  // 但需要用户自己填服务器 —— 我们不代运营中继。
-  if (S.settings.turnEnabled && S.settings.turnUrl) {
-    list.push({
-      urls: S.settings.turnUrl,
-      username: S.settings.turnUser,
-      credential: S.settings.turnPass,
-    });
+  return buildIceServers(S.settings);
+}
+
+/** 本机这次收集到的候选够不够用，连不上时用来给一句能照着做的话。 */
+function connectionAdvice(peer) {
+  const turnConfigured = Boolean(S.settings.turnEnabled && S.settings.turnUrl);
+  let stats = peer?.localCandidateStats || summarizeCandidates(peer?.pc?.localDescription?.sdp || '');
+
+  // 信令模式（trickle）下候选是单独发出去的，本地描述里一条都没有 ——
+  // 照着它下结论会一口咬定「一个候选都没收集到」，把用户支到查防火墙上去。
+  // 这种情况改用连接过程中实际记下来的候选类型。
+  if (!stats.total && peer?.candidateTypes?.size) {
+    stats = { host: 0, srflx: 0, prflx: 0, relay: 0, mdns: 0, total: peer.candidateTypes.size };
+    for (const type of peer.candidateTypes) if (type in stats) stats[type] = 1;
   }
-  return list;
+  return diagnoseCandidates(stats, { turnConfigured });
 }
 
 /* -------------------------------- 启动 -------------------------------- */
@@ -382,12 +397,20 @@ async function startHost(filePath) {
       }
 
       // 没有 ffmpeg 时「本来还能再省一点」不该拦住放映，照原样走就是了。
-      const plan = S.env.ffmpeg ? await choosePrepPlan(info, { needsRemux, canSlim }) : 'as-is';
-      if (!plan) return backHome();
+      const choice = S.env.ffmpeg
+        ? await choosePrepPlan(info, { needsRemux, canSlim })
+        : { plan: 'as-is' };
+      if (!choice) return backHome();
 
-      if (plan !== 'as-is') {
-        const slimming = plan === 'slim';
+      if (choice.plan !== 'as-is') {
+        const slimming = choice.plan === 'slim';
+        const reencoding = slimming && choice.toFlac?.length > 0;
         $('prep-title').textContent = slimming ? '正在无损精简' : '正在转封装';
+        // 转码是分钟级、丢轨是秒级，这两件事的等待体感差一个数量级，得先说清楚。
+        if (reencoding) {
+          $('prep-note').textContent =
+            '正在把未压缩的 PCM 音轨转成 FLAC（无损）。这一步要重新编码音频，长片可能要几分钟。';
+        }
         const onProgress = ({ progress }) => {
           $('prep-bar').style.width = `${(progress * 100).toFixed(1)}%`;
         };
@@ -395,12 +418,21 @@ async function startHost(filePath) {
           ? window.sw.media.onSlimProgress(onProgress)
           : window.sw.media.onRemuxProgress(onProgress);
         try {
-          const { outPath } = slimming
-            ? await window.sw.media.slim(filePath)
+          const result = slimming
+            ? await window.sw.media.slim(filePath, {
+                keepIndexes: choice.keepIndexes,
+                toFlac: choice.toFlac,
+              })
             : await window.sw.media.remux(filePath);
-          filePath = outPath;
-          temporaryPath = outPath;
-          $('prep-note').textContent = slimming ? `已精简到：${outPath}` : `已转封装到：${outPath}`;
+          filePath = result.outPath;
+          temporaryPath = result.outPath;
+          const saved =
+            result.inputSize > 0 && result.outputSize > 0
+              ? `，体积 ${fmtBytes(result.inputSize)} → ${fmtBytes(result.outputSize)}`
+              : '';
+          $('prep-note').textContent = slimming
+            ? `已精简到：${result.outPath}${saved}`
+            : `已转封装到：${result.outPath}`;
         } finally {
           off();
         }
@@ -590,24 +622,80 @@ async function activateLinkSession(linkInfo, { revision, broadcast = false } = {
  * 视频码流本身压不动 —— H.264/H.265 的输出熵接近满，再套一层通用压缩是零收益，
  * 所以传输过程里不做任何额外压缩，这个面板里也只给无损选项。
  */
+/** 一条轨在选择面板里怎么显示：语言、标题、编码、声道、码率，有什么写什么。 */
+function trackLabel(s) {
+  const bits = [];
+  if (s.language) bits.push(s.language.toUpperCase());
+  if (s.title) bits.push(s.title);
+  bits.push(s.codecName || '?');
+  if (s.channels) bits.push(`${s.channels}ch`);
+  if (s.bitRate) bits.push(`${Math.round(s.bitRate / 1000)} kbps${s.bitRateEstimated ? '≈' : ''}`);
+  return bits.join(' · ');
+}
+
+/**
+ * 「这一场要传哪个版本」。
+ *
+ * 三件事在这里定下来：用哪种处理方式、留哪条音轨、要不要把未压缩的 PCM 转成 FLAC。
+ * 音轨必须能选而不是自动挑默认轨 —— 一部日语番剧的 default 轨常常是英配，
+ * 自动挑的结果就是把大家真正要听的那条丢了，而这一步是不可逆的。
+ *
+ * @returns {Promise<{plan:'slim'|'remux'|'as-is', keepIndexes:number[]|null, toFlac:number[]|null}|null>}
+ */
 function choosePrepPlan(info, { needsRemux, canSlim }) {
   const slim = info.slim || {};
-  // 每一段各自过一次翻译再拼 —— 拼完再翻的话，字典里得为每种轨道组合都写一条，
-  // 那是不可能穷举的。
-  const dropped = [
-    slim.dropAudio > 0 ? t(`${slim.dropAudio} 条多余音轨`) : null,
-    slim.dropSubs > 0 ? t(`${slim.dropSubs} 条图形字幕`) : null,
-  ]
-    .filter(Boolean)
-    .join(currentLocale() === 'en' ? ', ' : '、');
-  // 容器没写每轨码率时（MKV 常见）就别硬凑一个数字出来。
-  const saving =
-    slim.savableBytes > 0
-      ? `${t(slim.estimateComplete ? '预计省下' : '预计至少省下')} ${fmtBytes(slim.savableBytes)}`
-      : '这个文件没有可靠的每轨码率，省下多少估不出来';
+  const streams = info.probe?.streams || [];
+  const audioTracks = streams.filter((s) => s.codecType === 'audio');
+  // 门槛由主进程定（省不到这个数就不值得让用户等重编码），别在这边另写一个。
+  const minFlacSaving = typeof slim.minFlacSaving === 'number' ? slim.minFlacSaving : 0.08;
+  let keepAudioIndex = slim.keepAudioIndex;
+
+  // 换了要保留的音轨，丢掉的那批和能不能转 FLAC 都得跟着重算。
+  const recompute = () => {
+    // 没有可精简的东西时（比如只是需要转封装），一条轨都不该丢。
+    // 少了这道判断，keepAudioIndex 会是 null，下面那个循环就把音轨全加进丢弃集了。
+    if (!slim.available) {
+      return { keepIndexes: null, toFlac: [], dropped: new Set(), saved: 0, complete: true, flacSaved: 0, chosen: null };
+    }
+    const dropped = new Set(slim.drop || []);
+    for (const a of audioTracks) {
+      if (a.index === keepAudioIndex) dropped.delete(a.index);
+      else dropped.add(a.index);
+    }
+    const keepIndexes = streams.map((s) => s.index).filter((i) => !dropped.has(i));
+    const chosen = audioTracks.find((a) => a.index === keepAudioIndex);
+    // flacRatio 是主进程对每条轨单独实测出来的（只有未压缩的 PCM 轨才有），
+    // 换一条轨就得看那条自己的数字，不能沿用默认轨的结论。
+    const flacOk = Boolean(
+      chosen && typeof chosen.flacRatio === 'number' && chosen.flacRatio <= 1 - minFlacSaving
+    );
+    const toFlac = flacOk ? [chosen.index] : [];
+    let saved = 0;
+    let complete = true;
+    for (const s of streams) {
+      if (!dropped.has(s.index)) continue;
+      if (!s.bitRate || !info.probe?.duration) {
+        complete = false;
+        continue;
+      }
+      saved += Math.round((s.bitRate / 8) * info.probe.duration);
+    }
+    let flacSaved = 0;
+    if (flacOk && info.probe?.duration) {
+      const bps =
+        chosen.bitRate ||
+        (chosen.sampleRate && chosen.channels && chosen.bitsPerRawSample
+          ? chosen.sampleRate * chosen.channels * chosen.bitsPerRawSample
+          : 0);
+      if (bps) flacSaved = Math.round((bps / 8) * info.probe.duration * (1 - chosen.flacRatio));
+    }
+    return { keepIndexes, toFlac, dropped, saved, complete, flacSaved, chosen };
+  };
 
   return new Promise((resolve) => {
     let picked = canSlim ? 'slim' : needsRemux ? 'remux' : 'as-is';
+    let current = recompute();
+
     openModal({
       title: '这一场要传哪个版本',
       body: () => {
@@ -629,28 +717,96 @@ function choosePrepPlan(info, { needsRemux, canSlim }) {
 
         const select = make('select', { id: 'prep-plan' }, options);
         select.value = picked;
+
+        const detail = make('div', { id: 'prep-plan-detail' });
+
+        const renderDetail = () => {
+          detail.replaceChildren();
+          if (picked !== 'slim') return;
+
+          // 每一段各自过一次翻译再拼 —— 拼完再翻的话，字典里得为每种轨道组合都写一条，
+          // 那是不可能穷举的。
+          const dropAudio = audioTracks.filter((a) => current.dropped.has(a.index)).length;
+          const dropSubs = streams.filter(
+            (s) => s.codecType === 'subtitle' && current.dropped.has(s.index)
+          ).length;
+          const droppedText = [
+            dropAudio > 0 ? t(`${dropAudio} 条多余音轨`) : null,
+            dropSubs > 0 ? t(`${dropSubs} 条图形字幕`) : null,
+          ]
+            .filter(Boolean)
+            .join(currentLocale() === 'en' ? ', ' : '、');
+
+          if (audioTracks.length > 1) {
+            const audioSelect = make(
+              'select',
+              { id: 'prep-audio' },
+              audioTracks.map((a) =>
+                make('option', { attrs: { value: String(a.index) }, text: trackLabel(a) })
+              )
+            );
+            audioSelect.value = String(keepAudioIndex);
+            audioSelect.onchange = () => {
+              keepAudioIndex = Number(audioSelect.value);
+              current = recompute();
+              renderDetail();
+            };
+            detail.appendChild(
+              field(
+                `保留哪条音轨（共 ${audioTracks.length} 条）`,
+                audioSelect,
+                hint('其余音轨会被丢掉。这一步不可逆，选错了得重新准备一次文件。')
+              )
+            );
+          }
+
+          if (droppedText) {
+            detail.appendChild(
+              field(
+                '无损精简会做什么',
+                hint(
+                  '丢掉 ',
+                  make('b', { props: { textContent: droppedText } }),
+                  '，保留下来的轨',
+                  make('b', { text: '原样搬运、不重新编码' }),
+                  '，画质音质都不变，几秒到几十秒完成。'
+                ),
+                hint(
+                  current.saved > 0
+                    ? `${t(current.complete ? '预计省下' : '预计至少省下')} ${fmtBytes(current.saved)}`
+                    : '这个文件没有可靠的每轨码率，省下多少估不出来'
+                )
+              )
+            );
+          }
+
+          if (current.toFlac.length) {
+            const pct = Math.round((1 - current.chosen.flacRatio) * 100);
+            detail.appendChild(
+              field(
+                '还会把这条音轨压一遍（无损）',
+                hint(
+                  '这条轨是',
+                  make('b', { text: '未压缩的 PCM' }),
+                  '，转成 FLAC 是数学无损的 —— 解码出来的采样逐字节相同。已经拿这个文件实测过：能压掉 ',
+                  make('b', { props: { textContent: `${pct}%` } }),
+                  `，约 ${fmtBytes(current.flacSaved)}。`
+                ),
+                hint('这一步要重新编码音频，比单纯丢轨慢，长片可能要几分钟。')
+              )
+            );
+          }
+        };
+
         select.onchange = () => {
           picked = select.value;
+          renderDetail();
         };
 
         const parts = [];
         if (needsRemux) parts.push(make('p', { className: 'fine', text: info.reason }));
         parts.push(field('这一场传哪个版本', select));
-        if (canSlim) {
-          parts.push(
-            field(
-              '无损精简会做什么',
-              hint(
-                '丢掉 ',
-                make('b', { props: { textContent: dropped } }),
-                '，保留下来的轨',
-                make('b', { text: '原样搬运、不重新编码' }),
-                '，画质音质都不变，几秒到几十秒完成。'
-              ),
-              hint(saving)
-            )
-          );
-        }
+        parts.push(detail);
         parts.push(
           field(
             '不会做的事',
@@ -660,18 +816,22 @@ function choosePrepPlan(info, { needsRemux, canSlim }) {
           )
         );
         parts.push(field('产物', hint('生成一个新文件放进临时缓存，原文件不动，退房时自动清理。')));
+        renderDetail();
         return parts;
       },
       okText: '按这个方案继续',
       onOk: () => {
-        resolve(picked);
+        resolve(
+          picked === 'slim'
+            ? { plan: 'slim', keepIndexes: current.keepIndexes, toFlac: current.toFlac }
+            : { plan: picked, keepIndexes: null, toFlac: null }
+        );
         return true;
       },
       onCancel: () => resolve(null),
     });
   });
 }
-
 function prepFail(msg) {
   $('prep-title').textContent = '没法用这个文件';
   $('prep-note').textContent = msg;
@@ -890,6 +1050,15 @@ async function connectSignaling(url, roomId) {
       return;
     }
 
+    if (payload.kind === 'renegotiate') {
+      // 对面的直连断了，而按「老成员向新来的发起 offer」的约定该由我发 offer。
+      // 两边同时发会撞车，所以断线的一方只发这条请求过来。
+      await reconnectPeer(from, name, sig).catch((e) =>
+        log(`重连 ${name || from} 失败：${e.message}`, 'bad')
+      );
+      return;
+    }
+
     if (!peer || peer.closed) return;
     if (payload.kind === 'answer') await peer.acceptAnswer(payload.sdp);
     else if (payload.kind === 'ice') await peer.addIceCandidate(payload.candidate);
@@ -900,6 +1069,7 @@ async function connectSignaling(url, roomId) {
   // （重连退避最长 30 秒），而界面上还写着「已建立的直连不受影响」。
   // 真正离开的人，数据通道自己会关，ICE 也会走到 failed，那两条路都会摘掉他。
   sig.on('peer-leave', ({ peerId }) => {
+    cancelRecovery(peerId); // 人是真走了，不是链路断了，别再去重连
     const peer = S.swarm.peers.get(peerId);
     if (peer?.ctrl?.readyState === 'open') {
       log(`${peer.name} 的信令连接断了，但直连还在，传输继续`, 'warn');
@@ -927,20 +1097,124 @@ async function connectSignaling(url, roomId) {
   return joined;
 }
 
+/* ---------------------------- 直连断线恢复 ---------------------------- */
+
+// 退避节奏。三次都失败就不再自动重试了 —— 再试下去只是把「连不上」这件事
+// 拖得更久，不如把诊断结论摆出来让人去配 TURN。
+const RECONNECT_BACKOFF_MS = [1500, 4000, 10000];
+// disconnected 不等于完了：ICE 自己有可能几秒内恢复。这段时间内先不动。
+const DISCONNECT_GRACE_MS = 6000;
+/** peerId -> {attempts, timer} */
+const RECOVERY = new Map();
+
+function cancelRecovery(peerId) {
+  const st = RECOVERY.get(peerId);
+  if (st?.timer) clearTimeout(st.timer);
+  RECOVERY.delete(peerId);
+}
+
+/**
+ * 直连断了之后自动重来。
+ *
+ * 跨境链路上这不是锦上添花：NAT 映射老化、Wi-Fi 漫游、运营商重新拨号，都会让
+ * 一条已经建好的连接走到 failed。以前走到这一步就彻底完了 —— 界面只留一句
+ * 「直连失败了」，两个人得退房重走一遍邀请流程，片子也白下了一半。
+ *
+ * 恢复手段是重新协商一条新连接，而不是 restartIce()：收到 offer 的一方本来
+ * 就会把同 id 的旧 Peer 整个换掉（见 sig.on('signal') 里那段注释），沿用这条
+ * 路径等于复用一条已经验证过的重建流程，不用再为重协商单开一套状态机。
+ *
+ * 只有 initiator 一侧主动重发 offer；另一侧发一条 renegotiate 请求过去，
+ * 免得两边同时发 offer 撞车。极简模式没有信令通道，重连无从谈起，原样保持
+ * 「重新生成一条应答链接」的手工路径。
+ */
+function scheduleReconnect(peer, sig) {
+  if (!sig || !S.swarm || peer.closed) return;
+  const peerId = peer.peerId;
+  const st = RECOVERY.get(peerId) || { attempts: 0, timer: null };
+  if (st.timer) return; // 已经排上了
+
+  if (st.attempts >= RECONNECT_BACKOFF_MS.length) {
+    const advice = connectionAdvice(peer);
+    log(`和 ${peer.name} 的直连试了 ${st.attempts} 次都没恢复。${advice.text}`, 'bad');
+    return;
+  }
+
+  const wait = RECONNECT_BACKOFF_MS[st.attempts];
+  st.attempts += 1;
+  const name = peer.name;
+  const initiator = peer.initiator;
+  log(`和 ${name} 的直连断了，${Math.round(wait / 1000)} 秒后自动重连（第 ${st.attempts} 次）`, 'warn');
+
+  st.timer = setTimeout(() => {
+    st.timer = null;
+    if (!sig.connected) {
+      // 信令也断着，重连的消息发不出去。信令自己会退避重连，等它回来这条
+      // 连接会由对面的 peer-join / renegotiate 重新拉起来。
+      log(`信令还没恢复，暂时没法重连 ${name}`, 'warn');
+      return;
+    }
+    if (initiator) {
+      reconnectPeer(peerId, name, sig).catch((e) => log(`重连 ${name} 失败：${e.message}`, 'bad'));
+    } else {
+      sig.signal(peerId, { kind: 'renegotiate' });
+    }
+  }, wait);
+
+  RECOVERY.set(peerId, st);
+}
+
+/** 以 initiator 身份重建一条到 peerId 的连接，并把新的 offer 发过去。 */
+async function reconnectPeer(peerId, name, sig) {
+  if (!S.swarm || !sig?.connected) return;
+  if (S.swarm.peers.has(peerId)) S.swarm.removePeer(peerId);
+  const peer = new Peer({
+    peerId,
+    name: name || peerId,
+    initiator: true,
+    iceServers: iceServers(),
+    trickle: true,
+  });
+  wirePeer(peer, sig);
+  S.swarm.addPeer(peer);
+  const offer = await peer.createOffer();
+  sig.signal(peerId, { kind: 'offer', sdp: offer });
+}
+
 /* ------------------------------ peer 接线 ------------------------------ */
 
 function wirePeer(peer, sig) {
   if (sig) peer.on('icecandidate', (c) => sig.signal(peer.peerId, { kind: 'ice', candidate: c }));
 
+  let graceTimer = null;
+  const clearGrace = () => {
+    clearTimeout(graceTimer);
+    graceTimer = null;
+  };
+
   peer.on('open', () => {
+    clearGrace();
+    cancelRecovery(peer.peerId); // 连上了，退避计数归零
     log(`已和 ${peer.name} 建立数据通道，正在校验房间模式…`);
   });
   peer.on('statechange', (s) => {
+    if (s === 'connected' || s === 'completed') {
+      clearGrace();
+      return;
+    }
+    if (s === 'disconnected' && sig && !graceTimer) {
+      // 先给 ICE 一点时间自己缓过来。网络抖一下就重建连接反而更慢。
+      graceTimer = setTimeout(() => {
+        graceTimer = null;
+        if (peer.pc.iceConnectionState === 'disconnected') scheduleReconnect(peer, sig);
+      }, DISCONNECT_GRACE_MS);
+      return;
+    }
     if (s === 'failed') {
-      log(
-        `和 ${peer.name} 的直连失败了。双方都在严格 NAT 后面时会这样 —— 在设置里配一个 TURN 中继可以兜底。`,
-        'bad'
-      );
+      clearGrace();
+      const advice = connectionAdvice(peer);
+      log(`和 ${peer.name} 的直连失败了。${advice.text}`, advice.level === 'ok' ? 'warn' : 'bad');
+      if (sig) scheduleReconnect(peer, sig);
     }
   });
   peer.on('close', () => {
@@ -2096,7 +2370,10 @@ $('btn-settings').onclick = () => {
             attrs: { type: 'text' },
             props: { value: S.settings.stun },
           }),
-          hint('用来发现自己的公网地址，不传数据。')
+          hint(
+            '用来发现自己的公网地址，不传数据。',
+            '留一条地址时会自动再挂两台备用服务器兜底；想自己管这个列表就用逗号或空格分隔多写几条，那样只用你写的。'
+          )
         ),
         make('div', { className: 'field' }, [
           make('label', { className: 'check' }, [
@@ -2118,7 +2395,8 @@ $('btn-settings').onclick = () => {
             id: 'set-turn-url',
             attrs: { type: 'text', placeholder: 'turn:example.com:3478' },
             props: { value: S.settings.turnUrl },
-          })
+          }),
+          hint('会自动同时尝试 UDP 和 TCP —— 酒店、公司和校园网经常只放行 TCP。')
         ),
         field(
           'TURN 用户名 / 密码',

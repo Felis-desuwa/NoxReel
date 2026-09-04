@@ -13,6 +13,7 @@ import { Peer } from './peer.js';
 import { Swarm } from './swarm.js';
 import { SyncEngine } from './syncEngine.js';
 import { WsSignaling, encodeCode, decodeCode, inviteLink, randomPeerId } from './signaling.js';
+import { buildIceServers } from './ice.js';
 import { MSG } from './protocol.js';
 import { currentLocale, setLocale, startI18n, translate as t } from './i18n.js';
 
@@ -71,15 +72,19 @@ function fmtTime(sec) {
 }
 
 /* ------------------------------ ICE 配置 ------------------------------ */
+// 只配一台 STUN 时 buildIceServers 会自动补两台兜底 —— 手机换基站、切 Wi-Fi 的
+// 频率比桌面高得多，那一台一旦不通就拿不到公网地址，跨 NAT 直接连不上。
+// TURN 地址也会自动展开成 UDP + TCP 两条。
 function iceServers() {
-  const list = [{ urls: 'stun:stun.l.google.com:19302' }];
   const turn = ($('turn') && $('turn').value.trim()) || '';
   // TURN 可选，格式 turn:host:port|user|pass（这里预留，界面暂未放出）
-  if (turn) {
-    const [urls, username, credential] = turn.split('|');
-    list.push({ urls, username, credential });
-  }
-  return list;
+  const [turnUrl, turnUser, turnPass] = turn ? turn.split('|') : [];
+  return buildIceServers({
+    turnEnabled: Boolean(turnUrl),
+    turnUrl: turnUrl || '',
+    turnUser: turnUser || '',
+    turnPass: turnPass || '',
+  });
 }
 
 /* ------------------------- 群管理 + 同步引擎 ------------------------- */

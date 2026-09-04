@@ -36,7 +36,8 @@ contextBridge.exposeInMainWorld('sw', {
     inspect: (filePath) => ipcRenderer.invoke('media:inspect', filePath),
     inspectLink: (url) => ipcRenderer.invoke('media:inspectLink', url),
     remux: (filePath) => ipcRenderer.invoke('media:remux', filePath),
-    slim: (filePath, keepIndexes = null) => ipcRenderer.invoke('media:slim', { filePath, keepIndexes }),
+    slim: (filePath, { keepIndexes = null, toFlac = null } = {}) =>
+      ipcRenderer.invoke('media:slim', { filePath, keepIndexes, toFlac }),
     releaseTemp: (filePath) => ipcRenderer.invoke('media:releaseTemp', filePath),
     onRemuxProgress: on('media:remuxProgress'),
     onSlimProgress: on('media:slimProgress'),

@@ -128,15 +128,25 @@ function manifest(value) {
   return data;
 }
 
-/** 无损精简参数：要保留的轨道下标。轨道数不会多到哪去，给个宽松上限挡住畸形输入。 */
+/** 轨道下标数组。轨道数不会多到哪去，给个宽松上限挡住畸形输入。 */
+function trackIndexes(raw, label) {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 64) fail(label);
+  const list = raw.map((i) => integer(i, '轨道下标', { min: 0, max: 1023 }));
+  if (new Set(list).size !== list.length) fail(label);
+  return list;
+}
+
+/**
+ * 无损精简参数：要保留的轨道下标，以及其中哪几条要转成 FLAC。
+ * toFlac 必须是 keepIndexes 的子集 —— 去转一条根本没保留的轨，ffmpeg 会直接报错。
+ */
 function slimOptions(value) {
   const data = plainObject(value, '精简参数');
-  const raw = data.keepIndexes;
-  if (raw === undefined || raw === null) return { keepIndexes: null };
-  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 64) fail('精简参数');
-  const keepIndexes = raw.map((i) => integer(i, '轨道下标', { min: 0, max: 1023 }));
-  if (new Set(keepIndexes).size !== keepIndexes.length) fail('精简参数');
-  return { keepIndexes };
+  const keepIndexes = trackIndexes(data.keepIndexes, '精简参数');
+  const toFlac = trackIndexes(data.toFlac, '精简参数');
+  if (toFlac && keepIndexes && toFlac.some((i) => !keepIndexes.includes(i))) fail('精简参数');
+  return { keepIndexes, toFlac };
 }
 
 function sessionId(value) {

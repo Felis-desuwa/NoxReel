@@ -322,7 +322,35 @@ const EN = new Map(Object.entries({
   '分片内存缓冲已达到上限': 'The in-memory chunk buffer reached its limit',
   '临时片源不属于当前运行实例': 'The temporary source does not belong to this app instance',
   '缓存目录尚未初始化': 'The cache directory has not been initialized',
-  '拒绝删除缓存根目录之外的路径': 'Refused to delete a path outside the cache root'
+  '拒绝删除缓存根目录之外的路径': 'Refused to delete a path outside the cache root',
+
+  // —— 连接层：STUN 冗余、TURN 展开、候选诊断 ——
+  '留一条地址时会自动再挂两台备用服务器兜底；想自己管这个列表就用逗号或空格分隔多写几条，那样只用你写的。':
+    'With a single address, two backup servers are added automatically. Enter several addresses separated by commas or spaces to manage the list yourself—then only yours are used.',
+  '会自动同时尝试 UDP 和 TCP —— 酒店、公司和校园网经常只放行 TCP。':
+    'UDP and TCP are both tried automatically—hotel, corporate, and campus networks often allow only TCP.',
+  '本机一个网络候选地址都没收集到 —— 通常是网络被完全隔离，或者防火墙拦掉了 NoxReel。':
+    'No network candidates were gathered at all—usually the network is fully isolated, or a firewall is blocking NoxReel.',
+  'STUN 服务器没能告诉本机公网地址，只有局域网候选。除非双方在同一个局域网，否则连不上；请在设置里换一台 STUN 服务器，或检查防火墙有没有放行 UDP。':
+    'The STUN server never reported this machine\u2019s public address, so only local candidates exist. Unless both sides are on the same LAN this cannot connect: choose a different STUN server in Settings, or check that the firewall allows UDP.',
+  '配了 TURN 中继却没拿到中继候选 —— 地址、端口或用户名密码大概率有一项不对，这时中继等于没配。':
+    'A TURN relay is configured but no relay candidate arrived—the address, port, username, or password is almost certainly wrong, which leaves you with no relay at all.',
+  '拿到了公网地址，但没有中继兜底。双方都在严格 NAT（对称 NAT、CGNAT、部分手机热点）后面时会连不上，配一个 TURN 中继可以解决。':
+    'A public address was found, but there is no relay fallback. Connections fail when both sides are behind strict NAT (symmetric NAT, CGNAT, some phone hotspots); configuring a TURN relay solves that.',
+  '公网地址和中继候选都齐了。': 'Both a public address and a relay candidate are available.',
+
+  // —— 无损精简：选音轨与 PCM 转 FLAC ——
+  '其余音轨会被丢掉。这一步不可逆，选错了得重新准备一次文件。':
+    'Every other audio track is dropped. This cannot be undone—picking the wrong one means preparing the file again.',
+  '还会把这条音轨压一遍（无损）': 'This audio track also gets compressed (losslessly)',
+  '这条轨是': 'This track is ',
+  '未压缩的 PCM': 'uncompressed PCM',
+  '，转成 FLAC 是数学无损的 —— 解码出来的采样逐字节相同。已经拿这个文件实测过：能压掉 ':
+    ', and converting it to FLAC is mathematically lossless—the decoded samples are byte-for-byte identical. Measured on this very file: it shrinks by ',
+  '这一步要重新编码音频，比单纯丢轨慢，长片可能要几分钟。':
+    'This step re-encodes the audio, so it is slower than simply dropping tracks—a long film can take a few minutes.',
+  '正在把未压缩的 PCM 音轨转成 FLAC（无损）。这一步要重新编码音频，长片可能要几分钟。':
+    'Converting the uncompressed PCM audio track to FLAC (lossless). This re-encodes the audio, so a long film can take a few minutes.'
 }));
 
 const trimEnd = (text) => String(text).replace(/[.。]+$/, '');
@@ -335,7 +363,21 @@ const EN_PATTERNS = [
   [/^缺少 (.+)$/, 'Missing $1'],
   [/^已找到：$/, 'Found:'],
   [/^已转封装到：(.*)$/, 'Remuxed to: $1'],
+  // 带体积对比的那条必须排在上面 —— 下面那条的 (.*) 是贪婪的，会把「，体积…」也吞进路径里。
+  [/^已精简到：(.*)，体积 (.*) → (.*)$/, 'Slimmed to: $1 — size $2 → $3'],
   [/^已精简到：(.*)$/, 'Slimmed to: $1'],
+  [/^保留哪条音轨（共 (\d+) 条）$/, (_all, n) => `Which audio track to keep (${n} available)`],
+  [
+    /^和 (.+) 的直连断了，(\d+) 秒后自动重连（第 (\d+) 次）$/,
+    'Lost the direct connection to $1. Reconnecting automatically in $2 seconds (attempt $3).',
+  ],
+  [
+    /^和 (.+) 的直连试了 (\d+) 次都没恢复。(.*)$/,
+    (_all, name, tries, advice) =>
+      `The direct connection to ${name} did not recover after ${tries} attempts. ${translate(advice, 'en')}`,
+  ],
+  [/^重连 (.+) 失败：(.*)$/, (_all, name, detail) => `Failed to reconnect to ${name}: ${translate(detail, 'en')}`],
+  [/^信令还没恢复，暂时没法重连 (.+)$/, 'Signaling has not recovered yet, so $1 cannot be reconnected for now'],
   [/^(\d+) 条多余音轨$/, (_all, n) => `${n} extra audio track${n === '1' ? '' : 's'}`],
   [/^(\d+) 条图形字幕$/, (_all, n) => `${n} image-based subtitle track${n === '1' ? '' : 's'}`],
   [/^已切换到：(.*)$/, 'Switched to: $1'],
@@ -347,7 +389,10 @@ const EN_PATTERNS = [
   [/^信令断开，(\d+) 秒后重连（已建立的直连不受影响）$/, 'Signaling disconnected. Reconnecting in $1 seconds; existing direct connections are unaffected.'],
   [/^信令错误：(.*)$/, (_all, detail) => `Signaling error: ${translate(detail, 'en')}`],
   [/^已和 (.+) 建立数据通道，正在校验房间模式…$/, 'Data channel established with $1; verifying room mode…'],
-  [/^和 (.+) 的直连失败了。.*$/, 'Direct connection to $1 failed. Configure a TURN relay in Settings when both sides are behind strict NAT.'],
+  [
+    /^和 (.+) 的直连失败了。(.*)$/,
+    (_all, name, advice) => `Direct connection to ${name} failed. ${translate(advice, 'en')}`,
+  ],
   [/^(.+) 断开了$/, '$1 disconnected'],
   [
     /^(.+) 的信令连接断了，但直连还在，传输继续$/,

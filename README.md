@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.6.5-7C5CFF?style=for-the-badge" alt="Version 0.6.5">
+    <img src="https://img.shields.io/badge/version-0.6.6-7C5CFF?style=for-the-badge" alt="Version 0.6.6">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -37,6 +37,8 @@
 - **一键邀请链接**：默认生成可点击的 `noxreel://` 零服务器邀请／应答链接；底层 `NR3` 握手数据更短，并兼容 `NR2`、`SW2`、`SW1`。
 - **链接解析回退**：YouTube 使用专用匿名客户端策略；普通解析遇到 Cloudflare 403 时，自动在无权限、无持久化的隔离浏览器中捕获公开媒体流。
 - **随时换片**：房主可在房间内切换本地视频或视频链接，成员不用退出重进。
+- **无损精简**：发片前可丢掉这一场用不上的音轨与图形字幕，并自选保留哪条音轨；未压缩的 PCM 音轨会转成 FLAC。全程不重编码视频，画质零损失，压缩比对每个文件实测后才提议。
+- **断线自动重连**：信令模式下直连中断（NAT 映射老化、Wi-Fi 漫游、运营商重拨）会自动重新协商，不用退房重走邀请流程；连不上时会指出是 STUN 不通、中继凭据有误还是双方都在严格 NAT 后面。
 - **缓冲联动**：任何成员可播余量不足时全员暂停，恢复后继续。
 - **真实成员状态**：只显示已建立连接的用户，并给出上传、下载速度和延迟。
 - **播放器可恢复**：播放器窗口关闭后，可从房间页面重新打开。
@@ -51,14 +53,14 @@
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!IMPORTANT]
-> `v0.6.5` 做了四件事。**传输快了 2.6 倍**：补片原本只靠 250ms 定时器驱动，而 Chromium 会把不可见窗口的定时器节流到 1 秒一次 —— 看片时 mpv 正压在 NoxReel 窗口上，于是吞吐被硬卡在 8 MB/s；现在改成分片一落地就立刻补请求（实测 285.8 MB 从 39 秒降到 15 秒）。**邀请码不再被聊天软件改坏**：旧字母表含 `_`，Discord 的 `__下划线__` 会把它从可复制文本里删掉（实测常见家用机 15%、多网卡机 75% 的码作废），现已换用 markdown 中性的字符集，并且改成能从一段聊天文本里把码提取出来。**新增无损精简**：发片前可丢掉多余音轨与图形字幕，不重编码、画质零损失。**修复安全扫描误报**：Defender 被第三方杀毒软件接管停用时，不再谎报「发现威胁」。
+> `v0.6.6` 做了四件事。**一半的传输流量是重复的，现在归零**：分片收齐后要先落盘，而落盘那一整个往返里它既不算在途、也还没进已有位图，调度器只能判定它还缺、于是再要一遍 —— 实测一个 25.9 MB 的文件，发送端总共发出 59.8 MB（2.31 倍），多出来的那份最后被校验认出是重复丢掉，带宽却已经花掉。**邀请码生成从 9 秒降到 1.3 秒**：极简模式要等 ICE 候选集齐，而 `iceGatheringState` 在 Electron 里从来不会走到 `complete`，于是每次都把 8 秒硬超时耗满；现在拿到公网地址后再静 1.2 秒没有新候选就收工，候选一条不少。**连接更容易建起来**：STUN 从 1 台增加到 3 台冗余，TURN 地址自动同时尝试 UDP 与 TCP（酒店和公司网络常常只放行 TCP），断线后自动重连而不是让人退房重来，连不上时会说清是 STUN 不通、中继凭据不对还是对称 NAT 对撞。**无损精简能真的压缩了**：未压缩的 PCM 音轨转成 FLAC，解码出来逐字节相同；压缩比对每个文件实测而不是照系数猜，省不到 8% 就不提议。发片前还可以自己选保留哪条音轨。
 
 ## 下载
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，可选择安装文件夹 | [NoxReel-Setup-0.6.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.5.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.6.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.5.exe) |
+| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，可选择安装文件夹 | [NoxReel-Setup-0.6.6.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.6.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.6.6.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.6.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 

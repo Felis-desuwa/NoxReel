@@ -7,6 +7,7 @@ import {
   BUFFER_LOW_WATER,
   PROTOCOL_VERSION,
 } from './protocol.js';
+import { pruneSdpCandidates, summarizeCandidates, hasRelay, parseCandidateLine } from './ice.js';
 
 const MAX_PENDING_CANDIDATES = 128; // 排队上限，别让对面用候选把内存灌爆
 
@@ -38,6 +39,12 @@ export class Peer extends Emitter {
     this.inflight = new Set(); // 我方已向该 peer 请求、还没收齐的分片
     this._pendingCandidates = []; // 远端描述落地前先攒着的 ICE 候选
     this.rtt = null;
+    // 本机收集到的候选类型。连不上的时候这是唯一能指路的东西 —— 没有 srflx
+    // 说明 STUN 不通，有 srflx 没 relay 说明只能靠打洞。见 ice.js 的 diagnoseCandidates()。
+    this.candidateTypes = new Set();
+    this.localCandidateStats = null;
+    this._sentCandidateKeys = new Set();
+    this._expectRelay = hasRelay(iceServers);
     this.bytesReceived = 0;
     this.bytesSent = 0;
     this._lastRecvSample = { t: performance.now(), bytes: 0 };
@@ -52,7 +59,20 @@ export class Peer extends Emitter {
     });
 
     this.pc.onicecandidate = (e) => {
-      if (this.trickle && e.candidate) this.emit('icecandidate', e.candidate.toJSON());
+      if (!e.candidate) return;
+      const json = e.candidate.toJSON();
+      const parsed = parseCandidateLine(`a=${json.candidate}`) || parseCandidateLine(json.candidate || '');
+      if (parsed) this.candidateTypes.add(parsed.type);
+      if (!this.trickle) return;
+      // 多台 STUN 会对同一个 NAT 映射各报一次，内容完全一样。重复候选传过去
+      // 只会让对端多试几遍同一个地址，白白占信令带宽和配对时间。
+      if (parsed) {
+        const key = `${parsed.component}|${parsed.protocol}|${parsed.address}|${parsed.port}|${parsed.type}`;
+        if (this._sentCandidateKeys.has(key)) return;
+        this._sentCandidateKeys.add(key);
+        if (String(parsed.address).toLowerCase().startsWith('fe80:')) return; // 链路本地，连不通
+      }
+      this.emit('icecandidate', json);
     };
     this.pc.oniceconnectionstatechange = () => {
       const s = this.pc.iceConnectionState;
@@ -149,7 +169,7 @@ export class Peer extends Emitter {
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
     if (!this.trickle) await this._waitIceComplete();
-    return this.pc.localDescription.toJSON();
+    return this._localDescription();
   }
 
   async acceptOffer(desc) {
@@ -158,7 +178,7 @@ export class Peer extends Emitter {
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
     if (!this.trickle) await this._waitIceComplete();
-    return this.pc.localDescription.toJSON();
+    return this._localDescription();
   }
 
   async acceptAnswer(desc) {
@@ -194,15 +214,49 @@ export class Peer extends Emitter {
     }
   }
 
-  /** 等 ICE 收集完成，非 trickle 模式下 SDP 必须包含全部候选才能离线交换。 */
-  _waitIceComplete(timeoutMs = 8000) {
+  /**
+   * 产出要发出去的那份本地描述：候选去重、去掉链路本地地址。
+   *
+   * 只精简发出去的副本，本地 ICE agent 的候选表保持完整 —— 删掉的都是
+   * 多台 STUN 对同一个 NAT 映射的重复上报，对端少试几次完全等价。
+   * 极简模式下这一步直接决定邀请码有多长。
+   */
+  _localDescription() {
+    const desc = this.pc.localDescription.toJSON();
+    const { sdp, removed } = pruneSdpCandidates(desc.sdp);
+    this.localCandidateStats = summarizeCandidates(sdp);
+    if (removed) console.debug(`[peer] SDP 去掉了 ${removed} 条重复/无用候选`);
+    return { ...desc, sdp };
+  }
+
+  /**
+   * 等 ICE 收集完成，非 trickle 模式下 SDP 必须包含全部候选才能离线交换。
+   *
+   * 收集不是「越久越全」：拿到公网映射地址之后再来的候选，绝大多数是另外几台
+   * STUN 报回来的同一个地址。所以一旦手上有了 srflx（配了 TURN 的还要等到 relay），
+   * 再静一小段没有新候选就收工 —— 极简模式下省下的每一秒都是用户盯着
+   * 「正在生成邀请码」干等的时间。硬超时兜底不变。
+   */
+  _waitIceComplete({ timeoutMs = 8000, quietMs = 1200 } = {}) {
     if (this.pc.iceGatheringState === 'complete') return Promise.resolve();
     return new Promise((resolve) => {
+      let quiet = null;
       const done = () => {
+        clearTimeout(quiet);
         clearTimeout(timer);
         this.pc.removeEventListener('icegatheringstatechange', check);
+        this.pc.removeEventListener('icecandidate', onCandidate);
         resolve();
       };
+      const armQuiet = () => {
+        if (!this.candidateTypes.has('srflx') && !this.candidateTypes.has('relay')) return;
+        // 配了 TURN 就一定要等到中继候选。它比 srflx 慢，抢跑会把兜底手段扔掉，
+        // 而兜底恰恰是严格 NAT 下唯一能连上的那条路。
+        if (this._expectRelay && !this.candidateTypes.has('relay')) return;
+        clearTimeout(quiet);
+        quiet = setTimeout(done, quietMs);
+      };
+      const onCandidate = (e) => (e.candidate ? armQuiet() : done());
       const check = () => {
         if (this.pc.iceGatheringState === 'complete') done();
       };
@@ -210,6 +264,8 @@ export class Peer extends Emitter {
       // 拿已有的候选去试也好过永远连不上。
       const timer = setTimeout(done, timeoutMs);
       this.pc.addEventListener('icegatheringstatechange', check);
+      this.pc.addEventListener('icecandidate', onCandidate);
+      armQuiet(); // 候选可能在两次 await 之间就已经到齐了
     });
   }
 
