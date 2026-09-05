@@ -208,6 +208,9 @@ const EN = new Map(Object.entries({
   '和房主的直连探测失败了：可能是房主那边的邀请链接放太久、网络地址已经过期，也可能双方都在严格 NAT 后面。重新生成一条应答链接发回给房主再试一次；还是不行就双方在设置里配同一个 TURN 中继。':
     'Connectivity checks with the host failed: the host’s invite link may have sat too long and its network addresses expired, or both sides are behind strict NAT. Generate a new answer link, send it back to the host, and try again; if it still fails, both sides should configure the same TURN relay in Settings.',
   '重新生成应答链接': 'Generate a new answer link',
+  '还没能连上房主': 'Still not connected to the host',
+  '等了几分钟还是没连上。如果你已经把应答链接发回给房主了，那多半是打洞没成功：双方都在严格 NAT 后面时，需要各自在设置里配同一个 TURN 中继。如果房主还没打开你的应答链接，就重新生成一条再发一次 —— 链接放太久，里面的网络地址会过期。':
+    'Still no connection after several minutes. If you already sent the answer link back to the host, the direct connection most likely failed: when both sides are behind strict NAT, each of you needs the same TURN relay configured in Settings. If the host has not opened your answer link yet, generate a new one and send it again—links that sit too long have expired network addresses inside.',
   '来源': 'Source',
   '原始视频网站': 'Original video website',
   '同步': 'Sync',

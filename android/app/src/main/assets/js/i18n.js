@@ -68,7 +68,11 @@ const EN = new Map(Object.entries({
   '邀请码损坏或不完整 —— 可能是复制时漏了一截，也可能是被聊天软件的格式化改掉了字符；把码放进反引号里再发一次通常能解决':
     'The invite code is damaged or incomplete. Part of it may be missing, or a chat app\u2019s formatting may have altered some characters \u2014 wrapping the code in backticks before sending usually fixes it.',
   '邀请码内容无法解析': 'The invite code could not be parsed',
-  '信令服务器拒绝了连接': 'The signaling server rejected the connection'
+  '信令服务器拒绝了连接': 'The signaling server rejected the connection',
+  '和房主的直连没建立起来。重新粘一次房主的邀请码生成新的应答链接；双方都在严格 NAT 后面时需要各自配同一个 TURN 中继。':
+    'The direct connection to the host was never established. Paste the host’s invite code again to generate a new answer link; when both sides are behind strict NAT, each of you needs the same TURN relay configured.',
+  '等了几分钟还是没连上房主。应答链接已经发回去的话多半是打洞没成功，双方都要配同一个 TURN 中继；房主还没打开的话，就重新粘一次邀请码生成新的应答链接。':
+    'Still not connected to the host after several minutes. If you already sent the answer link back, the direct connection most likely failed and both sides need the same TURN relay; if the host has not opened it yet, paste the invite code again to generate a new answer link.'
 }));
 
 const PATTERNS = [

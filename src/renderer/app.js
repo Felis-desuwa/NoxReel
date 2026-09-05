@@ -919,17 +919,53 @@ async function joinViaManual(payload) {
   // 应答生成之后本机就开始探测对方的候选地址了，而房主可能过好几分钟才粘贴。
   // 探测先失败的话，这条连接就废了 —— 房主那边再粘贴也连不上，界面却一直停在
   // 「等待房主打开应答链接」。所以失败要说出来，并且允许用同一份邀请重开一条。
-  peer.on('failed', () => {
-    if (peer.authenticated || roomEntered) return;
-    $('prep-title').textContent = '直连没建立起来';
-    $('prep-note').textContent =
-      '和房主的直连探测失败了：可能是房主那边的邀请链接放太久、网络地址已经过期，也可能双方都在严格 NAT 后面。重新生成一条应答链接发回给房主再试一次；还是不行就双方在设置里配同一个 TURN 中继。';
+  //
+  // 只挂 'failed' 不够：对方的 NAT 如果连出口 IP 都随目标变（云上的多出口 NAT
+  // 网关就是这样），ICE 会一直停在 checking 永远不进 failed，这条 handler 就永远
+  // 不触发。实测房主端按 MANUAL_HANDSHAKE_TIMEOUT_MS 五十秒就给出了结论并备好新
+  // 邀请链接，加入方这边十二分钟仍然停在「等待房主打开应答链接」，一个字都没有。
+  // 所以再补一条定时兜底，和 'failed' 共用同一套收尾。
+  let joinSettled = false;
+  let joinWaitTimer = null;
+  let offJoinAuthenticated = () => {};
+
+  const finishJoin = (title, note) => {
+    if (joinSettled || peer.authenticated || roomEntered) return;
+    // 用户点过「重新生成应答链接」的话，swarm 里已经换成新连接了，旧的定时器不能盖掉新界面。
+    if (S.swarm?.peers?.get(payload.from) !== peer) return;
+    joinSettled = true;
+    clearTimeout(joinWaitTimer);
+    offJoinAuthenticated();
+    $('prep-title').textContent = title;
+    $('prep-note').textContent = note;
     $('prep-bar').style.width = '0%';
     const retry = make('button', { className: 'primary', text: '重新生成应答链接' });
     retry.onclick = () => joinViaManual(payload).catch((error) => prepFail(error.message || String(error)));
     const back = make('button', { className: 'ghost', text: '返回' });
     back.onclick = backHome;
     replace('prep-actions', retry, back);
+  };
+
+  peer.on('failed', () =>
+    finishJoin(
+      '直连没建立起来',
+      '和房主的直连探测失败了：可能是房主那边的邀请链接放太久、网络地址已经过期，也可能双方都在严格 NAT 后面。重新生成一条应答链接发回给房主再试一次；还是不行就双方在设置里配同一个 TURN 中继。'
+    )
+  );
+
+  joinWaitTimer = setTimeout(
+    () =>
+      finishJoin(
+        '还没能连上房主',
+        '等了几分钟还是没连上。如果你已经把应答链接发回给房主了，那多半是打洞没成功：双方都在严格 NAT 后面时，需要各自在设置里配同一个 TURN 中继。如果房主还没打开你的应答链接，就重新生成一条再发一次 —— 链接放太久，里面的网络地址会过期。'
+      ),
+    MANUAL_JOIN_WAIT_TIMEOUT_MS
+  );
+  offJoinAuthenticated = S.swarm.on('peer-authenticated', (authenticatedPeer) => {
+    if (authenticatedPeer !== peer) return;
+    joinSettled = true;
+    clearTimeout(joinWaitTimer);
+    offJoinAuthenticated();
   });
 
   const answer = await peer.acceptOffer(payload.sdp);
@@ -1910,6 +1946,16 @@ async function inviteViaManual(notice = '') {
 }
 
 const MANUAL_HANDSHAKE_TIMEOUT_MS = 45_000;
+
+/**
+ * 加入方等房主打开应答链接的时限，比房主那条长得多。
+ *
+ * 房主是在粘完应答之后才开始计时的，那时双方都拿到了对方的 SDP，45 秒足够打洞。
+ * 加入方没有这个时刻可用：应答链接生成之后它就在探测了，而房主可能过好几分钟才
+ * 粘贴。也就是说加入方分不清「房主还没粘」和「粘了但没打通」，时限只能给足人去
+ * 转发链接的时间，文案也不能把话说死，两种可能都要说给用户。
+ */
+const MANUAL_JOIN_WAIT_TIMEOUT_MS = 180_000;
 
 /**
  * 盯住极简模式的最后一步，给它一个结局。

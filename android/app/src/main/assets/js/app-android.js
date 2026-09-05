@@ -20,6 +20,9 @@ import { currentLocale, setLocale, startI18n, translate as t } from './i18n.js';
 startI18n();
 
 const HEAD_READY_BYTES = 8 * 1024 * 1024; // 片头下够才起播（同 PC：全零稀疏文件起播拿不到 moov）
+// 极简模式下等房主打开应答链接的时限，与桌面端 MANUAL_JOIN_WAIT_TIMEOUT_MS 一致。
+// 比房主侧的握手超时宽得多：房主是粘完应答才开始计时，这边应答一生成就在探测了。
+const MANUAL_JOIN_WAIT_TIMEOUT_MS = 180_000;
 const normalizeSecurityMode = (mode) => (mode === 'trusted' ? 'trusted' : 'safe');
 const securityModeLabel = (mode) => (normalizeSecurityMode(mode) === 'trusted' ? '可信房间' : '安全模式');
 
@@ -536,6 +539,35 @@ async function joinManual(hostCode) {
   });
   wirePeer(peer, null);
   S.swarm.addPeer(peer);
+
+  // 打不通时得有个结局。这边以前生成完应答链接就再没有任何反馈，房主那边早已超时
+  // 放弃，手机上却还停在「发回给房主后对方点开即可」，用户不知道该等还是该重来。
+  //
+  // 光挂 failed 不够：对方的 NAT 如果连出口 IP 都随目标变（云上的多出口 NAT 网关
+  // 就是这样），ICE 会一直停在 checking 永远不进 failed。所以再加一条定时兜底。
+  // 时限给得宽，因为房主可能过好几分钟才粘贴，这边分不清「还没粘」和「粘了没打通」。
+  let joinSettled = false;
+  let joinWaitTimer = null;
+  const finishJoin = (text) => {
+    if (joinSettled || peer.authenticated || S.entered) return;
+    if (S.swarm?.peers?.get(payload.from) !== peer) return; // 已经被新一轮顶替的旧连接
+    joinSettled = true;
+    clearTimeout(joinWaitTimer);
+    log(text, 'bad');
+  };
+  peer.on('failed', () =>
+    finishJoin('和房主的直连没建立起来。重新粘一次房主的邀请码生成新的应答链接；双方都在严格 NAT 后面时需要各自配同一个 TURN 中继。')
+  );
+  joinWaitTimer = setTimeout(
+    () =>
+      finishJoin('等了几分钟还是没连上房主。应答链接已经发回去的话多半是打洞没成功，双方都要配同一个 TURN 中继；房主还没打开的话，就重新粘一次邀请码生成新的应答链接。'),
+    MANUAL_JOIN_WAIT_TIMEOUT_MS
+  );
+  S.swarm.on('peer-authenticated', (authenticatedPeer) => {
+    if (authenticatedPeer !== peer) return;
+    joinSettled = true;
+    clearTimeout(joinWaitTimer);
+  });
 
   log('正在生成应答链接，收集网络候选中…（几秒）', 'warn');
   const answer = await peer.acceptOffer(payload.sdp);

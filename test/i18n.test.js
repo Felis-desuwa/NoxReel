@@ -26,6 +26,15 @@ test('桌面端固定文案和动态状态可翻译为英文', async () => {
     'Alice lost the signaling connection, but the direct connection is still up and the transfer continues'
   );
   assert.equal(translate('直连没建立起来', 'en'), 'The direct connection failed');
+  // 加入方的定时兜底文案要几分钟后才出现，靠 MutationObserver 翻译，同样得有英文。
+  assert.equal(translate('还没能连上房主', 'en'), 'Still not connected to the host');
+  assert.match(
+    translate(
+      '等了几分钟还是没连上。如果你已经把应答链接发回给房主了，那多半是打洞没成功：双方都在严格 NAT 后面时，需要各自在设置里配同一个 TURN 中继。如果房主还没打开你的应答链接，就重新生成一条再发一次 —— 链接放太久，里面的网络地址会过期。',
+      'en'
+    ),
+    /^Still no connection after several minutes\..*TURN relay configured in Settings\./s
+  );
   assert.equal(
     translate('这条邀请已经用过或已失效，请用当前这条邀请链接重新走一遍。', 'en'),
     'That invite was already used or has expired. Start again with the current invite link.'
@@ -90,6 +99,15 @@ test('Android 观众端提供相同的中英语言入口', async () => {
   assert.equal(
     translate('邀请码无效：这不像是一个 NoxReel 邀请码', 'en'),
     'Invalid invite code: This does not look like a NoxReel invite code'
+  );
+  // 极简加入的两条兜底日志同样是用户可见文案。
+  assert.match(
+    translate('等了几分钟还是没连上房主。应答链接已经发回去的话多半是打洞没成功，双方都要配同一个 TURN 中继；房主还没打开的话，就重新粘一次邀请码生成新的应答链接。', 'en'),
+    /^Still not connected to the host after several minutes\..*TURN relay/s
+  );
+  assert.match(
+    translate('和房主的直连没建立起来。重新粘一次房主的邀请码生成新的应答链接；双方都在严格 NAT 后面时需要各自配同一个 TURN 中继。', 'en'),
+    /^The direct connection to the host was never established\./
   );
 
   const html = fs.readFileSync(
