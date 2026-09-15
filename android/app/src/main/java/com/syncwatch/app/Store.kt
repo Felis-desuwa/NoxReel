@@ -7,6 +7,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -52,6 +53,17 @@ class Store(private val context: Context) {
         val partFile = File(mediaDir(), "$fileId.swpart")
         require(dataFile.canonicalPath.startsWith(mediaDir().canonicalPath + File.separator)) {
             "接收缓存路径越界"
+        }
+
+        // 文件大小不再设上限以后，一部片子塞满手机存储就是常态风险。setLength 在 ext4/f2fs
+        // 上是稀疏的，照样成功，要传到一半才写不进去 —— 所以开会话前先看剩余空间够不够。
+        // 留 1% 或 256MB 余量（取大），和桌面端 ensureFreeSpace 一致。usableSpace 查不到时
+        // 返回 0，这时不拦，让真正的写入错误说话。
+        val free = mediaDir().usableSpace
+        val reserve = maxOf(256L * 1024 * 1024, size / 100)
+        require(free <= 0L || free >= size + reserve) {
+            val gb = 1024.0 * 1024 * 1024
+            String.format(Locale.ROOT, "磁盘空间不够：这部片子需要 %.2fGB，手机只剩 %.2fGB", size / gb, free / gb)
         }
 
         val raf = RandomAccessFile(dataFile, "rw")

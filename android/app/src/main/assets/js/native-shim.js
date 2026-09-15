@@ -50,7 +50,8 @@ window.sw.store = {
       manifest.chunkCount,
       JSON.stringify(manifest.hashes)
     );
-    if (!id) throw new Error('openLeech 失败');
+    // 原生层失败时返回 "!原因"（见 NativeBridge.openLeech），把原因原样抛出去给界面显示。
+    if (!id || id.startsWith('!')) throw new Error(id ? id.slice(1) : 'openLeech 失败');
     return id;
   },
   sessionState(sessionId) {

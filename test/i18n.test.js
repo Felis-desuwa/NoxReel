@@ -49,7 +49,7 @@ test('无损精简与传输诊断的新文案都有英文', async () => {
   assert.equal(translate('仅转封装（保留全部轨道）', 'en'), 'Remux only (keep every track)');
   assert.equal(translate('原样传输', 'en'), 'Share as is');
   assert.equal(translate('优化传输体积（按需）', 'en'), 'Optimize transfer size (when needed)');
-  assert.equal(translate('所需码率', 'en'), 'Required rate');
+  assert.equal(translate('文件码率', 'en'), 'File bitrate');
   // 中文不需要空格，英文需要 —— 这里丢了空格会渲染成「track iscopied over」
   assert.equal(translate('，保留下来的轨', 'en'), ', and every kept track is ');
   assert.equal(translate('速度充足，可稳定边下边播', 'en'), 'Fast enough for steady progressive playback');
@@ -127,4 +127,70 @@ test('中英文 README 互相提供语言入口', () => {
   assert.match(english, /href="README\.md">简体中文/);
   assert.match(english, /## Quick start/);
   assert.match(english, /## Security notice and disclaimer/);
+});
+
+/**
+ * 卡顿预判的文案大多带着动态数字（码率、人数、时长），查表命中不了，全靠模式翻译。
+ * 模式写错一个标点，整句就原样漏出中文 —— 所以每一种动态句式都要实际跑一遍。
+ */
+test('卡顿预判与不限文件大小的新文案都有英文', async () => {
+  const { translate } = await import('../src/renderer/lib/i18n.js');
+  const fixed = {
+    '不限文件大小 · 只支持你自己合法拥有的内容': 'No file size limit · Only share content you are legally allowed to use',
+    '当前速度': 'Current speed',
+    '房主上行（预估）': 'Host uplink (estimated)',
+    '上行带宽（预估）': 'Uplink bandwidth (estimated)',
+    '当前上传': 'Current upload',
+    '按码率最多流畅供': 'Smoothly serves at most',
+    '还能流畅播': 'Smooth playback left',
+    '正在测速…': 'Measuring speed…',
+    '片源': 'Source',
+    '流畅': 'Smooth',
+    '这个片子可能会让成员卡顿': 'This video may stall for members',
+    '仍然继续': 'Continue anyway',
+  };
+  for (const [zh, en] of Object.entries(fixed)) assert.equal(translate(zh, 'en'), en);
+
+  assert.equal(
+    translate('持有 42% · 延迟 31ms · 收片 12 Mbps', 'en'),
+    'Has 42% · Latency 31ms · Receiving 12 Mbps'
+  );
+  assert.equal(translate('按现在的速度约 3:20 后会卡', 'en'), 'Will stall in about 3:20 at the current speed');
+  assert.equal(translate('收完才播 · 预计还需 1:02:03', 'en'), 'Plays after full receipt · about 1:02:03 left');
+  assert.equal(translate('2 人按现在的速度会卡', 'en'), '2 viewer(s) will stall at the current speed');
+  assert.equal(translate('1 人余量很薄', 'en'), '1 viewer(s) have a thin margin');
+  assert.equal(translate('5 人', 'en'), '5 viewer(s)');
+  assert.equal(
+    translate('67 Mbps（人数上限 4 人，除你之外 3 人同时接收）', 'en'),
+    '67 Mbps (capacity 4; 3 viewer(s) besides you receiving at once)'
+  );
+  for (const line of [
+    '取消后重新选这个文件，改选「无损精简」，能降低一些码率',
+    '在邀请区调小房间人数上限',
+    '在设置里调小新房间的默认人数上限',
+    '改用安全模式开房：成员收完再播，不会中途卡顿，只是要等',
+    '也可以直接继续：成员缓冲不够时会自动暂停，攒够了再接着播',
+  ]) {
+    assert.notEqual(translate(line, 'en'), line, `建议缺英文：${line}`);
+  }
+  assert.equal(
+    translate('按这个码率，你的上行最多能同时供 4 人流畅边下边播。', 'en'),
+    'At this bitrate, your uplink can smoothly serve at most 4 viewer(s) at once.'
+  );
+  assert.equal(
+    translate('上行带宽没测出来，跳过卡顿预判：测速超过 15 秒', 'en'),
+    'Could not measure uplink bandwidth; skipping the stall check: 测速超过 15 秒'
+  );
+  assert.equal(
+    translate('没法接收这部片子：磁盘空间不够：这部片子需要 48.20GB，缓存所在的磁盘只剩 12.03GB', 'en'),
+    'Cannot receive this video: not enough disk space. It needs 48.20 GB, but the cache disk has only 12.03 GB free'
+  );
+  // 旧的上限提示已经删掉，不能还留着一条永远命不中的死翻译。
+  assert.equal(translate('文件超过 10GB 上限（当前 12.00GB）', 'en'), '文件超过 10GB 上限（当前 12.00GB）');
+
+  const android = await import('../android/app/src/main/assets/js/i18n.js');
+  assert.equal(
+    android.translate('打开接收会话失败：磁盘空间不够：这部片子需要 48.20GB，手机只剩 12.03GB', 'en'),
+    'Could not open the receive session: not enough storage. This video needs 48.20 GB, but the phone has only 12.03 GB free'
+  );
 });

@@ -76,6 +76,10 @@ const EN = new Map(Object.entries({
 }));
 
 const PATTERNS = [
+  [
+    /^打开接收会话失败：磁盘空间不够：这部片子需要 ([\d.]+)GB，手机只剩 ([\d.]+)GB$/,
+    'Could not open the receive session: not enough storage. This video needs $1 GB, but the phone has only $2 GB free',
+  ],
   [/^观众(\d+)$/, 'Viewer $1'],
   [/^(.+) 加入了房间$/, '$1 joined the room'],
   [

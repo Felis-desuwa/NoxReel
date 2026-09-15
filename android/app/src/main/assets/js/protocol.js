@@ -138,12 +138,37 @@ export function unpackBitfield(b64, chunkCount) {
   return have;
 }
 
-export function packBitfield(have) {
-  const bytes = new Uint8Array(Math.ceil(have.length / 8));
-  for (let i = 0; i < have.length; i++) {
-    if (have[i]) bytes[i >> 3] |= 0x80 >> (i & 7);
+/**
+ * 单条位图消息最多带多少片，与桌面端一致。
+ * 整张位图一条发的话，约 38 万片（约 750GB）就超过 DataChannel 单条 64KB 上限。
+ */
+export const BITFIELD_CHUNKS_PER_PART = 240_000;
+
+/** 打包 [start, end) 这一段位图；不传范围就是整张。 */
+export function packBitfield(have, start = 0, end = have.length) {
+  const count = Math.max(0, end - start);
+  const bytes = new Uint8Array(Math.ceil(count / 8));
+  for (let i = 0; i < count; i++) {
+    if (have[start + i]) bytes[i >> 3] |= 0x80 >> (i & 7);
   }
   let bin = '';
   for (const b of bytes) bin += String.fromCharCode(b);
   return btoa(bin);
+}
+
+/** 把一段位图解到 target 的 offset 处，最多写 count 片。格式不对就什么都不写。 */
+export function unpackBitfieldInto(target, b64, offset, count) {
+  const maxEncodedLength = Math.ceil(Math.ceil(count / 8) / 3) * 4 + 4;
+  if (typeof b64 !== 'string' || b64.length > maxEncodedLength) return false;
+  let bin;
+  try {
+    bin = atob(b64);
+  } catch {
+    return false;
+  }
+  for (let i = 0; i < count && offset + i < target.length; i++) {
+    const byte = bin.charCodeAt(i >> 3) || 0;
+    target[offset + i] = (byte >> (7 - (i & 7))) & 1;
+  }
+  return true;
 }

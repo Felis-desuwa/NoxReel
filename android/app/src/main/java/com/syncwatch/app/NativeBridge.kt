@@ -34,7 +34,10 @@ class NativeBridge(
         return try {
             store.openLeech(fileId, name, size.toLong(), chunkSize, chunkCount, hashesJson)
         } catch (e: Exception) {
-            Log.e(TAG, "openLeech 失败", e); ""
+            Log.e(TAG, "openLeech 失败", e)
+            // 失败原因要带回 JS：磁盘放不下这种情况，用户得知道是空间问题，而不是一句「openLeech 失败」。
+            // 会话 id 一律以 "leech-" 开头，用 "!" 前缀表示错误不会和正常返回值撞上。
+            "!" + (e.message ?: "openLeech 失败")
         }
     }
 

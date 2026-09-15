@@ -23,6 +23,7 @@ const media = require('./media');
 const linkMedia = require('./linkMedia');
 const browserMediaResolver = require('./browserMediaResolver');
 const geo = require('./geo');
+const uplink = require('./uplink');
 const { MpvController, findMpv } = require('./mpv');
 const validate = require('./security');
 const { CacheManager, cleanupLegacySidecars } = require('./cacheManager');
@@ -260,6 +261,13 @@ secureHandle('geo:check', async (opts) => {
   const value = opts === undefined ? {} : validate.plainObject(opts, '地区检测参数');
   if (value.force !== undefined && typeof value.force !== 'boolean') throw new TypeError('无效的强制检测参数');
   return geo.check({ force: value.force === true });
+});
+
+// 房主选片时预估上行带宽，用来判断「这个码率会不会让成员卡」。只发随机字节，结果缓存 10 分钟。
+secureHandle('net:estimateUplink', async (opts) => {
+  const value = opts === undefined ? {} : validate.plainObject(opts, '测速参数');
+  if (value.force !== undefined && typeof value.force !== 'boolean') throw new TypeError('无效的强制测速参数');
+  return uplink.estimate({ force: value.force === true });
 });
 
 /* --------------------------------- 文件相关 -------------------------------- */

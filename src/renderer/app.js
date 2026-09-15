@@ -5,6 +5,7 @@ import { MSG } from './lib/protocol.js';
 import { encodeCode, decodeCode, inviteLink, WsSignaling, randomRoomId, randomPeerId } from './lib/signaling.js';
 import { currentLocale, setLocale, startI18n, translate as t } from './lib/i18n.js';
 import { buildIceServers, diagnoseCandidates, summarizeCandidates } from './lib/ice.js';
+import { bitrateOf, forecastStall, hostPrecheck, viewersSupported, RateMeter } from './lib/stallForecast.js';
 
 startI18n();
 
@@ -84,6 +85,8 @@ const S = {
   roomCapacity: Math.max(2, Math.min(16, Number(localStorage.getItem('sw.roomCapacity')) || 4)),
   roomSecurityMode: null,
   pendingManualPeer: null,
+  // 房主选片时测得的上行带宽 { bytesPerSec, measuredAt }，房主面板用它算「最多能流畅供几个人」。
+  uplinkEstimate: null,
   settings: {
     language: currentLocale(),
     securityMode: localStorage.getItem('sw.securityMode') === 'safe' ? 'safe' : 'trusted',
@@ -106,6 +109,15 @@ const fmtBytes = (b) => {
 };
 
 const fmtRate = (bps) => (bps > 0 ? `${fmtBytes(bps)}/s` : '—');
+/**
+ * 字节/秒 → Mbps。码率、带宽、速度三个数要摆在一起比，必须同一个单位；
+ * 视频码率和宽带套餐都习惯按 Mbps 说，就统一成 Mbps。
+ */
+const fmtMbps = (bytesPerSec) => {
+  if (!(bytesPerSec > 0)) return '—';
+  const mbps = (bytesPerSec * 8) / 1e6;
+  return `${mbps >= 10 ? mbps.toFixed(0) : mbps >= 1 ? mbps.toFixed(1) : mbps.toFixed(2)} Mbps`;
+};
 const clampCapacity = (value) => Math.max(2, Math.min(16, Number.parseInt(value, 10) || 4));
 
 function connectedPeerCount() {
@@ -379,6 +391,15 @@ async function startHost(filePath) {
       return prepFail(info.reason);
     }
 
+    // 上行测速和后面的精简、转封装并行跑，等到要下结论时它多半已经测完了。
+    // 只有可信房间才会边下边播、才存在「中途卡顿」；安全模式成员收完才播，就不往外测。
+    const uplinkPromise =
+      S.roomSecurityMode === 'trusted'
+        ? window.sw.net.estimateUplink().catch((error) => ({ ok: false, reason: error.message || String(error) }))
+        : null;
+    let finalSize = info.size;
+    let slimmed = false;
+
     // 两种情况需要房主拿主意：非转封装不可，或者还有可无损省下的体积。
     // 都不沾边就别拿一个只有一个选项的弹窗去烦他。
     const needsRemux = info.action === 'remux';
@@ -404,6 +425,7 @@ async function startHost(filePath) {
 
       if (choice.plan !== 'as-is') {
         const slimming = choice.plan === 'slim';
+        slimmed = slimming;
         const reencoding = slimming && choice.toFlac?.length > 0;
         $('prep-title').textContent = slimming ? '正在无损精简' : '正在转封装';
         // 转码是分钟级、丢轨是秒级，这两件事的等待体感差一个数量级，得先说清楚。
@@ -426,6 +448,7 @@ async function startHost(filePath) {
             : await window.sw.media.remux(filePath);
           filePath = result.outPath;
           temporaryPath = result.outPath;
+          if (result.outputSize > 0) finalSize = result.outputSize;
           const saved =
             result.inputSize > 0 && result.outputSize > 0
               ? `，体积 ${fmtBytes(result.inputSize)} → ${fmtBytes(result.outputSize)}`
@@ -436,6 +459,24 @@ async function startHost(filePath) {
         } finally {
           off();
         }
+      }
+    }
+
+    // 卡顿预判放在算哈希之前：大文件的哈希要算好几分钟，房主要是决定不传了，别让他白等。
+    if (uplinkPromise) {
+      // 没走精简/转封装时，第一步一直停在「进行中」，预判期间步骤条会显得卡在格式检查上。
+      steps[0].state = 'done';
+      setSteps(steps);
+      const proceed = await confirmStreamability({
+        size: finalSize,
+        duration: info.probe?.duration,
+        uplinkPromise,
+        // 只有这个片子确实能精简、而房主这次没选时，「改选无损精简」才是一条真建议。
+        canSlimMore: canSlim && !slimmed && Boolean(S.env.ffmpeg),
+      });
+      if (!proceed) {
+        if (temporaryPath) await window.sw.media.releaseTemp(temporaryPath).catch(() => {});
+        return backHome();
       }
     }
 
@@ -470,6 +511,11 @@ async function startHost(filePath) {
       ...manifest,
       roomRevision: S.mediaRevision + 1,
       ...(info.probe?.duration > 0 ? { durationSec: info.probe.duration } : {}),
+      // 房主上行也跟着过去，成员面板据此显示「房主上行」，知道自己分到的速度上限在哪。
+      // 只带半小时内测的：带宽会变，太旧的数不如不给。
+      ...(S.uplinkEstimate?.bytesPerSec > 0 && Date.now() - S.uplinkEstimate.measuredAt < UPLINK_FRESH_MS
+        ? { uplinkBps: Math.round(S.uplinkEstimate.bytesPerSec) }
+        : {}),
     };
     const state = await window.sw.store.openSeed(manifest, filePath);
     preparedSessionId = state.sessionId;
@@ -642,6 +688,84 @@ function trackLabel(s) {
  *
  * @returns {Promise<{plan:'slim'|'remux'|'as-is', keepIndexes:number[]|null, toFlac:number[]|null}|null>}
  */
+const UPLINK_FRESH_MS = 30 * 60 * 1000;
+
+/**
+ * 选片时的卡顿预判：房主上行按房间人数平分之后，每人分到的速度够不够这个码率。
+ *
+ * 会卡或余量很薄就弹窗问一句，由房主决定要不要继续。测不出上行、或者不知道时长
+ * （没装 ffmpeg 就探测不到）时不拦，如实记一条日志 —— 预判是帮房主拿主意，不是替他拿。
+ *
+ * 人数按房间人数上限算而不是按当前在线人数：开房时一个人都还没进来，而上限就是
+ * 房主自己许诺能容纳的人数。上限设大了，这里就该提醒他。
+ *
+ * @returns {Promise<boolean>} 是否继续
+ */
+async function confirmStreamability({ size, duration, uplinkPromise, canSlimMore = false }) {
+  const bitrate = bitrateOf(size, duration);
+  if (!(bitrate > 0)) {
+    log('不知道这个片子的时长（需要 ffmpeg 才能探测），没法预判成员会不会卡。', 'warn');
+    return true;
+  }
+
+  $('prep-title').textContent = '正在评估上行带宽';
+  $('prep-note').textContent =
+    '往最近的 Cloudflare 测速节点传一小段随机数据，估算你的上行能同时供几个人流畅边下边播。只发随机字节，不涉及片子内容。';
+  // 主进程那边单次请求 8 秒超时、总预算 12 秒，最坏要二十秒才放弃。开房不该为一个
+  // 辅助判断卡这么久，这边再兜一道 15 秒。
+  const measured = await Promise.race([
+    uplinkPromise,
+    new Promise((resolve) => setTimeout(() => resolve({ ok: false, reason: '测速超过 15 秒' }), 15_000)),
+  ]);
+  if (!measured?.ok) {
+    log(`上行带宽没测出来，跳过卡顿预判：${measured?.reason || '未知原因'}`, 'warn');
+    return true;
+  }
+  S.uplinkEstimate = { bytesPerSec: measured.bytesPerSec, measuredAt: measured.measuredAt };
+
+  const viewers = Math.max(1, S.roomCapacity - 1);
+  const verdict = hostPrecheck({ uplink: measured.bytesPerSec, bitrate, viewers });
+  if (verdict.level === 'ok' || verdict.level === 'unknown') return true;
+
+  // 建议只列真能做的：片子没有可精简的轨就别让人回去找「无损精简」；
+  // 房间已经开着时安全模式改不了（两边必须一致），人数上限也是在邀请区改而不是设置里。
+  const advice = [];
+  if (canSlimMore) advice.push('取消后重新选这个文件，改选「无损精简」，能降低一些码率');
+  advice.push(roomEntered ? '在邀请区调小房间人数上限' : '在设置里调小新房间的默认人数上限');
+  if (!roomEntered) advice.push('改用安全模式开房：成员收完再播，不会中途卡顿，只是要等');
+  advice.push('也可以直接继续：成员缓冲不够时会自动暂停，攒够了再接着播');
+
+  return new Promise((resolve) => {
+    openModal({
+      title: verdict.level === 'stall' ? '这个片子可能会让成员卡顿' : '上行带宽余量很薄',
+      body: () => [
+        field('文件码率', hint(fmtMbps(bitrate))),
+        field('片长', hint(fmtTime(duration))),
+        field('你的上行带宽（预估）', hint(fmtMbps(measured.bytesPerSec))),
+        field(
+          '每人分到的上行',
+          hint(`${fmtMbps(verdict.perViewer)}（人数上限 ${S.roomCapacity} 人，除你之外 ${viewers} 人同时接收）`)
+        ),
+        field(
+          '结论',
+          hint(
+            verdict.supported > 0
+              ? `按这个码率，你的上行最多能同时供 ${verdict.supported} 人流畅边下边播。`
+              : '按这个码率，你的上行连一个人都供不上流畅边下边播。'
+          )
+        ),
+        field('可以怎么办', ...advice.map((line) => hint(line))),
+      ],
+      okText: '仍然继续',
+      onOk: () => {
+        resolve(true);
+        return true;
+      },
+      onCancel: () => resolve(false),
+    });
+  });
+}
+
 function choosePrepPlan(info, { needsRemux, canSlim }) {
   const slim = info.slim || {};
   const streams = info.probe?.streams || [];
@@ -1485,7 +1609,12 @@ function initSwarmAndSync() {
     try {
       state = await window.sw.store.openLeech(manifest);
     } catch (error) {
-      log(`已拒绝不安全的媒体清单：${error.message || error}`, 'bad');
+      const message = String(error.message || error);
+      // 磁盘放不下和清单不安全是两回事，混成一句会让人去怀疑片子有问题。
+      // Electron 会给主进程抛的错套一层「Error invoking remote method…」前缀，只取我们自己那句。
+      const diskFull = message.match(/磁盘空间不够：[^\n]*/);
+      if (diskFull) log(`没法接收这部片子：${diskFull[0]}`, 'bad');
+      else log(`已拒绝不安全的媒体清单：${message}`, 'bad');
       return;
     }
     if (revision && revision <= S.mediaRevision) {
@@ -2140,16 +2269,24 @@ function renderProgress(p) {
 /**
  * 传输诊断：把「这个片子需要多少码率」和「实际收多快」摆在一起。
  *
- * 所需码率 = 文件大小 ÷ 时长，也就是 scheduler.bytesPerSecond —— 直接复用它，
+ * 文件码率 = 文件大小 ÷ 时长，也就是 scheduler.bytesPerSecond —— 直接复用它，
  * 不重写第二遍同一个公式。起播后 mpv 报真时长，起播前用清单里房主带来的 durationSec。
  * 追不上就早点说，别让人对着一个反复卡住的进度条猜原因。
+ *
+ * 码率、当前速度、房主上行三个数一律用 Mbps，放在一起才比得出结论。
+ * 「会不会卡」看的不只是速度够不够：已经缓冲了大半部片子的人，速度掉到码率以下
+ * 也不会卡 —— forecastStall 会把这种情况区分出来。
  */
 function renderTransferVerdict(p) {
   const node = $('buf-verdict');
   if (!node) return;
+  if (S.isSeeder) {
+    renderHostVerdict();
+    return;
+  }
   node.className = 'buffer-verdict';
 
-  if (S.isSeeder || p.complete || !S.manifest || S.sourceType === 'link') {
+  if (p.complete || !S.manifest || S.sourceType === 'link') {
     node.classList.add('hidden');
     return;
   }
@@ -2171,19 +2308,32 @@ function renderTransferVerdict(p) {
     if (rate > 0) parts.push(stat('预计还需', fmtTime(remaining / rate)));
   }
 
-  if (need > 0) {
-    parts.push(stat('所需码率', fmtRate(need)));
-    if (rate > 0) {
-      const margin = rate / need;
-      if (margin < 1) {
-        node.classList.add('bad');
-        parts.push(make('span', { text: '当前速度追不上这个码率，边下边播会反复卡住；建议房主改用无损精简后的文件' }));
-      } else if (margin < 1.2) {
-        node.classList.add('warn');
-        parts.push(make('span', { text: '余量很薄，网络一抖就会卡' }));
-      } else {
-        parts.push(make('span', { text: '速度充足，可稳定边下边播' }));
-      }
+  parts.push(stat('文件码率', need > 0 ? fmtMbps(need) : '未知'));
+  parts.push(stat('当前速度', fmtMbps(rate)));
+  if (S.manifest.uplinkBps > 0) parts.push(stat('房主上行（预估）', fmtMbps(S.manifest.uplinkBps)));
+
+  // 安全模式收完才播，不存在中途卡顿，上面的「还剩 / 预计还需」就是全部要说的。
+  if (need > 0 && rate > 0 && S.roomSecurityMode === 'trusted') {
+    const forecast = forecastStall({
+      size: S.manifest.size,
+      bitrate: need,
+      rate,
+      contiguous: p.contiguousBytes,
+      playhead: roomPlayheadByte(),
+    });
+    if (forecast.level === 'stall') {
+      node.classList.add('bad');
+      parts.push(make('span', { text: '当前速度追不上这个码率，边下边播会反复卡住；建议房主改用无损精简后的文件' }));
+      if (forecast.stallInSec >= 1) parts.push(stat('还能流畅播', fmtTime(forecast.stallInSec)));
+    } else if (forecast.level === 'thin') {
+      node.classList.add('warn');
+      parts.push(
+        make('span', {
+          text: forecast.finishSec != null ? '速度低于码率，但缓冲够撑到收完' : '余量很薄，网络一抖就会卡',
+        })
+      );
+    } else if (forecast.level === 'ok') {
+      parts.push(make('span', { text: '速度充足，可稳定边下边播' }));
     }
   }
 
@@ -2227,11 +2377,130 @@ function drawChunkMap() {
 
 const ROLE_LABEL = { host: '房主', admin: '管理员', guest: '游客' };
 
+/* ------------------------------ 卡顿预判 ------------------------------ */
+
+// 每个成员一个速度计，按「对方已有字节」随时间的增长算他从所有来源收片的总速度。
+const intakeMeters = new Map();
+// 最近一轮算出的每人预判。房主面板汇总时直接用，免得同一轮把速度计采样两遍。
+let lastForecasts = new Map();
+
+/** 当前片子的码率（字节/秒）。起播后用 mpv 报的真时长，之前用清单里房主带来的。 */
+function mediaBitrate() {
+  if (!S.manifest || S.sourceType === 'link') return 0;
+  const duration = S.sync?.duration > 0 ? S.sync.duration : S.manifest.durationSec;
+  return bitrateOf(S.manifest.size, duration);
+}
+
+/** 房间当前播放到的字节位置。mpv 的 stream-pos 最准；拿不到时按码率从时间折算。 */
+function roomPlayheadByte() {
+  const snap = S.sync?.lastTick;
+  if (!snap) return 0;
+  if (snap.streamPos > 0) return snap.streamPos;
+  return (snap.position || 0) * mediaBitrate();
+}
+
+function updatePeerForecasts(list) {
+  const now = Date.now();
+  const size = S.manifest?.size || 0;
+  const bitrate = mediaBitrate();
+  const playhead = roomPlayheadByte();
+  const hostId = S.sync?.hostId || S.hostId;
+  const next = new Map();
+  for (const info of list) {
+    let meter = intakeMeters.get(info.peerId);
+    if (!meter) {
+      meter = new RateMeter();
+      intakeMeters.set(info.peerId, meter);
+    }
+    meter.sample(now, info.remoteHeldBytes || 0);
+    const rate = meter.rate;
+    const held = info.remoteHeldBytes || 0;
+    let forecast;
+    if (!size || S.sourceType === 'link') forecast = { level: 'unknown' };
+    else if (info.peerId === hostId && !S.isSeeder) forecast = { level: 'source' };
+    else if ((info.remoteContiguousBytes || 0) >= size) forecast = { level: 'done' };
+    else if (rate === null) forecast = { level: 'measuring' };
+    else forecast = forecastStall({ size, bitrate, rate, contiguous: info.remoteContiguousBytes || 0, playhead });
+    next.set(info.peerId, { ...forecast, rate, held });
+  }
+  for (const id of intakeMeters.keys()) if (!next.has(id)) intakeMeters.delete(id);
+  lastForecasts = next;
+  return next;
+}
+
+/** 预判给人看的那一句。安全模式收完才播，不存在中途卡顿，说的是还要等多久。 */
+function forecastLabel(f) {
+  if (!f) return '';
+  if (f.level === 'source') return '片源';
+  if (f.level === 'done') return '已收完，不会卡';
+  if (f.level === 'measuring') return '正在测速…';
+  if (f.level === 'unknown') return mediaBitrate() > 0 ? '' : '码率未知，没法预判';
+  if (S.roomSecurityMode !== 'trusted') {
+    const remaining = Math.max(0, (S.manifest?.size || 0) - (f.held || 0));
+    return f.rate > 0 ? `收完才播 · 预计还需 ${fmtTime(remaining / f.rate)}` : '收完才播';
+  }
+  if (f.level === 'ok') return '流畅';
+  if (f.level === 'thin') return f.finishSec != null ? '速度低于码率，但缓冲够撑到收完' : '余量很薄，网络一抖就会卡';
+  return f.stallInSec >= 1 ? `按现在的速度约 ${fmtTime(f.stallInSec)} 后会卡` : '已经跟不上码率，会卡';
+}
+
+/**
+ * 房主面板：文件码率、上行带宽、当前上传，以及按码率算出的「最多能流畅供几个人」
+ * 和「现在有几个人会卡」。成员面板只看得到自己，能对全房拿主意的只有房主。
+ */
+function renderHostVerdict(list = S.swarm?.peerList() || []) {
+  const node = $('buf-verdict');
+  if (!node || !S.isSeeder) return;
+  node.className = 'buffer-verdict';
+  if (!S.manifest || S.sourceType === 'link') {
+    node.classList.add('hidden');
+    return;
+  }
+
+  const bitrate = mediaBitrate();
+  const uplink = S.uplinkEstimate?.bytesPerSec || 0;
+  const uploading = list.reduce((sum, p) => sum + (p.upRate || 0), 0);
+  const parts = [
+    stat('文件码率', bitrate > 0 ? fmtMbps(bitrate) : '未知'),
+    stat('上行带宽（预估）', uplink > 0 ? fmtMbps(uplink) : '未测'),
+    stat('当前上传', fmtMbps(uploading)),
+  ];
+
+  if (S.roomSecurityMode !== 'trusted') {
+    parts.push(make('span', { text: '安全模式：成员收完才播，不会中途卡顿' }));
+  } else {
+    const supported = viewersSupported(uplink, bitrate);
+    if (supported !== null) parts.push(stat('按码率最多流畅供', `${supported} 人`));
+    let stalling = 0;
+    let thin = 0;
+    let receiving = 0;
+    for (const p of list) {
+      const f = lastForecasts.get(p.peerId);
+      if (!f || f.level === 'done' || f.level === 'source' || f.level === 'unknown') continue;
+      receiving++;
+      if (f.level === 'stall') stalling++;
+      else if (f.level === 'thin' && f.finishSec == null) thin++;
+    }
+    if (stalling) {
+      node.classList.add('bad');
+      parts.push(make('span', { text: `${stalling} 人按现在的速度会卡` }));
+    } else if (thin) {
+      node.classList.add('warn');
+      parts.push(make('span', { text: `${thin} 人余量很薄` }));
+    } else if (receiving) {
+      parts.push(make('span', { text: '在收的成员都跟得上' }));
+    }
+  }
+  replace(node, ...parts);
+}
+
 function renderPeers(list) {
   list = list || S.swarm?.peerList() || [];
   list = list.filter((p) => p.state === 'connected' || p.state === 'completed');
   $('peer-count').textContent = list.length;
   renderCapacityStatus();
+  const forecasts = updatePeerForecasts(list);
+  renderHostVerdict(list);
 
   if (!list.length) {
     const empty = make('p', { className: 'fine', text: '还没有人加入。用右边的邀请码叫人。' });
@@ -2268,14 +2537,17 @@ function renderPeers(list) {
         const ratio = Math.max(0, Math.min(1, Number(peer.remoteRatio) || 0));
         const barValue = make('div');
         barValue.style.width = `${(ratio * 100).toFixed(1)}%`;
+        const forecast = forecasts.get(peer.peerId);
+        const forecastText = forecastLabel(forecast);
+        // 安全模式下不存在「会卡」，不上红黄色，免得把「要等」看成「出故障」。
+        const tone = S.roomSecurityMode === 'trusted' ? forecast?.level || '' : '';
         mediaProgress = [
           make('div', { className: 'peer-bar' }, [barValue]),
           make('div', {
             className: 'peer-sub',
-            text: `持有 ${(ratio * 100).toFixed(0)}% · 延迟 ${
-              peer.rtt != null ? `${peer.rtt}ms` : '—'
-            } · ↓ ${fmtRate(peer.downRate)} · ↑ ${fmtRate(peer.upRate)}`,
+            text: `持有 ${(ratio * 100).toFixed(0)}% · 延迟 ${peer.rtt != null ? `${peer.rtt}ms` : '—'} · 收片 ${fmtMbps(forecast?.rate)}`,
           }),
+          ...(forecastText ? [make('div', { className: `peer-forecast ${tone}`, text: forecastText })] : []),
         ];
       }
 

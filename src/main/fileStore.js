@@ -11,7 +11,6 @@ const crypto = require('crypto');
 const { validateMediaHeader } = require('./mediaGuard');
 
 const CHUNK_SIZE = 2 * 1024 * 1024;
-const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024;
 const MEMORY_CACHE_LIMIT = 256 * 1024 * 1024;
 const FLUSH_THRESHOLD = 64 * 1024 * 1024;
 const FLUSH_DELAY_MS = 100;
@@ -104,9 +103,6 @@ async function buildManifest(filePath, onProgress) {
   const stat = await fsp.stat(filePath);
   if (!stat.isFile()) throw new Error('不是一个文件');
   if (stat.size === 0) throw new Error('文件是空的');
-  if (stat.size > MAX_FILE_SIZE) {
-    throw new Error(`文件超过 10GB 上限（当前 ${(stat.size / 1024 ** 3).toFixed(2)}GB）`);
-  }
 
   const cacheKey = await canonicalFileKey(filePath, stat);
   const cached = manifestCache.get(cacheKey);
@@ -380,6 +376,28 @@ async function openSeed(manifest, filePath, { ownedDir = null } = {}) {
   return session.state();
 }
 
+/**
+ * 接收前先看磁盘放不放得下。
+ *
+ * 以前有 10GB 上限兜着，磁盘被一部片子塞满的情况很少见；上限去掉以后这就是常态风险。
+ * 不先查的话，NTFS 上 truncate 会直接抛一个 ENOSPC，用户看到的是一串英文错误码；
+ * 在 ext4 这类稀疏文件系统上更糟 —— truncate 照样成功，传到一半才写不进去。
+ * 留 1% 或 256MB 的余量（取大），别把系统盘刚好塞到 0 字节。
+ */
+async function ensureFreeSpace(dir, bytesNeeded) {
+  let stats;
+  try {
+    stats = await fsp.statfs(dir);
+  } catch {
+    return; // 查不到就不拦：宁可让真正的写入错误说话，也不因为探测失败误伤正常接收
+  }
+  const free = Number(stats.bavail) * Number(stats.bsize);
+  const reserve = Math.max(256 * 1024 * 1024, Math.round(bytesNeeded * 0.01));
+  if (!Number.isFinite(free) || free >= bytesNeeded + reserve) return;
+  const gb = (n) => (n / 1024 ** 3).toFixed(2);
+  throw new Error(`磁盘空间不够：这部片子需要 ${gb(bytesNeeded)}GB，缓存所在的磁盘只剩 ${gb(free)}GB`);
+}
+
 async function openLeech(manifest) {
   if (!cacheManager) throw new Error('缓存目录尚未初始化');
   const id = nextId('leech');
@@ -387,6 +405,7 @@ async function openLeech(manifest) {
   const filePath = path.join(ownedDir, safeName(manifest.name));
   const session = new Session({ id, manifest, filePath, mode: 'leech', ownedDir });
   try {
+    await ensureFreeSpace(ownedDir, manifest.size);
     session.fh = await fsp.open(filePath, 'w+');
     await session.fh.truncate(manifest.size);
     sessions.set(id, session);
@@ -516,7 +535,7 @@ function resetForTests() {
 
 module.exports = {
   CHUNK_SIZE,
-  MAX_FILE_SIZE,
+  ensureFreeSpace,
   MEMORY_CACHE_LIMIT,
   FLUSH_THRESHOLD,
   FLUSH_DELAY_MS,

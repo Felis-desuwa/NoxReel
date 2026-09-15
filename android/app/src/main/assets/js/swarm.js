@@ -1,5 +1,13 @@
 import { Emitter } from './emitter.js';
-import { MSG, ChunkAssembler, unpackBitfield, packBitfield, chunkLengthAt } from './protocol.js';
+import {
+  MSG,
+  ChunkAssembler,
+  unpackBitfield,
+  unpackBitfieldInto,
+  packBitfield,
+  chunkLengthAt,
+  BITFIELD_CHUNKS_PER_PART,
+} from './protocol.js';
 import { Scheduler } from './scheduler.js';
 
 /**
@@ -14,10 +22,8 @@ const TICK_MS = 250;
 const SERVE_CONCURRENCY = 2; // 每个 peer 同时最多给他发 2 片，多了会把 ctrl 通道也拖慢
 const PING_MS = 3000;
 const MANIFEST_HASHES_PER_PART = 600; // 约 40KB/条，稳稳低于 DataChannel 常见 64KB 单消息上限
-const MAX_MANIFEST_PARTS = 32;
 const PEER_ID_RE = /^[A-Za-z0-9_-]{6,128}$/;
 const HASH_RE = /^[a-f0-9]{64}$/i;
-const MAX_MANIFEST_CHUNKS = 5120;
 
 export class Swarm extends Emitter {
   constructor({ peerId, name, securityMode = 'safe' }) {
@@ -229,8 +235,24 @@ export class Swarm extends Emitter {
   _sendIntro(peer) {
     if (!peer.authenticated || !this.manifest) return;
     this._sendManifest(peer, this.manifest);
-    peer.send({ t: MSG.BITFIELD, bits: packBitfield(this.have) });
+    this._sendBitfield(peer);
     peer.ready = true;
+  }
+
+  /**
+   * 片数不多就整张一条发（和旧版本完全一样）；超过一段的量才分段，每段带 offset。
+   * 旧版本收不到分段位图也无妨：它连超过 10GB 的清单都不收，根本走不到这一步。
+   */
+  _sendBitfield(peer) {
+    const total = this.have.length;
+    if (total <= BITFIELD_CHUNKS_PER_PART) {
+      peer.send({ t: MSG.BITFIELD, bits: packBitfield(this.have) });
+      return;
+    }
+    for (let offset = 0; offset < total; offset += BITFIELD_CHUNKS_PER_PART) {
+      const end = Math.min(total, offset + BITFIELD_CHUNKS_PER_PART);
+      peer.send({ t: MSG.BITFIELD, bits: packBitfield(this.have, offset, end), offset });
+    }
   }
 
   _sendManifest(peer, manifest) {
@@ -256,7 +278,7 @@ export class Swarm extends Emitter {
       !manifest?.fileId ||
       !Number.isInteger(manifest.chunkCount) ||
       manifest.chunkCount < 1 ||
-      manifest.chunkCount > MAX_MANIFEST_CHUNKS ||
+      !Number.isSafeInteger(manifest.chunkCount) ||
       !Array.isArray(manifest.hashes) ||
       manifest.hashes.length !== manifest.chunkCount ||
       manifest.hashes.some((hash) => typeof hash !== 'string' || !HASH_RE.test(hash))
@@ -269,7 +291,23 @@ export class Swarm extends Emitter {
   }
 
   _peerInfo(peer) {
-    const remoteCount = peer.remoteHave ? peer.remoteHave.reduce((a, b) => a + b, 0) : 0;
+    // 一次遍历同时数出「总共有几片」和「从头连续有几片」。后者是对方能连续播到哪，
+    // 前者随时间的增长是对方从所有来源收片的总速度 —— 两个都是卡顿预判要用的。
+    let remoteCount = 0;
+    let remoteLeading = 0;
+    if (peer.remoteHave) {
+      let gap = false;
+      for (let i = 0; i < peer.remoteHave.length; i++) {
+        if (peer.remoteHave[i]) {
+          remoteCount++;
+          if (!gap) remoteLeading++;
+        } else {
+          gap = true;
+        }
+      }
+    }
+    const size = this.manifest?.size || 0;
+    const chunkSize = this.manifest?.chunkSize || 0;
     return {
       peerId: peer.peerId,
       name: peer.name,
@@ -281,6 +319,9 @@ export class Swarm extends Emitter {
       bytesSent: peer.bytesSent,
       authenticated: peer.authenticated === true,
       remoteRatio: this.manifest?.chunkCount ? remoteCount / this.manifest.chunkCount : 0,
+      // 末片比 chunkSize 小，按片数乘出来会略大于文件，所以封顶到文件大小。
+      remoteHeldBytes: Math.min(size, remoteCount * chunkSize),
+      remoteContiguousBytes: Math.min(size, remoteLeading * chunkSize),
       inflight: peer.inflight.size,
     };
   }
@@ -330,9 +371,11 @@ export class Swarm extends Emitter {
           !meta?.fileId ||
           !Number.isInteger(totalParts) ||
           totalParts < 1 ||
-          totalParts > MAX_MANIFEST_PARTS ||
-          !Number.isInteger(meta.chunkCount) ||
-          meta.chunkCount < 1
+          !Number.isSafeInteger(meta.chunkCount) ||
+          meta.chunkCount < 1 ||
+          // 不再限制文件多大，但分段数必须正好是片数除以每段容量。以前靠「最多 32 段」
+          // 顺带挡住了对方乱报一个巨大的 totalParts；上限去掉后这道一致性检查就是那道闸。
+          totalParts !== Math.ceil(meta.chunkCount / MANIFEST_HASHES_PER_PART)
         ) break;
         peer.pendingManifest = { meta, totalParts, parts: new Array(totalParts), received: 0 };
         break;
@@ -365,7 +408,23 @@ export class Swarm extends Emitter {
         // 更不能拿本机的 chunkCount 去解。
         const source = peer.remoteManifest || this.manifest;
         if (source) {
-          peer.remoteHave = unpackBitfield(msg.bits, source.chunkCount);
+          if (msg.offset === undefined) {
+            peer.remoteHave = unpackBitfield(msg.bits, source.chunkCount);
+          } else {
+            // 分段位图：offset 必须落在段边界上，第一段到来时换一张新表。
+            const offset = Number(msg.offset);
+            if (
+              !Number.isSafeInteger(offset) ||
+              offset < 0 ||
+              offset >= source.chunkCount ||
+              offset % BITFIELD_CHUNKS_PER_PART !== 0
+            ) break;
+            if (offset === 0 || peer.remoteHave?.length !== source.chunkCount) {
+              peer.remoteHave = new Uint8Array(source.chunkCount);
+            }
+            const count = Math.min(BITFIELD_CHUNKS_PER_PART, source.chunkCount - offset);
+            if (!unpackBitfieldInto(peer.remoteHave, msg.bits, offset, count)) break;
+          }
           peer.ready = true;
           this.emit('peers', this.peerList());
         }

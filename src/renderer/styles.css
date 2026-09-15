@@ -698,6 +698,20 @@ select:disabled {
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
+.peer-forecast {
+  color: var(--dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.peer-forecast.ok {
+  color: #3fb950;
+}
+.peer-forecast.thin {
+  color: #e3b341;
+}
+.peer-forecast.stall {
+  color: #f0883e;
+}
 .peer-bar {
   height: 3px;
   background: var(--bg);

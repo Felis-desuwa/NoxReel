@@ -527,14 +527,6 @@ async function inspect(filePath) {
       reason: `只支持 MP4／MOV 和 MKV，当前是 ${ext || '(无扩展名)'}`,
     };
   }
-  if (stat.size > 10 * 1024 ** 3) {
-    return {
-      action: 'reject',
-      ext,
-      size: stat.size,
-      reason: `文件超过 10GB 上限（当前 ${(stat.size / 1024 ** 3).toFixed(2)}GB）`,
-    };
-  }
 
   // 这里是唯一需要把「能省多少」说清楚的地方，值得多花一两秒去采样估码率。
   const probe = await probeStreams(filePath, { sample: true }).catch(() => null);

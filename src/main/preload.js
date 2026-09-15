@@ -27,6 +27,10 @@ contextBridge.exposeInMainWorld('sw', {
     check: (opts) => ipcRenderer.invoke('geo:check', opts),
   },
 
+  net: {
+    estimateUplink: (opts) => ipcRenderer.invoke('net:estimateUplink', opts),
+  },
+
   dialog: {
     pickVideo: () => ipcRenderer.invoke('dialog:pickVideo'),
     approveDroppedVideo: (filePath) => ipcRenderer.invoke('dialog:approveDroppedVideo', filePath),

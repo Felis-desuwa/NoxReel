@@ -3,7 +3,7 @@
 const path = require('path');
 const net = require('net');
 const dns = require('dns/promises');
-const { CHUNK_SIZE, MAX_FILE_SIZE } = require('./fileStore');
+const { CHUNK_SIZE } = require('./fileStore');
 const { validateManifestName } = require('./mediaGuard');
 
 const MAX_TEXT = 4096;
@@ -111,9 +111,10 @@ function plainObject(value, label) {
 
 function manifest(value) {
   const data = plainObject(value, '媒体清单');
-  const size = integer(data.size, '文件大小', { min: 1, max: MAX_FILE_SIZE });
+  // 不再限制文件大小，只要求是能精确表示的整数（超过 2^53 连字节偏移都算不准）。
+  const size = integer(data.size, '文件大小', { min: 1, max: Number.MAX_SAFE_INTEGER });
   const chunkSize = integer(data.chunkSize, '分片大小', { min: CHUNK_SIZE, max: CHUNK_SIZE });
-  const chunkCount = integer(data.chunkCount, '分片数量', { min: 1, max: Math.ceil(MAX_FILE_SIZE / CHUNK_SIZE) });
+  const chunkCount = integer(data.chunkCount, '分片数量', { min: 1, max: Math.ceil(Number.MAX_SAFE_INTEGER / CHUNK_SIZE) });
   if (chunkCount !== Math.ceil(size / chunkSize)) fail('分片数量');
   if (!FILE_ID_RE.test(string(data.fileId, '文件标识', { max: 32 }))) fail('文件标识');
   validateManifestName(string(data.name, '文件名', { max: 200 }));
@@ -125,6 +126,9 @@ function manifest(value) {
   // 时长是可选的诊断信息（房主的 ffprobe 给的）。接收端靠它在起播之前就能算出
   // 「这个片子需要多少码率」，从而判断当前速度追不追得上。缺了不影响传输。
   if (data.durationSec !== undefined) finiteNumber(data.durationSec, '媒体时长', { min: 0, max: 86400 });
+  // 房主选片时测得的上行带宽（字节/秒），同样只是诊断信息：成员据此显示「房主上行」，
+  // 知道自己分到的速度上限在哪。上限给到 1Tbps，挡住畸形值。
+  if (data.uplinkBps !== undefined) finiteNumber(data.uplinkBps, '房主上行带宽', { min: 0, max: 125_000_000_000 });
   return data;
 }
 

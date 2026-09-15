@@ -41,9 +41,27 @@ test('文件路径必须是绝对路径且不能含 NUL', () => {
   assert.throws(() => validate.absolutePath(`${path.resolve('movie.mkv')}\0bad`), /无效/);
 });
 
-test('媒体清单严格限制分片结构和 10GB 边界', () => {
+test('媒体清单严格限制分片结构，但不再限制文件大小', () => {
   assert.equal(validate.manifest(validManifest()).chunkCount, 1);
-  assert.throws(() => validate.manifest({ ...validManifest(), size: 10 * 1024 ** 3 + 1 }), /无效/);
+
+  // 这条以前断言「10GB + 1 字节会被拒」，可它造的清单分片数还是 1，真正拒绝它的是
+  // 分片数一致性检查 —— 上限去掉以后它照样能过，等于在空跑。改成造一个结构完全
+  // 合法的 12GB 清单：能拒绝它的只可能是大小上限，所以它能通过才证明上限真的没了。
+  const big = 12 * 1024 ** 3;
+  const chunks = Math.ceil(big / CHUNK_SIZE);
+  const large = { ...validManifest(), size: big, chunkCount: chunks, hashes: Array(chunks).fill('b'.repeat(64)) };
+  assert.equal(validate.manifest(large).chunkCount, chunks);
+
+  // 去掉上限不等于去掉一致性检查：大小和分片数对不上照样拒绝。
+  assert.throws(() => validate.manifest({ ...validManifest(), size: CHUNK_SIZE * 3 }), /无效/);
+  // 超过 2^53 连字节偏移都算不准，这是唯一保留的数值边界。
+  assert.throws(() => validate.manifest({ ...validManifest(), size: Number.MAX_SAFE_INTEGER + 2 }), /无效/);
+
+  // 房主上行是可选的诊断字段，只接受非负有限数。
+  assert.equal(validate.manifest({ ...validManifest(), uplinkBps: 3_000_000 }).uplinkBps, 3_000_000);
+  assert.throws(() => validate.manifest({ ...validManifest(), uplinkBps: -1 }), /无效/);
+  assert.throws(() => validate.manifest({ ...validManifest(), uplinkBps: 'fast' }), /无效/);
+
   assert.throws(() => validate.manifest({ ...validManifest(), chunkCount: 2 }), /无效/);
   assert.throws(() => validate.manifest({ ...validManifest(), hashes: ['not-a-hash'] }), /无效/);
   assert.throws(() => validate.manifest({ ...validManifest(), name: 'payload.exe' }), /只允许接收/);
