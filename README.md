@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.6.7-7C5CFF?style=for-the-badge" alt="Version 0.6.7">
+    <img src="https://img.shields.io/badge/version-0.6.8-7C5CFF?style=for-the-badge" alt="Version 0.6.8">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -54,14 +54,14 @@
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!IMPORTANT]
-> `v0.6.7` 是一次修 bug 的版本：一轮全仓库审查（17 个维度分头找、每条结论再由三个不同视角的验证者试图证伪）确认了 **47 处缺陷**，全部修掉，其中约十处是 `v0.6.6` 自己引入的。**最要紧的一条是安全模式被绕过**：房间里的「重新打开播放器」按钮直接调用启动函数，而扫描门槛只长在其他几个调用方身上 —— 接收方一建好会话按钮就露出来，点一下就把还没收完、更没扫过的文件交给了播放器。门槛现在长在启动函数内部，调用方漏判也拦得住。**无损精简此前对绝大多数片子直接报错**：没有可转 FLAC 的 PCM 轨时渲染进程会传一个空数组，而主进程的参数校验把空数组当成畸形输入拒了 —— 也就是说这个功能只在源文件恰好带未压缩 PCM 轨时才能用。**采样估码率一次都没生效过**：ffprobe 不按请求顺序输出字段，代码把包时长当成了包大小，函数永远返回空。**断线自动重连会自己撞自己**：两端同时重连时，发起方既跑自己的定时器又响应对面的请求，连发两份 offer，过期的应答被套到新连接上，反而永远连不上；安卓端则根本不认这个协议，手机侧的链路断了就再也回不来。另外还修了传输记账的在途名额泄漏（会让上游被永久剔除、进度条停住）、全员暂停期间按空格能永久解除本机暂停、重开播放器把全房拉回 00:00、信令服务器的 XFF 伪造与房主身份顶替、安卓端接收缓存永不删除，以及一批漏翻的界面文案。测试从 205 条增加到 252 条。
+> `v0.6.8` 取消了文件大小上限，并把「这场放映会不会卡」摆到明面上。**不再有 10GB 上限**：分片位图原来整张用一条控制消息发，约 38 万片（约 750GB）就会超过 DataChannel 单条 64KB 的上限，而超限的 `send()` 会让整条通道断掉、表现成莫名掉线 —— 现在清单和位图都会自动分段，普通大小的文件仍是一条发，和旧版本兼容。上限没了之后，接收端在开会话前会先查磁盘余量：`NTFS` 上会直接抛 `ENOSPC`，而 `ext4`/`f2fs` 上稀疏文件照样建得成，要传到一半才写不进去。**房间里能看见码率、速度和带宽**：成员面板显示文件码率、当前速度和房主上行（统一用 Mbps，放在一起才比得出结论），会卡时给出「还能流畅播多久」；成员列表每人一条实时预判。判断不只看速度够不够 —— 已经缓冲了大半部片子的人，速度掉到码率以下也不会卡，这种情况不会误报。成员的接收速度由对方位图随时间的增长算出，信令模式下他从多个人同时收片也算得准。**房主选片时先预判**：按房间人数上限把上行平分，和码率比较，会卡或余量很薄就先问一句要不要继续，并给出能做什么（调小人数、改用安全模式、改选无损精简）。这一步放在算分片哈希之前 —— 大文件的哈希要好几分钟，不想传了不该白等。上行带宽由 `src/main/uplink.js` 往 Cloudflare 测速节点传一小段随机字节估出来，不涉及片子内容，界面上一律标「预估」。安全模式成员收完才播，不存在中途卡顿，所以既不测速也不弹窗。测试从 255 条增加到 298 条。
 
 ## 下载
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，可选择安装文件夹 | [NoxReel-Setup-0.6.7.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.7.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.6.7.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.7.exe) |
+| Windows 完整版 | 推荐。内置 mpv 与 yt-dlp，可选择安装文件夹 | [NoxReel-Setup-0.6.8.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.6.8.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.6.8.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.6.8.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
