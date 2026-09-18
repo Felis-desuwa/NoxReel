@@ -214,6 +214,8 @@ class PotAdapter extends EventEmitter {
       if (!startPaused) await this._setPauseInternal(false);
 
       this._quiet = false;
+      // 启动期间的文件名回报都没算数，马上问一次，拿它当「换没换文件」的基准
+      this._askFileName();
       this._emitTick();
       return { bin: exe, filePath: source, pid: this.pid, hwnd: this.hwnd, args };
     } catch (error) {
@@ -366,8 +368,15 @@ class PotAdapter extends EventEmitter {
     if (!msg || this._closing) return;
     const fromOurs = Number(msg.pid) === this.pid || Number(msg.from) === this.hwnd;
     if (!fromOurs) return;
+    // 只认文件名查询的回包，别的字符串消息不是「当前文件名」
+    if (Number(msg.code) !== POT.GET_FILENAME) return;
     const text = String(msg.text || '');
     if (!text) return;
+    // 还在启动时的回报一律不比：PotPlayer 刚起来会先报一次它**上次**放过的文件，加载好我们的片子
+    // 之后才换成这一部。以前拿这两次一比就判成「有人在 PotPlayer 里打开了别的文件」，界面随即放开它，
+    // 启动流程收尾时又把它当成作废的一代关掉 —— 看上去就是 PotPlayer 放了两秒就崩了。
+    // 基准取启动完成后的第一次回报（launch 末尾会马上问一次）。
+    if (this._quiet) return;
     if (this._fileName && text !== this._fileName) this._onFileSwitched();
     this._fileName = text;
   }

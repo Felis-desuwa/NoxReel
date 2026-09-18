@@ -603,6 +603,10 @@ const EN = new Map(Object.entries({
   '上行': 'Upload',
   '即将开始': 'Starting soon',
   '还没开始': 'Not started',
+  'TURN 中继开着但没填用户名或密码，这次先不走中继、只尝试直连。到设置里补全，或者把中继关掉。':
+    'The TURN relay is on but has no username or password, so it is skipped this time and only direct connections are tried. Complete it in Settings, or turn the relay off.',
+  'TURN 中继要填用户名和密码（中继服务器靠它们认人）。没有的话把「启用 TURN 中继」的勾去掉。':
+    'A TURN relay needs a username and password (the relay server uses them to authenticate you). If you do not have them, uncheck “Enable TURN relay”.',
   '点开对方发回的 NoxReel 应答链接，或粘贴 NR3-…': 'Open the NoxReel reply link they sent back, or paste NR3-…',
   '还没有人加入：照下面的步骤把朋友拉进来，也可以自己先放':
     'Nobody has joined yet: follow the steps below to bring friends in, or start watching on your own',
@@ -996,6 +1000,8 @@ const EN_PATTERNS = [
   [/^读取分片 (.*) 短读$/, 'Short read while reading chunk $1'],
   // 房间页重排（0.7.1）。放在最后：「持有 N% · 延迟 X」要排在上面三段式那条后面，不然会把它吞掉
   [/^还能再来 (\d+) 人$/, (_all, n) => `Room for ${n} more`],
+  [/^没能生成邀请链接：(.+)$/, 'Could not create the invite link: $1'],
+  [/^生成邀请链接失败：(.+)$/, 'Failed to create the invite link: $1'],
   [
     /^(已连接|等人加入) · (可信房间|安全模式) · (\d+) \/ (\d+) 人$/,
     (_all, state, mode, n, max) =>

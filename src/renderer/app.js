@@ -42,6 +42,7 @@ import {
   normalizeTurnInput,
   parseSdpCandidates,
   summarizeCandidates,
+  turnMissingCredentials,
 } from './lib/ice.js';
 import {
   bitrateOf,
@@ -297,7 +298,15 @@ function log(text, kind = '') {
  *
  * TURN 依旧需要用户自己填服务器 —— 中继要花真金白银的带宽，我们不代运营。
  */
+let turnWarned = false;
+
 function iceServers() {
+  // 以前存下的设置可能就是「开了中继、没填密码」：这种中继 buildIceServers 不会交出去，
+  // 在日志里说一声，别让人以为中继在工作
+  if (!turnWarned && turnMissingCredentials(S.settings)) {
+    turnWarned = true;
+    log('TURN 中继开着但没填用户名或密码，这次先不走中继、只尝试直连。到设置里补全，或者把中继关掉。', 'warn');
+  }
   return buildIceServers(S.settings);
 }
 
@@ -5102,7 +5111,23 @@ async function inviteViaManual(notice = '') {
   S.mode = 'manual';
   const out = $('inv-out');
   replace(out, make('p', { text: '正在收集网络候选地址（几秒钟）…' }));
+  try {
+    await createManualInvite(out, notice);
+  } catch (error) {
+    // 生成失败不能停在「正在收集网络候选地址」上：把原因写出来，底下「重新生成邀请链接」随时能再点。
+    // 上一条在 createManualInvite 开头就作废了，这一条又没生成出来 —— 手上没有能用的邀请。
+    S.pendingManualPeer?.close?.();
+    S.pendingManualPeer = null;
+    const reason = error?.message || String(error);
+    const failed = make('p', { text: `没能生成邀请链接：${reason}` });
+    failed.style.color = 'var(--danger)';
+    replace(out, failed);
+    log(`生成邀请链接失败：${reason}`, 'bad');
+  }
+}
 
+/** 极简模式邀请链接的实际生成：作废上一条、新建待加入的连接、收集候选、画出两步。 */
+async function createManualInvite(out, notice) {
   S.pendingManualPeer?.close();
 
   const peer = new Peer({
@@ -6705,6 +6730,12 @@ $('btn-settings').onclick = () => {
       }
       if ($('set-turn-on').checked && !turnRaw) {
         errorBox.textContent = t('勾了启用 TURN 中继，但地址是空的 —— 这样等于没配。填一个地址，或者把勾去掉。');
+        errorBox.classList.remove('hidden');
+        return false;
+      }
+      // 缺用户名或密码的中继，浏览器会连整个连接对象一起拒掉（邀请、加入全都失败），得当场拦下
+      if ($('set-turn-on').checked && (!$('set-turn-user').value.trim() || !$('set-turn-pass').value.trim())) {
+        errorBox.textContent = t('TURN 中继要填用户名和密码（中继服务器靠它们认人）。没有的话把「启用 TURN 中继」的勾去掉。');
         errorBox.classList.remove('hidden');
         return false;
       }

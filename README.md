@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析；一整晚的片单、飘过画面的弹幕和你自己惯用的播放器都在里面。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.1-7C5CFF?style=for-the-badge" alt="Version 0.7.1">
+    <img src="https://img.shields.io/badge/version-0.7.2-7C5CFF?style=for-the-badge" alt="Version 0.7.2">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -60,6 +60,9 @@
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!NOTE]
+> `v0.7.2` 修了两个问题。**TURN 中继开着却没填用户名或密码**时，以前整个连接都建不起来（一进房就报错，「重新生成邀请链接」一直转圈）；现在这种中继会被跳过、只走直连，日志里提示一次，设置里保存时也会当场拦下。**切到 PotPlayer 放两秒就被关掉**：PotPlayer 刚启动时会先报一次它上次放过的文件，以前被误判成「有人在 PotPlayer 里打开了别的文件」；现在启动完成之前的文件名回报一律不算，MPC-BE 同样处理。
+
+> [!NOTE]
 > `v0.7.1` 重排了房间页，主次按「现在该干什么」来排：片名下面一条**状态带**只说现在在发生什么，外加最多一个该按的按钮（比如「仍然开始」）；进度条就是缓冲条，图例直接带数值（播放到哪、不用等还能放多久、收到多少）；新增**实时上下行速率**和最近 30 秒的折线；成员页改成表格，谁准备好了、谁收得慢一眼看得到；**邀请不再只有一次** —— 空房间时成员页就是三步邀请，有人进来后成员表底下常驻「邀请下一位」。离开房间和邀请挪到顶栏，弹幕开关挪到聊天标题上。协议没有变，和 0.7.0 互通。
 
 > [!IMPORTANT]
@@ -69,8 +72,8 @@
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.1.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.1.exe) |
+| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.2.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.2.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 

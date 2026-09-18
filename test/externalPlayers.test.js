@@ -161,11 +161,15 @@ class FakePotBridge extends EventEmitter {
       case 'close':
         if (this.onClose) this.onClose();
         return true;
-      case 'potString':
-        if (sim.fileName) {
-          setImmediate(() => this.emit('copydata', { from: this.hwnd, pid: 1234, code: POT.GET_FILENAME, text: sim.fileName }));
+      case 'potString': {
+        // 可以给一串：依次报出去，报到最后一个就一直报它（模拟「先报上次的文件，加载好才换成这一部」）
+        const names = Array.isArray(sim.fileName) ? sim.fileName : [sim.fileName];
+        const name = names.length > 1 ? names.shift() : names[0];
+        if (name) {
+          setImmediate(() => this.emit('copydata', { from: this.hwnd, pid: 1234, code: POT.GET_FILENAME, text: name }));
         }
         return true;
+      }
       case 'potSetString':
         return 1;
       case 'pot':
@@ -659,6 +663,31 @@ test('PotPlayer 换文件：时长一变就是换了片，没放完就暂停并�
   await adapter.quit();
 });
 
+/**
+ * 用户实际撞上的：PotPlayer 刚起来先报一次它**上次**放过的文件，加载好我们的片子才换成这一部。
+ * 以前拿这两次一比就判成「有人在 PotPlayer 里打开了别的文件」，界面随即放开它，
+ * 启动流程收尾时又把它当成作废的一代关掉 —— 看上去就是 PotPlayer 放了两秒就崩了。
+ */
+test('PotPlayer 刚起来先报上次放过的文件：启动期间的文件名不算换片', async () => {
+  const stale = `C:${BS}Users${BS}A${BS}Desktop${BS}A_48秒版.mp4`;
+  const { adapter, bridge, errors } = await launchPot({
+    state: POT_STATE.PLAYING,
+    ignorePauses: 2,
+    fileName: [stale, LOCAL_FILE],
+  });
+  await sleep(80); // 启动之后的文件名轮询再走几轮
+  assert.deepEqual(errors.map((e) => e.code), [], '启动途中那一次旧文件名不能算数');
+  // 别的字符串消息不是文件名，不拿来比
+  bridge.emit('copydata', { from: bridge.hwnd, pid: 1234, code: 0x6030, text: '别的回包' });
+  await sleep(20);
+  assert.deepEqual(errors.map((e) => e.code), []);
+  // 启动之后真有人换了片，照样认得出来
+  bridge.sim.fileName = [`C:${BS}other.mkv`];
+  const error = await until(() => errors[0]);
+  assert.equal(error.code, 'PLAYER_FOREIGN_FILE');
+  await adapter.quit();
+});
+
 test('PotPlayer 换文件：换之前已经贴着片尾，算放完而不是走神', async () => {
   const { adapter, bridge, ticks, errors } = await launchPot({ state: POT_STATE.PLAYING, durationMs: 600000 });
   await playTo(adapter, bridge, 599);
@@ -958,6 +987,30 @@ test('MPC-BE 换文件：NOWPLAYING 的文件名变了就暂停并提示', async
   const error = await until(() => errors[0]);
   assert.equal(error.code, 'PLAYER_FOREIGN_FILE');
   assert.ok(bridge.mpcCalls(MPC.PAUSE).length > 0);
+  await adapter.quit();
+});
+
+test('MPC-BE 启动途中报的上一个文件不算换片，启动完之后换了照样认得出', async () => {
+  const bridge = new FakeMpcBridge();
+  const proc = fakeChild();
+  const adapter = new MpcAdapter({ bridge, spawn: () => proc, exePath: `C:${BS}mpc${BS}mpc-be64.exe`, timing: mpcTiming });
+  const errors = [];
+  adapter.on('error', (e) => errors.push(e));
+  bridge.onClose = () => {
+    bridge.sim.alive = false;
+    proc.exit(0);
+  };
+  setImmediate(() => {
+    bridge.push(MPC.CONNECT, bridge.playerHwnd);
+    bridge.push(MPC.NOWPLAYING, '标题|作者|描述|上次放的.mkv|600');
+    bridge.push(MPC.NOWPLAYING, '标题|作者|描述|a.mkv|600');
+  });
+  await adapter.launch({ source: `D:${BS}a.mkv`, startPaused: true, startAt: 0 });
+  await sleep(40);
+  assert.deepEqual(errors.map((e) => e.code), []);
+  bridge.push(MPC.NOWPLAYING, '标题|作者|描述|另一部.mkv|600');
+  const error = await until(() => errors[0]);
+  assert.equal(error.code, 'PLAYER_FOREIGN_FILE');
   await adapter.quit();
 });
 

@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links — now with a playlist for the whole evening, danmaku comments over the picture, and your own preferred player.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.1-7C5CFF?style=for-the-badge" alt="Version 0.7.1">
+    <img src="https://img.shields.io/badge/version-0.7.2-7C5CFF?style=for-the-badge" alt="Version 0.7.2">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -60,6 +60,9 @@
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
 
 > [!NOTE]
+> `v0.7.2` fixes two problems. **A TURN relay that is enabled but has no username or password** used to stop every connection from being created (an error as soon as you entered a room, and "Generate a new invite link" spinning forever); such a relay is now skipped so only direct connections are tried, the log says so once, and Settings refuses to save it. **PotPlayer being closed two seconds after switching to it**: right after starting, PotPlayer first reports the file it played last time, which used to be mistaken for "someone opened another file in PotPlayer"; file-name reports before startup completes are now ignored, and MPC-BE is handled the same way.
+
+> [!NOTE]
 > `v0.7.1` reorganizes the room page around "what should happen next": a single **status strip** under the title says what is going on right now, with at most one button to press (such as "Start anyway"); the progress bar doubles as the buffer bar, and its legend carries the numbers (where playback is, how long it can keep playing without waiting, how much has arrived); **live download and upload rates** with a 30-second sparkline are new; the member list is now a table that shows at a glance who is ready and who is receiving slowly; and **inviting is no longer one-shot** — an empty room shows a three-step invite flow, and once someone joins, an "Invite someone else" row stays under the member list. Leave room and Invite moved to the title bar, and the danmaku toggle moved to the chat header. The protocol is unchanged, so 0.7.1 works with 0.7.0.
 
 > [!IMPORTANT]
@@ -69,8 +72,8 @@
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.1.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.1.exe) |
+| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.2.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.2.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 

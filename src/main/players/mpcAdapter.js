@@ -378,7 +378,9 @@ class MpcAdapter extends EventEmitter {
     const name = parts[3];
     const duration = parseFloat(parts[4]);
     if (Number.isFinite(duration) && duration > 0) this._duration = duration;
-    if (this._fileName && name && name !== this._fileName) this._onFileSwitched();
+    // 启动途中只记下来、不比较：还没稳下来时报的可能是它上一次放的文件（PotPlayer 就是这样）。
+    // MPC-BE 的 NOWPLAYING 是推送、打开文件时只来一次，所以这里照样记录，不然启动完就没有基准了。
+    if (!this._quiet && this._fileName && name && name !== this._fileName) this._onFileSwitched();
     if (name) this._fileName = name;
     this._notify(this._sample());
   }

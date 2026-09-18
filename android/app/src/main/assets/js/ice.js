@@ -125,11 +125,25 @@ export function buildIceServers({
   }
 
   const list = [{ urls }];
-  if (turnEnabled) {
+  // 缺用户名或密码的中继不交出去：Chromium 会因为它把整个连接对象拒掉（见 turnMissingCredentials）
+  if (turnEnabled && !turnMissingCredentials({ turnEnabled, turnUrl, turnUser, turnPass })) {
     const relays = expandTurnUrls(turnUrl);
     if (relays.length) list.push({ urls: relays, username: turnUser || '', credential: turnPass || '' });
   }
   return list;
+}
+
+/**
+ * 开了 TURN、也填了地址，却缺用户名或密码。
+ *
+ * Chromium 对 turn: / turns: 地址要求用户名和密码都在，缺一个，RTCPeerConnection 的构造函数
+ * 直接抛「ICE server parsing failed: TURN server with empty username or password」——
+ * 不是这一条中继用不了，是整个连接对象都建不起来：生成邀请、加入房间全部失败。
+ * 所以这种中继干脆不交给浏览器，只走直连，由界面另外提醒去补全。
+ */
+export function turnMissingCredentials({ turnEnabled = false, turnUrl = '', turnUser = '', turnPass = '' } = {}) {
+  if (!turnEnabled || !expandTurnUrls(turnUrl).length) return false;
+  return !String(turnUser || '').trim() || !String(turnPass || '').trim();
 }
 
 /** 配置里真的带了可用的 TURN 中继吗。用来决定 ICE 收集要不要多等一会儿。 */

@@ -84,6 +84,28 @@ test('开了开关但地址是空的，也不该多出一个空中继项', async
   assert.equal(buildIceServers({ turnEnabled: true, turnUrl: '   ' }).length, 1);
 });
 
+/**
+ * 用户实际撞上的：设置里勾了 TURN、填了地址，用户名和密码空着。Chromium 对这种中继不是「这一条不用」，
+ * 而是 RTCPeerConnection 的构造函数直接抛错 —— 生成邀请、加入房间统统失败，界面停在「正在收集网络候选地址」。
+ */
+test('TURN 缺用户名或密码时不交给浏览器，只走直连', async () => {
+  const { buildIceServers, hasRelay, turnMissingCredentials } = await load();
+  const base = { turnEnabled: true, turnUrl: 'turn:relay.example:3478' };
+  for (const creds of [{}, { turnUser: 'u' }, { turnPass: 'p' }, { turnUser: '  ', turnPass: 'p' }]) {
+    const settings = { ...base, ...creds };
+    assert.equal(turnMissingCredentials(settings), true, JSON.stringify(creds));
+    const list = buildIceServers(settings);
+    assert.equal(hasRelay(list), false, `缺鉴权信息的中继不能交出去：${JSON.stringify(creds)}`);
+    assert.equal(list.length, 1, '只剩 STUN');
+  }
+  const full = { ...base, turnUser: 'u', turnPass: 'p' };
+  assert.equal(turnMissingCredentials(full), false);
+  assert.equal(hasRelay(buildIceServers(full)), true, '填齐了照常用');
+  // 没开开关、或者地址压根认不出来，谈不上「缺密码」—— 不该拿这个去提醒用户
+  assert.equal(turnMissingCredentials({ turnEnabled: false, turnUrl: 'turn:relay.example:3478' }), false);
+  assert.equal(turnMissingCredentials({ turnEnabled: true, turnUrl: '   ' }), false);
+});
+
 test('hasRelay 认得出配置里有没有真的中继', async () => {
   const { buildIceServers, hasRelay } = await load();
   assert.equal(hasRelay(buildIceServers({})), false);
