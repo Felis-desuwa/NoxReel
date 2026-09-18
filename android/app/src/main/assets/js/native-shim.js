@@ -66,12 +66,17 @@ window.sw.store = {
 };
 
 // 播放器控制。同步引擎通过它驱动原生 ExoPlayer（对应 PC 端驱动 mpv）。
+//
+// load / loadUrl / release 都只是把活投递到主线程，同步返回时播放器还没换完。
+// 它们返回的是这次换片的「代号」（0 表示失败），快照里也带着同一个代号：
+// 对不上就说明手里这条读数还是上一部片的，必须整条丢掉 —— 否则换片瞬间会把
+// 上一部的位置当成「有人拖动了」广播给全房。
 window.swPlayer = {
   load(sessionId) {
-    return Native.playerLoad(sessionId);
+    return Number(Native.playerLoad(sessionId)) || 0;
   },
   loadUrl(url, headers = {}) {
-    return Native.playerLoadUrl(url, JSON.stringify(headers));
+    return Number(Native.playerLoadUrl(url, JSON.stringify(headers))) || 0;
   },
   setPause(paused) {
     Native.playerSetPause(!!paused);
@@ -83,7 +88,7 @@ window.swPlayer = {
     return JSON.parse(Native.playerSnapshot());
   },
   release() {
-    Native.playerRelease();
+    return Number(Native.playerRelease()) || 0;
   },
 };
 

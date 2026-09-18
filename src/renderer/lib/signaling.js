@@ -1,4 +1,5 @@
 import { Emitter } from './emitter.js';
+import { PROTOCOL_VERSION } from './protocol.js';
 
 /**
  * 两种节点发现方式。
@@ -81,6 +82,15 @@ function expandSecurityMode(mode) {
   return mode === 't' || mode === 'trusted' ? 'trusted' : 'safe';
 }
 
+/**
+ * 码里末尾追加的协议版本号。0.6 的解码只按下标取前几项，多出来的尾巴会被忽略，
+ * 所以旧码没有这一项 —— 缺省就是 1。版本不一致的两端在数据通道上也会被 HELLO 拦下，
+ * 这里提前一步，是为了在粘贴码的那一刻就能说清楚「对方是旧版」。
+ */
+function expandVersion(value) {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 ? value : 1;
+}
+
 /** SW2 用定长数组代替重复的 JSON 键；房间可切片后，信令短码不再绑定片名。 */
 function sdpText(value) {
   return typeof value === 'string' ? value : String(value?.sdp || '');
@@ -88,15 +98,15 @@ function sdpText(value) {
 
 function compactPayload(payload) {
   if (payload?.k === 'room') {
-    return ['r', payload.url, payload.room, payload.from, Number(payload.maxMembers) || 0, packSecurityMode(payload.securityMode)];
+    return ['r', payload.url, payload.room, payload.from, Number(payload.maxMembers) || 0, packSecurityMode(payload.securityMode), PROTOCOL_VERSION];
   }
   if (payload?.k === 'offer') {
     // NR3 不再重复携带 type、昵称和片名；昵称会在加密数据通道的 HELLO 中发送，
     // 视频信息则在握手后发送。SDP 仍完整保留，避免破坏 NAT 打洞。
-    return ['o', payload.from, sdpText(payload.sdp), Number(payload.maxMembers) || 0, packSecurityMode(payload.securityMode)];
+    return ['o', payload.from, sdpText(payload.sdp), Number(payload.maxMembers) || 0, packSecurityMode(payload.securityMode), PROTOCOL_VERSION];
   }
   if (payload?.k === 'answer') {
-    return ['a', payload.from, sdpText(payload.sdp), packSecurityMode(payload.securityMode)];
+    return ['a', payload.from, sdpText(payload.sdp), packSecurityMode(payload.securityMode), PROTOCOL_VERSION];
   }
   return payload;
 }
@@ -104,7 +114,7 @@ function compactPayload(payload) {
 function expandPayload(value, version = 3) {
   if (!Array.isArray(value)) {
     if (value && ['room', 'offer', 'answer'].includes(value.k)) {
-      return { ...value, securityMode: expandSecurityMode(value.securityMode) };
+      return { ...value, securityMode: expandSecurityMode(value.securityMode), protocolVersion: 1 };
     }
     return value;
   }
@@ -116,6 +126,7 @@ function expandPayload(value, version = 3) {
       from: value[3],
       maxMembers: Number(value[4]) || 0,
       securityMode: expandSecurityMode(value[5]),
+      protocolVersion: expandVersion(value[6]),
     };
   }
   if (value[0] === 'o') {
@@ -123,6 +134,7 @@ function expandPayload(value, version = 3) {
       return {
         k: 'offer', from: value[1], name: '', sdp: { type: 'offer', sdp: value[2] }, file: null,
         maxMembers: Number(value[3]) || 0, securityMode: expandSecurityMode(value[4]),
+        protocolVersion: expandVersion(value[5]),
       };
     }
     const f = value[4];
@@ -134,13 +146,17 @@ function expandPayload(value, version = 3) {
       file: Array.isArray(f) ? { name: f[0], size: Number(f[1]) || 0, kind: f[2] === 'l' ? 'link' : 'file' } : null,
       maxMembers: Number(value[5]) || 0,
       securityMode: expandSecurityMode(value[6]),
+      protocolVersion: 1,
     };
   }
   if (value[0] === 'a') {
     if (version >= 3) {
-      return { k: 'answer', from: value[1], name: '', sdp: { type: 'answer', sdp: value[2] }, securityMode: expandSecurityMode(value[3]) };
+      return {
+        k: 'answer', from: value[1], name: '', sdp: { type: 'answer', sdp: value[2] },
+        securityMode: expandSecurityMode(value[3]), protocolVersion: expandVersion(value[4]),
+      };
     }
-    return { k: 'answer', from: value[1], name: value[2], sdp: value[3], securityMode: expandSecurityMode(value[4]) };
+    return { k: 'answer', from: value[1], name: value[2], sdp: value[3], securityMode: expandSecurityMode(value[4]), protocolVersion: 1 };
   }
   return value;
 }
@@ -182,7 +198,7 @@ export function unwrapInviteInput(input) {
   const cleaned = String(input || '')
     .replace(INVISIBLE_RE, '')
     // 邮件/聊天软件的引用前缀。'>' 不在码的字母表里，留着会把折行的码从中间截断。
-    .replace(/^[ 	]*>+[ 	]?/gm, '');
+    .replace(/^[ \t]*>+[ \t]?/gm, '');
   // 空白必须先在**每一段之内**剥掉（对付邮件的 78 列折行），而不是把整段输入
   // 拼成一条长串再搜 —— BARE_RE 是贪婪的、字母数字又都在码的字母表里，
   // 「NR3-xxxx thanks」拼起来之后 thanks 会被整个吞进码体，解不开。

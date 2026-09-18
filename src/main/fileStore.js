@@ -99,7 +99,12 @@ function rememberManifest(key, manifest) {
   while (manifestCache.size > MANIFEST_CACHE_LIMIT) manifestCache.delete(manifestCache.keys().next().value);
 }
 
-async function buildManifest(filePath, onProgress) {
+/**
+ * 算整部片的分片哈希。signal 用于用户在房间里取消加片：每读一片前查一次，
+ * 已取消就抛「操作已取消」，文件句柄照常在 finally 里关掉。
+ * 命中清单缓存时不读文件、瞬间返回，不看 signal。
+ */
+async function buildManifest(filePath, onProgress, { signal } = {}) {
   const stat = await fsp.stat(filePath);
   if (!stat.isFile()) throw new Error('不是一个文件');
   if (stat.size === 0) throw new Error('文件是空的');
@@ -119,6 +124,7 @@ async function buildManifest(filePath, onProgress) {
   try {
     const buf = Buffer.allocUnsafe(CHUNK_SIZE);
     for (let i = 0; i < chunkCount; i++) {
+      if (signal?.aborted) throw new Error('操作已取消');
       const len = chunkLengthAt(i, stat.size);
       const { bytesRead } = await fh.read(buf, 0, len, i * CHUNK_SIZE);
       if (bytesRead !== len) throw new Error(`读取分片 ${i} 失败：期望 ${len} 字节，实际 ${bytesRead}`);
@@ -483,6 +489,14 @@ async function scanTarget(sessionId) {
   return session.filePath;
 }
 
+/**
+ * 还有没有开着的会话。换缓存目录时要拦 —— cache.owns() 是一道授权检查，
+ * 中途换掉 runDir 会让当前会话的文件立刻变成「不属于本实例」。
+ */
+function hasOpenSessions() {
+  return sessions.size > 0;
+}
+
 function state(sessionId) {
   return get(sessionId).state();
 }
@@ -546,6 +560,7 @@ module.exports = {
   readChunk,
   writeChunk,
   state,
+  hasOpenSessions,
   scanTarget,
   close,
   closeAll,

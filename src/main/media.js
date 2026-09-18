@@ -81,15 +81,31 @@ const PCM_TO_FLAC_CODECS = new Set([
 const FLAC_SAMPLE_SECONDS = 20;
 const MIN_FLAC_SAVING = 0.08; // 省不到 8% 就不值得让用户等这几分钟
 
-const FFMPEG_CANDIDATES =
-  process.platform === 'win32'
-    ? ['C:\\ffmpeg\\bin\\', 'C:\\Program Files\\ffmpeg\\bin\\']
-    : [];
+/**
+ * ffmpeg / ffprobe 的候选位置。
+ *
+ * 前两条和 mpv.js 的 MPV_CANDIDATES 对齐：打包后的 resources/bin，以及源码树里的
+ * vendor/bin。原来这两条都没有 —— 于是把 ffmpeg.exe 放进 vendor/bin 也照样找不到，
+ * 而 mpv 放进去就能用。这是两边不一致，不是有意的取舍。
+ *
+ * 做成纯函数是为了能测：开发机上 process.resourcesPath 是 undefined，
+ * 直接断言 findFfmpeg() 的结果只会得到一条永远走不到那个分支的空测试。
+ */
+function toolCandidates(name, { resourcesPath = process.resourcesPath, dirname = __dirname, platform = process.platform } = {}) {
+  const exe = platform === 'win32' ? `${name}.exe` : name;
+  return [
+    ...(resourcesPath ? [path.join(resourcesPath, 'bin', exe)] : []),
+    path.join(dirname, '..', '..', 'vendor', 'bin', exe),
+    ...(platform === 'win32'
+      ? [path.join('C:\\ffmpeg\\bin\\', exe), path.join('C:\\Program Files\\ffmpeg\\bin\\', exe)]
+      : []),
+  ];
+}
 
 const findTool = (name) =>
   findBin(name, {
     envVar: `SYNCWATCH_${name.toUpperCase()}_PATH`,
-    candidates: FFMPEG_CANDIDATES.map((d) => d + name + (process.platform === 'win32' ? '.exe' : '')),
+    candidates: toolCandidates(name),
   });
 
 const findFfmpeg = () => findTool('ffmpeg');
@@ -119,10 +135,29 @@ function cancelAll() {
   activeProcesses.clear();
 }
 
-function run(bin, args, { onStderr } = {}) {
+/**
+ * 跑一个外部程序，收集输出。signal 用于用户取消：已取消就不启动；
+ * 运行中取消就结束子进程，等它真正退出（close）后再以「操作已取消」拒绝 ——
+ * 调用方接着要删输出目录，Windows 上 ffmpeg 还攥着写句柄时删不掉。
+ * 被取消的进程退出码没有意义，不再报「退出码」。
+ */
+function run(bin, args, { onStderr, signal } = {}) {
+  if (signal?.aborted) return Promise.reject(new Error('操作已取消'));
   return new Promise((resolve, reject) => {
     const p = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     activeProcesses.add(p);
+    let cancelled = false;
+    const onAbort = () => {
+      cancelled = true;
+      try {
+        p.kill();
+      } catch {}
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    const cleanup = () => {
+      activeProcesses.delete(p);
+      signal?.removeEventListener('abort', onAbort);
+    };
     let out = '';
     let err = '';
     p.stdout.on('data', (d) => (out += d.toString()));
@@ -133,12 +168,13 @@ function run(bin, args, { onStderr } = {}) {
       if (onStderr) onStderr(s);
     });
     p.on('error', (e) => {
-      activeProcesses.delete(p);
-      reject(e);
+      cleanup();
+      reject(cancelled ? new Error('操作已取消') : e);
     });
     p.on('close', (code) => {
-      activeProcesses.delete(p);
-      if (code === 0) resolve({ stdout: out, stderr: err });
+      cleanup();
+      if (cancelled) reject(new Error('操作已取消'));
+      else if (code === 0) resolve({ stdout: out, stderr: err });
       else reject(new Error(`${path.basename(bin)} 退出码 ${code}：${err.slice(-600)}`));
     });
   });
@@ -556,8 +592,9 @@ async function inspect(filePath) {
 /**
  * 转封装：只重写容器，-c copy 表示编码数据原样搬运，不重新编码。
  * onProgress 收到 0..1 的进度（从 ffmpeg stderr 的 time= 里解出来）。
+ * signal 取消时结束 ffmpeg 并以「操作已取消」拒绝，输出目录由调用方回收。
  */
-async function remux(filePath, outDir, { onProgress } = {}) {
+async function remux(filePath, outDir, { onProgress, signal } = {}) {
   const bin = requireFfmpeg();
 
   await fsp.mkdir(outDir, { recursive: true });
@@ -569,7 +606,7 @@ async function remux(filePath, outDir, { onProgress } = {}) {
   await run(
     bin,
     ['-y', '-i', filePath, '-c', 'copy', '-movflags', '+faststart', outPath],
-    { onStderr: progressWatcher(probe?.duration || 0, onProgress) }
+    { onStderr: progressWatcher(probe?.duration || 0, onProgress), signal }
   );
 
   return { outPath };
@@ -599,7 +636,7 @@ function slimArgs(filePath, outPath, keepIndexes, { toFlac = [] } = {}) {
  * 同时把转封装做了，需要 remux 的文件选了精简就不必再单独跑一次。
  * 输入是 MKV 时输出仍是 MKV（保住 ASS 字幕和内嵌字体）。
  */
-async function slim(filePath, outDir, { keepIndexes, toFlac: toFlacIn, onProgress } = {}) {
+async function slim(filePath, outDir, { keepIndexes, toFlac: toFlacIn, onProgress, signal } = {}) {
   const bin = requireFfmpeg();
 
   const ext = path.extname(filePath).toLowerCase();
@@ -629,6 +666,7 @@ async function slim(filePath, outDir, { keepIndexes, toFlac: toFlacIn, onProgres
 
   await run(bin, slimArgs(filePath, outPath, indexes, { toFlac }), {
     onStderr: progressWatcher(probe?.duration || 0, onProgress),
+    signal,
   });
 
   const [inputSize, outputSize] = await Promise.all([
@@ -662,11 +700,13 @@ module.exports = {
   isFlacConvertible,
   measureFlacRatio,
   probeStreams,
+  run,
   sampleBitRates,
   streamBitRate,
   inspectMp4Faststart,
   findFfmpeg,
   findFfprobe,
+  toolCandidates,
   toolStatus,
   SUPPORTED_EXT,
   GRAPHIC_SUB_CODECS,

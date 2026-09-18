@@ -1,6 +1,6 @@
 {
   "name": "noxreel",
-  "version": "0.6.8",
+  "version": "0.7.0",
   "description": "多人同步观影工具：P2P 安全接收、视频链接解析与房间同步",
   "main": "src/main/main.js",
   "scripts": {
@@ -8,8 +8,11 @@
     "signal": "node signaling-server/server.js",
     "test": "node --test",
     "build:launcher": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-launcher.ps1",
+    "build:bridge": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-bridge.ps1",
     "prepare:runtime": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-runtime.ps1",
-    "predist": "npm run prepare:runtime",
+    "predist": "npm run build:bridge && npm run prepare:runtime",
+    "predist:offline": "npm run build:bridge && npm run prepare:runtime",
+    "predist:web": "npm run build:bridge && npm run prepare:runtime",
     "dist": "npm run dist:offline && npm run dist:web",
     "dist:offline": "electron-builder --win nsis",
     "dist:web": "electron-builder --win nsis-web"
@@ -74,7 +77,15 @@
         "to": "bin",
         "filter": [
           "mpv.exe",
-          "yt-dlp.exe"
+          "yt-dlp.exe",
+          "NoxReelPlayerBridge.exe"
+        ]
+      },
+      {
+        "from": "resources/mpv-scripts",
+        "to": "mpv-scripts",
+        "filter": [
+          "noxreel-chat.lua"
         ]
       }
     ]

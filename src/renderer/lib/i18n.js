@@ -9,7 +9,7 @@ const EN = new Map(Object.entries({
   '和朋友一起看，本地视频和视频链接都能同步': 'Watch together with friends—local videos and video links stay in sync',
   '分享本地视频时边下边播；粘贴公开视频链接时，每个人从原网站播放，\n            播放、暂停和进度保持同步。': 'Share local videos over P2P, or paste a public video link so everyone streams from the original site. Playback, pause, and position stay synchronized.',
   '发起放映': 'Host a watch party',
-  '把 MP4 或 MKV 拖到这里，或者点击选择': 'Drop an MP4 or MKV here, or click to choose',
+  '把 MP4 或 MKV 拖到这里，或者点击选择（可多选）': 'Drop MP4 or MKV files here, or click to choose (you can pick several)',
   '不限文件大小 · 只支持你自己合法拥有的内容': 'No file size limit · Only share content you are legally allowed to use',
   '解析视频链接': 'Open a video link',
   '粘贴单个视频页面或 MP4 / HLS 直链': 'Paste one video page, MP4 URL, or HLS URL',
@@ -33,10 +33,6 @@ const EN = new Map(Object.entries({
   '打开临时缓存位置': 'Open temporary cache location',
   '成员': 'Members',
   '邀请': 'Invite',
-  '增加 / 切换视频': 'Add / switch video',
-  '选择本地视频': 'Choose a local video',
-  '切换到视频链接': 'Switch to a video link',
-  '成员保持连接，房主换片后会自动同步到全房。': 'Members stay connected and the new video is synchronized to the room.',
   '传输': 'Transfer',
   '离开房间': 'Leave room',
   '取消': 'Cancel',
@@ -104,11 +100,11 @@ const EN = new Map(Object.entries({
     'A new file is written to the temporary cache. The original is untouched, and the copy is removed when you leave the room.',
   '按这个方案继续': 'Continue with this plan',
   '距起播还差': 'Left before playback starts',
+  '距起播还差（当前位置附近）': 'Left before playback starts (around the current position)',
   '预计还需': 'about',
   '安全模式 · 完整接收后才播，还剩': 'Safe mode · plays only after full receipt; remaining',
   '文件码率': 'File bitrate',
   '当前速度': 'Current speed',
-  '房主上行（预估）': 'Host uplink (estimated)',
   '还能流畅播': 'Smooth playback left',
   '速度低于码率，但缓冲够撑到收完': 'Slower than the bitrate, but the buffer lasts until the download finishes',
   '未知': 'Unknown',
@@ -178,19 +174,10 @@ const EN = new Map(Object.entries({
   '已进入房间，正在和其他成员打洞…': 'Joined the room. Establishing direct connections with other members…',
   '房主身份与邀请码不一致，已拒绝加入': 'The host identity does not match the invite code. Join request rejected.',
   '未知站点': 'Unknown site',
-  '房主请求打开在线视频': 'The host wants to open an online video',
-  '继续后，你的电脑会直接连接这个网站并解析视频。只在你信任房主和该站点时继续。': 'Your computer will connect directly to this website and parse the video. Continue only if you trust both the host and the site.',
-  '允许并继续': 'Allow and continue',
-  '你拒绝了房主发送的视频链接': 'You declined the video link sent by the host',
-  '正在本机解析房主的视频链接': 'Parsing the host’s video link locally',
-  '视频由你的电脑直接从原网站读取；信令服务器和房主都不会中转内容。': 'Your computer streams directly from the original website; neither the signaling server nor the host relays the media.',
-  '验证房主身份': 'Verify host identity',
-  '启动播放器': 'Start player',
   '你的缓冲不够，先暂停你自己（不影响他人）': 'Your buffer is low, so only your playback is paused',
   '缓冲不足，暂停你自己…': 'Buffer low—pausing your playback…',
   '你是游客，不能跳转进度': 'Guests cannot seek',
   '游客不能跳转进度': 'Guests cannot seek',
-  '忽略了非房主发来的换片请求': 'Ignored a media switch request from a non-host member',
   '文件已全部接收并校验，正在执行本机安全扫描…': 'The file is fully received and verified. Running a local security scan…',
   '安全模式': 'Safe mode',
   '可信房间': 'Trusted room',
@@ -267,7 +254,7 @@ const EN = new Map(Object.entries({
   '极简（零服务器）': 'Manual (no server)',
   '信令服务器': 'Signaling server',
   '已接收': 'Received',
-  '可连续播放到': 'Playable through',
+  '从当前位置可连续播放': 'Continuous playback from here',
   '在途': 'In flight',
   '速度': 'Speed',
   '已收': 'Received',
@@ -275,8 +262,8 @@ const EN = new Map(Object.entries({
   '下行': 'Download',
   '房主': 'Host',
   '管理员': 'Moderator',
+  '（手机）': ' (phone)',
   '游客': 'Guest',
-  '还没有人加入。用右边的邀请码叫人。': 'No one has joined yet. Use the invite panel to add members.',
   '设为游客': 'Make guest',
   '设为管理员': 'Make moderator',
   '你是游客：播放/暂停只对你自己生效，不影响其他人，也不能拖动进度条。': 'You are a guest: play/pause only affects you, and seeking is disabled.',
@@ -293,6 +280,41 @@ const EN = new Map(Object.entries({
   '未找到。安全模式需要它才能放行收到的文件；可信房间不受影响。':
     'Not found. Safe mode needs it before a received file can play; Trusted rooms are unaffected.',
   '安全扫描未通过，已阻止播放并清理缓存': 'Security scan did not pass. Playback was blocked and the cache was cleared.',
+  '文件已完整接收但没有扫完 —— 文件还在，可以重新扫描':
+    'The file is fully received but the scan did not finish — the file is still here and can be scanned again.',
+  '重新扫描': 'Scan again',
+  '停止扫描': 'Stop scanning',
+  '安全扫描已取消': 'The security scan was stopped',
+  '缓冲还不够，攒够了会自动继续': 'Not enough buffer yet — it resumes automatically once there is enough',
+  '复制': 'Copy',
+  '已复制 ✓': 'Copied ✓',
+  '复制失败': 'Copy failed',
+  'ffmpeg —— 转封装与无损精简（按需）': 'ffmpeg — remuxing and lossless slim-down (as needed)',
+  '未找到。转封装和无损精简都需要它。': 'Not found. Both remuxing and the lossless slim-down need it.',
+  'ffprobe —— 读取媒体信息（按需）': 'ffprobe — reading media information (as needed)',
+  '未找到。它和 ffmpeg 是两个程序。没有它读不到时长和每轨码率，卡顿预判和无损精简都会失效。':
+    'Not found. It is a separate executable from ffmpeg. Without it NoxReel cannot read the duration or per-track bitrates, so the stall forecast and the lossless slim-down both stop working.',
+  '重试': 'Retry',
+  '复制诊断信息': 'Copy diagnostics',
+  '房间进行中不能改名，退出后可改。': 'Your display name cannot change during a screening; leave the room first.',
+  '缓存位置': 'Cache location',
+  '换个位置': 'Change location',
+  '清理残留': 'Clean up leftovers',
+  '正在统计…': 'Measuring…',
+  '（未知）': '(unknown)',
+  '放映进行中不能换位置，退出房间后可改。': 'The location cannot change during a screening; leave the room first.',
+  '接收到的片子放在这里，退房或关闭软件时自动删除。':
+    'Received videos live here and are deleted when you leave the room or close the app.',
+  '换到空间大的盘上，才收得下大文件。': 'Point it at a drive with room, so large files fit.',
+  '清理只认本软件自己建的目录，同目录下你自己的文件一个都不会动。':
+    'Cleanup only touches directories NoxReel created itself; your own files in the same folder are never touched.',
+  '遇到问题时': 'When something goes wrong',
+  '。诊断信息里只有运行环境和连接状态，不含文件路径和片名。':
+    '. The diagnostics contain only environment and connection state — no file paths and no video titles.',
+  '勾了启用 TURN 中继，但地址是空的 —— 这样等于没配。填一个地址，或者把勾去掉。':
+    'TURN relay is enabled but the address is empty, which means there is no relay at all. Enter an address, or clear the checkbox.',
+  '扫描没做完 · 文件仍在': 'Scan unfinished · File kept',
+  '扫描已停止 · 文件仍在': 'Scan stopped · File kept',
   '可信房间：正在接收片头，达到约 8 MB 后将边下边播…': 'Trusted room: receiving initial data; progressive playback starts at about 8 MB…',
   '正在完整接收并校验媒体，完成后会进行安全扫描…': 'Receiving and verifying the full media file. A security scan will run when complete…',
   '房间安全模式': 'Room security mode',
@@ -397,12 +419,307 @@ const EN = new Map(Object.entries({
   '这一步要重新编码音频，比单纯丢轨慢，长片可能要几分钟。':
     'This step re-encodes the audio, so it is slower than simply dropping tracks—a long film can take a few minutes.',
   '正在把未压缩的 PCM 音轨转成 FLAC（无损）。这一步要重新编码音频，长片可能要几分钟。':
-    'Converting the uncompressed PCM audio track to FLAC (lossless). This re-encodes the audio, so a long film can take a few minutes.'
+    'Converting the uncompressed PCM audio track to FLAC (lossless). This re-encodes the audio, so a long film can take a few minutes.',
+  // 房间界面重排（0.7）
+  '播放列表': 'Playlist',
+  '+ 本地视频': '+ Local video',
+  '+ 链接': '+ Link',
+  '加入列表': 'Add to playlist',
+  '聊天': 'Chat',
+  '日志': 'Log',
+  '正在播放': 'Now playing',
+  '还没有消息': 'No messages yet',
+  // 弹幕聊天（0.7）
+  '发送': 'Send',
+  '说点什么…': 'Say something…',
+  '聊天输入框': 'Chat input box',
+  '发送中': 'Sending…',
+  '已送达': 'Delivered',
+  '你加入前的消息': 'Messages from before you joined',
+  '弹幕': 'Danmaku',
+  '弹幕设置': 'Danmaku settings',
+  // 播放器里按 Ctrl+Shift+D 调出的输入框提示语：随 player:launch 的 chatPrompt 传给 mpv
+  '弹幕：': 'Danmaku: ',
+  '不透明度': 'Opacity',
+  '字号': 'Font size',
+  '显示区域': 'Display area',
+  '上半屏': 'Top half',
+  '全屏': 'Full screen',
+  '还没有人加入。去「邀请」页签生成邀请链接。': 'Nobody has joined yet. Open the Invite tab to create an invite link.',
+  '还没有其他成员。': 'No other members yet.',
+  '列表还是空的，点右上角加一部。': 'The playlist is empty. Add a video with the buttons at the top right.',
+  '列表还是空的，等房主加片。': 'The playlist is empty. Waiting for the host to add a video.',
+  // 播放列表（0.7）
+  '你没有编辑播放列表的权限': 'You do not have permission to edit the playlist',
+  '没能加进播放列表': 'Could not add it to the playlist',
+  '和房主的连接断了': 'The connection to the host is lost',
+  '房主没有回应': 'The host did not respond',
+  '房间已关闭': 'The room is closed',
+  '无效的操作': 'Invalid operation',
+  '无效的列表条目': 'Invalid playlist entry',
+  '列表里已经有这部片了': 'This video is already in the playlist',
+  '列表里已经有这个链接了': 'This link is already in the playlist',
+  '列表里没有这一项': 'That item is not in the playlist',
+  '列表里没有目标位置': 'The target position is not in the playlist',
+  '已播放区里没有这一项': 'That item is not in the played list',
+  '不认识的操作': 'Unknown operation',
+  '收到一份格式不对的播放列表，已忽略': 'Ignored a malformed playlist',
+  '收到的播放列表把已有条目的内容换掉了，已忽略': 'Ignored a playlist that replaced the contents of existing items',
+  '播放列表已经放完了': 'The playlist has finished',
+  '播放列表是空的': 'The playlist is empty',
+  '改用房主提供的临时播放地址': 'Using the host’s temporary stream URL',
+  '没有人能提供这部片的清单': 'Nobody can provide the manifest for this video',
+  // 播放列表表格、就绪、行内加片（0.7）
+  '上移': 'Move up',
+  '下移': 'Move down',
+  '移除': 'Remove',
+  '立即播放': 'Play now',
+  '跳过': 'Skip',
+  '跳过这一部': 'Skip this one',
+  '再放一次': 'Play again',
+  '再放一次（需重新传输）': 'Play again (needs a new transfer)',
+  '从已播放中移除': 'Remove from played',
+  '复制链接': 'Copy link',
+  '链接已复制': 'Link copied',
+  '更多操作': 'More actions',
+  '自动连播': 'Autoplay',
+  '放完一部接着放下一部，等所有人准备好再开始': 'When a video ends, play the next one once everyone is ready',
+  '添加者：': 'Added by ',
+  '下一部': 'Up next',
+  '已开播：把别的片拖到它上面会先问你要不要切过去': 'Already playing: dragging another video above it asks before switching',
+  '切换正在播放的片子？': 'Switch the video that is playing?',
+  '切到': 'Switch to',
+  '正在放': 'Now playing',
+  '切换': 'Switch',
+  '正在放的这部排到下一位。': 'The current video moves to the next position.',
+  '移除正在播放的这一部？': 'Remove the video that is playing?',
+  '会直接换到下一部。': 'Playback switches straight to the next video.',
+  '列表已播完': 'The playlist has finished',
+  '房主已离开，列表暂停更新': 'The host left; the playlist is no longer updated',
+  '和房主的连接断了，正在重连；列表暂停更新':
+    'The connection to the host dropped and is being retried; the playlist is not updating',
+  '已取消': 'Cancelled',
+  '这一部没有加入放映。': 'This video was not added to the watch party.',
+  '清掉已播放的缓存也放不下这一部，缓存先都留着':
+    'Even clearing every played cache would not make room for this video, so they are all kept',
+  '房主已离开，列表暂停更新；已经连上的成员之间照常传输': 'The host left; the playlist is no longer updated, but connected members keep transferring',
+  '房主已离开，这个房间结束了': 'The host left; this room has ended',
+  // 传输一栏
+  '本机有完整文件': 'Full file on this computer',
+  '已拒绝接收': 'Refused',
+  '磁盘空间不够': 'Not enough disk space',
+  '正在获取清单': 'Fetching the manifest',
+  '排队中': 'Queued',
+  '排队中（等大家先收完当前这部）': 'Queued (until everyone has the current video)',
+  '片源已离开': 'Source left',
+  '暂时没人能提供': 'Nobody can provide it right now',
+  '已收完': 'Received',
+  '已收完 · 扫描中': 'Received · Scanning',
+  '已收完 · 扫描通过': 'Received · Scan passed',
+  '已收完 · 未经扫描': 'Received · Not scanned',
+  '已收完 · 没扫完': 'Received · Scan incomplete',
+  '已收完 · 等待扫描': 'Received · Waiting to scan',
+  '各自从原网站播放': 'Everyone streams from the original site',
+  '片源上行（预估）': 'Source upload (estimated)',
+  // 链接授权（行内，不弹窗）
+  '需要允许打开': 'Needs your permission to open',
+  '房主给的播放地址需要允许打开': 'The host’s stream URL needs your permission to open',
+  '本机无法解析这个链接': 'This link cannot be resolved on your computer',
+  '这个视频链接在你的电脑上无法解析，可以先跳过这一部':
+    'This video link cannot be resolved on your computer. You can skip this one for now.',
+  '允许': 'Allow',
+  '允许打开': 'Allow',
+  '改为允许': 'Allow instead',
+  '你跳过了这一部': 'You skipped this one',
+  '这一部我先跳过': 'Skip this one for me',
+  '你跳过了这一部，播放器保持空闲（不影响其他人）': 'You skipped this one; your player stays idle (others are not affected)',
+  '这一部你先跳过了，播放器保持空闲，不影响其他人': 'You skipped this one; your player stays idle and others are not affected',
+  // 行内加片
+  '排队准备中': 'Waiting to prepare',
+  '正在检查格式': 'Checking the format',
+  '正在优化传输体积': 'Optimizing transfer size',
+  '正在加入列表': 'Adding to the playlist',
+  '等待房主确认': 'Waiting for the host',
+  '正在取消': 'Cancelling',
+  '没加进列表': 'Not added',
+  '房主没有接受': 'The host did not accept it',
+  '你已不是管理员，还没加进列表的片撤回了': 'You are no longer a moderator, so videos not yet added were withdrawn',
+  '拿不到拖进来的文件的路径，请改用「+ 本地视频」选择': 'Could not get the path of the dropped file. Use “+ Local video” instead.',
+  '正在给成员供片，这时测不准上行': 'You are serving members right now, so upload speed cannot be measured accurately',
+  '操作已取消': 'Cancelled',
+  '安全扫描没能完成': 'The security scan did not finish',
+  '未知原因': 'Unknown reason',
+  '同一任务已在进行中': 'The same task is already running',
+  // 就绪与自动开播
+  '仍然开始': 'Start anyway',
+  '所有人都准备好了，马上开始': 'Everyone is ready; starting now',
+  '所有人都准备好了，点「播放」开始': 'Everyone is ready. Press Play to start',
+  '所有人都准备好了，等房主或管理员开始': 'Everyone is ready. Waiting for the host or a moderator to start',
+  '所有人都准备好了，自动开始播放': 'Everyone is ready; starting playback',
+  // 中途加入（可信房间）
+  '你是中途加入的，正在下载房间当前位置附近的内容':
+    'You joined mid-playback; downloading the part the room is at now.',
+  '正在优先获取索引（MKV 的索引常在文件尾）':
+    'Fetching the index first (MKV keeps it at the end of the file).',
+  '跳转到的位置还没收到，已暂停等缓冲': 'That position has not arrived yet; paused while it buffers.',
+  '播放到已接收内容的末尾，等后续分片': 'Reached the end of what has been received; waiting for more.',
+  '片源没提供时长，算不出房间播到哪；这一部要完整接收后才能播放':
+    "The source did not provide a duration, so the room's position cannot be calculated; this video will play only after it is fully received.",
+  '片源没提供时长 · 完整接收后才播，还剩': 'No duration from the source · plays after full receipt, remaining',
+  '播放列表是空的，加一部就能开始': 'The playlist is empty. Add a video to start',
+  '播放列表是空的，等房主加片': 'The playlist is empty. Waiting for the host to add a video',
+  '这一部的片源已经离开，暂时没人能提供': 'The source of this video left, and nobody can provide it right now',
+  '本机磁盘放不下这一部，已跳过，不影响其他人': "This video doesn't fit on this computer's disk. Skipped here without holding up anyone else",
+  // 协议版本（0.7 与 0.6 不互通）
+  '这个邀请来自旧版 NoxReel（0.6.x），和 0.7 不互通。请让房主升级到 0.7 后重新发邀请。':
+    'This invite comes from an older NoxReel (0.6.x), which cannot connect to 0.7. Ask the host to upgrade to 0.7 and send a new invite.',
+  '这个邀请来自更新版本的 NoxReel，和本机不互通。请先升级本机的 NoxReel。':
+    'This invite comes from a newer NoxReel that cannot connect to this one. Upgrade NoxReel on this computer first.',
+  '对方是旧版 NoxReel（0.6.x），和 0.7 不互通。请让他升级到 0.7 再加入。':
+    'The other person is using an older NoxReel (0.6.x), which cannot connect to 0.7. Ask them to upgrade to 0.7 and join again.',
+  '对方用的是更新版本的 NoxReel，和本机不互通。请先升级本机的 NoxReel。':
+    'The other person is using a newer NoxReel that cannot connect to this one. Upgrade NoxReel on this computer first.',
+  // 可切换播放器（控制条上的下拉框、不可用原因、播放器那一侧的提示）
+  '播放器': 'Player',
+  '指定路径…': 'Set path…',
+  '未找到': 'Not found',
+  '桥接程序未构建': 'Bridge not built',
+  '只支持 Windows': 'Windows only',
+  '这一部还没收完': 'This video is not fully received yet',
+  '这个链接要带请求头': 'This link needs request headers',
+  '不可用': 'Unavailable',
+  '桥接程序未构建（npm run build:bridge）': 'The bridge program is not built (npm run build:bridge)',
+  '切换失败，已回到 mpv': 'Switching failed, back on mpv',
+  '独占全屏下看不到弹幕，切成无边框全屏就能看到':
+    'Danmaku cannot be shown over exclusive fullscreen. Switch the player to borderless fullscreen to see it.',
+  'Ctrl+Shift+D 被别的程序占用了，在播放器里发不了弹幕':
+    'Ctrl+Shift+D is taken by another program, so danmaku cannot be sent from inside the player',
+  '这会儿弹不出输入条：播放器不在前台，或者正处于独占全屏':
+    'The input bar cannot open right now: the player is not in the foreground, or it is in exclusive fullscreen',
 }));
 
 const trimEnd = (text) => String(text).replace(/[.。]+$/, '');
 
+/** 等待名单：只把我们自己的「你」这个标记翻过去，别人的昵称原样保留。 */
+const joinWaiting = (list) =>
+  String(list)
+    .split('、')
+    .map((name) => (name === '你' ? 'you' : name))
+    .join(', ');
+
+/** 主进程参数校验报「无效的 xxx」时的字段名。 */
+const INVALID_LABELS = {
+  临时媒体路径: 'temporary media path',
+  任务标识: 'task id',
+  会话标识: 'session id',
+  做种参数: 'seeding parameters',
+  写入分片参数: 'chunk write parameters',
+  读取分片参数: 'chunk read parameters',
+  分片下标: 'chunk index',
+  分片哈希: 'chunk hashes',
+  分片大小: 'chunk size',
+  分片数据: 'chunk data',
+  分片数量: 'chunk count',
+  剪贴板文本: 'clipboard text',
+  地区检测参数: 'region check parameters',
+  媒体时长: 'media duration',
+  媒体清单: 'media manifest',
+  媒体请求头: 'media request headers',
+  媒体链接: 'media link',
+  片源上行带宽: 'source upload speed',
+  房间版本: 'room revision',
+  提示文本: 'message text',
+  提示时长: 'message duration',
+  播放位置: 'playback position',
+  播放器代号: 'player id',
+  播放器启动参数: 'player launch parameters',
+  播放器提示参数: 'player message parameters',
+  播放地址: 'stream URL',
+  文件名: 'file name',
+  文件大小: 'file size',
+  文件标识: 'file id',
+  测速参数: 'speed test parameters',
+  精简参数: 'slimming parameters',
+  转封装参数: 'remux parameters',
+  校验参数: 'validation parameters',
+  缓存目录: 'cache folder',
+  缓存目录参数: 'cache folder parameters',
+  覆盖层参数: 'overlay parameters',
+  覆盖层文本: 'overlay text',
+  视频链接: 'video link',
+  起播位置: 'start position',
+  轨道下标: 'track index',
+  隔离浏览器请求: 'isolated browser request',
+};
+
 const EN_PATTERNS = [
+  // 播放列表表格、就绪、行内加片（0.7）
+  [/^传输中 (\d+)%$/, 'Transferring $1%'],
+  [/^传输已暂停 (\d+)%$/, 'Transfer paused $1%'],
+  [/^等待片源 (\d+)%$/, 'Waiting for the source $1%'],
+  [/^片源已离开 (\d+)%$/, 'Source left $1%'],
+  [/^暂时没人能提供 (\d+)%$/, 'Nobody can provide it right now $1%'],
+  [/^已播放（(\d+)）$/, 'Played ($1)'],
+  [/^等待 (\d+) 人准备好：$/, (_all, n) => `Waiting for ${n} ${n === '1' ? 'person' : 'people'} to get ready: `],
+  [/^正在放的这部排到下一位，回头从 (.+) 接着放。$/, 'The current video moves to the next position and resumes from $1 later.'],
+  [/^列表没改成：(.*)$/, (_all, detail) => `The playlist was not changed: ${translate(detail, 'en')}`],
+  [/^《(.+)》没加进列表：(.*)$/, (_all, name, detail) => `“${name}” was not added to the playlist: ${translate(detail, 'en')}`],
+  [/^《(.+)》已经在列表里了，跳过$/, '“$1” is already in the playlist; skipped'],
+  [
+    /^还有 (\d+) 部没有加入，要用它们开房请重新选择。$/,
+    (_all, n) => `${n} more ${n === '1' ? 'video was' : 'videos were'} not added; pick them again to host with them.`,
+  ],
+  [/^这些也没能用：(.+)$/, 'These could not be used either: $1'],
+  [/^《(.+)》安全扫描通过$/, '“$1” passed the security scan'],
+  [/^《(.+)》没有扫完：(.*)$/, (_all, name, detail) => `“${name}” was not fully scanned: ${translate(detail, 'en')}`],
+  [/^先扫正在放的这部，《(.+)》稍后接着扫$/, 'Scanning the current video first; “$1” will be scanned afterwards'],
+  [/^磁盘空间不够，先清掉已播放的《(.+)》的缓存$/, 'Not enough disk space; clearing the cache of the played video “$1” first'],
+  [/^这一部来自 (.+)，在列表或上方点「允许打开」后才会播放$/, 'This video comes from $1. It plays after you choose “Allow” in the playlist or above.'],
+  [/^这一部要打开 (.+)，需要你先允许$/, 'This video opens $1 and needs your permission first'],
+  [/^房主提供的播放地址来自 (.+)，需要你先允许$/, 'The host’s stream URL comes from $1 and needs your permission first'],
+  [/^房主提供的临时播放地址来自 (.+)，在列表或上方点「允许打开」后才会使用$/, 'The host’s temporary stream URL comes from $1. It is used only after you choose “Allow” in the playlist or above.'],
+  [/^房主给的播放地址刚更新，现在来自 (.+)，看清楚再点「允许」$/, 'The host’s stream URL just changed and now comes from $1. Check it before choosing “Allow”.'],
+  [/^这一部的网址刚换成 (.+)，看清楚再点「允许」$/, 'This item’s address just changed to $1. Check it before choosing “Allow”.'],
+  [/^这个询问刚出现，要打开的是 (.+)，看清楚再点「允许」$/, 'This prompt just appeared and opens $1. Check it before choosing “Allow”.'],
+  [/^列表最多 (\d+) 项$/, 'The playlist can hold at most $1 items'],
+  [/^(.+)（极简模式下你只供房主一人，再由房主转给其他人）$/, '$1 (in Minimal mode you only serve the host, who relays it to everyone else)'],
+  [/^(.+)（房间里另外 (\d+) 人同时接收）$/, '$1 ($2 other people in the room receive at the same time)'],
+  [/^无效的 (.+)$/, (_all, label) => `Invalid ${INVALID_LABELS[label] || `input (${label})`}`],
+  // 播放列表（0.7）
+  [/^切换到下一部失败：(.*)$/, (_all, detail) => `Could not switch to the next item: ${translate(detail, 'en')}`],
+  [/^现在放：(.*)$/, 'Now playing: $1'],
+  [/^还没拿到《(.+)》的清单：(.*)$/, (_all, name, detail) => `Still waiting for the manifest of “${name}”: ${translate(detail, 'en')}`],
+  [/^没拿到这部片的清单：(.*)$/, (_all, detail) => `Could not get the manifest for this video: ${translate(detail, 'en')}`],
+  [/^(.+) 给的媒体清单没通过校验，已换人再要$/, 'The media manifest from $1 failed verification; asking someone else'],
+  [/^《(.+)》已全部接收$/, '“$1” has been fully received'],
+  [/^已阻止接收文件：(.*)$/, (_all, detail) => `Blocked receiving the file: ${translate(detail, 'en')}`],
+  [
+    /^视频链接 · 正在解析… · (安全模式 · 扫描后播放|可信房间 · 边下边播|Safe mode · Play after scanning|Trusted room · Progressive playback)$/,
+    (_all, mode) => `Video link · Resolving… · ${translate(mode, 'en')}`,
+  ],
+  [
+    /^(.+) · (安全模式 · 扫描后播放|可信房间 · 边下边播|Safe mode · Play after scanning|Trusted room · Progressive playback) · (正在获取清单…|这部片已被拒绝接收|本机磁盘放不下，这一部跳过)$/,
+    (_all, size, mode, state) =>
+      `${size} · ${translate(mode, 'en')} · ${
+        {
+          '正在获取清单…': 'Fetching the manifest…',
+          '这部片已被拒绝接收': 'This video was refused',
+          '本机磁盘放不下，这一部跳过': "Doesn't fit on this computer's disk; skipped here",
+        }[state]
+      }`,
+  ],
+  [
+    /^(.+) 用的是旧版 NoxReel（0\.6\.x），和 0\.7 不互通，已断开。请让对方升级到 0\.7 再加入。$/,
+    '$1 is using an older NoxReel (0.6.x), which cannot connect to 0.7, and was disconnected. Ask them to upgrade to 0.7 and join again.',
+  ],
+  [
+    /^(.+) 用的是更新版本的 NoxReel，和本机不互通，已断开。请先升级本机的 NoxReel。$/,
+    '$1 is using a newer NoxReel that cannot connect to this one, and was disconnected. Upgrade NoxReel on this computer first.',
+  ],
+  [
+    /^没法接收《(.+)》：磁盘空间不够：这部片子需要 ([\d.]+)GB，缓存所在的磁盘只剩 ([\d.]+)GB$/,
+    'Cannot receive “$1”: not enough disk space. It needs $2 GB, but the cache disk has only $3 GB free',
+  ],
   [/^观众-(\d+)$/, 'Viewer-$1'],
   [/^已复制完整 (\d+) 字符 ✓$/, 'Copied all $1 characters ✓'],
   [/^复制邀请码失败：(.*)$/, (_all, detail) => `Failed to copy invite code: ${translate(detail, 'en')}`],
@@ -429,11 +746,16 @@ const EN_PATTERNS = [
   [/^信令还没恢复，暂时没法重连 (.+)$/, 'Signaling has not recovered yet, so $1 cannot be reconnected for now'],
   [/^(\d+) 条多余音轨$/, (_all, n) => `${n} extra audio track${n === '1' ? '' : 's'}`],
   [/^(\d+) 条图形字幕$/, (_all, n) => `${n} image-based subtitle track${n === '1' ? '' : 's'}`],
-  [/^已切换到：(.*)$/, 'Switched to: $1'],
-  [/^已切换到链接：(.*)$/, 'Switched to link: $1'],
   [/^(.*)\n\n如果对方没有部署信令服务器，让他改用「极简模式」生成邀请码 —— 那个不需要服务器。$/, '$1\n\nIf the other person has no signaling server, ask them to use Manual mode, which requires no server.'],
   [/^房间使用(.+)，你的本机设置是(.+)。请先在设置中切换为相同模式，再重新粘贴邀请码。$/, 'The room uses $1, while your local setting is $2. Select the same mode in Settings, then paste the invite code again.'],
   [/^(.+) 加入了房间$/, '$1 joined the room'],
+  [/^(.+) 离开了房间$/, '$1 left the room'],
+  // 未读条数和限速倒计时是动态的，单复数得跟着变
+  [/^↓ (\d+) 条新消息$/, (_all, n) => `↓ ${n} new message${n === '1' ? '' : 's'}`],
+  [
+    /^发得太快了（(\d+) 秒后再试）$/,
+    (_all, n) => `Too many messages — try again in ${n} second${n === '1' ? '' : 's'}`,
+  ],
   [/^房间人数上限已设为 (\d+)$/, 'Room capacity set to $1'],
   [/^信令断开，(\d+) 秒后重连（已建立的直连不受影响）$/, 'Signaling disconnected. Reconnecting in $1 seconds; existing direct connections are unaffected.'],
   [/^信令错误：(.*)$/, (_all, detail) => `Signaling error: ${translate(detail, 'en')}`],
@@ -447,7 +769,6 @@ const EN_PATTERNS = [
     /^(.+) 的信令连接断了，但直连还在，传输继续$/,
     '$1 lost the signaling connection, but the direct connection is still up and the transfer continues',
   ],
-  [/^来源：(.*)$/, 'Source: $1'],
   [/^这个视频链接在你的电脑上无法解析：(.*)$/, (_all, detail) => `This video link could not be parsed on your computer: ${translate(detail, 'en')}`],
   [/^本机解析失败，改用房主提供的临时播放地址：(.*)$/, (_all, detail) => `Local parsing failed; using the host's temporary stream URL: ${translate(detail, 'en')}`],
   [/^已和 (.+) 完成(.+)握手$/, 'Completed $2 handshake with $1'],
@@ -455,15 +776,62 @@ const EN_PATTERNS = [
   [/^等待 (.+) 缓冲…$/, 'Waiting for $1 to buffer…'],
   [/^你缓冲够了$/, 'Your buffer has recovered'],
   [/^(.+)缓冲够了$/, '$1 has enough buffer'],
+  // 自己的操作要排在通用那条前面，否则「你」会被当成别人的昵称原样留下来
+  [
+    /^你 (播放|暂停|跳转) @ (.+)（只影响你自己）$/,
+    (_all, action, position) =>
+      `You ${{ 播放: 'played', 暂停: 'paused', 跳转: 'seeked' }[action]} @ ${position} (affects only you)`,
+  ],
+  [
+    /^你 (播放|暂停|跳转) @ (.+)$/,
+    (_all, action, position) => `You ${{ 播放: 'played', 暂停: 'paused', 跳转: 'seeked' }[action]} @ ${position}`,
+  ],
   [/^(.+) (播放|暂停|跳转) @ (.+)$/, (_all, name, action, position) => `${name} ${{ 播放: 'played', 暂停: 'paused', 跳转: 'seeked' }[action]} @ ${position}`],
   [/^已拒绝不安全的媒体清单：(.*)$/, (_all, detail) => `Rejected an unsafe media manifest: ${translate(detail, 'en')}`],
   [/^开始接收：(.*)（(.*)，(\d+) 片）$/, 'Receiving: $1 ($2, $3 chunks)'],
-  [/^(.+) 手里是另一个文件，已忽略他的分片$/, '$1 has a different file; their chunks were ignored'],
   [/^分片 (\d+) 校验未通过（(.*)），已丢弃重下$/, 'Chunk $1 failed verification ($2) and will be downloaded again'],
   [/^已断开身份校验失败的成员：(.*)$/, 'Disconnected member after identity verification failed: $1'],
   [/^(.+) 的模式是(.+)，本房间是(.+)，已在传输媒体前断开。$/, '$1 uses $2 while this room uses $3. Disconnected before media transfer.'],
   [/^已阻止打开接收文件：(.*)$/, (_all, detail) => `Blocked the received file: ${translate(detail, 'en')}`],
   [/^启动 mpv 失败：(.*)$/, (_all, detail) => `Failed to start mpv: ${translate(detail, 'en')}`],
+  // 可切换播放器：文案里的 X 是播放器名（mpv / PotPlayer / MPC-BE），名字本身不翻译。
+  // 这几条必须排在上面那条 mpv 专用的后面，否则「启动 mpv 失败」会被通用式先吃掉。
+  [/^(.+) 已启动（先暂停着，等所有人就绪）$/, '$1 started and is paused while everyone gets ready'],
+  [/^启动 (.+) 失败：(.*)$/, (_all, name, detail) => `Failed to start ${name}: ${translate(detail, 'en')}`],
+  [/^没找到 (.+)，可以在控制条里指定它的路径$/, '$1 was not found. You can set its path from the control bar.'],
+  [/^(.+) 以管理员身份运行，NoxReel 遥控不了它$/, '$1 runs as administrator, so NoxReel cannot control it'],
+  [/^(.+) 打不开需要请求头的链接$/, '$1 cannot open a link that needs request headers'],
+  [/^(.+) 脱离了遥控，请关掉它再重开$/, '$1 is no longer under remote control — close it and open it again'],
+  [/^(.+) 脱离了遥控$/, '$1 is no longer under remote control'],
+  [/^(.+) 不再应答遥控$/, '$1 stopped answering remote control'],
+  [/^有人在 (.+) 里打开了别的文件$/, 'Someone opened a different file in $1'],
+  // 运行期出错后自动退回 mpv：前半段自己还要再翻一道
+  [/^(.+)，正在退回 mpv$/, (_all, head) => `${translate(head, 'en')} — falling back to mpv`],
+  [/^退回 mpv 失败：(.*)$/, (_all, detail) => `Could not fall back to mpv: ${translate(detail, 'en')}`],
+  [/^你在 (.+) 里打开了别的文件，这边已经不跟着它同步了$/, 'You opened another file in $1, so this room no longer follows it'],
+  [/^播放器 (.+) 报错：(.*)$/, (_all, name, detail) => `Player ${name} error: ${translate(detail, 'en')}`],
+  // 主进程适配器报上来的错误正文。它们会被上面那条「播放器 X 报错：…」按 detail 再翻一道，
+  // 没有这几条的话英文界面上会原样蹦出一句中文。
+  [/^有人在 (.+) 里打开了别的文件，已暂停$/, 'Someone opened a different file in $1, so playback is paused'],
+  [
+    /^(.+) 不再响应遥控（可能是被资源管理器转发启动的）。已退回 mpv$/,
+    '$1 stopped answering remote control (it was probably launched through Explorer). Falling back to mpv.',
+  ],
+  [/^(.+) 没有应答$/, '$1 is not answering'],
+  [/^(.+) 断开了遥控连接$/, '$1 closed the remote-control connection'],
+  [
+    /^当前实际使用：(.+)（原因：(.+)）$/,
+    (_all, name, reason) => `Actually using ${name} (reason: ${translate(reason, 'en')})`,
+  ],
+  [/^已收完 · 切换到 (.+)$/, 'Fully received · switch to $1'],
+  [/^切换播放器失败：(.*)$/, (_all, detail) => `Could not switch player: ${translate(detail, 'en')}`],
+  [/^指定播放器路径失败：(.*)$/, (_all, detail) => `Could not set the player path: ${translate(detail, 'en')}`],
+  [/^已指定 (.+) 的路径$/, 'Path set for $1'],
+  // 下拉框里那一项：「PotPlayer（未找到）」。原因是枚举出来的那几个，不会误伤别的括号文案。
+  [
+    /^(.+)（(未找到|桥接程序未构建|只支持 Windows|这一部还没收完|这个链接要带请求头|不可用)）$/,
+    (_all, name, reason) => `${name} (${translate(reason, 'en')})`,
+  ],
   [/^当前 (\d+) \/ (\d+) 人（包含房主）$/, '$1 / $2 people, including the host'],
   [/^当前已有 (\d+) 人，人数上限不能低于当前人数。$/, 'There are already $1 people; capacity cannot be lower than the current count.'],
   [/^完整短码共 (\d+) 字符，可重复使用。房间会一直开着直到你离开。$/, 'Complete code: $1 characters. It can be reused while the room remains open.'],
@@ -473,25 +841,73 @@ const EN_PATTERNS = [
   [/^已生成可点击的邀请链接；压缩握手数据 (\d+) 字符。在对方真正连上前，不会计入成员列表。$/, 'Clickable invite created; compressed handshake data: $1 characters. The member is not counted until connected.'],
   [/^对方选择的是(.+)，本房间是(.+)。双方需分别选择相同模式。$/, 'The other member selected $1 while this room uses $2. Both sides must select the same mode.'],
   [/^(.+) 已连上 ✓$/, '$1 connected ✓'],
-  [/^视频链接 · (.+) · (安全模式 · 扫描后播放|可信房间 · 边下边播|Safe mode · Play after scanning|Trusted room · Progressive playback) · 每位成员从原网站播放$/, 'Video link · $1 · $2 · Each member streams from the original site'],
-  [/^(.+) · (\d+) 片 × (.+) · (安全模式 · 扫描后播放|可信房间 · 边下边播|Safe mode · Play after scanning|Trusted room · Progressive playback) · (你是片源|接收中)$/, (_all, size, chunks, chunkSize, mode, state) => `${size} · ${chunks} chunks × ${chunkSize} · ${mode} · ${state === '你是片源' ? 'You are the source' : 'Receiving'}`],
+  [/^视频链接 · (.+) · (安全模式 · 扫描后播放|可信房间 · 边下边播|Safe mode · Play after scanning|Trusted room · Progressive playback) · 每位成员从原网站播放$/, (_all, detail, mode) => `Video link · ${detail} · ${translate(mode, 'en')} · Each member streams from the original site`],
+  [/^(.+) · (\d+) 片 × (.+) · (安全模式 · 扫描后播放|可信房间 · 边下边播|Safe mode · Play after scanning|Trusted room · Progressive playback) · (你是片源|接收中)$/, (_all, size, chunks, chunkSize, mode, state) => `${size} · ${chunks} chunks × ${chunkSize} · ${translate(mode, 'en')} · ${state === '你是片源' ? 'You are the source' : 'Receiving'}`],
   [/^(\d+(?:\.\d+)?)%（(\d+)\/(\d+) 片）$/, '$1% ($2/$3 chunks)'],
   [/^(\d+) 片$/, '$1 chunks'],
   [/^持有 (\d+)% · 延迟 (.+) · 收片 (.+)$/, 'Has $1% · Latency $2 · Receiving $3'],
   [/^收完才播 · 预计还需 (.+)$/, 'Plays after full receipt · about $1 left'],
   [/^按现在的速度约 (.+) 后会卡$/, 'Will stall in about $1 at the current speed'],
+  [
+    /^再缓冲 (.+) 可一路看完，届时手上有 (.+) 的画面$/,
+    'Buffer for another $1 to play through without stalling; you will then hold $2 of video',
+  ],
+  // 成员列表里这一句是拼出来的，前半段自己还要再翻一道
+  [/^(.+) · 再缓冲 (.+) 可看完$/, (_all, head, wait) => `${translate(head, 'en')} · buffer ${wait} more to play through`],
   [/^(\d+) 人按现在的速度会卡$/, '$1 viewer(s) will stall at the current speed'],
   [/^(\d+) 人余量很薄$/, '$1 viewer(s) have a thin margin'],
   [/^(\d+) 人$/, '$1 viewer(s)'],
   [/^(.+)（人数上限 (\d+) 人，除你之外 (\d+) 人同时接收）$/, '$1 (capacity $2; $3 viewer(s) besides you receiving at once)'],
   [/^按这个码率，你的上行最多能同时供 (\d+) 人流畅边下边播。$/, 'At this bitrate, your uplink can smoothly serve at most $1 viewer(s) at once.'],
   [/^上行带宽没测出来，跳过卡顿预判：(.+)$/, 'Could not measure uplink bandwidth; skipping the stall check: $1'],
-  [
-    /^没法接收这部片子：磁盘空间不够：这部片子需要 ([\d.]+)GB，缓存所在的磁盘只剩 ([\d.]+)GB$/,
-    'Cannot receive this video: not enough disk space. It needs $1 GB, but the cache disk has only $2 GB free',
-  ],
   [/^延迟 (.+) · P2P 媒体速度 —（各自读取原网站）$/, 'Latency $1 · P2P media rate — (each member streams from source)'],
-  [/^全员暂停中 —— 在等 (.+) 把缓冲攒够$/, 'Paused for everyone — waiting for $1 to buffer'],
+  // 名单里可能混着我们自己的「你」这个标记，它要翻，别人的昵称一个字都不能动。
+  // 顺带把中文顿号换成英文逗号 —— 整句都英文了，分隔符还是顿号会很刺眼。
+  [
+    /^全员暂停中 —— 在等 (.+) 把缓冲攒够，约 (.+)$/,
+    (_all, who, eta) => `Paused for everyone — waiting for ${joinWaiting(who)} to buffer, about ${eta}`,
+  ],
+  [
+    /^全员暂停中 —— 在等 (.+) 把缓冲攒够$/,
+    (_all, who) => `Paused for everyone — waiting for ${joinWaiting(who)} to buffer`,
+  ],
+  [/^缓冲还不够，约 (.+) 后自动继续$/, 'Not enough buffer yet — resuming automatically in about $1'],
+  [/^启动失败：(.+)$/, 'Startup failed: $1'],
+  [
+    /^这些 TURN 地址认不出来：(.+)。地址要形如 turn:example\.com:3478$/,
+    'These TURN addresses could not be understood: $1. An address looks like turn:example.com:3478',
+  ],
+  [/^当前版本 (.+)$/, 'Current version $1'],
+  [/^本次会话 (.+) · 上次退出没清掉 (.+)$/, 'This session $1 · $2 left over from last exit'],
+  [/^本次会话 (.+)$/, 'This session $1'],
+  [/^统计不出来：(.+)$/, 'Could not measure: $1'],
+  [/^换不了：(.+)$/, 'Could not change it: $1'],
+  [/^清不掉：(.+)$/, 'Could not clean up: $1'],
+  [/^缓存目录已改到 (.+)$/, 'Cache directory moved to $1'],
+  [/^清掉了 (\d+) 处残留缓存$/, 'Cleaned up $1 leftover cache director(ies)'],
+  [
+    /^你配置的 (.+) 这次用不了（(.+)），已临时用回系统临时目录。$/,
+    'The directory you configured ($1) is unavailable this time ($2); the system temp directory is being used instead.',
+  ],
+  [/^正在放映时不能换缓存目录，退出房间后再改$/, 'The cache directory cannot change during a screening; leave the room first'],
+  [/^还有临时文件没回收，退出房间后再改$/, 'Temporary files are still in use; leave the room first'],
+  [/^正在转封装或精简，完成后再换缓存目录$/, 'A remux or slim job is running; change the cache directory after it finishes'],
+  [
+    /^本机在对称 NAT 后面（几台 STUN 服务器各看到一个不同的公网端口）—— 这种网络打洞必定失败，只能走 TURN 中继。请在设置里配一个。$/,
+    'This machine is behind a symmetric NAT (several STUN servers each saw a different public port). Hole punching always fails on such a network — only a TURN relay works. Configure one in Settings.',
+  ],
+  [
+    /^本机的公网出口地址随目标而变（多出口的 NAT 网关，云主机上常见）—— 这种网络打洞必定失败，只能走 TURN 中继。请在设置里配一个。$/,
+    'This machine’s public egress address changes per destination (a multi-exit NAT gateway, common on cloud hosts). Hole punching always fails on such a network — only a TURN relay works. Configure one in Settings.',
+  ],
+  [/^TURN 中继 (.+) 拒绝了用户名或密码 —— 请核对设置里的 TURN 凭据。$/, 'The TURN relay $1 rejected the username or password — check the TURN credentials in Settings.'],
+  [/^连不上 TURN 中继 (.+) —— 地址或端口可能写错了，也可能被防火墙挡住。$/, 'Cannot reach the TURN relay $1 — the address or port may be wrong, or a firewall is blocking it.'],
+  [/^TURN 中继 (.+) 要求改用另一个地址，当前这条可能已经迁移。$/, 'The TURN relay $1 asked for a different address; this one may have moved.'],
+  [/^TURN 中继 (.+) 报错（(.+)）。$/, 'The TURN relay $1 reported an error ($2).'],
+  [/^STUN 服务器 (.+) 没能应答 —— 换一台，或检查防火墙有没有放行 UDP。$/, 'The STUN server $1 did not answer — try another one, or check whether the firewall allows UDP.'],
+  [/^诊断：(.+)$/, (_all, detail) => `Diagnosis: ${translate(detail, 'en')}`],
+  [/^运行环境检查失败：(.+)$/, 'Environment check failed: $1'],
+  [/^缓存目录准备失败：(.+)$/, 'Could not prepare the cache directory: $1'],
   [/^播放器已关闭（code (.+)），可在房间里重新打开$/, 'Player closed (code $1). You can reopen it from the room.'],
   [/^mpv 错误：(.*)$/, (_all, detail) => `mpv error: ${translate(detail, 'en')}`],
   [/^信令地址无效：(.*)$/, 'Invalid signaling URL: $1'],
@@ -504,6 +920,19 @@ const EN_PATTERNS = [
   [/^没找到 mpv。请安装后重试（(.*)），或设置环境变量 (.*)$/, 'mpv was not found. Install it ($1) or set $2.'],
   [/^没找到 yt-dlp，无法解析视频网页。请重新安装完整版本，或设置 (.*)。$/, 'yt-dlp was not found, so video pages cannot be parsed. Reinstall the full build or set $1.'],
   [/^安全扫描失败（代码 (.+)）$/, 'Security scan failed (code $1)'],
+  [/^安全扫描超过 (\d+) 分钟仍未完成$/, 'The security scan did not finish within $1 minutes'],
+  [/^文件已接收，正在进行安全扫描… 已用 (.+)$/, 'File received. Running a security scan… $1 elapsed'],
+  // 「没扫完」的两句：和上面「扫描器不可用」的两句同构，前半段同样要再翻一道并削掉句号
+  [
+    /^(.*)。可信房间不因此中断播放，但这份文件没有扫完 —— 可以点「重新扫描」再来一遍。$/,
+    (_all, detail) =>
+      `${trimEnd(translate(detail, 'en'))}. The trusted room keeps playing, but this file was not fully scanned — use "Scan again" to retry.`,
+  ],
+  [
+    /^(.*)。安全模式必须扫过才放行，先不打开播放器；文件还在，可以点「重新扫描」再来一遍。$/,
+    (_all, detail) =>
+      `${trimEnd(translate(detail, 'en'))}. Safe mode plays a file only after it is scanned, so the player stays closed; the file is still here — use "Scan again" to retry.`,
+  ],
   [
     /^(.*)。可信房间不因此中断播放，但这份文件始终没有经过本机扫描 —— 请自行确认片源可信。$/,
     (_all, detail) =>
@@ -563,22 +992,48 @@ export function translate(input, targetLocale = locale) {
   return translated ? `${leading}${translated}${trailing}` : value;
 }
 
+// 带这个属性的元素连同整棵子树都不参与自动翻译。昵称、片名、聊天这类用户输入必须原样显示，
+// 否则昵称叫「播放」的人会被翻成 Play。
+export const SKIP_ATTR = 'data-i18n-skip';
+const SKIP_SELECTOR = `[${SKIP_ATTR}]`;
+
+// 元素看它自己，文本节点看所在的元素；祖先链上任何一层带标记都算跳过。
+export function isSkipped(node) {
+  if (!node) return false;
+  const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+  return !!element?.closest?.(SKIP_SELECTOR);
+}
+
+// TreeWalker 的过滤器：遇到带标记的元素返回 FILTER_REJECT，整棵子树（含文本节点）都不会被遍历到。
+function skipFilter(node) {
+  return node.nodeType === Node.ELEMENT_NODE && node.hasAttribute?.(SKIP_ATTR)
+    ? NodeFilter.FILTER_REJECT
+    : NodeFilter.FILTER_ACCEPT;
+}
+
 function translateElement(element) {
+  if (isSkipped(element)) return;
   for (const attr of ['placeholder', 'title', 'aria-label']) {
     if (element.hasAttribute?.(attr)) element.setAttribute(attr, translate(element.getAttribute(attr)));
   }
 }
 
-function translateTree(root) {
+export function translateTree(root) {
   if (locale !== 'en' || !root) return;
   if (root.nodeType === Node.TEXT_NODE) {
+    // characterData 变化的目标就是文本节点，靠 parentElement 判断它是否落在被跳过的子树里。
+    if (isSkipped(root)) return;
     const next = translate(root.nodeValue);
     if (next !== root.nodeValue) root.nodeValue = next;
     return;
   }
   if (root.nodeType !== Node.ELEMENT_NODE && root.nodeType !== Node.DOCUMENT_NODE) return;
-  if (root.nodeType === Node.ELEMENT_NODE) translateElement(root);
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+  if (root.nodeType === Node.ELEMENT_NODE) {
+    // TreeWalker 不会把根交给过滤器，根自己带标记或落在被跳过的子树里时得先挡掉。
+    if (isSkipped(root)) return;
+    translateElement(root);
+  }
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, skipFilter);
   let node;
   while ((node = walker.nextNode())) {
     if (node.nodeType === Node.TEXT_NODE) {
@@ -597,6 +1052,7 @@ export function startI18n() {
   if (locale !== 'en') return;
   observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
+      // 新增节点和文本改动都经 translateTree，带 data-i18n-skip 的子树在那里统一挡掉。
       if (mutation.type === 'characterData') translateTree(mutation.target);
       for (const node of mutation.addedNodes) translateTree(node);
     }

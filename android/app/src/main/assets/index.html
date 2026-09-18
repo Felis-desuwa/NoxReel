@@ -45,6 +45,73 @@
   #time { font-size:12px; color:var(--dim); min-width:92px; text-align:right; font-variant-numeric: tabular-nums; }
   #waiting { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#000b; border:1px solid var(--warn);
              color:var(--warn); padding:14px 20px; border-radius:12px; font-size:14px; display:none; text-align:center; max-width:80%; }
+
+  /* -------- 弹幕层（贴在画面上，不吃触摸） -------- */
+  #danmaku { position:absolute; inset:0; overflow:hidden; pointer-events:none; z-index:1; }
+  #danmaku .dm { position:absolute; top:0; left:0; white-space:nowrap; font-weight:600; line-height:1.2;
+                 color:#fff; text-shadow:0 1px 2px #000c; will-change:transform; }
+  #danmaku .dm.self { -webkit-text-stroke:1px var(--accent); }
+  #topbar, #botbar { z-index:2; }
+
+  /* -------- 顶部的三个开关 -------- */
+  #topbtns { display:flex; gap:6px; align-items:center; }
+  #topbtns button { position:relative; padding:6px 10px; font-size:12px; background:#ffffff22; border-radius:8px; }
+  #topbtns button.on { background:var(--accent); color:#fff; }
+  #topbtns button.dm-off { opacity:.5; }
+  #chat-unread { display:none; position:absolute; top:-6px; right:-6px; min-width:16px; padding:0 4px;
+                 border-radius:8px; background:var(--bad); color:#fff; font-size:10px; line-height:16px; text-align:center; }
+  #chat-unread.on { display:block; }
+
+  /* -------- 抽屉：竖屏在底部，横屏在右侧 -------- */
+  .sheet { position:absolute; left:0; right:0; bottom:0; max-height:62%; display:none; flex-direction:column;
+           background:#12101cf2; border-top:1px solid #332f47; pointer-events:auto; z-index:3; }
+  .sheet.on { display:flex; }
+  @media (orientation: landscape) {
+    .sheet { left:auto; top:0; width:min(340px, 46vw); max-height:none; border-top:none; border-left:1px solid #332f47; }
+  }
+  .sheet-head { display:flex; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid #26233a; font-size:14px; font-weight:600; }
+  .sheet-head .grow { flex:1; }
+  .sheet-close { padding:4px 10px; background:transparent; color:var(--dim); }
+  .sheet-note { padding:8px 14px; font-size:12px; color:var(--warn); background:#ffcc6614; }
+  .sheet-body { flex:1; overflow:auto; padding:8px 14px 14px; font-size:13px; }
+  .panel-empty { color:var(--dim); font-size:12px; margin:6px 0; }
+
+  /* -------- 播放列表（只读，手机端没有编辑入口） -------- */
+  .pl-row { display:flex; gap:8px; align-items:baseline; padding:7px 0; border-bottom:1px solid #26233a; }
+  .pl-tag { flex:0 0 auto; font-size:11px; color:var(--dim); }
+  .pl-row.now .pl-tag { color:var(--good); }
+  .pl-row.done { opacity:.55; }
+  .pl-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  /* -------- 聊天 -------- */
+  #chat-body { display:flex; flex-direction:column; gap:6px; }
+  .chat-msg { display:flex; flex-wrap:wrap; gap:6px; align-items:baseline; }
+  .chat-name { flex:0 0 auto; max-width:40%; color:var(--accent); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .chat-msg.self .chat-name { color:var(--good); }
+  .chat-text { flex:1; min-width:0; overflow-wrap:anywhere; }
+  .chat-state { flex:0 0 auto; font-size:11px; color:var(--dim); }
+  .chat-system { color:var(--dim); font-size:12px; }
+  .chat-divider { color:var(--dim); font-size:11px; text-align:center; border-top:1px solid #332f47; padding-top:6px; }
+  #chat-foot { padding:8px 14px 14px; border-top:1px solid #26233a; }
+  #chat-notice { font-size:12px; color:var(--warn); margin-bottom:6px; }
+  #chat-notice.off { display:none; }
+  .chat-input-row { display:flex; gap:8px; align-items:flex-end; }
+  #chat-input { flex:1; max-height:96px; }
+  #chat-send { flex:0 0 auto; padding:10px 14px; }
+
+  /* -------- 弹幕设置（只影响自己） -------- */
+  .dm-row { display:flex; align-items:center; gap:10px; padding:7px 0; }
+  .dm-row > span { flex:0 0 76px; color:var(--dim); font-size:12px; }
+  .dm-row input[type=range], .dm-row select { flex:1; }
+  .dm-row input[type=checkbox] { flex:0 0 auto; width:auto; }
+
+  /* -------- 链接项：按站点授权 -------- */
+  #site-ask { position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+              padding:24px; background:#000a; pointer-events:auto; z-index:4; }
+  #site-ask.on { display:flex; }
+  #site-ask .box { max-width:420px; padding:18px; border-radius:14px; border:1px solid #332f47; background:var(--panel); }
+  #site-ask .row { display:flex; gap:10px; margin-top:16px; }
+  #site-ask .row button { flex:1; }
 </style>
 </head>
 <body>
@@ -103,13 +170,21 @@
 
   <!-- 播放层：叠在 ExoPlayer 画面之上 -->
   <div id="stage">
+    <!-- 弹幕层：pointer-events:none，只显示文字，不挡触摸 -->
+    <div id="danmaku"></div>
+
     <div id="topbar" class="bar">
-      <div>
+      <div style="flex:1; min-width:0">
         <div id="film">—</div>
         <div id="status"></div>
         <div id="role-hint"></div>
       </div>
       <div id="peers"></div>
+      <div id="topbtns">
+        <button id="btn-playlist">列表</button>
+        <button id="btn-chat">聊天<span id="chat-unread"></span></button>
+        <button id="btn-danmaku">弹幕</button>
+      </div>
     </div>
 
     <div id="waiting"></div>
@@ -120,6 +195,64 @@
         <button id="pp">▶</button>
         <input id="seek" type="range" min="0" max="1000" value="0" />
         <div id="time">0:00 / 0:00</div>
+      </div>
+    </div>
+
+    <!-- 播放列表：只读。房主是列表的唯一权威，手机端没有任何编辑入口 -->
+    <div id="playlist-sheet" class="sheet">
+      <div class="sheet-head">
+        <span class="grow">播放列表</span>
+        <button class="sheet-close" id="playlist-close" aria-label="关闭">✕</button>
+      </div>
+      <div class="sheet-note">手机端暂不支持编辑列表</div>
+      <div class="sheet-body" id="playlist-body"></div>
+    </div>
+
+    <!-- 聊天：竖屏是底部面板，横屏是侧边抽屉（见 .sheet 的方向媒体查询） -->
+    <div id="chat-sheet" class="sheet">
+      <div class="sheet-head">
+        <span class="grow">聊天</span>
+        <button class="sheet-close" id="chat-close" aria-label="关闭">✕</button>
+      </div>
+      <div class="sheet-body" id="chat-body"></div>
+      <div id="chat-foot">
+        <div id="chat-notice" class="off"></div>
+        <div class="chat-input-row">
+          <textarea id="chat-input" rows="1" maxlength="400" placeholder="说点什么…" aria-label="聊天输入框"></textarea>
+          <button class="primary" id="chat-send">发送</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹幕设置：存在本机，只影响自己 -->
+    <div id="danmaku-sheet" class="sheet">
+      <div class="sheet-head">
+        <span class="grow">弹幕设置</span>
+        <button class="sheet-close" id="danmaku-close" aria-label="关闭">✕</button>
+      </div>
+      <div class="sheet-body">
+        <div class="dm-row"><span>弹幕</span><input id="dm-enabled" type="checkbox" /></div>
+        <div class="dm-row"><span>不透明度</span><input id="dm-opacity" type="range" min="0.1" max="1" step="0.05" aria-label="不透明度" /></div>
+        <div class="dm-row"><span>字号</span><input id="dm-font" type="range" min="0.5" max="2" step="0.1" aria-label="字号" /></div>
+        <div class="dm-row"><span>速度</span><input id="dm-speed" type="range" min="0.25" max="4" step="0.25" aria-label="速度" /></div>
+        <div class="dm-row"><span>显示区域</span>
+          <select id="dm-area" aria-label="显示区域">
+            <option value="half">上半屏</option>
+            <option value="full">全屏</option>
+          </select>
+        </div>
+        <div class="hint">这些设置只影响你自己的画面。</div>
+      </div>
+    </div>
+
+    <!-- 链接项：按站点授权，允许过的站点这一场里不再问 -->
+    <div id="site-ask">
+      <div class="box">
+        <div id="site-ask-text"></div>
+        <div class="row">
+          <button id="site-deny">拒绝</button>
+          <button class="primary" id="site-allow">允许</button>
+        </div>
       </div>
     </div>
   </div>

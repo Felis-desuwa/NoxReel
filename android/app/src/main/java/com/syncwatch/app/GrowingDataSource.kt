@@ -10,11 +10,16 @@ import com.google.android.exoplayer2.upstream.TransferListener
  * 读一个正在被下载填充的文件。
  *
  * 普通 FileDataSource 会把还没下到的区域（预分配的 0）当正常数据读出来，
- * 解码器直接花屏/崩。这里改成：读到连续水位线以外就阻塞等下载补齐
- * （[Store.Session.awaitData]），补上再往下读。
+ * 解码器直接花屏/崩。这里改成：**读到当前位置所在那段连续已收数据的末尾就阻塞**，
+ * 等下载补齐（[Store.Session.awaitData]）再往下读。判据不是从文件头起的连续水位线
+ * —— 中途加入房间时播放位置之前整段都是空洞，按水位线算根本读不出数据。
  *
- * 正常播放时全员暂停联动会保证本地播放位置不会冲到自己的水位线前头，
+ * 正常播放时全员暂停联动会保证本地播放位置不会冲到本段连续区的末尾，
  * 所以这个阻塞通常很短；真卡住时阻塞会自然让 ExoPlayer 停在这，和暂停等价。
+ *
+ * seek 之后 ExoPlayer 会带着新的 position 重新 open()，所以「中途加入」和「往回拖到
+ * 未接收区域」都会重新走一遍 awaitData：落在空洞里就一直是「缓冲中」，
+ * 不会被误判成文件到头（那会让播放器直接 ENDED）。
  */
 class GrowingDataSource(private val session: Store.Session) : DataSource {
 
@@ -45,7 +50,8 @@ class GrowingDataSource(private val session: Store.Session) : DataSource {
         if (length == 0) return 0
         if (bytesRemaining == 0L) return C.RESULT_END_OF_INPUT
 
-        // 等到 position 处有数据可读（或读完/关闭）
+        // 等到 position 处有数据可读（或真读完 / 会话关闭）。
+        // available 是「从 position 起连续可读多少」，不是「水位线还剩多少」。
         val available = session.awaitData(position, WAIT_SLICE_MS)
         if (available < 0) return C.RESULT_END_OF_INPUT
 

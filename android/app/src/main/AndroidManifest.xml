@@ -22,7 +22,11 @@
             android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
             android:screenOrientation="fullUser"
-            android:launchMode="singleTask">
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
+            <!-- adjustResize：0.7 加了聊天输入条，默认的 adjustPan 会把整个窗口往上顶，
+                 输入条被键盘盖住、聊天记录也跟着跑出屏幕。改成 resize 后窗口自己变矮，
+                 输入条稳稳贴在键盘上方。主题不是全屏窗口，resize 才生效。 -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

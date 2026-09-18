@@ -1,5 +1,10 @@
 const STORAGE_KEY = 'sw.language';
 const EN = new Map(Object.entries({
+  // 中途加入（可信房间）
+  '你是中途加入的，正在下载房间当前位置附近的内容':
+    'You joined mid-playback; downloading the part the room is at now.',
+  '片源没提供时长，算不出房间播到哪；这一部要完整接收后才能播放':
+    "The source did not provide a duration, so the room's position cannot be calculated; this video will play only after it is fully received.",
   'P2P 同步观影 · 手机作为观众加入（不做房主）': 'P2P synchronized watching · Join as a viewer from your phone',
   '界面语言': 'Interface language',
   '中文（简体）': 'Chinese (Simplified)',
@@ -51,7 +56,6 @@ const EN = new Map(Object.entries({
   '安全模式文件已完整接收并校验，开始播放': 'Safe mode: the file is fully received and verified. Starting playback.',
   '可信房间片头已就绪，开始边接收边播放（风险较高）': 'Trusted room: initial data is ready. Starting progressive playback (higher risk).',
   '全部下载完成': 'Download complete',
-  '已忽略非房主发来的换片请求': 'Ignored a media switch request from a non-host member',
   '已忽略非房主发来的视频链接': 'Ignored a video link sent by a non-host member',
   '房主分享的是网页链接，但没有可供 Android 播放的安全直链': 'The host shared a webpage, but no safe Android-compatible stream URL was available',
   '你拒绝了房主发送的视频链接': 'You declined the video link sent by the host',
@@ -72,13 +76,66 @@ const EN = new Map(Object.entries({
   '和房主的直连没建立起来。重新粘一次房主的邀请码生成新的应答链接；双方都在严格 NAT 后面时需要各自配同一个 TURN 中继。':
     'The direct connection to the host was never established. Paste the host’s invite code again to generate a new answer link; when both sides are behind strict NAT, each of you needs the same TURN relay configured.',
   '等了几分钟还是没连上房主。应答链接已经发回去的话多半是打洞没成功，双方都要配同一个 TURN 中继；房主还没打开的话，就重新粘一次邀请码生成新的应答链接。':
-    'Still not connected to the host after several minutes. If you already sent the answer link back, the direct connection most likely failed and both sides need the same TURN relay; if the host has not opened it yet, paste the invite code again to generate a new answer link.'
+    'Still not connected to the host after several minutes. If you already sent the answer link back, the direct connection most likely failed and both sides need the same TURN relay; if the host has not opened it yet, paste the invite code again to generate a new answer link.',
+  // 播放列表与协议版本（0.7）
+  '已忽略非房主发来的播放列表': 'Ignored a playlist from someone other than the host',
+  '播放列表已经放完了': 'The playlist has finished',
+  '没有人能提供这部片的清单': 'Nobody can provide the manifest for this video',
+  '这个邀请来自旧版 NoxReel（0.6.x），和 0.7 不互通。请让房主升级到 0.7 后重新发邀请。':
+    'This invite comes from an older NoxReel (0.6.x), which cannot connect to 0.7. Ask the host to upgrade to 0.7 and send a new invite.',
+  '这个邀请来自更新版本的 NoxReel，请先升级手机上的 NoxReel。':
+    'This invite comes from a newer NoxReel. Upgrade NoxReel on this phone first.',
+  // 播放列表面板（只读）
+  '列表': 'List',
+  '播放列表': 'Playlist',
+  '手机端暂不支持编辑列表': 'Editing the playlist is not supported on phones',
+  '列表还是空的，等房主加片。': 'The playlist is empty. Waiting for the host to add a video.',
+  '正在播放': 'Now playing',
+  '待播': 'Up next',
+  '已播放': 'Played',
+  // 聊天
+  '聊天': 'Chat',
+  '还没有消息': 'No messages yet',
+  '说点什么…': 'Say something…',
+  '聊天输入框': 'Chat input box',
+  '发送': 'Send',
+  '发送中': 'Sending…',
+  '已送达': 'Delivered',
+  '你加入前的消息': 'Messages from before you joined',
+  // 弹幕与它的本地设置
+  '弹幕': 'Danmaku',
+  '弹幕设置': 'Danmaku settings',
+  '不透明度': 'Opacity',
+  '字号': 'Font size',
+  '速度': 'Speed',
+  '显示区域': 'Display area',
+  '上半屏': 'Top half',
+  '全屏': 'Full screen',
+  '这些设置只影响你自己的画面。': 'These settings only affect your own screen.',
+  // 站点授权对话框
+  '允许': 'Allow',
+  '拒绝': 'Decline',
+  '关闭': 'Close',
 }));
 
 const PATTERNS = [
   [
+    /^(.+) 用的是旧版 NoxReel（0\.6\.x），和 0\.7 不互通，已断开。$/,
+    '$1 is using an older NoxReel (0.6.x), which cannot connect to 0.7, and was disconnected.',
+  ],
+  [/^(.+) 用的是更新版本的 NoxReel，请先升级手机上的 NoxReel。$/, '$1 is using a newer NoxReel. Upgrade NoxReel on this phone first.'],
+  [/^还没拿到《(.+)》的清单：(.*)$/, (_all, name, detail) => `Still waiting for the manifest of “${name}”: ${translate(detail, 'en')}`],
+  [/^(.+) · (安全模式|可信房间|Safe mode|Trusted room) · 正在获取清单…$/, (_all, name, mode) => `${name} · ${translate(mode, 'en')} · Fetching the manifest…`],
+  [/^播放列表是空的 · (安全模式|可信房间|Safe mode|Trusted room)$/, (_all, mode) => `The playlist is empty · ${translate(mode, 'en')}`],
+  [
     /^打开接收会话失败：磁盘空间不够：这部片子需要 ([\d.]+)GB，手机只剩 ([\d.]+)GB$/,
     'Could not open the receive session: not enough storage. This video needs $1 GB, but the phone has only $2 GB free',
+  ],
+  // 状态栏：本机收不下当前这一部（原因多半是下面这条存储不够）
+  [/^没法接收这一部：(.*)$/, (_all, detail) => `Cannot receive this video: ${translate(detail, 'en')}`],
+  [
+    /^磁盘空间不够：这部片子需要 ([\d.]+)GB，手机只剩 ([\d.]+)GB$/,
+    'Not enough storage: this video needs $1 GB, but the phone has only $2 GB free',
   ],
   [/^观众(\d+)$/, 'Viewer $1'],
   [/^(.+) 加入了房间$/, '$1 joined the room'],
@@ -99,8 +156,26 @@ const PATTERNS = [
   [/^邀请码无效：(.*)$/, (_all, detail) => `Invalid invite code: ${translate(detail, 'en')}`],
   [/^房间使用(.+)，本机设置是(.+)。请切换为相同模式后重试。$/, 'The room uses $1 while this device uses $2. Select the same mode and try again.'],
   [/^房主的片子：(.+) · (.+)$/, 'Host video: $1 · $2'],
-  [/^身份：(.+)$/, 'Role: $1'],
+  // 具体的身份说明要排在通配的「身份：X」前面：PATTERNS first-match-wins，排在后面就永远轮不到
   [/^身份：游客 · 播放\/暂停仅对自己生效，不能拖动进度$/, 'Role: Guest · Play/pause only affects you; seeking is disabled'],
+  [
+    /^身份：(.+) · 可以控制播放，但手机端不能编辑列表$/,
+    (_all, role) => `Role: ${translate(role, 'en')} · You can control playback, but the playlist cannot be edited on phones`,
+  ],
+  // 角色名本身也要翻，'Role: $1' 那种写法会把「房主」原样留在英文界面里
+  [/^身份：(.+)$/, (_all, role) => `Role: ${translate(role, 'en')}`],
+  // 聊天流里的系统事件：整句翻译，昵称和片名靠捕获原样带过去
+  [/^现在放：(.*)$/, 'Now playing: $1'],
+  [/^(.+) 离开了房间$/, '$1 left the room'],
+  [
+    /^(.+) (播放|暂停) @ (.+)$/,
+    (_all, name, action, position) => `${name} ${{ 播放: 'played', 暂停: 'paused' }[action]} @ ${position}`,
+  ],
+  // 限速倒计时是动态的，单复数得跟着变
+  [
+    /^发得太快了（(\d+) 秒后再试）$/,
+    (_all, n) => `Too many messages — try again in ${n} second${n === '1' ? '' : 's'}`,
+  ],
   [/^可播 (\d+)% · 已有 (\d+)\/(\d+) 片 · ↓(.+)$/, 'Playable $1% · $2/$3 chunks · ↓$4'],
   [/^(\d+) 人在线$/, '$1 online'],
   [/^⏳ 等待缓冲：(.*)$/, '⏳ Waiting for buffer: $1'],
@@ -133,15 +208,37 @@ export function translate(input, targetLocale = locale) {
   return translated ? `${leading}${translated}${trailing}` : value;
 }
 
-function translateTree(root) {
+// 带这个属性的元素连同整棵子树都不参与自动翻译。昵称、片名、聊天这类用户输入必须原样显示，
+// 否则昵称叫「播放」的人会被翻成 Play。和桌面端 src/renderer/lib/i18n.js 保持同一套规则。
+export const SKIP_ATTR = 'data-i18n-skip';
+const SKIP_SELECTOR = `[${SKIP_ATTR}]`;
+
+// 元素看它自己，文本节点看所在的元素；祖先链上任何一层带标记都算跳过。
+export function isSkipped(node) {
+  if (!node) return false;
+  const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+  return !!element?.closest?.(SKIP_SELECTOR);
+}
+
+// TreeWalker 的过滤器：遇到带标记的元素返回 FILTER_REJECT，整棵子树（含文本节点）都不会被遍历到。
+const skipFilter = (node) =>
+  node.nodeType === Node.ELEMENT_NODE && node.hasAttribute?.(SKIP_ATTR)
+    ? NodeFilter.FILTER_REJECT
+    : NodeFilter.FILTER_ACCEPT;
+
+export function translateTree(root) {
   if (locale !== 'en' || !root) return;
   if (root.nodeType === Node.TEXT_NODE) {
+    // characterData 变化的目标就是文本节点，靠 parentElement 判断它是否落在被跳过的子树里。
+    if (isSkipped(root)) return;
     const next = translate(root.nodeValue);
     if (next !== root.nodeValue) root.nodeValue = next;
     return;
   }
   if (root.nodeType !== Node.ELEMENT_NODE && root.nodeType !== Node.DOCUMENT_NODE) return;
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+  // TreeWalker 不会把根交给过滤器，根自己带标记或落在被跳过的子树里时得先挡掉。
+  if (root.nodeType === Node.ELEMENT_NODE && isSkipped(root)) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, skipFilter);
   const apply = (node) => {
     if (node.nodeType === Node.TEXT_NODE) {
       const next = translate(node.nodeValue);
@@ -163,6 +260,7 @@ export function startI18n() {
   if (locale !== 'en') return;
   const observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
+      // 新增节点和文本改动都经 translateTree，带 data-i18n-skip 的子树在那里统一挡掉。
       if (mutation.type === 'characterData') translateTree(mutation.target);
       for (const node of mutation.addedNodes) translateTree(node);
     }

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      覆盖窗上画的是房间里别人发来的文字。CSP 收到最紧：除了本地的脚本和样式，
+      什么都不许加载 —— 没有图片、没有字体、没有网络连接，连 frame 都不许有。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'none'; font-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';"
+    />
+    <title>NoxReel 弹幕层</title>
+    <link rel="stylesheet" href="overlay/overlay.css" />
+  </head>
+  <body>
+    <!-- 弹幕和常驻横幅全部画在这一张 canvas 上：正文一个字也不进 DOM -->
+    <canvas id="overlay-canvas"></canvas>
+    <!-- 输入条开着时才出现的挡板：点在输入条以外就把它关掉，别把播放器挡死 -->
+    <div id="overlay-shield" class="hidden"></div>
+    <!-- 按 Ctrl+Shift+D 才出现的输入条。提示语由主进程按界面语言传进来 -->
+    <div id="overlay-bar" class="hidden">
+      <input id="overlay-input" type="text" autocomplete="off" spellcheck="false" maxlength="200" />
+    </div>
+    <script type="module" src="overlay/overlay.js"></script>
+  </body>
+</html>

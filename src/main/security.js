@@ -1,14 +1,26 @@
 'use strict';
 
+const crypto = require('crypto');
 const path = require('path');
 const net = require('net');
 const dns = require('dns/promises');
 const { CHUNK_SIZE } = require('./fileStore');
 const { validateManifestName } = require('./mediaGuard');
+// 弹幕的各种上限由覆盖层那一侧定义（它还要按同一个数截断播放器里发回来的文本），
+// 这里只负责把关。两边各写一份就迟早会对不上。
+const {
+  MAX_DANMAKU_ITEMS,
+  MAX_DANMAKU_TEXT,
+  MAX_OVERLAY_COORD,
+  MIN_OVERLAY_SIZE,
+  MAX_OVERLAY_SIZE,
+} = require('./mpv');
 
 const MAX_TEXT = 4096;
-const HASH_RE = /^[a-f0-9]{64}$/i;
-const FILE_ID_RE = /^[a-f0-9]{32}$/i;
+// 只认小写：buildManifest 产出的就是小写，共享库的 manifestShapeOk 也只认小写
+const HASH_RE = /^[a-f0-9]{64}$/;
+const FILE_ID_RE = /^[a-f0-9]{32}$/;
+const TASK_ID_RE = /^[a-z0-9]{6,32}$/;
 const SAFE_MEDIA_HEADERS = new Set(['accept', 'accept-language', 'origin', 'referer', 'user-agent']);
 
 function fail(label) {
@@ -93,6 +105,10 @@ async function publicHttpUrl(value, label = '链接') {
   return safe;
 }
 
+// 清单里媒体时长的上限（秒）。渲染进程那边 lib/swarm.js 的 MAX_DURATION_SEC、
+// lib/playlist.js 用的是同一个数，改一处就要三处一起改。
+const MAX_DURATION_SEC = 24 * 60 * 60;
+
 function finiteNumber(value, label, { min = -Infinity, max = Infinity } = {}) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) fail(label);
   return value;
@@ -122,13 +138,19 @@ function manifest(value) {
   for (const hash of data.hashes) {
     if (typeof hash !== 'string' || !HASH_RE.test(hash)) fail('分片哈希');
   }
+  // fileId 由全部分片哈希推导（见 fileStore.buildManifest）。对不上说明清单被改过：
+  // 拿一个别人的 fileId 配上自己的哈希，就能让缓存和进度记到别的片子头上。
+  const digest = crypto.createHash('sha256').update(data.hashes.join('')).digest('hex').slice(0, 32);
+  if (digest !== data.fileId) fail('文件标识');
   if (data.roomRevision !== undefined) integer(data.roomRevision, '房间版本', { min: 0 });
   // 时长是可选的诊断信息（房主的 ffprobe 给的）。接收端靠它在起播之前就能算出
   // 「这个片子需要多少码率」，从而判断当前速度追不追得上。缺了不影响传输。
-  if (data.durationSec !== undefined) finiteNumber(data.durationSec, '媒体时长', { min: 0, max: 86400 });
-  // 房主选片时测得的上行带宽（字节/秒），同样只是诊断信息：成员据此显示「房主上行」，
+  if (data.durationSec !== undefined) finiteNumber(data.durationSec, '媒体时长', { min: 0, max: MAX_DURATION_SEC });
+  // 片源选片时测得的上行带宽（字节/秒），同样只是诊断信息：成员据此显示「片源上行」，
   // 知道自己分到的速度上限在哪。上限给到 1Tbps，挡住畸形值。
-  if (data.uplinkBps !== undefined) finiteNumber(data.uplinkBps, '房主上行带宽', { min: 0, max: 125_000_000_000 });
+  // 0.7 起加片的不一定是房主，字段也改名了；旧名字不再认，免得未经校验的值混进来。
+  if (data.sourceUplinkBps !== undefined) finiteNumber(data.sourceUplinkBps, '片源上行带宽', { min: 0, max: 125_000_000_000 });
+  if (data.uplinkBps !== undefined) fail('媒体清单');
   return data;
 }
 
@@ -171,6 +193,17 @@ function sessionId(value) {
   return string(value, '会话标识', { max: 128 });
 }
 
+/**
+ * 长任务（算哈希 / 转封装 / 精简）的标识，由渲染进程生成，用来取消和区分进度事件。
+ * 可选：没给（undefined / null）就返回 null；给了就必须是 6–32 位小写字母数字。
+ * 它会当 Map 的键、原样回传给渲染进程，所以字符集收得很窄。
+ */
+function taskId(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string' || !TASK_ID_RE.test(value)) fail('任务标识');
+  return value;
+}
+
 function binary(value, max = CHUNK_SIZE) {
   const isArrayBuffer = value instanceof ArrayBuffer;
   const isView = ArrayBuffer.isView(value);
@@ -178,6 +211,68 @@ function binary(value, max = CHUNK_SIZE) {
   const bytes = isArrayBuffer ? value.byteLength : value.byteLength;
   if (bytes < 0 || bytes > max) fail('分片数据');
   return value;
+}
+
+/** 码点数，不是 UTF-16 长度：一个 emoji 占两个 .length，却只算一个字。 */
+function codePointCount(text) {
+  let n = 0;
+  for (const _ of text) n++;
+  return n;
+}
+
+/**
+ * 一帧弹幕。条数、字数、坐标全部卡死上限。
+ *
+ * 这道校验比别的都值钱：这一帧每秒来 30 次，正文来自房间里的其他人，
+ * 而它的去处是拼进一条 ASS 字符串交给 mpv。松一点就是给别人一把每秒 30 次的锤子。
+ * 转义由 mpv.js 的 escapeAss 负责，这里管的是「量」：多少条、多长、画到哪。
+ */
+function danmakuFrame(value) {
+  const data = plainObject(value, '弹幕帧');
+  finiteNumber(data.w, '弹幕画布宽', { min: MIN_OVERLAY_SIZE, max: MAX_OVERLAY_SIZE });
+  const height = finiteNumber(data.h, '弹幕画布高', { min: MIN_OVERLAY_SIZE, max: MAX_OVERLAY_SIZE });
+  // 播放器代号：带了就只画给那一代，见 PlayerManager.setDanmakuFrame
+  if (data.gen !== undefined && data.gen !== null) integer(data.gen, '播放器代号', { min: 1 });
+  if (!Array.isArray(data.items) || data.items.length > MAX_DANMAKU_ITEMS) fail('弹幕条数');
+  for (const raw of data.items) {
+    const item = plainObject(raw, '弹幕');
+    string(item.text, '弹幕正文', { max: MAX_DANMAKU_TEXT * 2 });
+    if (codePointCount(item.text) > MAX_DANMAKU_TEXT) fail('弹幕正文');
+    // x 可以是很大的负数（长弹幕整条还在屏幕左边外面）；y 必须落在画布里
+    finiteNumber(item.x, '弹幕横坐标', { min: -MAX_OVERLAY_COORD, max: MAX_OVERLAY_COORD });
+    finiteNumber(item.y, '弹幕纵坐标', { min: 0, max: height });
+    if (item.fontSize !== undefined) finiteNumber(item.fontSize, '弹幕字号', { min: 1, max: 400 });
+    if (item.opacity !== undefined) finiteNumber(item.opacity, '弹幕不透明度', { min: 0, max: 1 });
+    if (item.outline !== undefined && typeof item.outline !== 'boolean') fail('弹幕描边');
+  }
+  return data;
+}
+
+/**
+ * 要塞进 mpv --script-opt 的值（目前只有播放器内输入框的提示语，由界面按语言给）。
+ *
+ * 逗号是 script-opts 那张表的分隔符，控制字符会把一整行参数劈开，两类都得挡住。
+ * 一个反斜杠都不写：这个文件里的正则字符类曾经被工具多转义过一层，改用码点判断就没这风险。
+ * 44 = 逗号，0x7f = DEL。
+ */
+function scriptOptValue(value, label = '脚本参数') {
+  const text = string(value, label, { max: 40 });
+  for (const ch of text) {
+    const code = ch.codePointAt(0);
+    if (code < 0x20 || code === 0x7f || code === 44) fail(label);
+  }
+  return text;
+}
+
+/**
+ * 播放器 id。只认调用方递进来的那张登记表 —— 这个字符串最终会变成
+ * `new ADAPTERS[id]()`，不比对登记表就等于让渲染进程点名要主进程构造任意对象。
+ * 登记表由 PlayerManager 给（它才知道装了哪几个适配器），这一层只负责卡住。
+ */
+function playerId(value, allowed) {
+  const id = string(value, '播放器', { max: 16 });
+  if (!Array.isArray(allowed) || !allowed.includes(id)) fail('播放器');
+  return id;
 }
 
 function externalUrl(value) {
@@ -198,8 +293,10 @@ function mediaHeaders(value) {
 }
 
 module.exports = {
+  MAX_DURATION_SEC,
   absolutePath,
   binary,
+  danmakuFrame,
   externalUrl,
   finiteNumber,
   httpUrl,
@@ -207,8 +304,11 @@ module.exports = {
   manifest,
   mediaHeaders,
   plainObject,
+  playerId,
   publicHttpUrl,
+  scriptOptValue,
   sessionId,
   slimOptions,
   string,
+  taskId,
 };

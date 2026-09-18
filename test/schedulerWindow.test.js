@@ -192,9 +192,155 @@ test('关键窗口仍然优先 —— 自适应没把播放位置优先调度冲
 
   const plan = s.plan({ have, playbackByte, inflight: new Set(), peers: [p] });
   assert.ok(plan.length > 0);
+  // 0.7 的契约变更：队列里允许出现播放位置之前的片，但只能是文件头保留区那 4 片
+  // （容器头，缺了播放器连格式都认不出来）。除此之外回拖片仍排在最后。
+  const headEnd = 8 * 1024 * 1024 / CHUNK;
   for (const a of plan) {
-    assert.ok(a.index >= 100, `派了播放位置之前的第 ${a.index} 片，回拖片不该排在前面`);
+    assert.ok(
+      a.index >= 100 || a.index < headEnd,
+      `派了播放位置之前的第 ${a.index} 片，回拖片不该排在前面`
+    );
   }
+});
+
+/* --------------------------- 头部 / 尾部保留区 --------------------------- */
+
+test('中途加入：队列首批必须含文件头，否则播放器认不出格式直接退出', async () => {
+  const { Scheduler } = await load();
+  const s = new Scheduler({ manifest: manifest() });
+  s.setDuration(3600);
+  const p = peer('p', { downRate: 10e6, rtt: 60 });
+  const { critical } = s.priorityList(new Uint8Array(200), 100 * CHUNK, new Set());
+  assert.deepEqual(critical.slice(0, 4), [0, 1, 2, 3], '8MB 的文件头保留区要排在最前面');
+  assert.ok(critical.includes(100), '关键窗口仍然在，只是排在保留区后面');
+});
+
+/** 第 0 片的前几十个字节：faststart MP4（ftyp 之后紧跟 moov）。 */
+function mp4FaststartHead({ ftypSize = 32, second = 'moov' } = {}) {
+  const b = new Uint8Array(4 * 1024);
+  const putBox = (off, size, type) => {
+    b[off] = (size >>> 24) & 0xff;
+    b[off + 1] = (size >>> 16) & 0xff;
+    b[off + 2] = (size >>> 8) & 0xff;
+    b[off + 3] = size & 0xff;
+    for (let i = 0; i < 4; i++) b[off + 4 + i] = type.charCodeAt(i);
+  };
+  putBox(0, ftypSize, 'ftyp');
+  putBox(ftypSize, 1024, second);
+  return b;
+}
+
+/** 第 0 片的前几个字节：MKV / WebM 的 EBML 魔数。 */
+function matroskaHead() {
+  const b = new Uint8Array(4 * 1024);
+  b.set([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42, 0x82, 0x88], 0);
+  return b;
+}
+
+test('只有确认过 faststart 的 MP4 才不预留文件尾，其余一律预留', async () => {
+  const { Scheduler } = await load();
+  const make = (name) => {
+    const s = new Scheduler({ manifest: { ...manifest(), name } });
+    s.setDuration(3600);
+    return s;
+  };
+  const tail = (s) => s.priorityList(new Uint8Array(200), 100 * CHUNK, new Set()).critical.slice(0, 6);
+
+  // 还没拿到第 0 片：认不出容器，保守预留（多花 4MB，无害）
+  const unknown = make('片子.mp4');
+  assert.equal(unknown.needsTailIndex(), true, '认不出容器时必须预留，不能凭扩展名放行');
+  assert.deepEqual(tail(unknown), [0, 1, 2, 3, 198, 199], '4MB 的尾部保留区 = 最后两片');
+
+  // 第 0 片是 faststart MP4：索引在文件头，不用预留
+  const mp4 = make('片子.mp4');
+  mp4.setHeadBytes(mp4FaststartHead());
+  assert.equal(mp4.needsTailIndex(), false);
+  const mp4List = mp4.priorityList(new Uint8Array(200), 100 * CHUNK, new Set());
+  assert.equal(mp4List.critical.includes(199), false, 'faststart MP4 的索引在头部，不需要文件尾');
+  assert.equal(mp4List.critical.includes(198), false);
+
+  // 这条是 F5 的回归：MKV 被改名成 .mp4。只认扩展名的话尾部不预留，
+  // 安卓的 MatroskaExtractor 在 prepare 阶段就要 seek 到文件尾读 Cues，读不到永远转圈。
+  const disguised = make('其实是mkv.mp4');
+  disguised.setHeadBytes(matroskaHead());
+  assert.equal(disguised.needsTailIndex(), true, '按内容认出是 MKV，名字叫什么都要预留文件尾');
+  assert.deepEqual(tail(disguised), [0, 1, 2, 3, 198, 199]);
+
+  // 名字是 .mkv、内容也是 MKV：照旧预留
+  const mkv = make('片子.MKV');
+  mkv.setHeadBytes(matroskaHead());
+  assert.equal(mkv.needsTailIndex(), true);
+
+  // moov 在 mdat 后面（非 faststart）、根本不是 ISOBMFF、第 0 片太短：全部保守处理
+  const tailMoov = make('尾索引.mp4');
+  tailMoov.setHeadBytes(mp4FaststartHead({ second: 'mdat' }));
+  assert.equal(tailMoov.needsTailIndex(), true, 'moov 在文件尾，更得预留');
+  const junk = make('乱码.mp4');
+  junk.setHeadBytes(new Uint8Array(4096));
+  assert.equal(junk.needsTailIndex(), true);
+  const tooShort = make('短.mp4');
+  tooShort.setHeadBytes(new Uint8Array(4));
+  assert.equal(tooShort.needsTailIndex(), true, '看不到 8 个字节就别下结论');
+  // 没有 name 的清单（老测试夹具）同样保守
+  const bare = new Scheduler({ manifest: manifest() });
+  assert.equal(bare.needsTailIndex(), true);
+
+  // 认定之后不再被后来的数据改写（重复片、坏片都不该翻案）
+  mp4.setHeadBytes(matroskaHead());
+  assert.equal(mp4.needsTailIndex(), false, '第 0 片只认第一次');
+});
+
+test('保留区的片已经有了或在途，不重复排入', async () => {
+  const { Scheduler } = await load();
+  const s = new Scheduler({ manifest: { ...manifest(), name: 'a.mkv' } });
+  s.setDuration(3600);
+  const have = new Uint8Array(200);
+  have[0] = 1;
+  have[1] = 1;
+  const { critical } = s.priorityList(have, 100 * CHUNK, new Set([199]));
+  assert.deepEqual(critical.slice(0, 3), [2, 3, 198]);
+  // 每个下标只出现一次，保留区和关键窗口重叠时也不会重复
+  assert.equal(new Set(critical).size, critical.length);
+});
+
+test('从片头起播的 faststart MP4：整条队列的顺序与 0.6 一模一样', async () => {
+  const { Scheduler } = await load();
+  const s = new Scheduler({ manifest: manifest() });
+  s.setDuration(3600);
+  s.setHeadBytes(mp4FaststartHead()); // 索引在头部 → 没有尾部保留区
+  const off = new Scheduler({ manifest: manifest(), headReserveBytes: 0, tailReserveBytes: 0 });
+  off.setDuration(3600);
+  // 头部保留区可能比关键窗口长（窗口按码率算），那几片会从 rest 挪进 critical；
+  // 但它们本来就紧跟在窗口后面顺序排，拼起来的队列一个字都没变。
+  const queue = (list) => [...list.critical, ...list.rest];
+  assert.deepEqual(
+    queue(s.priorityList(new Uint8Array(200), 0, new Set())),
+    queue(off.priorityList(new Uint8Array(200), 0, new Set()))
+  );
+});
+
+test('容器认不出来时，从片头起播也会先取文件尾那两片（保守策略的代价）', async () => {
+  const { Scheduler } = await load();
+  const s = new Scheduler({ manifest: manifest() });
+  s.setDuration(3600);
+  const { critical, rest } = s.priorityList(new Uint8Array(200), 0, new Set());
+  assert.deepEqual(critical.slice(0, 6), [0, 1, 2, 3, 198, 199]);
+  // 代价仅此而已：片子还是那些片子，一片不多一片不少
+  assert.equal(new Set([...critical, ...rest]).size, 200);
+});
+
+test('保留区可以整个关掉 —— 这是它的回退开关', async () => {
+  const { Scheduler } = await load();
+  const s = new Scheduler({
+    manifest: { ...manifest(), name: 'a.mkv' },
+    headReserveBytes: 0,
+    tailReserveBytes: 0,
+  });
+  s.setDuration(3600);
+  const { critical } = s.priorityList(new Uint8Array(200), 100 * CHUNK, new Set());
+  assert.equal(critical[0], 100, '关掉之后队首就是播放位置，回到 0.6 的行为');
+  assert.equal(critical.includes(0), false);
+  assert.equal(critical.includes(199), false);
 });
 
 test('没有可用 peer 时返回空，不抛异常', async () => {
@@ -228,16 +374,16 @@ test('Android 端也拿得到同样的窗口值', async () => {
 test('测不出 RTT／速率时，请求超时退回 20 秒', async () => {
   const { Swarm } = await import('../src/renderer/lib/swarm.js');
   const s = new Swarm({ peerId: 'me', name: 'me' });
-  s.manifest = manifest();
-  assert.equal(s._requestTimeout(undefined), 20000);
-  assert.equal(s._requestTimeout({ rtt: 30, downRate: 0 }), 20000);
+  assert.equal(s._requestTimeout(undefined, CHUNK), 20000);
+  assert.equal(s._requestTimeout({ rtt: 30, downRate: 0 }, CHUNK), 20000);
+  // 多文件以后片大小按槽位取；槽位已经摘掉时 _expireStale 拿不到它，同样退回 20 秒而不是算出 NaN
+  assert.equal(s._requestTimeout({ rtt: 30, downRate: 20e6, inflight: new Set([1]) }, undefined), 20000);
 });
 
 test('快链路上超时收紧，丢一条请求不用干等 20 秒', async () => {
   const { Swarm } = await import('../src/renderer/lib/swarm.js');
   const s = new Swarm({ peerId: 'me', name: 'me' });
-  s.manifest = manifest();
-  const t = s._requestTimeout({ rtt: 30, downRate: 20e6, inflight: new Set([1]) });
+  const t = s._requestTimeout({ rtt: 30, downRate: 20e6, inflight: new Set([1]) }, CHUNK);
   assert.ok(t < 20000, `快链路上还是 ${t}ms`);
   assert.ok(t >= 6000, '也不能收得太狠，抖动一下就误判成超时');
 });
@@ -245,7 +391,6 @@ test('快链路上超时收紧，丢一条请求不用干等 20 秒', async () =
 test('慢链路上超时永远不低于自己算出的期望送达时间', async () => {
   const { Swarm } = await import('../src/renderer/lib/swarm.js');
   const s = new Swarm({ peerId: 'me', name: 'me' });
-  s.manifest = manifest();
   // 200 KB/s、欠 4 片：光把队尾那片传完就要 40 秒出头。
   // 原来这里被 Math.min(20000, …) 一刀切在 20 秒 —— 那片必然在能到达之前
   // 就被判超时，无限重派、永远收不齐。
@@ -253,7 +398,7 @@ test('慢链路上超时永远不低于自己算出的期望送达时间', async
   const rate = 200e3;
   const queued = 4;
   const expected = rtt + ((queued * CHUNK) / rate) * 1000;
-  const t = s._requestTimeout({ rtt, downRate: rate, inflight: new Set([1, 2, 3, 4]) });
+  const t = s._requestTimeout({ rtt, downRate: rate, inflight: new Set([1, 2, 3, 4]) }, CHUNK);
   assert.ok(t > expected, `期望送达 ${Math.round(expected)}ms，超时却只给了 ${t}ms`);
   assert.ok(t >= 20000, '不该比原来的固定上限还短');
 });
@@ -261,26 +406,23 @@ test('慢链路上超时永远不低于自己算出的期望送达时间', async
 test('窗口放深之后，深窗口的超时跟着放宽而不是被一刀切', async () => {
   const { Swarm } = await import('../src/renderer/lib/swarm.js');
   const s = new Swarm({ peerId: 'me', name: 'me' });
-  s.manifest = manifest();
   const slow = { rtt: 150, downRate: 500e3 };
-  const shallow = s._requestTimeout({ ...slow, inflight: new Set([1, 2]) });
-  const deep = s._requestTimeout({ ...slow, inflight: new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]) });
+  const shallow = s._requestTimeout({ ...slow, inflight: new Set([1, 2]) }, CHUNK);
+  const deep = s._requestTimeout({ ...slow, inflight: new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]) }, CHUNK);
   assert.ok(deep > shallow, `欠 12 片 (${deep}ms) 不该和欠 2 片 (${shallow}ms) 一样早超时`);
 });
 
 test('欠得越多，允许等的时间越长 —— 排队是正常的，不是超时', async () => {
   const { Swarm } = await import('../src/renderer/lib/swarm.js');
   const s = new Swarm({ peerId: 'me', name: 'me' });
-  s.manifest = manifest();
   // 挑一条会真的算出中间值的链路：快链路上两者都会撞到 6 秒下限，看不出差别。
-  const one = s._requestTimeout({ rtt: 100, downRate: 2e6, inflight: new Set([1]) });
-  const many = s._requestTimeout({ rtt: 100, downRate: 2e6, inflight: new Set([1, 2, 3]) });
+  const one = s._requestTimeout({ rtt: 100, downRate: 2e6, inflight: new Set([1]) }, CHUNK);
+  const many = s._requestTimeout({ rtt: 100, downRate: 2e6, inflight: new Set([1, 2, 3]) }, CHUNK);
   assert.ok(many > one, `欠 3 片 (${many}ms) 反而比欠 1 片 (${one}ms) 更早判超时`);
 });
 
 test('再快的链路也留 6 秒下限 —— 抢跑重派会把已经在路上的分片整片作废', async () => {
   const { Swarm } = await import('../src/renderer/lib/swarm.js');
   const s = new Swarm({ peerId: 'me', name: 'me' });
-  s.manifest = manifest();
-  assert.equal(s._requestTimeout({ rtt: 1, downRate: 200e6, inflight: new Set([1]) }), 6000);
+  assert.equal(s._requestTimeout({ rtt: 1, downRate: 200e6, inflight: new Set([1]) }, CHUNK), 6000);
 });

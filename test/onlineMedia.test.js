@@ -70,7 +70,9 @@ test('Android 观众端识别房主的视频链接消息并交给原生播放器
     path.join(root, 'android/app/src/main/java/com/syncwatch/app/SyncPlayer.kt'),
     'utf8'
   );
-  assert.match(app, /MSG\.MEDIA_LINK/);
+  // 0.7 起链接项跟着播放列表走，房主解析好的地址经 NOW_LINK 发过来（手机自己解析不了网页）
+  assert.match(app, /MSG\.NOW_LINK/);
+  assert.match(app, /MSG\.PLAYLIST/);
   assert.match(app, /window\.swPlayer\.loadUrl/);
   assert.match(bridge, /fun playerLoadUrl/);
   assert.match(bridge, /requirePublicHttpUrl/);

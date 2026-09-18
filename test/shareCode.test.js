@@ -23,7 +23,10 @@ test('NR3 信令房间码紧凑且可往返', async () => {
   const code = await encodeCode(payload);
   const decoded = await decodeCode(code);
   assert.match(code, /^NR3-[RG]/);
+  // 0.7 在紧凑数组末尾多了一个协议版本号，只多两三个字节，原来的上限不用放宽。
   assert.ok(code.length < 160, `房间码仍然过长：${code.length}`);
+  const { PROTOCOL_VERSION } = await import('../src/renderer/lib/protocol.js');
+  assert.equal(PROTOCOL_VERSION, 2);
   assert.deepEqual(decoded, {
     k: 'room',
     url: payload.url,
@@ -31,7 +34,19 @@ test('NR3 信令房间码紧凑且可往返', async () => {
     from: payload.from,
     maxMembers: 6,
     securityMode: 'trusted',
+    // 粘贴码的那一刻就要能说清楚「对方是旧版」，所以版本号必须随码往返
+    protocolVersion: 2,
   });
+
+  // 版本号就在紧凑数组的最后一位：0.6 的解码只按下标取前几项，追加在末尾它才不会读错。
+  const body = code.slice('NR3-'.length + 1).replace(/-/g, '+').replace(/[._]/g, '/');
+  const bytes = Buffer.from(body, 'base64');
+  const compact = JSON.parse((code[4] === 'G' ? zlib.gunzipSync(bytes) : bytes).toString('utf8'));
+  assert.deepEqual(compact, ['r', payload.url, payload.room, payload.from, 6, 't', PROTOCOL_VERSION]);
+
+  // 0.6 发出的 NR3 房间码没有这一位，只能当成 1 版 —— 不能因为缺省就认成同版本。
+  const legacy = `NR3-R${Buffer.from(JSON.stringify(compact.slice(0, 6))).toString('base64url')}`;
+  assert.equal((await decodeCode(legacy)).protocolVersion, 1);
 });
 
 test('NR3 零服务器邀请码保留完整 SDP，且兼容 NR2 / SW2 / SW1', async () => {

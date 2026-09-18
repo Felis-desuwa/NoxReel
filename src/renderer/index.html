@@ -51,7 +51,7 @@
             <div class="card drop" id="dropzone">
               <div class="card-icon">＋</div>
               <h3>发起放映</h3>
-              <p>把 MP4 或 MKV 拖到这里，或者点击选择</p>
+              <p>把 MP4 或 MKV 拖到这里，或者点击选择（可多选）</p>
               <p class="fine">不限文件大小 · 只支持你自己合法拥有的内容</p>
             </div>
 
@@ -87,7 +87,7 @@
       <section id="view-prepare" class="view">
         <div class="prepare">
           <h2 id="prep-title">正在准备文件</h2>
-          <div class="file-line" id="prep-file"></div>
+          <div class="file-line" id="prep-file" data-i18n-skip></div>
           <div class="steps" id="prep-steps"></div>
           <div class="bar"><div class="bar-fill" id="prep-bar"></div></div>
           <div class="prep-note" id="prep-note"></div>
@@ -95,73 +95,124 @@
         </div>
       </section>
 
-      <!-- 房间 -->
+      <!-- 房间：左边是正在播放和页签，右边是播放列表和聊天。整页固定高度，各块自己滚动。 -->
       <section id="view-room" class="view">
         <div class="room">
           <div class="room-main">
-            <div class="film">
-              <div class="film-name">
-                <span id="room-file"></span>
-                <span class="role-badge" id="my-role"></span>
+            <!-- 正在播放 -->
+            <div class="now-card">
+              <div class="now-head">
+                <div class="film">
+                  <div class="film-name">
+                    <span id="room-file" data-i18n-skip></span>
+                    <span class="role-badge" id="my-role"></span>
+                  </div>
+                  <div class="film-meta" id="room-meta"></div>
+                </div>
+                <button class="ghost danger" id="btn-leave">离开房间</button>
               </div>
-              <div class="film-meta" id="room-meta"></div>
               <div class="role-hint hidden" id="role-hint"></div>
+
+              <div class="status-row">
+                <div class="status-banner" id="status-banner"></div>
+                <div class="status-actions">
+                  <button class="ghost hidden" id="btn-reopen">重新打开播放器</button>
+                  <button class="ghost hidden" id="btn-rescan">重新扫描</button>
+                  <button class="ghost hidden" id="btn-cancel-scan">停止扫描</button>
+                  <button class="ghost hidden" id="btn-allow-link">允许打开</button>
+                  <button class="ghost hidden" id="btn-skip-link">这一部我先跳过</button>
+                  <button class="ghost hidden" id="btn-skip-current">跳过这一部</button>
+                </div>
+              </div>
+
+              <!-- 这一部还没开播时：谁还没准备好 -->
+              <div class="ready-row hidden" id="ready-row">
+                <div class="ready-text" id="ready-text"></div>
+                <button class="ghost tiny hidden" id="btn-force-start">仍然开始</button>
+              </div>
+
+              <!-- 核心可视化：连续水位线 vs 播放头 -->
+              <div class="buffer-block">
+                <div class="buffer-legend">
+                  <span><i class="sw-play"></i>播放位置</span>
+                  <span><i class="sw-safe"></i>可连续播放</span>
+                  <span><i class="sw-have"></i>已接收（含空洞）</span>
+                </div>
+                <div class="buffer" id="buffer">
+                  <div class="buf-have" id="buf-have"></div>
+                  <div class="buf-safe" id="buf-safe"></div>
+                  <div class="buf-head" id="buf-head"></div>
+                  <canvas class="buf-map" id="buf-map"></canvas>
+                </div>
+                <div class="buffer-stats" id="buffer-stats"></div>
+                <div class="buffer-verdict hidden" id="buf-verdict"></div>
+              </div>
             </div>
 
-            <!-- 核心可视化：连续水位线 vs 播放头 -->
-            <div class="buffer-block">
-              <div class="buffer-legend">
-                <span><i class="sw-play"></i>播放位置</span>
-                <span><i class="sw-safe"></i>可连续播放</span>
-                <span><i class="sw-have"></i>已接收（含空洞）</span>
-              </div>
-              <div class="buffer" id="buffer">
-                <div class="buf-have" id="buf-have"></div>
-                <div class="buf-safe" id="buf-safe"></div>
-                <div class="buf-head" id="buf-head"></div>
-                <canvas class="buf-map" id="buf-map"></canvas>
-              </div>
-              <div class="buffer-stats" id="buffer-stats"></div>
-              <div class="buffer-verdict hidden" id="buf-verdict"></div>
-            </div>
-
-            <div class="status-banner" id="status-banner"></div>
-
+            <!-- 控制条 -->
             <div class="controls">
               <button class="primary big" id="btn-playpause" disabled>播放</button>
               <div class="time" id="time-display">0:00 / 0:00</div>
-              <button class="ghost hidden" id="btn-reopen">重新打开播放器</button>
+              <div class="controls-spacer"></div>
+              <div class="controls-slot" id="player-slot"></div>
+              <button class="ghost tiny hidden" id="btn-switch-player"></button>
+              <div class="controls-slot" id="danmaku-slot"></div>
               <button class="ghost" id="btn-reveal">打开源文件位置</button>
             </div>
 
-            <div class="log" id="event-log"></div>
+            <!-- 页签：成员 / 邀请（仅房主）/ 传输 / 日志 -->
+            <div class="room-tabs" role="tablist">
+              <button class="room-tab on" id="tab-peers" data-tab="peers" role="tab" aria-selected="true">
+                成员 <span class="count" id="peer-count">0</span><i class="tab-dot hidden" id="peers-dot"></i>
+              </button>
+              <button class="room-tab hidden" id="tab-invite" data-tab="invite" role="tab" aria-selected="false">邀请</button>
+              <button class="room-tab" id="tab-transfer" data-tab="transfer" role="tab" aria-selected="false">传输</button>
+              <button class="room-tab" id="tab-log" data-tab="log" role="tab" aria-selected="false">日志</button>
+            </div>
+            <div class="tab-panels">
+              <div class="tab-panel on" id="panel-peers" role="tabpanel">
+                <div id="peer-list" class="peer-list"></div>
+              </div>
+              <div class="tab-panel" id="panel-invite" role="tabpanel">
+                <div id="invite-body"></div>
+              </div>
+              <div class="tab-panel" id="panel-transfer" role="tabpanel">
+                <div class="kv" id="transfer-stats"></div>
+              </div>
+              <div class="tab-panel" id="panel-log" role="tabpanel">
+                <div class="log" id="event-log"></div>
+              </div>
+            </div>
           </div>
 
           <aside class="room-side">
-            <div class="side-block">
-              <h4>成员 <span class="count" id="peer-count">0</span></h4>
-              <div id="peer-list" class="peer-list"></div>
-            </div>
+            <section class="side-panel playlist-panel" id="playlist-panel">
+              <header class="panel-head">
+                <h4>播放列表 <span class="count" id="playlist-count"></span></h4>
+                <div class="panel-actions">
+                  <label class="pl-autoplay" title="放完一部接着放下一部，等所有人准备好再开始">
+                    <input type="checkbox" id="pl-autoplay" /> 自动连播
+                  </label>
+                  <span class="panel-edit hidden" id="playlist-actions">
+                    <button class="ghost tiny" id="btn-add-file">+ 本地视频</button>
+                    <button class="ghost tiny" id="btn-add-link">+ 链接</button>
+                  </span>
+                </div>
+              </header>
+              <div class="add-link-row hidden" id="add-link-row">
+                <input id="room-video-link" type="url" placeholder="https://…" spellcheck="false" />
+                <button class="ghost tiny" id="btn-add-link-go">加入列表</button>
+              </div>
+              <div class="playlist-body" id="playlist-body"></div>
+            </section>
 
-            <div class="side-block" id="invite-block">
-              <h4>邀请</h4>
-              <div id="invite-body"></div>
-            </div>
-
-            <div class="side-block hidden" id="media-switch-block">
-              <h4>增加 / 切换视频</h4>
-              <button class="ghost" id="btn-switch-file">选择本地视频</button>
-              <input id="room-video-link" type="url" placeholder="https://…" spellcheck="false" />
-              <button class="ghost" id="btn-switch-link">切换到视频链接</button>
-              <p class="fine">成员保持连接，房主换片后会自动同步到全房。</p>
-            </div>
-
-            <div class="side-block">
-              <h4>传输</h4>
-              <div class="kv" id="transfer-stats"></div>
-            </div>
-
-            <button class="ghost danger" id="btn-leave">离开房间</button>
+            <section class="side-panel chat-panel" id="chat-panel">
+              <header class="panel-head">
+                <h4>聊天</h4>
+              </header>
+              <div class="chat-body" id="chat-body"></div>
+              <div class="chat-foot" id="chat-foot"></div>
+            </section>
           </aside>
         </div>
       </section>

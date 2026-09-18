@@ -77,19 +77,40 @@ class NativeBridge(
         store.close(sessionId)
     }
 
+    /**
+     * 接收缓存所在分区还能用多少字节。
+     *
+     * 0.7 起手机端最多同时开两个接收会话（当前项和下一项），要不要开第二个由 JS 侧
+     * 做空间预算决定 —— 预算得有个数可算，就是这里。数字可能远超 2^31，按字符串返回
+     * （与 [contiguousBytes] 同一约定），JS 侧 `Number()` 一下即可。
+     *
+     * 查不到时返回 "0"：这时 JS **不应该**拦，让真正的写入错误说话（和 openLeech 的
+     * 空间检查同一判据，两边都读 [Store.usableSpace]）。
+     */
+    @JavascriptInterface
+    fun usableSpace(): String = store.usableSpace().toString()
+
     /* ------------------------------ 播放器 ------------------------------ */
 
-    /** 让 ExoPlayer 加载某个接收会话的文件，开始边下边播。 */
+    /**
+     * 让 ExoPlayer 加载某个接收会话的文件，开始边下边播。
+     *
+     * @return 这次换片的快照代号（见 [SyncPlayer]），**0 表示失败**（会话不存在）。
+     * 代号从 1 开始递增，所以 JS 侧原来的 `if (!Native.playerLoad(id))` 判真假照样成立；
+     * 接上代号过滤后改成记下这个数，再拿它和快照里的 `generation` 比对。
+     */
     @JavascriptInterface
-    fun playerLoad(sessionId: String): Boolean {
-        val s = store.get(sessionId) ?: return false
-        player.load(s)
-        return true
+    fun playerLoad(sessionId: String): Int {
+        val s = store.get(sessionId) ?: return 0
+        return player.load(s)
     }
 
-    /** 加载由房主桌面端解析出的临时 HTTP(S) 播放地址。 */
+    /**
+     * 加载由房主桌面端解析出的临时 HTTP(S) 播放地址。
+     * @return 快照代号，0 表示地址或请求头没通过校验。
+     */
     @JavascriptInterface
-    fun playerLoadUrl(rawUrl: String, headersJson: String): Boolean {
+    fun playerLoadUrl(rawUrl: String, headersJson: String): Int {
         return try {
             val url = requirePublicHttpUrl(rawUrl)
             val headersObject = JSONObject(headersJson.ifBlank { "{}" })
@@ -103,10 +124,9 @@ class NativeBridge(
                 headers[name] = value
             }
             player.loadRemote(url, headers)
-            true
         } catch (e: Exception) {
             Log.e(TAG, "playerLoadUrl 失败", e)
-            false
+            0
         }
     }
 
@@ -116,12 +136,17 @@ class NativeBridge(
     @JavascriptInterface
     fun playerSeek(seconds: Double) = player.seek(seconds)
 
-    /** @return 播放快照 JSON：{position, duration, paused, idle, eof}（秒） */
+    /**
+     * @return 播放快照 JSON：{generation, position, duration, paused, idle, eof}（位置单位秒）。
+     * `generation` 是这组读数属于哪个播放器：和最后一次 playerLoad/playerLoadUrl/playerRelease
+     * 返回的数对不上，说明换片还没落到主线程，这条快照是上一部片的，整条丢弃。
+     */
     @JavascriptInterface
     fun playerSnapshot(): String = player.snapshotJson()
 
+    /** @return 这次释放的快照代号；释放完成前的快照仍带旧代号。 */
     @JavascriptInterface
-    fun playerRelease() = player.release()
+    fun playerRelease(): Int = player.release()
 
     /* ------------------------------ 杂项 ------------------------------ */
 

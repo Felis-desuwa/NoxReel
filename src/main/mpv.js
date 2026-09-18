@@ -12,6 +12,7 @@
 
 const { spawn } = require('child_process');
 const net = require('net');
+const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { EventEmitter } = require('events');
@@ -22,6 +23,126 @@ const { findYtDlp } = require('./linkMedia');
 // 我们关心的属性。stream-pos 是字节位置 —— 这个比 time-pos 更适合跟连续水位线比，
 // 因为不用靠码率去猜时间和字节的换算。
 const OBSERVED = ['time-pos', 'pause', 'duration', 'stream-pos', 'core-idle', 'eof-reached', 'seeking'];
+
+// 覆盖层的虚拟画布。字号按它定，窗口化和全屏下横幅大小才一致。
+const OVERLAY_RES_X = 1280;
+const OVERLAY_RES_Y = 720;
+
+/** 房间状态横幅固定占这一层，不让调用方随便分配 id。 */
+const OVERLAY_ROOM = 1;
+
+/**
+ * 弹幕固定占这一层。和横幅分层是必须的：横幅几分钟才换一次文本，弹幕每秒重画 30 次，
+ * 挤在同一层上，横幅会被每一帧弹幕覆盖掉。
+ */
+const OVERLAY_DANMAKU = 2;
+
+/** 一帧最多画几条。同时飞 60 条已经糊成一片，再多只是白烧 CPU 和带宽。 */
+const MAX_DANMAKU_ITEMS = 60;
+
+/**
+ * 单条弹幕的字数上限，和 lib/chat.js 的 MAX_TEXT 是同一个数（有测试钉住）。
+ * 播放器里发回来的文本也按它截断 —— 脚本是我们自己的，但截断这一刀由主进程落。
+ */
+const MAX_DANMAKU_TEXT = 200;
+
+/**
+ * 坐标的兜底范围。长弹幕刚出场时 x 是很大的正数、快走完时是很大的负数
+ * （整条还在屏幕左边外面），所以这不是屏幕尺寸，只是挡住畸形值的护栏。
+ */
+const MAX_OVERLAY_COORD = 100_000;
+
+/** 覆盖层虚拟画布的允许范围，两边都是像素。 */
+const MIN_OVERLAY_SIZE = 16;
+const MAX_OVERLAY_SIZE = 16_384;
+
+/** 播放器内发弹幕的 Lua 脚本文件名，以及它回传消息时用的 script-message 名字。 */
+const CHAT_SCRIPT_FILE = 'noxreel-chat.lua';
+const CHAT_MESSAGE_NAME = 'noxreel-chat';
+
+/**
+ * 覆盖层文本的清洗。这一步不是排版，是防注入。
+ *
+ * 横幅里会拼进别人的昵称，而 ASS 把花括号当样式覆盖块、把反斜杠当转义引导符。
+ * 不清掉的话，对方把昵称改成一个覆盖块就能把横幅挪走甚至整条隐形 ——
+ * 等于用昵称关掉别人的状态提示。
+ *
+ * 选择「丢掉」而不是「转义」：ASS 没有通用的字面反斜杠写法，丢掉是唯一守得住的。
+ * 昵称里带花括号的情况极少，丢掉不会有人受影响。换行由我们在清洗之后自己插入，
+ * 所以 ASS 的换行标记只可能来自我们。
+ *
+ * 用码点判断而不是正则字符类：反斜杠字面量经过多层工具极易被多转义一层，
+ * 这里一个反斜杠都不写，就没有这个风险。92=反斜杠，123/125=花括号。
+ */
+const ASS_DROP = new Set([92, 123, 125]);
+
+function escapeAss(text) {
+  let out = '';
+  for (const ch of String(text)) {
+    const code = ch.codePointAt(0);
+    if (code < 0x20 || code === 0x7f) {
+      out += ' ';
+      continue;
+    }
+    if (ASS_DROP.has(code)) continue;
+    out += ch;
+  }
+  return out;
+}
+
+function buildAssEvent(text) {
+  const lines = String(text == null ? '' : text).split('\n').map(escapeAss);
+  // an8=顶部居中，避开底部的 OSC 控制条；描边跟 --osd-outline-color 保持一致
+  return `{\\an8}{\\fs34}{\\bord2}{\\shad0}{\\1c&HFFFFFF&}{\\3c&H000000&}${lines.join('\\N')}`;
+}
+
+/** 按码点截断：按 .length 截会把 emoji 劈成半个代理对，拼进 ASS 就是个乱码方块。 */
+function sliceCodePoints(text, max) {
+  const chars = Array.from(String(text == null ? '' : text));
+  return chars.length <= max ? chars.join('') : chars.slice(0, max).join('');
+}
+
+function clampNumber(value, lo, hi, fallback) {
+  const n = typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+  return n < lo ? lo : n > hi ? hi : n;
+}
+
+/** 不透明度（0–1）换成 ASS 的 alpha 字节。ASS 里反着来：00 是完全不透明，FF 是全透明。 */
+function assAlpha(opacity) {
+  const clamped = clampNumber(opacity, 0, 1, 1);
+  return Math.round((1 - clamped) * 255).toString(16).toUpperCase().padStart(2, '0');
+}
+
+/**
+ * 把一帧弹幕拼成一条 osd-overlay 的数据。
+ *
+ * mpv 把 data 按换行拆成多条 ASS 事件，所以每条弹幕占一行、各自带 \pos。
+ * 为什么必须逐帧重拼、而不是用 \move 让 mpv 自己动：覆盖层的渲染时间恒为 0
+ * （sub/osd_libass.c），按时间插值的标签在这一层上一动不动。
+ *
+ * 正文先过 escapeAss：花括号和反斜杠被丢掉、控制字符换成空格。于是别人的弹幕
+ * 既拼不出样式覆盖块（能把整屏弹幕挪走或者变透明），也拼不出第二条事件 ——
+ * 换行是事件之间的分隔符，只可能由我们插入。
+ */
+function buildDanmakuAss(items) {
+  const lines = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item !== 'object') continue;
+    const text = escapeAss(sliceCodePoints(item.text, MAX_DANMAKU_TEXT));
+    if (!text.trim()) continue;
+    const x = Math.round(clampNumber(item.x, -MAX_OVERLAY_COORD, MAX_OVERLAY_COORD, 0));
+    const y = Math.round(clampNumber(item.y, -MAX_OVERLAY_COORD, MAX_OVERLAY_COORD, 0));
+    const fontSize = Math.round(clampNumber(item.fontSize, 8, 200, 28));
+    // 自己发的那条描边更粗、换成品牌色，一屏几十条里一眼能认出哪句是自己说的
+    const mine = item.outline === true;
+    lines.push(
+      `{\\an7}{\\pos(${x},${y})}{\\fs${fontSize}}{\\bord${mine ? '2.4' : '1.2'}}{\\shad0}` +
+        `{\\1c&HFFFFFF&}{\\3c&H${mine ? 'FF8D4C' : '000000'}&}{\\alpha&H${assAlpha(item.opacity)}&}${text}`
+    );
+    if (lines.length >= MAX_DANMAKU_ITEMS) break;
+  }
+  return lines.join('\n');
+}
 
 // mpv 特有的安装位置。'MPV Player' 是 winget 上 shinchiro.mpv（最主流的包）的落点，
 // 它既不进 PATH 也不叫 'mpv'，光靠通用规则找不到。
@@ -38,7 +159,17 @@ const MPV_CANDIDATES = [
   path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'mpv', 'mpv.exe'),
 ];
 
-function buildLaunchArgs({ ipcPath, source, startPaused = true, ytDlp = null, headers = {} } = {}) {
+function buildLaunchArgs({
+  ipcPath,
+  source,
+  startPaused = true,
+  startAt = 0,
+  muted = false,
+  ytDlp = null,
+  headers = {},
+  chatScript = null,
+  chatPrompt = '',
+} = {}) {
   const isRemote = /^https?:\/\//i.test(source);
   return [
     '--no-config',
@@ -85,6 +216,10 @@ function buildLaunchArgs({ ipcPath, source, startPaused = true, ytDlp = null, he
     '--autofit=960x540',
     '--autofit-larger=92%x88%',
     `--pause=${startPaused ? 'yes' : 'no'}`,
+    // 换播放器、重开播放器时直接从房间当前位置起，省得先从片头解码一段再跳
+    ...(startAt > 0 ? [`--start=${Number(startAt).toFixed(3)}`] : []),
+    // 只有开发期的自动化测试会要静音
+    ...(muted ? ['--mute=yes'] : []),
     '--title=NoxReel · ${media-title}',
     ...(process.platform === 'win32'
       ? ['--border=no', '--window-corners=round', '--backdrop-type=mica']
@@ -95,9 +230,38 @@ function buildLaunchArgs({ ipcPath, source, startPaused = true, ytDlp = null, he
     ...(isRemote
       ? Object.entries(headers).map(([name, value]) => `--http-header-fields-append=${name}: ${value}`)
       : []),
+    // 播放器内发弹幕的脚本。只许这一条，而且必须是绝对路径：--load-scripts=no 仍然在，
+    // 用户配置目录里的脚本一个都不会被加载，能进来的只有我们自己这一个文件。
+    ...(chatScript && path.isAbsolute(chatScript)
+      ? [`--script=${chatScript}`, ...(chatPrompt ? [`--script-opt=noxreel_chat-prompt=${chatPrompt}`] : [])]
+      : []),
     '--',
     source,
   ];
+}
+
+/**
+ * 播放器内发弹幕的 Lua 脚本在哪。打包时它单独放在 resources/mpv-scripts 下 ——
+ * 塞进 asar 里 mpv 根本读不到，asar 只有 Electron 自己认。
+ *
+ * 和 media.js 的 toolCandidates 一样把参数摊开，才测得到打包后的那条分支：
+ * 开发机上 process.resourcesPath 是 undefined，直接断言只能测到一半。
+ */
+function chatScriptCandidates({ resourcesPath = process.resourcesPath, dirname = __dirname } = {}) {
+  return [
+    ...(resourcesPath ? [path.join(resourcesPath, 'mpv-scripts', CHAT_SCRIPT_FILE)] : []),
+    path.join(dirname, '..', '..', 'resources', 'mpv-scripts', CHAT_SCRIPT_FILE),
+  ];
+}
+
+/** 找不到就返回 null：脚本缺了只是播放器里发不了弹幕，房间窗口里的输入框照常能用。 */
+function findChatScript(opts) {
+  for (const candidate of chatScriptCandidates(opts)) {
+    try {
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch {}
+  }
+  return null;
 }
 
 /** 返回 mpv 可执行文件路径，找不到返回 null。 */
@@ -118,6 +282,13 @@ class MpvController extends EventEmitter {
     this.buf = '';
     this.props = Object.create(null);
     this.running = false;
+    // 每个覆盖层上一次发过去的文本，用来去重，见 setOverlay
+    this._overlays = new Map();
+    // 弹幕层的状态。弹幕帧不进 _overlays 那张去重表：那张表按「文本没变就不发」去重，
+    // 而弹幕每帧的坐标都不一样，进去只会白占内存，还会把横幅的去重搅乱。
+    this._danmaku = { inFlight: false, visible: false };
+    // pause/seek 在途的条数。这两条是用户等着看结果的命令，不能让 30Hz 的弹幕帧排在前面。
+    this._cmdHold = 0;
   }
 
   _ipcPath() {
@@ -135,7 +306,7 @@ class MpvController extends EventEmitter {
    *  --cache=yes        让 mpv 自己也缓冲一层
    *  --pause=yes        先暂停，等同步引擎决定什么时候放
    */
-  async launch(filePath, { startPaused = true, headers = {} } = {}) {
+  async launch(filePath, { startPaused = true, startAt = 0, muted = false, headers = {}, chatPrompt = '' } = {}) {
     if (this.running) await this.quit();
 
     const bin = findMpv();
@@ -148,10 +319,24 @@ class MpvController extends EventEmitter {
     const ipcPath = this._ipcPath();
     const isRemote = /^https?:\/\//i.test(filePath);
     const ytDlp = isRemote ? findYtDlp() : null;
-    const args = buildLaunchArgs({ ipcPath, source: filePath, startPaused, ytDlp, headers });
+    const args = buildLaunchArgs({
+      ipcPath,
+      source: filePath,
+      startPaused,
+      startAt,
+      muted,
+      ytDlp,
+      headers,
+      chatScript: findChatScript(),
+      chatPrompt,
+    });
 
     this.proc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: false });
     this.running = true;
+    // 新进程身上没有任何覆盖层，缓存必须跟着清零，否则重开播放器后
+    // setOverlay 会以为「文本没变」而不再发送，横幅再也不出现。
+    this.forgetOverlays();
+    this._resetDanmaku();
 
     let stderr = '';
     this.proc.stderr.on('data', (d) => {
@@ -160,6 +345,8 @@ class MpvController extends EventEmitter {
     });
     this.proc.on('exit', (code) => {
       this.running = false;
+      this.forgetOverlays();
+      this._resetDanmaku();
       this._failAllPending(new Error('mpv 已退出'));
       this.emit('exit', { code, stderr: stderr.slice(-1000) });
     });
@@ -251,6 +438,18 @@ class MpvController extends EventEmitter {
       return;
     }
 
+    // 播放器里按快捷键发的弹幕。脚本是我们自己的，但文本仍按聊天上限截断了才往外转：
+    // 这一刀落在主进程，渲染进程那边的清洗是第二道，不是唯一一道。
+    if (
+      msg.event === 'client-message' &&
+      Array.isArray(msg.args) &&
+      msg.args[0] === CHAT_MESSAGE_NAME &&
+      typeof msg.args[1] === 'string'
+    ) {
+      const text = sliceCodePoints(msg.args[1], MAX_DANMAKU_TEXT);
+      if (text) this.emit('chat-input', { text });
+    }
+
     if (msg.event) this.emit('mpv-event', msg);
   }
 
@@ -294,21 +493,132 @@ class MpvController extends EventEmitter {
     });
   }
 
+  /**
+   * 命令在途期间挂起弹幕帧。返回的仍是原来那个 promise，调用方照常能收到失败。
+   *
+   * 为什么要挂：暂停和跳转是用户等着看结果的，而弹幕每秒 30 帧 —— 排在它们前面的
+   * 每一帧都是实打实的延迟。丢几帧弹幕没人看得出来，晚半秒暂停是所有人都看得出来的。
+   */
+  _hold(promise) {
+    this._cmdHold++;
+    const done = () => {
+      this._cmdHold--;
+    };
+    promise.then(done, done);
+    return promise;
+  }
+
   setPause(paused) {
-    return this.command(['set_property', 'pause', !!paused]);
+    return this._hold(this.command(['set_property', 'pause', !!paused]));
   }
 
   seek(seconds) {
-    return this.command(['seek', seconds, 'absolute', 'exact']);
+    return this._hold(this.command(['seek', seconds, 'absolute', 'exact']));
   }
 
   getProperty(name) {
     return this.command(['get_property', name]);
   }
 
-  /** 在 mpv 画面上打一行字，用来告诉用户「在等谁」。 */
+  /** 在 mpv 画面上打一行字，用来告诉用户「在等谁」。转瞬即逝，用于对某个动作的即时回应。 */
   osd(text, durationMs = 2000) {
     return this.command(['show-text', text, durationMs]).catch(() => {});
+  }
+
+  /**
+   * 常驻覆盖层。和 show-text 是两条独立通道 —— 这一点正是选它的理由：
+   * 进度条（--osd-on-seek=msg-bar）、音量提示、以及我们自己那些一次性提示全都走
+   * show-text，用一条要挂好几分钟的横幅去挤那个槽位，用户一调音量横幅就没了。
+   *
+   * 全员暂停时房间信息只能靠这条路送到用户眼前：mpv 是独立窗口，全屏之后
+   * Electron 那边的横幅、成员列表、日志他一个都看不见。
+   */
+  setOverlay(id, text) {
+    const next = String(text || '');
+    // renderStatus 每个 tick 都会调一次，文本没变就别发 —— 否则高负载下
+    // 这条 socket 上每秒十几个命令，会和 pause/seek 抢队列。
+    if (this._overlays.get(id) === next) return Promise.resolve();
+    this._overlays.set(id, next);
+    if (!next) return this.command(['osd-overlay', id, 'none', '']).catch(() => {});
+    return this.command([
+      'osd-overlay',
+      id,
+      'ass-events',
+      buildAssEvent(next),
+      OVERLAY_RES_X,
+      OVERLAY_RES_Y,
+      0,
+    ]).catch(() => {});
+  }
+
+  /** 新起的 mpv 身上没有任何覆盖层，缓存必须跟着清，否则重开播放器后横幅再也不会重发。 */
+  forgetOverlays() {
+    this._overlays.clear();
+  }
+
+  /**
+   * 画一帧弹幕。返回 true 表示真发出去了，false 表示这一帧被丢掉。
+   *
+   * 三道闸，一律「宁可丢帧也不排队」：同一时间只有一帧在途；pause/seek 在途时不发；
+   * 没连上播放器时不发。弹幕是此刻的画面，攒一帧到几百毫秒后再画没有任何意义，
+   * 反而会把这条 socket 上的控制命令挤到后面去。
+   */
+  setDanmakuFrame(frame) {
+    const data = buildDanmakuAss(frame && frame.items);
+    // 这一帧一条都没有：把上一帧留在画面上的字清掉
+    if (!data) return this.clearDanmaku();
+    if (!this.sock || this.sock.destroyed) return false;
+    if (this._danmaku.inFlight || this._cmdHold > 0) return false;
+    const width = Math.round(clampNumber(frame.w, MIN_OVERLAY_SIZE, MAX_OVERLAY_SIZE, OVERLAY_RES_X));
+    const height = Math.round(clampNumber(frame.h, MIN_OVERLAY_SIZE, MAX_OVERLAY_SIZE, OVERLAY_RES_Y));
+    this._danmaku.visible = true;
+    this._danmaku.inFlight = true;
+    const done = () => {
+      this._danmaku.inFlight = false;
+    };
+    this.command(['osd-overlay', OVERLAY_DANMAKU, 'ass-events', data, width, height, 0]).then(done, done);
+    return true;
+  }
+
+  /**
+   * 清掉弹幕层。这一条不受「同一时间只有一帧在途」约束 —— 它是状态变化，不是画面刷新：
+   * 用户刚关掉弹幕，正好撞上一帧在途就被丢掉的话，最后那一屏字会一直挂在画面上。
+   * socket 上的写入是有序的，所以它一定排在那一帧之后被 mpv 执行。
+   */
+  clearDanmaku() {
+    if (!this._danmaku.visible) return false;
+    this._danmaku.visible = false;
+    if (!this.sock || this.sock.destroyed) return false;
+    this.command(['osd-overlay', OVERLAY_DANMAKU, 'none', '']).catch(() => {});
+    return true;
+  }
+
+  /** 新进程身上没有任何覆盖层，弹幕层这边的状态也要跟着清零。 */
+  _resetDanmaku() {
+    this._danmaku.inFlight = false;
+    this._danmaku.visible = false;
+    this._cmdHold = 0;
+  }
+
+  /**
+   * 等进程真正退出。quit() 只等 IPC 回包，进程落地要晚几百毫秒 ——
+   * 这期间文件句柄还开着，删缓存会失败。超时就强杀。
+   */
+  waitForExit(timeoutMs = 3000) {
+    const proc = this.proc;
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        try {
+          proc.kill();
+        } catch {}
+        resolve(false);
+      }, timeoutMs);
+      proc.once('exit', () => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
   }
 
   async quit() {
@@ -324,4 +634,24 @@ class MpvController extends EventEmitter {
   }
 }
 
-module.exports = { MpvController, findMpv, OBSERVED, buildLaunchArgs };
+module.exports = {
+  MpvController,
+  findMpv,
+  findChatScript,
+  chatScriptCandidates,
+  OBSERVED,
+  buildLaunchArgs,
+  buildAssEvent,
+  buildDanmakuAss,
+  escapeAss,
+  sliceCodePoints,
+  OVERLAY_ROOM,
+  OVERLAY_DANMAKU,
+  MAX_DANMAKU_ITEMS,
+  MAX_DANMAKU_TEXT,
+  MAX_OVERLAY_COORD,
+  MIN_OVERLAY_SIZE,
+  MAX_OVERLAY_SIZE,
+  CHAT_SCRIPT_FILE,
+  CHAT_MESSAGE_NAME,
+};

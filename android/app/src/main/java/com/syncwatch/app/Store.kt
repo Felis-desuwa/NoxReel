@@ -15,9 +15,14 @@ import kotlin.concurrent.withLock
 /**
  * 分片存储层。对应 PC 端的 fileStore.js（只保留 leech 一侧 —— 手机是纯观众）。
  *
- * 「边下边播」的支点是连续水位线 contiguousBytes：从文件头开始连续已落盘的字节数。
- * 播放器只能安全读到这里，往后是空洞。这里额外提供 [Session.awaitData]：
- * 播放器的自定义数据源读到水位线以外时会阻塞在这上面，等下载补上再往下读，
+ * 这里有两条不同的「水位线」，千万别混用：
+ * - contiguousBytes()：从**文件头**起连续已落盘的字节数，只代表**完整度**
+ *   （进度显示、完整性判断）。
+ * - [Session.awaitData] 返回的可读长度：从**当前播放位置**起连续已落盘的字节数
+ *   （与桌面端 swarm.js 的 runEndFrom() 同一算法），代表**播放器现在还能安全读多远**。
+ *   中途加入房间时 [0, P) 整段是空洞，两者相差整整一部片。
+ *
+ * 播放器的自定义数据源读到当前连续区末尾时会阻塞在 awaitData 上，等分片补上再往下读，
  * 而不是读出一堆 0 把解码器喂花。
  */
 class Store(private val context: Context) {
@@ -29,6 +34,18 @@ class Store(private val context: Context) {
     private val FILE_ID_RE = Regex("^[a-f0-9]{8,64}$")
 
     private fun mediaDir(): File = File(context.filesDir, "media").apply { mkdirs() }
+
+    /**
+     * 接收缓存所在分区的可用字节数。
+     *
+     * 两个地方读它，必须是同一个数：[openLeech] 开会话前的空间检查，和 JS 侧
+     * （`Native.usableSpace()`）决定要不要为下一项再开一个会话的空间预算。
+     * 判据分家的话，会出现「JS 觉得放得下、原生这边直接 require 失败」的自相矛盾。
+     *
+     * 查不到时返回 0（File.usableSpace 在拿不到配额时就返回 0），调用方一律把 0
+     * 解释成「不知道」而不是「没空间」—— 别拦，让真正的写入错误说话。
+     */
+    fun usableSpace(): Long = runCatching { mediaDir().usableSpace }.getOrDefault(0L)
 
     /**
      * 打开一个接收会话。清单由房主通过 DataChannel 发来，这里不自己算。
@@ -59,7 +76,7 @@ class Store(private val context: Context) {
         // 上是稀疏的，照样成功，要传到一半才写不进去 —— 所以开会话前先看剩余空间够不够。
         // 留 1% 或 256MB 余量（取大），和桌面端 ensureFreeSpace 一致。usableSpace 查不到时
         // 返回 0，这时不拦，让真正的写入错误说话。
-        val free = mediaDir().usableSpace
+        val free = usableSpace()
         val reserve = maxOf(256L * 1024 * 1024, size / 100)
         require(free <= 0L || free >= size + reserve) {
             val gb = 1024.0 * 1024 * 1024
@@ -226,7 +243,7 @@ class Store(private val context: Context) {
                     while (contiguousIndex < chunkCount && have[contiguousIndex]) contiguousIndex++
                 }
 
-                // 唤醒可能正卡在水位线外等数据的播放器数据源
+                // 唤醒可能正卡在连续区末尾等数据的播放器数据源
                 progress.signalAll()
 
                 dirtyWrites++
@@ -252,29 +269,51 @@ class Store(private val context: Context) {
         }
 
         /**
-         * 供播放器数据源调用：从 pos 起至少要读到有数据可读。
-         * 若 pos 已在水位线内立即返回可读字节数；否则阻塞等下载补齐。
-         * @return 从 pos 起连续可读的字节数；文件读完或会话关闭返回 -1。
+         * 从 pos 起连续可读的字节数；pos 所在分片还没收到就返回 0。调用方持锁。
+         *
+         * 这是「播放器从当前位置能安全读到哪」的唯一算法，与桌面端 swarm.js 的
+         * runEndFrom() 必须保持一致：看的是 **pos 所在分片开始的那一段连续已收片**，
+         * 不是从文件头起的连续水位线 contiguousBytes()。中途加入房间时播放位置 P
+         * 之前全是空洞，按水位线算会永远报 0。
+         */
+        private fun readableFrom(pos: Long): Long {
+            if (pos < 0 || pos >= size) return 0
+            val k = (pos / chunkSize).toInt()
+            if (k >= chunkCount || !have[k]) return 0
+            var i = k
+            while (i < chunkCount && have[i]) i++
+            // 末片比 chunkSize 小，按文件大小封顶，别报出文件尾以外的字节
+            return minOf(i.toLong() * chunkSize, size) - pos
+        }
+
+        /**
+         * 供播放器数据源调用：阻塞到 pos 处有数据可读为止。
+         * @return 从 pos 起连续可读的字节数；真到文件尾或会话关闭返回 -1。
+         *
+         * 三条必须守住的不变量：
+         * ① pos 所在分片还没收到时**绝不能**返回 -1 —— ExoPlayer 把 END_OF_INPUT 当作
+         *   文件到头，会直接进 ENDED（表现是中途加入的人刚进房就「放完了」）。
+         *   这里只能继续阻塞等分片补上。
+         * ② complete（全片收齐）的情形已被 readableFrom 覆盖（返回 size - pos），
+         *   不需要特判；收齐了还读不出来只可能是越界，那才返回 -1。
+         * ③ 真 EOF（pos >= size）仍然返回 -1。
          */
         fun awaitData(pos: Long, timeoutMs: Long): Long {
             lock.withLock {
                 while (true) {
                     if (closed) return -1
-                    val cont = contiguousBytes()
-                    if (pos < cont) return cont - pos
-                    if (complete) {
-                        // 全部下完，pos 若已到文件尾就是 EOF
-                        return if (pos >= size) -1 else size - pos
-                    }
-                    if (!progress.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                        // 超时也回一圈重判，交由上层决定是否继续等
-                        if (closed) return -1
-                    }
+                    if (pos < 0 || pos >= size) return -1   // 真 EOF / 越界
+                    val n = readableFrom(pos)
+                    if (n > 0) return n
+                    // 收完了还读不到 = 越界；没收完就继续等，绝不能当 EOF 返回 -1
+                    if (complete) return -1
+                    // 超时也回一圈重判，交由上层决定是否继续等
+                    progress.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
                 }
             }
         }
 
-        /** 直接读文件字节（数据源用）。调用前应确保 pos+len 在水位线内。 */
+        /** 直接读文件字节（数据源用）。调用前应确保 pos+len 落在 awaitData 报出的连续区内。 */
         fun readAt(pos: Long, buffer: ByteArray, offset: Int, len: Int): Int {
             lock.withLock {
                 if (closed) return -1

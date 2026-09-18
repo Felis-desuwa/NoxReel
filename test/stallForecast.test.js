@@ -126,3 +126,77 @@ test('速度计只看最近一个窗口，老样本会被丢掉', async () => {
   assert.ok(m.rate > 700_000, `应当只看最近 8 秒，实际 ${m.rate}`);
   assert.equal(m.samples[0].t, 2000);
 });
+
+/**
+ * 预缓冲时间的骨架就是一个恒等式：等待时间 + 剩余播放时长 = 剩余下载时间。
+ * 拿这条去校对，比重抄一遍被测公式有意义 —— 抄错了两边会一起错。
+ */
+test('预缓冲时间 = 剩余下载时间 − 剩余播放时长', async () => {
+  const { bufferLead } = await load();
+  // 2 小时片子，码率 1MB/s（总 7200MB），已收 200MB，速度 0.5MB/s。
+  const size = 7200 * MB;
+  const r = bufferLead({ size, bitrate: MB, rate: 0.5 * MB, contiguous: 200 * MB, playhead: 0 });
+  const downloadSec = (size - 200 * MB) / (0.5 * MB); // 14000 秒
+  assert.equal(r.waitSec, downloadSec - 7200);
+  assert.equal(r.waitSec, 6800);
+  // 等的这 6800 秒里又收了 3400MB，开播时手上 3600MB，正好是 3600 秒的画面。
+  assert.equal(r.needBytes, 3400 * MB);
+  assert.equal(r.bufferSec, 3600);
+});
+
+test('速度追得上码率时不用等，waitSec 为 0', async () => {
+  const { bufferLead } = await load();
+  const base = { size: 4 * GB, bitrate: MB, contiguous: 8 * MB, playhead: 0 };
+  assert.equal(bufferLead({ ...base, rate: MB }).waitSec, 0);
+  assert.equal(bufferLead({ ...base, rate: 2 * MB }).waitSec, 0);
+  // 刚好等于码率时，开播那一刻手上有多少就一直有多少
+  assert.equal(bufferLead({ ...base, rate: MB }).bufferSec, 8);
+});
+
+// 0.7 起 contiguous 由调用方传「从播放位置起连续可播到的绝对位置」（swarm.runEndFrom），
+// 这条用例的名字才真正成立：中途加入时播放头之前那段空洞压根不算进等待时间。
+// 函数本身没改，所以这里的期望值一个字也没动。
+test('从播放头往后算，不是从文件头', async () => {
+  const { bufferLead } = await load();
+  const size = 1000 * MB;
+  const at = (playhead) => bufferLead({ size, bitrate: MB, rate: 0.5 * MB, contiguous: 400 * MB, playhead });
+  // 播放头越靠后，剩下要播的越少，能容忍的落后就越少 —— 等待时间反而更长
+  assert.equal(at(0).waitSec, (600 * MB) / (0.5 * MB) - 1000);
+  assert.equal(at(300 * MB).waitSec, (600 * MB) / (0.5 * MB) - 700);
+  assert.ok(at(300 * MB).waitSec > at(0).waitSec);
+});
+
+test('已经收完就不用再等；速度为 0 时说等不到，而不是给个 0', async () => {
+  const { bufferLead } = await load();
+  const done = bufferLead({ size: 100 * MB, bitrate: MB, rate: 0, contiguous: 100 * MB, playhead: 0 });
+  assert.equal(done.waitSec, 0);
+  assert.equal(done.bufferSec, 100);
+  const stuck = bufferLead({ size: 100 * MB, bitrate: MB, rate: 0, contiguous: 10 * MB, playhead: 0 });
+  assert.equal(stuck.waitSec, Infinity);
+  assert.equal(stuck.needBytes, 90 * MB);
+});
+
+test('码率或大小未知时返回 null，不编数字', async () => {
+  const { bufferLead } = await load();
+  const ok = { size: 100 * MB, bitrate: MB, rate: MB, contiguous: 0 };
+  assert.equal(bufferLead({ ...ok, bitrate: 0 }), null);
+  assert.equal(bufferLead({ ...ok, size: 0 }), null);
+  assert.ok(bufferLead(ok));
+});
+
+/**
+ * 界面上这两个数是并排出现的，说的必须是同一件事：forecastStall 说会卡，
+ * bufferLead 就该给出一个大于 0 的等待时间；说不卡，就该是 0。
+ */
+test('和 forecastStall 的结论一致：报会卡才需要等，不卡就不用等', async () => {
+  const { bufferLead, forecastStall } = await load();
+  const size = 2000 * MB;
+  for (const rate of [0.2, 0.5, 0.9, 1, 1.1, 1.5].map((x) => x * MB)) {
+    for (const contiguous of [0, 100 * MB, 1000 * MB, 1900 * MB]) {
+      const o = { size, bitrate: MB, rate, contiguous, playhead: 0 };
+      const willStall = forecastStall(o).level === 'stall';
+      const { waitSec } = bufferLead(o);
+      assert.equal(waitSec > 0, willStall, `rate=${rate} contiguous=${contiguous} 两者结论不一致`);
+    }
+  }
+});

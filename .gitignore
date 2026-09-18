@@ -43,3 +43,6 @@ android/*.iml
 *.apk
 *.keystore
 *.jks
+
+# 本地 agent / 编辑器配置
+.claude/

@@ -1,0 +1,95 @@
+/*
+ * 覆盖窗的样式。整页只有三样东西：铺满的 canvas、那条平时藏着的输入条，
+ * 以及输入条开着时才出现的那层「点空了就关掉」的挡板。
+ *
+ * 背景必须是完全透明的：窗口开了 transparent，这里给任何一点底色都会糊在画面上。
+ * **整页默认点击穿透**（html/body 都是 pointer-events:none），只有输入条和它的挡板
+ * 例外。弹输入条时窗口本身要临时摘掉 setIgnoreMouseEvents(true)，那一刻这层窗口
+ * 压着播放器的整个客户区 —— 页面这边再不把可点区域收窄到输入条那一块，
+ * 用户想去点播放器的进度条就会点在一张透明画布上，什么都不会发生。
+ */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  /* 默认谁也不吃鼠标事件，下面单独把输入条那一块放开 */
+  pointer-events: none;
+  /* 弹幕正文里可能有 emoji 和各种中日韩字符，字体栈按 Windows 的实际情况排 */
+  font-family: 'Microsoft YaHei', 'Segoe UI', 'PingFang SC', system-ui, sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+#overlay-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+/*
+ * 输入条开着时铺满整页的挡板。它只有一个用处：接住「点在输入条以外」的那一下，
+ * 当场把输入条关掉，用户第二下就能点到播放器了。完全透明，不画任何东西。
+ */
+#overlay-shield {
+  position: fixed;
+  inset: 0;
+  background: transparent;
+  pointer-events: auto;
+}
+
+#overlay-shield.hidden {
+  display: none;
+}
+
+/* 输入条：贴在底部偏上，避开播放器自己的进度条 */
+#overlay-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 12%;
+  transform: translateX(-50%);
+  width: min(560px, 76%);
+  padding: 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(76, 141, 255, 0.55);
+  background: rgba(14, 17, 22, 0.88);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  /* 整页 pointer-events:none，只有这一块（和它的挡板）能点 */
+  pointer-events: auto;
+  /* 压在挡板上面，点输入条本身不算「点空了」 */
+  z-index: 1;
+}
+
+#overlay-bar.hidden {
+  display: none;
+}
+
+#overlay-input {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 6px;
+  outline: none;
+  background: rgba(28, 35, 45, 0.95);
+  color: #e6edf3;
+  font-size: 15px;
+  font-family: inherit;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+#overlay-input::placeholder {
+  color: #6b7683;
+}

@@ -20,7 +20,7 @@ const read = (f) => fs.readFileSync(path.join(__dirname, '..', f), 'utf8');
 test('起播门槛长在 launchPlayer 里，不是只长在调用方身上', () => {
   const app = read('src/renderer/app.js');
   assert.match(app, /function playbackAllowed\(\)/, '缺少集中的门槛判定');
-  const fn = app.slice(app.indexOf('async function launchPlayer()'));
+  const fn = app.slice(app.indexOf('async function launchPlayer('));
   const body = fn.slice(0, fn.indexOf('\n}'));
   assert.match(body, /playbackAllowed\(\)/, 'launchPlayer 自己不判门槛，调用方漏判就绕过去了');
 });
@@ -85,20 +85,69 @@ test('安卓端认识 renegotiate —— 否则手机侧链路断了永远回不
 
 /* --------------------------- 同步引擎的权限 --------------------------- */
 
-test('两端的 SYNC/STALL 权限锚点都是 P2P 连接身份，不是消息体字段', () => {
+/**
+ * v2 起房主会转发成员的 SYNC / STALL（星型拓扑下成员之间收不到彼此），消息里多了 origin。
+ * 「这条到底是谁发的」统一由 _originOf 决定：只认承载消息的那条连接；origin 只有在
+ * 这条连接恰好是房主时才采信。任何人都能往消息体里写 by / peerId / origin，这些字段
+ * 一旦被当成身份，游客就能冒充房主或管理员控场。
+ */
+test('两端的 SYNC/STALL 权限锚点都是 P2P 连接身份，不是消息体字段', async () => {
+  const { IMPLS } = require('./helpers/impls');
+  const body = (src, head) => {
+    // 锚在定义处，别撞上 `return this._onRemoteSync(msg, fromPeer);` 之类的调用点
+    const at = src.indexOf(head);
+    assert.ok(at !== -1, `找不到 ${head.trim()}`);
+    const rest = src.slice(at);
+    return rest.slice(0, rest.indexOf('\n  }'));
+  };
   for (const f of ['src/renderer/lib/syncEngine.js', 'android/app/src/main/assets/js/syncEngine.js']) {
     const src = read(f);
-    // 锚在定义处，别撞上前面那行 `return this._onRemoteSync(msg, fromPeer);` 的调用点
-    const sync = src.slice(src.indexOf('  _onRemoteSync(msg, fromPeer) {'));
-    const syncBody = sync.slice(0, sync.indexOf('\n  }'));
-    assert.match(syncBody, /fromPeer\?\.peerId/, `${f}: SYNC 没用连接身份`);
-    assert.ok(!/msg\.by \|\|/.test(syncBody), `${f}: SYNC 还在信可伪造的 msg.by`);
-    assert.match(syncBody, /isController\(senderId\)/, `${f}: SYNC 没强制控场权`);
+    const originBody = body(src, '  _originOf(msg, fromPeer) {');
+    assert.match(originBody, /const senderId = fromPeer\?\.peerId;/, `${f}: 发送者没取连接身份`);
+    assert.match(originBody, /senderId === this\.hostId/, `${f}: origin 没限定只从房主连接采信`);
+    assert.ok(!/msg\.(by|peerId)\b/.test(originBody), `${f}: 身份判定还在信可伪造的 msg.by / msg.peerId`);
 
-    const stall = src.slice(src.indexOf('  _onRemoteStall(msg, fromPeer) {'));
-    const stallBody = stall.slice(0, stall.indexOf('\n  }'));
+    const syncBody = body(src, '  _onRemoteSync(msg, fromPeer) {');
+    assert.match(syncBody, /this\._originOf\(msg, fromPeer\)/, `${f}: SYNC 没走 _originOf`);
+    assert.ok(!/msg\.by \|\|/.test(syncBody), `${f}: SYNC 还在信可伪造的 msg.by`);
+    assert.match(syncBody, /isController\(from\.origin\)/, `${f}: SYNC 没强制控场权`);
+
+    const stallBody = body(src, '  _onRemoteStall(msg, fromPeer) {');
+    assert.match(stallBody, /this\._originOf\(msg, fromPeer\)/, `${f}: STALL 没走 _originOf`);
+    assert.match(stallBody, /const id = from\.origin;/, `${f}: STALL 的身份不是 _originOf 给的`);
     assert.ok(!/msg\.peerId \|\|/.test(stallBody), `${f}: STALL 还在信可伪造的 msg.peerId`);
-    assert.match(stallBody, /isController\(id\)/, `${f}: STALL 解除时没校验角色`);
+    assert.match(stallBody, /isController\(id\)/, `${f}: STALL 没校验角色`);
+  }
+
+  // 读源码只能证明写法没退回去，行为还得真走一遍
+  for (const { name, dir } of IMPLS) {
+    const { SyncEngine } = await import(dir + 'syncEngine.js');
+    const eng = new SyncEngine({ peerId: 'me', name: 'me', isSeeder: false, hostId: 'host' });
+    eng.applyRoles([['me', 'guest'], ['adm', 'admin'], ['adm2', 'admin'], ['gst', 'guest']], 'host');
+    const sync = (over) => ({ t: 'sync', paused: false, position: 10, seq: 0, ...over });
+    const via = (peerId) => ({ peerId, name: peerId });
+
+    eng.onCtrl(sync({ lamport: 5, by: 'host' }), via('gst'));
+    eng.onCtrl(sync({ lamport: 5, origin: 'host', originName: '房主' }), via('gst'));
+    eng.onCtrl(sync({ lamport: 5, origin: 'adm', originName: '管理员' }), via('gst'));
+    assert.equal(eng.shared.lamport, 0, `${name}: 游客在消息体里冒充别人就拿到了控场权`);
+    // 房主转发的，也得是控制者的原话；转发回我自己的回声同样不算
+    eng.onCtrl(sync({ lamport: 6, origin: 'gst', originName: '游客' }), via('host'));
+    eng.onCtrl(sync({ lamport: 7, origin: 'me', originName: 'me' }), via('host'));
+    assert.equal(eng.shared.lamport, 0, `${name}: 房主转发的游客指令 / 自己的回声被采信了`);
+
+    // 非房主连接上的 origin 直接无视，按连接本人算
+    eng.onCtrl(sync({ lamport: 8, origin: 'adm2' }), via('adm'));
+    assert.equal(eng.shared.by, 'adm', `${name}: 非房主连接上的 origin 被采信了`);
+    // 从房主连接来的 origin 才采信
+    eng.onCtrl(sync({ lamport: 9, origin: 'adm2', originName: '管理员二' }), via('host'));
+    assert.equal(eng.shared.by, 'adm2', `${name}: 房主转发的管理员指令没被采信`);
+
+    eng.onCtrl({ t: 'stall', stalled: true, peerId: 'adm', seq: 0, stallSeq: 1 }, via('gst'));
+    eng.onCtrl({ t: 'stall', stalled: true, origin: 'adm', seq: 0, stallSeq: 1 }, via('gst'));
+    assert.equal(eng.stalledPeers.size, 0, `${name}: 游客冒充管理员喊停了全场`);
+    eng.onCtrl({ t: 'stall', stalled: true, origin: 'adm', originName: '管理员', seq: 0, stallSeq: 1 }, via('host'));
+    assert.deepEqual([...eng.stalledPeers.keys()], ['adm'], `${name}: 卡顿要记在原发送者头上，不是房主`);
   }
 });
 
@@ -128,15 +177,64 @@ test('播放器没起来时收到的位置会被记住，起来后补放', async
   assert.deepEqual(seeks, [930], '播放器起来后没把房间位置补上，接收方会从 00:00 开始播');
 });
 
-test('resetMedia 只在会广播时才推进 Lamport', () => {
-  const src = read('src/renderer/lib/syncEngine.js');
-  const fn = src.slice(src.indexOf('resetMedia({ isSeeder = this.isSeeder } = {})'));
-  const body = fn.slice(0, fn.indexOf('\n  }'));
-  assert.match(body, /willBroadcast/, '观众静默推进 Lamport 会让房主换片后的首条指令被丢掉');
-  assert.ok(
-    !/lamport: this\.shared\.lamport \+ 1,/.test(body),
-    '还在无条件自增'
-  );
+/**
+ * 换片时只有房主广播新一部的初始状态。其他人若在重置时静默推进 Lamport，本地时钟就会
+ * 领先房主，房主换片后的第一条 SYNC 会和它撞平甚至落后 —— 平局按 peerId 比大小，
+ * 约一半人会判「自己更新」把房主的指令丢掉。v2 的做法是不广播的一方把时间戳置成 -1，
+ * 这一部的任何合法 SYNC 都比它新；原来读源码找 willBroadcast 的写法换成直接看行为。
+ */
+test('resetMedia 只在会广播时才推进 Lamport', async () => {
+  const { IMPLS } = require('./helpers/impls');
+  for (const { name, dir } of IMPLS) {
+    const { SyncEngine } = await import(dir + 'syncEngine.js');
+    const roles = [['adm', 'admin'], ['adm2', 'admin'], ['gst', 'guest']];
+    const make = (peerId) => {
+      const eng = new SyncEngine({ peerId, name: peerId, isSeeder: peerId === 'host', hostId: 'host' });
+      eng.applyRoles(roles, 'host');
+      const out = [];
+      eng.on('outbound', (m) => out.push(m));
+      return { eng, out };
+    };
+    const sync = (lamport, seq, over) => ({ t: 'sync', paused: false, position: 10, lamport, seq, ...over });
+
+    // 非房主的控制者：见过比房主更大的时钟（另一个管理员刚发过指令，房主还没收到）
+    const admin = make('adm');
+    admin.eng.onCtrl(sync(12, 0), { peerId: 'adm2', name: 'adm2' });
+    assert.equal(admin.eng.clock, 12);
+    admin.out.length = 0;
+    admin.eng.resetMedia({ isSeeder: false, seq: 1 });
+    assert.equal(admin.eng.seq, 1);
+    assert.equal(admin.eng.shared.lamport, -1, `${name}: 不广播的一方时间戳要置成 -1`);
+    assert.equal(admin.eng.clock, 12, `${name}: 不广播就不能推进本地时钟`);
+    assert.deepEqual(admin.out, [], `${name}: 非房主重置时不该发任何消息`);
+
+    // 房主：只见过 9，换片时广播一条 SYNC，Lamport 从见过的最大值往上加，并带上新 seq
+    const host = make('host');
+    host.eng.onCtrl(sync(9, 0), { peerId: 'adm', name: 'adm' });
+    assert.equal(host.eng.clock, 9);
+    host.out.length = 0;
+    host.eng.resetMedia({ broadcast: true, seq: 1, position: 30 });
+    assert.equal(host.out.length, 1, `${name}: 房主换片应当正好广播一条`);
+    const [first] = host.out;
+    assert.equal(first.t, 'sync');
+    assert.equal(first.lamport, 10, `${name}: Lamport 应为见过的最大值 + 1，实际 ${first.lamport}`);
+    assert.equal(first.seq, 1);
+    assert.equal(first.paused, true);
+    assert.equal(first.position, 30);
+    assert.equal(host.eng.shared.lamport, 10);
+
+    // 这条比管理员见过的时钟还小，但他那边这一部的时间戳是 -1，照样采信
+    admin.eng.onCtrl(first, { peerId: 'host', name: 'host' });
+    assert.equal(admin.eng.shared.by, 'host', `${name}: 房主换片后的第一条指令被丢掉了`);
+    assert.equal(admin.eng.shared.position, 30);
+
+    // 没有控场权的人即使要求广播也不发
+    const guest = make('gst');
+    guest.eng.resetMedia({ broadcast: true, seq: 1 });
+    assert.deepEqual(guest.out, [], `${name}: 游客换片时广播了状态`);
+    assert.equal(guest.eng.shared.lamport, -1);
+    assert.equal(guest.eng.clock, 0);
+  }
 });
 
 /* ------------------------------ 信令服务器 ------------------------------ */
@@ -198,9 +296,12 @@ test('v0.6.6 新增的用户可见文案都能翻出英文', async () => {
   }
 });
 
-test('OSD 文案过 translate —— 它走 IPC 交给 mpv，自动翻译碰不到', () => {
-  const src = read('src/renderer/app.js');
-  const calls = [...src.matchAll(/window\.sw\.mpv\.osd\(([^,]+),/g)].map((m) => m[1].trim());
+test('OSD 文案过 translate —— 它走 IPC 交给播放器，自动翻译碰不到', () => {
+  // 界面逻辑拆到 ui/ 目录之后也要一起扫，否则新面板里的 OSD 调用不受这条规则约束
+  const uiDir = path.join(__dirname, '..', 'src', 'renderer', 'ui');
+  const uiFiles = fs.existsSync(uiDir) ? fs.readdirSync(uiDir).filter((f) => f.endsWith('.js')).map((f) => 'src/renderer/ui/' + f) : [];
+  const src = ['src/renderer/app.js', ...uiFiles].map((f) => read(f)).join('\n');
+  const calls = [...src.matchAll(/window\.sw\.player\.osd\(([^,]+),/g)].map((m) => m[1].trim());
   assert.ok(calls.length >= 5, `只找到 ${calls.length} 处 osd 调用，是不是漏了`);
   for (const arg of calls) {
     assert.match(arg, /\bt\(/, `这处 OSD 没过 translate：${arg}`);
@@ -264,15 +365,47 @@ test('退出软件时会终止还在跑的 ffmpeg', () => {
   assert.match(main, /media\.cancelAll\(\)/, '孤儿 ffmpeg 会继续满速写盘，用户看不见也停不掉');
 });
 
-test('换 mpv 控制器时摘掉旧监听器', () => {
-  const main = read('src/main/main.js');
-  assert.match(main, /mpv\.removeAllListeners\(\)/, '旧进程迟到的 exit 会把新播放器标记成已关闭');
-  assert.match(main, /mpv === controller/, '缺少第二道世代校验');
+test('换播放器时旧一代迟到的 exit 不会转发给渲染进程', async () => {
+  const { EventEmitter } = require('node:events');
+  const { PlayerManager } = require('../src/main/players');
+  const made = [];
+  class FakeAdapter extends EventEmitter {
+    constructor() {
+      super();
+      this.caps = {};
+      this.quitCalls = 0;
+      made.push(this);
+    }
+    async launch() {
+      return { bin: 'fake' };
+    }
+    async quit() {
+      this.quitCalls++;
+    }
+  }
+  const sent = [];
+  const mgr = new PlayerManager({ send: (ch, payload) => sent.push([ch, payload]), adapters: { fake: FakeAdapter } });
+  const first = await mgr.launch('fake', {});
+  const old = made[0];
+  const second = await mgr.launch('fake', {});
+  assert.equal(old.quitCalls, 1, '拉起新播放器之前要先退掉旧的');
+  assert.ok(second.gen > first.gen);
+  // 旧进程几百毫秒后才真正退出，这条 exit 绝不能转发
+  old.emit('exit', { code: 0 });
+  old.emit('tick', { position: 1 });
+  assert.deepEqual(sent, [], '旧一代的事件被转发了：新播放器会被标记成已关闭');
+  made[1].emit('tick', { position: 2 });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0][1].gen, second.gen);
+  // 就算有人忘了摘监听器，按代比对也要拦住
+  const src = read('src/main/players/index.js');
+  assert.match(src, /removeAllListeners\(\)/);
+  assert.match(src, /this\.current === current/);
 });
 
 test('换片期间迟到的 mpv exit 不会把新播放器打成已关闭', () => {
   const app = read('src/renderer/app.js');
-  const i = app.indexOf('window.sw.mpv.onExit');
+  const i = app.indexOf('window.sw.player.onExit');
   assert.match(app.slice(i, i + 700), /S\.switchingMedia/, '换片窗口内的 exit 要当成预期收尾');
 });
 

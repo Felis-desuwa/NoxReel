@@ -10,6 +10,9 @@ import {
 import { pruneSdpCandidates, summarizeCandidates, hasRelay, parseCandidateLine } from './ice.js';
 
 const MAX_PENDING_CANDIDATES = 128; // 排队上限，别让对面用候选把内存灌爆
+// DataChannel 单条消息的安全上限。超过它的 send() 会让整条通道断掉，
+// 表现成莫名其妙的掉线 —— 宁可这里拒发并留下日志。大消息要走 PART 分段。
+const MAX_CTRL_BYTES = 60 * 1024;
 
 /**
  * 单个 P2P 连接。
@@ -36,14 +39,21 @@ export class Peer extends Emitter {
 
     this.ctrl = null;
     this.data = null;
-    this.remoteManifest = null;
-    this.remoteHave = null; // Uint8Array
-    this.inflight = new Set(); // 我方已向该 peer 请求、还没收齐的分片
+    this.platform = null; // HELLO 里对方报的平台：desktop / android
+    // 对方每个文件槽位上有哪些分片：slot -> { have: Uint8Array }
+    this.remote = new Map();
+    this.inflight = new Set(); // 我方已向该 peer 请求、还没收齐的分片，键是 "槽位:下标"
+    this._drainWaiters = new Set(); // 正在等 data 缓冲回落的 sendChunk，关连接时要统一放掉
     this._pendingCandidates = []; // 远端描述落地前先攒着的 ICE 候选
     this.rtt = null;
     // 本机收集到的候选类型。连不上的时候这是唯一能指路的东西 —— 没有 srflx
     // 说明 STUN 不通，有 srflx 没 relay 说明只能靠打洞。见 ice.js 的 diagnoseCandidates()。
     this.candidateTypes = new Set();
+    // 解析过的本机候选。判对称 NAT 要按「同一个本地基地址映射出几个公网端点」分组，
+    // 光有类型集合不够。信令模式下候选是一条条冒出来的，SDP 里看不到，只能在这儿攒。
+    this.localCandidates = [];
+    // 最近几条 ICE 候选错误。这是唯一能分清「TURN 密码错」和「TURN 地址连不上」的信息源。
+    this.candidateErrors = [];
     this.localCandidateStats = null;
     this._sentCandidateKeys = new Set();
     this._expectRelay = hasRelay(iceServers);
@@ -64,7 +74,10 @@ export class Peer extends Emitter {
       if (!e.candidate) return;
       const json = e.candidate.toJSON();
       const parsed = parseCandidateLine(`a=${json.candidate}`) || parseCandidateLine(json.candidate || '');
-      if (parsed) this.candidateTypes.add(parsed.type);
+      if (parsed) {
+        this.candidateTypes.add(parsed.type);
+        if (this.localCandidates.length < 64) this.localCandidates.push(parsed);
+      }
       if (!this.trickle) return;
       // 多台 STUN 会对同一个 NAT 映射各报一次，内容完全一样。重复候选传过去
       // 只会让对端多试几遍同一个地址，白白占信令带宽和配对时间。
@@ -75,6 +88,20 @@ export class Peer extends Emitter {
         if (String(parsed.address).toLowerCase().startsWith('fe80:')) return; // 链路本地，连不通
       }
       this.emit('icecandidate', json);
+    };
+    // ICE 候选收集失败。这是唯一能把「TURN 凭据不对」和「TURN 根本连不上」分开的事件：
+    // 光看「配了 TURN 却没有 relay 候选」只知道有一项不对，不知道是哪一项。
+    // 按 url + 错误码去重，STUN/TURN 重试时同一条会反复来。
+    this.pc.onicecandidateerror = (e) => {
+      const key = `${e.url}|${e.errorCode}`;
+      if (this.candidateErrors.some((x) => x.key === key)) return;
+      if (this.candidateErrors.length >= 8) return;
+      this.candidateErrors.push({
+        key,
+        url: String(e.url || ''),
+        errorCode: Number(e.errorCode) || 0,
+        errorText: String(e.errorText || ''),
+      });
     };
     this.pc.oniceconnectionstatechange = () => {
       const s = this.pc.iceConnectionState;
@@ -275,12 +302,18 @@ export class Peer extends Emitter {
 
   send(msg) {
     if (this.ctrl?.readyState !== 'open') return false;
-    this.ctrl.send(JSON.stringify(msg));
+    const text = JSON.stringify(msg);
+    // 一个字符最多 3 个 UTF-8 字节，短消息不必真去编码
+    if (text.length * 3 > MAX_CTRL_BYTES && new TextEncoder().encode(text).length > MAX_CTRL_BYTES) {
+      console.warn(`[peer] 控制消息 ${msg.t} 太大（${text.length} 字符），已拒发`);
+      return false;
+    }
+    this.ctrl.send(text);
     return true;
   }
 
-  hello(peerId, name, securityMode = 'safe') {
-    this.send({ t: MSG.HELLO, peerId, name, ver: PROTOCOL_VERSION, securityMode });
+  hello(peerId, name, securityMode = 'safe', platform = 'desktop') {
+    this.send({ t: MSG.HELLO, peerId, name, ver: PROTOCOL_VERSION, securityMode, platform });
   }
 
   ping() {
@@ -293,32 +326,53 @@ export class Peer extends Emitter {
    * 发一个分片。切帧 + 背压：缓冲满了就等它排空，
    * 不然几个大分片就能把内存顶爆，而且 ctrl 通道的延迟也会被拖垮。
    */
-  async sendChunk(chunkIndex, buffer) {
+  async sendChunk(slot, chunkIndex, buffer) {
     if (this.data?.readyState !== 'open') throw new Error('数据通道未打开');
-    const frames = encodeFrames(chunkIndex, buffer);
+    const frames = encodeFrames(slot, chunkIndex, buffer);
     for (const frame of frames) {
       if (this.data.readyState !== 'open') throw new Error('发送途中数据通道关闭');
-      if (this.data.bufferedAmount > BUFFER_HIGH_WATER) await this._drain();
+      if (this.data.bufferedAmount > BUFFER_HIGH_WATER) {
+        await this._drain();
+        if (this.closed || this.data.readyState !== 'open') throw new Error('发送途中数据通道关闭');
+      }
       this.data.send(frame);
       this.bytesSent += frame.byteLength;
       this._sampleUploadRate();
     }
   }
 
+  /**
+   * 等 data 缓冲回落。通道关掉时必须落定（reject），不能一直挂着：
+   * 关闭后 bufferedAmount 不会归零，bufferedamountlow 永远等不到；pc.close() 按规范
+   * 连 close 事件都不发。挂住的 sendChunk 会让上层发片计数永远扣不回去 ——
+   * swarm 的「当前这部优先」据此判断还有没有人在收，于是后面几部的片再也发不出去。
+   */
   _drain() {
     return new Promise((resolve, reject) => {
-      if (this.data.readyState !== 'open') return reject(new Error('数据通道已关闭'));
-      const onLow = () => {
-        this.data.removeEventListener('bufferedamountlow', onLow);
-        resolve();
+      const ch = this.data;
+      if (this.closed || ch?.readyState !== 'open') return reject(new Error('数据通道已关闭'));
+      const settle = (error) => {
+        ch.removeEventListener('bufferedamountlow', onLow);
+        ch.removeEventListener('close', onGone);
+        ch.removeEventListener('error', onGone);
+        this._drainWaiters.delete(settle);
+        if (error) reject(error);
+        else resolve();
       };
-      this.data.addEventListener('bufferedamountlow', onLow);
+      const onLow = () => settle(null);
+      const onGone = () => settle(new Error('数据通道已关闭'));
+      ch.addEventListener('bufferedamountlow', onLow);
+      ch.addEventListener('close', onGone);
+      ch.addEventListener('error', onGone);
+      this._drainWaiters.add(settle);
     });
   }
 
   close() {
     if (this.closed) return;
     this.closed = true;
+    // 先放掉等缓冲的发送：下面的 pc.close() 不会再给通道发任何事件
+    for (const settle of [...this._drainWaiters]) settle(new Error('连接已关闭'));
     try {
       this.ctrl?.close();
       this.data?.close();

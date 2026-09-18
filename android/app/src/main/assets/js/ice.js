@@ -38,6 +38,43 @@ export function splitUrls(raw) {
 }
 
 /**
+ * 保存设置时检查 TURN 地址写得对不对。
+ *
+ * expandTurnUrls 对认不出的地址是 `continue` —— 静默丢弃。于是把地址写成
+ * `example.com:3478`（漏了 turn: 前缀）的人，会看到设置里「启用 TURN 中继」
+ * 勾得好好的，实际上一条中继都没有，而且到连不上那一刻也不会有人告诉他为什么。
+ *
+ * 漏前缀是最常见的写法错误，所以这里直接补上而不是报错 —— 用户想表达的意思很清楚。
+ * 真正认不出的才报出来。
+ *
+ * @returns {{urls: string[], fixed: string[], invalid: string[]}}
+ */
+export function normalizeTurnInput(raw) {
+  const urls = [];
+  const fixed = [];
+  const invalid = [];
+  for (const url of splitUrls(raw)) {
+    if (/^turns?:/i.test(url)) {
+      urls.push(url);
+      continue;
+    }
+    // stun: 写进 TURN 框是另一回事 —— 它不是中继，补个前缀也变不成中继
+    if (/^\w+:\/\//.test(url) || /^stuns?:/i.test(url)) {
+      invalid.push(url);
+      continue;
+    }
+    if (/^[\w.\-[\]:]+(:\d+)?(\?.*)?$/.test(url)) {
+      const next = `turn:${url}`;
+      urls.push(next);
+      fixed.push(next);
+      continue;
+    }
+    invalid.push(url);
+  }
+  return { urls, fixed, invalid };
+}
+
+/**
  * TURN 地址展开成 UDP 与 TCP 两条。
  *
  * 酒店、公司和一部分校园网会封掉 UDP，只留 TCP/443 出去。这种网络下
@@ -102,8 +139,10 @@ export function hasRelay(iceServers) {
   );
 }
 
-// a=candidate:<foundation> <component> <proto> <priority> <addr> <port> typ <type> ...
-const CANDIDATE_RE = /^a=candidate:(\S+) (\d+) (\S+) (\d+) (\S+) (\d+) typ (\S+)/;
+// a=candidate:<foundation> <component> <proto> <priority> <addr> <port> typ <type> [raddr <ip> rport <port>] ...
+// raddr/rport 是这条候选背后的本地基地址。只有 srflx 和 relay 带它，host 没有。
+const CANDIDATE_RE =
+  /^a=candidate:(\S+) (\d+) (\S+) (\d+) (\S+) (\d+) typ (\S+)(?: raddr (\S+) rport (\d+))?/;
 
 /** 从一行 SDP 里解析候选，不是候选行返回 null。 */
 export function parseCandidateLine(line) {
@@ -117,6 +156,8 @@ export function parseCandidateLine(line) {
     address: m[5],
     port: Number(m[6]),
     type: m[7],
+    relatedAddress: m[8] || null,
+    relatedPort: m[9] === undefined ? null : Number(m[9]),
   };
 }
 
@@ -189,11 +230,107 @@ export function summarizeCandidates(sdp) {
 }
 
 /**
+ * 把一条 ICE 候选错误翻译成用户能照着做的话。
+ *
+ * 这是唯一能把「TURN 密码错」「TURN 地址连不上」「TURN 服务器没开」分开的信息源 ——
+ * 光看「配了 TURN 却没拿到 relay 候选」只知道三者之一，不知道是哪一个。
+ *
+ * 各版本 Chromium 的错误码有出入，所以以码为主、文本兜底，认不出的一律返回 null
+ * 让上层退回原来那句笼统的话。**宁可不说，也别硬安一个错误的原因**：
+ * 说错方向比不说更费时间。
+ *
+ * @param {{url?: string, errorCode?: number, errorText?: string}} error
+ * @returns {{level: 'bad'|'warn', text: string}|null}
+ */
+export function describeCandidateError(error) {
+  if (!error) return null;
+  const url = String(error.url || '');
+  const code = Number(error.errorCode) || 0;
+  const text = String(error.errorText || '');
+  const isTurn = /^turns?:/i.test(url);
+  const host = url.replace(/^\w+:/, '').split('?')[0] || url;
+
+  // 401/438 是 STUN 认证握手的正常往返，TURN 每次都会先来一发再带凭据重试。
+  // 只有服务器明确拒绝（403）或反复认证失败才是真问题。
+  if (code === 438) return null;
+
+  if (isTurn) {
+    if (code === 401 || code === 403) {
+      return { level: 'bad', text: `TURN 中继 ${host} 拒绝了用户名或密码 —— 请核对设置里的 TURN 凭据。` };
+    }
+    if (code === 300) {
+      return { level: 'warn', text: `TURN 中继 ${host} 要求改用另一个地址，当前这条可能已经迁移。` };
+    }
+    if (code === 701 || code === 0 || /timeout|unreachable|refused|resolve/i.test(text)) {
+      return { level: 'bad', text: `连不上 TURN 中继 ${host} —— 地址或端口可能写错了，也可能被防火墙挡住。` };
+    }
+    return { level: 'bad', text: `TURN 中继 ${host} 报错（${code}${text ? ` ${text}` : ''}）。` };
+  }
+
+  if (/^stuns?:/i.test(url)) {
+    return { level: 'warn', text: `STUN 服务器 ${host} 没能应答 —— 换一台，或检查防火墙有没有放行 UDP。` };
+  }
+  return null;
+}
+
+/** 把一份 SDP 里的候选行都解析出来。 */
+export function parseSdpCandidates(sdp) {
+  const list = [];
+  for (const line of String(sdp || '').split(/\r?\n/)) {
+    const c = parseCandidateLine(line);
+    if (c) list.push(c);
+  }
+  return list;
+}
+
+/**
+ * 判断本机是不是在对称 NAT（或多出口 NAT 网关）后面。
+ *
+ * 原理：srflx 候选是某台 STUN 服务器看到的「你的公网端点」。锥形 NAT 给同一个本地
+ * 端口分配同一个映射，不管对面是谁 —— 所以几台 STUN 报回来的完全一样，Chromium
+ * 会把重复的合并掉，最后只留一条。对称 NAT 则按目标分配不同映射，几台 STUN 各看到
+ * 一个不同的端点，合并不掉，于是同一个本地基地址下会冒出好几条 srflx。
+ *
+ * **这个判定只能单向成立。** 因为有上面那个去重，「只有一条 srflx」既可能是锥形
+ * NAT，也可能是只有一台 STUN 回了话 —— 两者看起来一模一样。所以拿不准时返回 null，
+ * 绝不输出「你不是对称 NAT」。宁可不说，也别给一个会让人往错方向查的结论。
+ *
+ * 分组键必须带上本地基地址、协议和分量，一条都不能少：
+ *  - 不跨基地址比：多网卡、VPN 虚拟网卡、Hyper-V 的 vEthernet 各有各的映射，
+ *    混在一起比必然把正常的多宿主机器读成对称 NAT。这是最容易误报的一条。
+ *  - 不跨地址族比：v4 和 v6 是两条独立的路。基地址不同，天然隔开。
+ *  - 不跨协议／分量比：udp 和 tcp 的映射本来就不是一回事。
+ *
+ * @param {Array<ReturnType<typeof parseCandidateLine>>} candidates
+ * @returns {{kind: 'symmetric'|'multi-exit', mappings: string[]}|null}
+ */
+export function detectSymmetricNat(candidates) {
+  const groups = new Map();
+  for (const c of candidates || []) {
+    if (!c || c.type !== 'srflx') continue;
+    // 没有基地址就没法分组。抹成 0.0.0.0 的同样不能用 —— 那会把所有网卡归成一桶。
+    if (!c.relatedAddress || isUselessAddress(c.relatedAddress)) continue;
+    const key = `${c.component}|${c.protocol}|${c.relatedAddress}|${c.relatedPort}`;
+    if (!groups.has(key)) groups.set(key, new Set());
+    groups.get(key).add(`${c.address}:${c.port}`);
+  }
+
+  for (const endpoints of groups.values()) {
+    if (endpoints.size < 2) continue;
+    const list = [...endpoints];
+    const addresses = new Set(list.map((e) => e.slice(0, e.lastIndexOf(':'))));
+    // 出口 IP 都随目标变，那是多出口的 NAT 网关（常见于云主机），比对称 NAT 更难打洞
+    return { kind: addresses.size > 1 ? 'multi-exit' : 'symmetric', mappings: list };
+  }
+  return null;
+}
+
+/**
  * 把候选统计翻译成一句用户能照着做的话。
  * @param {ReturnType<typeof summarizeCandidates>} stats
- * @param {{turnConfigured?: boolean}} ctx
+ * @param {{turnConfigured?: boolean, symmetric?: ReturnType<typeof detectSymmetricNat>}} ctx
  */
-export function diagnoseCandidates(stats, { turnConfigured = false } = {}) {
+export function diagnoseCandidates(stats, { turnConfigured = false, symmetric = null } = {}) {
   if (!stats || !stats.total) {
     return {
       level: 'bad',
@@ -212,6 +349,17 @@ export function diagnoseCandidates(stats, { turnConfigured = false } = {}) {
       text: '配了 TURN 中继却没拿到中继候选 —— 地址、端口或用户名密码大概率有一项不对，这时中继等于没配。',
     };
   }
+  // 这一条比下面那句笼统的警告确定得多：不是「可能在严格 NAT 后面」，
+  // 而是几台 STUN 各看到一个不同的公网端点，已经量出来了。
+  if (symmetric && !stats.relay) {
+    return {
+      level: 'bad',
+      text:
+        symmetric.kind === 'multi-exit'
+          ? '本机的公网出口地址随目标而变（多出口的 NAT 网关，云主机上常见）—— 这种网络打洞必定失败，只能走 TURN 中继。请在设置里配一个。'
+          : '本机在对称 NAT 后面（几台 STUN 服务器各看到一个不同的公网端口）—— 这种网络打洞必定失败，只能走 TURN 中继。请在设置里配一个。',
+    };
+  }
   if (!stats.relay) {
     return {
       level: 'warn',
@@ -219,4 +367,22 @@ export function diagnoseCandidates(stats, { turnConfigured = false } = {}) {
     };
   }
   return { level: 'ok', text: '公网地址和中继候选都齐了。' };
+}
+
+/**
+ * 连不上时给一句能照着做的话。这是诊断的总入口。
+ *
+ * 顺序是有讲究的：**候选错误优先于候选统计**。候选错误是服务器亲口说的
+ * （「401，凭据不对」），而统计只能反推（「配了 TURN 却没有 relay，三件事之一错了」）。
+ * 有确凿信息就别去推断。
+ *
+ * 做成纯函数是为了能按行为测这个顺序 —— 在编排层里靠 grep 源码验不出
+ * 「这个循环到底有没有在迭代」。
+ */
+export function adviseConnection({ stats, candidates = [], candidateErrors = [], turnConfigured = false } = {}) {
+  for (const error of candidateErrors) {
+    const told = describeCandidateError(error);
+    if (told) return told;
+  }
+  return diagnoseCandidates(stats, { turnConfigured, symmetric: detectSymmetricNat(candidates) });
 }

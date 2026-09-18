@@ -8,6 +8,17 @@
  * 这里反过来：以「当前播放位置 + 前瞻窗口」为第一优先级，窗口外才按顺序补齐。
  * 牺牲一部分 swarm 健康度，换取「点开就能看」。这在小房间（几个人一起看）里
  * 是划算的 —— 我们本来也不是要做长期存活的公共种子。
+ *
+ * ── 两个保留区（0.7）──
+ * 队列最前面另有两段和播放位置无关的片，缺了它们播放器根本起不来：
+ *  - 文件头：MP4 的 moov（faststart 后落在第 0 片）、MKV 的 EBML+Tracks。
+ *    缺了是「无法识别格式」直接退出，不是花屏。
+ *  - 文件尾（除了确认过 faststart 的 MP4，其余都留）：MKV 的 Cues 常写在文件尾。
+ *    mpv 缺了它会退化成从片头扫到播放位置去建索引（实测起播晚约 2 秒），
+ *    ExoPlayer 更硬 —— 它在 prepare 完成之前就要 seek 到 Cues，读不到就永远起不来。
+ *    容器按第 0 片的内容认（setHeadBytes），不认扩展名：改个名字就绕过保留区太脆。
+ * 因此 plan() 的结果允许包含 index < startChunk 的片，但**仅限这两个保留区**。
+ * 中途加入房间时这条契约变更才显形，从片头起播时保留区与关键窗口重合、行为不变。
  */
 
 const DEFAULT_LOOKAHEAD_SECONDS = 30; // 规格：未来 30 秒的窗口
@@ -16,6 +27,8 @@ const MAX_INFLIGHT_PER_PEER = 4; // 在途窗口下限：局域网上 4 片（8M
 const MAX_INFLIGHT_CEILING = 12; // 上限。再深就是拿「seek 之后的空转」换吞吐，不划算
 const RTT_PER_EXTRA_CHUNK_MS = 25; // 每多 25ms 往返延迟，窗口加一片
 const COLD_START_RATE = 1; // 还没测出速率的新 peer 先按最乐观处理，好让它尽快被采样到
+const DEFAULT_HEAD_RESERVE_BYTES = 8 * 1024 * 1024; // 容器头。实测 mpv 只要前 1.2MB，这里和起播门槛取同一个数
+const DEFAULT_TAIL_RESERVE_BYTES = 4 * 1024 * 1024; // MKV 的 Cues，两片足够盖住常见体积
 
 /**
  * 一个 peer 该同时欠我几片。
@@ -42,15 +55,26 @@ function inflightWindow({ downRate = 0, rtt = 0, chunkSize = 0 } = {}) {
 }
 
 export class Scheduler {
-  constructor({ manifest, lookaheadSeconds = DEFAULT_LOOKAHEAD_SECONDS, maxInflightPerPeer = null }) {
+  constructor({
+    manifest,
+    lookaheadSeconds = DEFAULT_LOOKAHEAD_SECONDS,
+    maxInflightPerPeer = null,
+    headReserveBytes = DEFAULT_HEAD_RESERVE_BYTES,
+    tailReserveBytes = DEFAULT_TAIL_RESERVE_BYTES,
+  }) {
     this.manifest = manifest;
     this.lookaheadSeconds = lookaheadSeconds;
+    // 两个都给 0 就退回 0.6 的行为（队列里只有窗口和顺序补齐），这是保留区的回退开关。
+    this.headReserveBytes = headReserveBytes > 0 ? headReserveBytes : 0;
+    this.tailReserveBytes = tailReserveBytes > 0 ? tailReserveBytes : 0;
     // 不指定就按链路自适应；指定了就钉死（测试和排障要的确定性）。
     this.fixedWindow = Number.isInteger(maxInflightPerPeer) && maxInflightPerPeer > 0;
     this.maxInflightPerPeer = this.fixedWindow ? maxInflightPerPeer : MAX_INFLIGHT_PER_PEER;
     // 起播之后由 mpv 报真值。起播之前先用清单里房主带来的时长兜底 ——
     // 接收端要在还没开播时就能回答「这个片子需要多少码率、我现在的速度追不追得上」。
     this.duration = manifest?.durationSec > 0 ? manifest.durationSec : 0;
+    // 第 0 片到手后按内容认出来的容器。认不出之前一律按「索引可能在文件尾」处理。
+    this.headContainer = null;
   }
 
   setDuration(d) {
@@ -72,6 +96,56 @@ export class Scheduler {
     return Math.max(0, Math.min(this.manifest.chunkCount - 1, Math.floor(byte / this.manifest.chunkSize)));
   }
 
+  /**
+   * 第 0 片到手时喂进来，按内容认容器。只看前几十个字节，不留引用。
+   *
+   * 扩展名不是容器的可靠证据：MKV 被改名成 .mp4 照样能进房（主进程那边认不出 MP4 的
+   * box 结构，只会提示转封装，用户执意分享原文件就带着这个名字传出去了）。而安卓的
+   * MatroskaExtractor 在 prepare 阶段就要 seek 到文件尾读 Cues，读不到会一直阻塞在
+   * awaitData 上 —— 表现是永远转圈，没有任何报错。所以容器要按内容判。
+   */
+  setHeadBytes(bytes) {
+    if (this.headContainer || !bytes || bytes.length < 8) return;
+    const b = bytes;
+    // EBML 魔数：MKV / WebM 都是 1A 45 DF A3
+    if (b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) {
+      this.headContainer = 'matroska';
+      return;
+    }
+    // ISOBMFF：顶层 box 顺着走，moov 排在 mdat 前面就是 faststart（索引在文件头）
+    if (String.fromCharCode(b[4], b[5], b[6], b[7]) !== 'ftyp') {
+      this.headContainer = 'unknown';
+      return;
+    }
+    let off = 0;
+    for (let i = 0; i < 64 && off + 8 <= b.length; i++) {
+      const size = (b[off] << 24 >>> 0) + (b[off + 1] << 16) + (b[off + 2] << 8) + b[off + 3];
+      const type = String.fromCharCode(b[off + 4], b[off + 5], b[off + 6], b[off + 7]);
+      if (type === 'moov') {
+        this.headContainer = 'mp4-faststart';
+        return;
+      }
+      if (type === 'mdat' || size < 8) {
+        this.headContainer = 'unknown'; // 索引在文件尾，或者 box 畸形：一律按保守处理
+        return;
+      }
+      off += size;
+    }
+    // 第 0 片里没看完顶层 box（moov 很大时会这样），等下一次判不出来也没关系：保守 = 预留尾部
+  }
+
+  /**
+   * 这一部要不要预留文件尾。
+   *
+   * MKV 的索引（Cues）常写在文件尾，缺了它 mpv 要从片头扫到播放位置去建索引，
+   * ExoPlayer 更硬 —— 它在 prepare 完成之前就要读 Cues，读不到就永远起不来。
+   * 所以判据是反着的：**只有确认过索引在文件头（faststart MP4）才敢不预留**。
+   * 认不出容器（还没拿到第 0 片、或者根本不是这两种）时一律预留，代价只是多几 MB。
+   */
+  needsTailIndex() {
+    return this.headContainer !== 'mp4-faststart';
+  }
+
   /** 播放位置（秒）换算成字节。mpv 给了 stream-pos 就用真值，没有才按比例估。 */
   positionToByte(seconds, streamPos) {
     if (typeof streamPos === 'number' && streamPos > 0) return streamPos;
@@ -86,27 +160,43 @@ export class Scheduler {
    * @param {Set<number>} inflight 全局已在途的分片
    */
   priorityList(have, playbackByte, inflight) {
-    const { chunkCount } = this.manifest;
+    const { chunkCount, size } = this.manifest;
     const startChunk = this.byteToChunk(playbackByte);
     const endChunk = this.byteToChunk(playbackByte + this.lookaheadBytes);
 
     const critical = [];
     const rest = [];
+    // 保留区和关键窗口会重叠（从片头起播时完全重合），去重后顺序与 0.6 一模一样。
+    const picked = new Set();
+    const take = (i, into) => {
+      if (i < 0 || i >= chunkCount) return;
+      if (picked.has(i) || have[i] || inflight.has(i)) return;
+      picked.add(i);
+      into.push(i);
+    };
 
-    // 关键窗口：正在播的位置往后 30 秒。这些片不到，播放就会卡。
-    for (let i = startChunk; i <= endChunk && i < chunkCount; i++) {
-      if (!have[i] && !inflight.has(i)) critical.push(i);
+    // 1) 文件头保留区：容器头（MP4 的 moov、MKV 的 EBML+Tracks）。缺了播放器连格式都认不出来。
+    if (this.headReserveBytes > 0) {
+      const headEnd = this.byteToChunk(Math.min(this.headReserveBytes, size) - 1);
+      for (let i = 0; i <= headEnd; i++) take(i, critical);
     }
 
-    // 窗口外顺序补齐。从窗口末尾往后接着排，这样正常播放时下载会走在播放前面，
+    // 2) 文件尾保留区：仅 MKV。Cues 常在文件尾，缺了 mpv 要从片头扫到播放位置去建索引，
+    //    ExoPlayer 则在 prepare 完成之前就要读它。
+    if (this.tailReserveBytes > 0 && this.needsTailIndex()) {
+      const tailStart = this.byteToChunk(size - Math.min(this.tailReserveBytes, size));
+      for (let i = tailStart; i < chunkCount; i++) take(i, critical);
+    }
+
+    // 3) 关键窗口：正在播的位置往后 30 秒。这些片不到，播放就会卡。
+    for (let i = startChunk; i <= endChunk && i < chunkCount; i++) take(i, critical);
+
+    // 4) 窗口外顺序补齐。从窗口末尾往后接着排，这样正常播放时下载会走在播放前面，
     // 天然形成一个不断前移的缓冲带。
-    for (let i = endChunk + 1; i < chunkCount; i++) {
-      if (!have[i] && !inflight.has(i)) rest.push(i);
-    }
-    // 播放位置之前还缺的片放最后 —— 只有用户往回 seek 才会用到。
-    for (let i = 0; i < startChunk; i++) {
-      if (!have[i] && !inflight.has(i)) rest.push(i);
-    }
+    for (let i = endChunk + 1; i < chunkCount; i++) take(i, rest);
+    // 播放位置之前还缺的片放最后 —— 只有用户往回 seek 才会用到。中途加入留下的
+    // [片头, P) 那个洞也在这里慢慢补平，不占关键窗口的带宽。
+    for (let i = 0; i < startChunk; i++) take(i, rest);
 
     return { critical, rest, startChunk, endChunk };
   }
@@ -177,4 +267,11 @@ export class Scheduler {
   }
 }
 
-export { DEFAULT_LOOKAHEAD_SECONDS, MAX_INFLIGHT_PER_PEER, MAX_INFLIGHT_CEILING, inflightWindow };
+export {
+  DEFAULT_LOOKAHEAD_SECONDS,
+  MAX_INFLIGHT_PER_PEER,
+  MAX_INFLIGHT_CEILING,
+  DEFAULT_HEAD_RESERVE_BYTES,
+  DEFAULT_TAIL_RESERVE_BYTES,
+  inflightWindow,
+};
