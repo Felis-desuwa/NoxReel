@@ -21,11 +21,23 @@
       </section>
 
       <header id="topbar" class="hidden">
-        <div class="brand"><img src="assets/noxreel-icon.png" alt="" /><span>NoxReel</span></div>
+        <div class="brand">
+          <img src="assets/noxreel-icon.png" alt="" /><span>NoxReel</span>
+          <!-- 进房后才出现：连接状态 · 房间模式 · 人数 -->
+          <span class="pill room-pill hidden" id="pill-room"></span>
+        </div>
         <div class="topbar-right">
           <span class="pill" id="pill-geo"></span>
           <span class="pill" id="pill-deps"></span>
+          <button class="ghost top-btn hidden" id="btn-invite-top">
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M19 8v6M22 11h-6"></path></svg>
+            <span>邀请</span>
+          </button>
           <button class="ghost" id="btn-settings">设置</button>
+          <button class="ghost top-btn leave hidden" id="btn-leave">
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><path d="M16 17l5-5-5-5"></path><path d="M21 12H9"></path></svg>
+            <span>离开房间</span>
+          </button>
         </div>
       </header>
 
@@ -99,103 +111,141 @@
       <section id="view-room" class="view">
         <div class="room">
           <div class="room-main">
-            <!-- 正在播放 -->
-            <div class="now-card">
+            <!-- 正在播放：片名 → 状态带（现在在发生什么 + 该按的那一个按钮）→ 进度与缓冲 → 控制条 → 实时速率 -->
+            <section class="now-card" aria-label="正在播放">
               <div class="now-head">
                 <div class="film">
-                  <div class="film-name">
-                    <span id="room-file" data-i18n-skip></span>
-                    <span class="role-badge" id="my-role"></span>
+                  <div class="now-kicker">
+                    <span class="now-badge hidden" id="now-badge"></span>
+                    <span class="now-pos" id="now-pos"></span>
                   </div>
+                  <div class="film-name"><span id="room-file" data-i18n-skip></span></div>
                   <div class="film-meta" id="room-meta"></div>
                 </div>
-                <button class="ghost danger" id="btn-leave">离开房间</button>
+                <span class="role-badge" id="my-role"></span>
               </div>
-              <div class="role-hint hidden" id="role-hint"></div>
-
-              <div class="status-row">
-                <div class="status-banner" id="status-banner"></div>
+              <div class="status-strip" id="status-strip" data-tone="info" role="status">
+                <span class="strip-dot" aria-hidden="true"></span>
+                <div class="strip-body">
+                  <div class="status-banner" id="status-banner"></div>
+                  <!-- 这一部还没开播时：谁还没准备好 -->
+                  <div class="ready-row hidden" id="ready-row">
+                    <div class="ready-text" id="ready-text"></div>
+                  </div>
+                  <div class="role-hint hidden" id="role-hint"></div>
+                </div>
                 <div class="status-actions">
-                  <button class="ghost hidden" id="btn-reopen">重新打开播放器</button>
-                  <button class="ghost hidden" id="btn-rescan">重新扫描</button>
-                  <button class="ghost hidden" id="btn-cancel-scan">停止扫描</button>
-                  <button class="ghost hidden" id="btn-allow-link">允许打开</button>
-                  <button class="ghost hidden" id="btn-skip-link">这一部我先跳过</button>
-                  <button class="ghost hidden" id="btn-skip-current">跳过这一部</button>
+                  <button class="ghost tiny hidden" id="btn-force-start">仍然开始</button>
+                  <button class="ghost tiny hidden" id="btn-reopen">重新打开播放器</button>
+                  <button class="ghost tiny hidden" id="btn-rescan">重新扫描</button>
+                  <button class="ghost tiny hidden" id="btn-cancel-scan">停止扫描</button>
+                  <button class="ghost tiny hidden" id="btn-allow-link">允许打开</button>
+                  <button class="ghost tiny hidden" id="btn-skip-link">这一部我先跳过</button>
+                  <button class="ghost tiny hidden" id="btn-skip-current">跳过这一部</button>
                 </div>
               </div>
-
-              <!-- 这一部还没开播时：谁还没准备好 -->
-              <div class="ready-row hidden" id="ready-row">
-                <div class="ready-text" id="ready-text"></div>
-                <button class="ghost tiny hidden" id="btn-force-start">仍然开始</button>
-              </div>
-
-              <!-- 核心可视化：连续水位线 vs 播放头 -->
+              <!-- 进度条就是缓冲条：白点 = 播放位置，绿 = 从这里起不用等的一段，深蓝 = 已收到 -->
               <div class="buffer-block">
-                <div class="buffer-legend">
-                  <span><i class="sw-play"></i>播放位置</span>
-                  <span><i class="sw-safe"></i>可连续播放</span>
-                  <span><i class="sw-have"></i>已接收（含空洞）</span>
-                </div>
-                <div class="buffer" id="buffer">
+                <div
+                  class="buffer"
+                  id="buffer"
+                  title="白点是播放位置；绿色是从这里起不用等就能接着放的部分，用完之前还没补上，全员会暂停等你；深蓝是已经收到的部分，断开的地方还在补"
+                >
+                  <div class="buf-track"></div>
                   <div class="buf-have" id="buf-have"></div>
+                  <canvas class="buf-map" id="buf-map"></canvas>
                   <div class="buf-safe" id="buf-safe"></div>
                   <div class="buf-head" id="buf-head"></div>
-                  <canvas class="buf-map" id="buf-map"></canvas>
                 </div>
-                <div class="buffer-stats" id="buffer-stats"></div>
+                <div class="buffer-legend" id="buffer-stats"></div>
                 <div class="buffer-verdict hidden" id="buf-verdict"></div>
               </div>
-            </div>
+              <div class="controls">
+                <button class="play-btn" id="btn-playpause" data-state="play" disabled>播放</button>
+                <div class="time" id="time-display">0:00 / 0:00</div>
+                <div class="controls-spacer"></div>
+                <span class="ctl-label">播放器</span>
+                <div class="controls-slot" id="player-slot"></div>
+                <button class="ghost tiny hidden" id="btn-switch-player"></button>
+                <button class="ghost icon-btn" id="btn-reveal">打开源文件位置</button>
+              </div>
+              <!-- 实时速率：本机此刻收多快、发多快，和片子码率摆在一起才比得出结论 -->
+              <div class="rate-row" id="rate-row">
+                <span class="rate down">
+                  <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"></path></svg>
+                  <span class="rate-label">下行</span>
+                  <b class="rate-val" id="rate-down">0.0</b>
+                  <span class="rate-unit">Mbps</span>
+                  <canvas class="rate-spark" id="spark-down" width="48" height="18"></canvas>
+                </span>
+                <span class="rate up">
+                  <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"></path></svg>
+                  <span class="rate-label">上行</span>
+                  <b class="rate-val" id="rate-up">0.0</b>
+                  <span class="rate-unit">Mbps</span>
+                  <canvas class="rate-spark" id="spark-up" width="48" height="18"></canvas>
+                </span>
+                <span class="rate-bitrate" id="rate-bitrate"></span>
+                <span class="rate-verdict" id="rate-verdict"></span>
+              </div>
+            </section>
 
-            <!-- 控制条 -->
-            <div class="controls">
-              <button class="primary big" id="btn-playpause" disabled>播放</button>
-              <div class="time" id="time-display">0:00 / 0:00</div>
-              <div class="controls-spacer"></div>
-              <div class="controls-slot" id="player-slot"></div>
-              <button class="ghost tiny hidden" id="btn-switch-player"></button>
-              <div class="controls-slot" id="danmaku-slot"></div>
-              <button class="ghost" id="btn-reveal">打开源文件位置</button>
-            </div>
-
-            <!-- 页签：成员 / 邀请（仅房主）/ 传输 / 日志 -->
-            <div class="room-tabs" role="tablist">
-              <button class="room-tab on" id="tab-peers" data-tab="peers" role="tab" aria-selected="true">
-                成员 <span class="count" id="peer-count">0</span><i class="tab-dot hidden" id="peers-dot"></i>
-              </button>
-              <button class="room-tab hidden" id="tab-invite" data-tab="invite" role="tab" aria-selected="false">邀请</button>
-              <button class="room-tab" id="tab-transfer" data-tab="transfer" role="tab" aria-selected="false">传输</button>
-              <button class="room-tab" id="tab-log" data-tab="log" role="tab" aria-selected="false">日志</button>
-            </div>
-            <div class="tab-panels">
-              <div class="tab-panel on" id="panel-peers" role="tabpanel">
-                <div id="peer-list" class="peer-list"></div>
+            <!-- 页签：成员 / 传输 / 日志。邀请不再单独一页：空房间时成员页就是邀请流程，之后常驻「邀请下一位」 -->
+            <section class="room-lower">
+              <div class="room-tabs" role="tablist">
+                <button class="room-tab on" id="tab-peers" data-tab="peers" role="tab" aria-selected="true">
+                  成员 <span class="count" id="peer-count">1</span><i class="tab-dot hidden" id="peers-dot"></i>
+                </button>
+                <button class="room-tab" id="tab-transfer" data-tab="transfer" role="tab" aria-selected="false">传输</button>
+                <button class="room-tab" id="tab-log" data-tab="log" role="tab" aria-selected="false">日志</button>
               </div>
-              <div class="tab-panel" id="panel-invite" role="tabpanel">
-                <div id="invite-body"></div>
+              <div class="tab-panels">
+                <div class="tab-panel on" id="panel-peers" role="tabpanel">
+                  <div id="peer-list" class="peer-list"></div>
+                  <div class="invite-next hidden" id="invite-next">
+                    <span class="invite-plus" aria-hidden="true">+</span>
+                    <span class="invite-left" id="invite-left"></span>
+                    <span class="controls-spacer"></span>
+                    <button class="ghost tiny" id="btn-invite-next">邀请下一位</button>
+                  </div>
+                  <div class="invite-card hidden" id="invite-card">
+                    <div class="invite-head">
+                      <h3 class="invite-title" id="invite-title"></h3>
+                      <button class="ghost tiny hidden" id="btn-invite-close">收起</button>
+                    </div>
+                    <div id="invite-body"></div>
+                    <div class="invite-step invite-step-last" id="invite-step3">
+                      <span class="step-no">3</span>
+                      <div>
+                        <div class="step-title">人到齐后按播放</div>
+                        <div class="step-hint">还有人要来？这位连上后，成员表底下会出现「邀请下一位」。</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="tab-panel" id="panel-transfer" role="tabpanel">
+                  <div class="kv" id="transfer-stats"></div>
+                </div>
+                <div class="tab-panel" id="panel-log" role="tabpanel">
+                  <div class="log" id="event-log"></div>
+                </div>
               </div>
-              <div class="tab-panel" id="panel-transfer" role="tabpanel">
-                <div class="kv" id="transfer-stats"></div>
-              </div>
-              <div class="tab-panel" id="panel-log" role="tabpanel">
-                <div class="log" id="event-log"></div>
-              </div>
-            </div>
+            </section>
           </div>
-
           <aside class="room-side">
             <section class="side-panel playlist-panel" id="playlist-panel">
               <header class="panel-head">
                 <h4>播放列表 <span class="count" id="playlist-count"></span></h4>
                 <div class="panel-actions">
-                  <label class="pl-autoplay" title="放完一部接着放下一部，等所有人准备好再开始">
-                    <input type="checkbox" id="pl-autoplay" /> 自动连播
+                  <label class="pl-autoplay switch" title="放完一部接着放下一部，等所有人准备好再开始">
+                    <input type="checkbox" id="pl-autoplay" role="switch" /> 自动连播
                   </label>
                   <span class="panel-edit hidden" id="playlist-actions">
-                    <button class="ghost tiny" id="btn-add-file">+ 本地视频</button>
-                    <button class="ghost tiny" id="btn-add-link">+ 链接</button>
+                    <button class="ghost tiny" id="btn-add" aria-haspopup="menu" aria-expanded="false">+ 添加</button>
+                    <span class="add-menu hidden" id="add-menu" role="menu">
+                      <button class="add-item" id="btn-add-file" role="menuitem">本地视频…</button>
+                      <button class="add-item" id="btn-add-link" role="menuitem">视频链接…</button>
+                    </span>
                   </span>
                 </div>
               </header>
@@ -205,13 +255,15 @@
               </div>
               <div class="playlist-body" id="playlist-body"></div>
             </section>
-
             <section class="side-panel chat-panel" id="chat-panel">
               <header class="panel-head">
                 <h4>聊天</h4>
+                <!-- 弹幕开关和设置跟着聊天走：弹幕就是飘在画面上的聊天 -->
+                <div class="controls-slot dm-slot" id="danmaku-slot"></div>
               </header>
               <div class="chat-body" id="chat-body"></div>
               <div class="chat-foot" id="chat-foot"></div>
+              <div class="chat-hint">在播放器里按 Ctrl+Shift+D 也能直接发弹幕</div>
             </section>
           </aside>
         </div>

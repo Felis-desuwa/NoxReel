@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析；一整晚的片单、飘过画面的弹幕和你自己惯用的播放器都在里面。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.0-7C5CFF?style=for-the-badge" alt="Version 0.7.0">
+    <img src="https://img.shields.io/badge/version-0.7.1-7C5CFF?style=for-the-badge" alt="Version 0.7.1">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -59,6 +59,9 @@
 - **模式握手**：邀请码和 P2P 数据通道都会核对协议版本和房间模式；任一项不一致会在媒体清单、控制消息和视频数据传输前断开。
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
+> [!NOTE]
+> `v0.7.1` 重排了房间页，主次按「现在该干什么」来排：片名下面一条**状态带**只说现在在发生什么，外加最多一个该按的按钮（比如「仍然开始」）；进度条就是缓冲条，图例直接带数值（播放到哪、不用等还能放多久、收到多少）；新增**实时上下行速率**和最近 30 秒的折线；成员页改成表格，谁准备好了、谁收得慢一眼看得到；**邀请不再只有一次** —— 空房间时成员页就是三步邀请，有人进来后成员表底下常驻「邀请下一位」。离开房间和邀请挪到顶栏，弹幕开关挪到聊天标题上。协议没有变，和 0.7.0 互通。
+
 > [!IMPORTANT]
 > `v0.7.0` 把「一部片」变成「一整晚」：**播放列表**、**弹幕聊天**和**可切换播放器**三件事一起落地，代价是**协议升到 v2、与 0.6.x 不互通**。以前一个房间只放得下一部片 —— 传输层从头到尾只有一份清单、一张位图，控制消息里连文件标识都没有，「先暂停第一部、去传第二部」这件事在旧协议下根本表达不出来。现在数据帧头带上了 slot，清单、位图、请求和取消都按 slot 分开，一个房间可以同时挂着多部片，而调度永远只服务当前这一部：**先收完的人去拉下一部，不会拖慢还在收当前这部的人**。列表由房主一人裁决，管理员和房主权限相同（加片、调序、立即播放、删除、开关自动连播），改角色仍然只有房主能做。**弹幕**走的是同一条控制通道，收端先按 id 去重再扣令牌桶，昵称和正文都不进翻译表。mpv 那一路每秒 30 帧重新拼 ASS 覆盖层（mpv 的覆盖层渲染时间固定为 0，`\move` 不会动，只能逐帧画），外部播放器那一路由一个点击穿透的透明覆盖窗用 canvas 画。**可切换播放器**新增了一个 C# 桥接程序遥控 PotPlayer 和 MPC-BE：它们打开正在增长的文件会跳走并停止，所以只接手已经收完的文件，可信房间边下边播的那一段仍由 mpv 顶着，收完后再给一键切换的提示。**中途加入**也重做了门槛：起播点附近攒够数据才播，只补当前位置附近的内容，不再让全房陪着等。协议不互通是取舍的结果 —— 维护两套传输逻辑，对 2–16 人的朋友房间不值得，所以邀请码里干脆带上版本号，把「对方是 0.6.x」这件事当场说清楚。测试从 298 条增加到 1500 条以上。
 
@@ -66,8 +69,8 @@
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.0.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.0.exe) |
+| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.1.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.1.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 

@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links — now with a playlist for the whole evening, danmaku comments over the picture, and your own preferred player.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.0-7C5CFF?style=for-the-badge" alt="Version 0.7.0">
+    <img src="https://img.shields.io/badge/version-0.7.1-7C5CFF?style=for-the-badge" alt="Version 0.7.1">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -59,6 +59,9 @@
 - **Version and mode handshake:** invite codes and the P2P data channel both verify the protocol version and the selected room mode. A mismatch disconnects before media manifests, room controls, or video data are exchanged.
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
 
+> [!NOTE]
+> `v0.7.1` reorganizes the room page around "what should happen next": a single **status strip** under the title says what is going on right now, with at most one button to press (such as "Start anyway"); the progress bar doubles as the buffer bar, and its legend carries the numbers (where playback is, how long it can keep playing without waiting, how much has arrived); **live download and upload rates** with a 30-second sparkline are new; the member list is now a table that shows at a glance who is ready and who is receiving slowly; and **inviting is no longer one-shot** — an empty room shows a three-step invite flow, and once someone joins, an "Invite someone else" row stays under the member list. Leave room and Invite moved to the title bar, and the danmaku toggle moved to the chat header. The protocol is unchanged, so 0.7.1 works with 0.7.0.
+
 > [!IMPORTANT]
 > `v0.7.0` turns "one movie" into "one evening": the **playlist**, **danmaku chat**, and the **switchable player** all land together, at the cost of a **protocol bump to v2 that cannot talk to 0.6.x**. A room used to hold exactly one video — the transfer layer had a single manifest and a single bitfield, and the control messages carried no file identifier at all, so "pause the first video and transfer the second one instead" was not expressible in the old protocol. Data frames now carry a slot, and manifests, bitfields, requests, and cancellations are all per-slot, so a room can hold several videos while the scheduler only ever serves the current one: **someone who finished early and moved on to the next video does not slow down the people still receiving the current one**. The host is the single authority over the list, moderators have the same list powers (add, reorder, play now, remove, toggle autoplay), and only the host can still change roles. **Danmaku** travels over the same control channel; the receiver deduplicates by id before spending a token, and neither nicknames nor message bodies enter the translation tables. The mpv path rebuilds an ASS overlay 30 times a second (mpv renders overlays at a fixed time of 0, so `\move` never animates and every frame must be drawn), while external players get a click-through transparent overlay window that paints on a canvas. **The switchable player** adds a small C# bridge that remote-controls PotPlayer and MPC-BE: both seek away and stop when handed a file that is still growing, so they only take over fully received files, mpv still covers the progressive part of a Trusted room, and a one-click hint appears once the file is complete. **Joining mid-playback** was reworked as well: playback starts only once enough data has arrived around the starting point, and only the part near the room's current position is fetched, so nobody else has to wait. The incompatibility is a deliberate trade — maintaining two transfer stacks is not worth it for rooms of 2–16 friends, so the invite code simply carries the version and says "the other side is on 0.6.x" outright. Tests grew from 298 to more than 1,500.
 
@@ -66,8 +69,8 @@
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.0.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.0.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.0.exe) |
+| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.1.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.1.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.1.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 

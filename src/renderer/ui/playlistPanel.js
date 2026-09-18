@@ -104,13 +104,15 @@ export function createPlaylistPanel({ body, onAction, onMove, onDropFiles }) {
     el.setAttribute('role', 'listitem');
 
     const badges = [];
-    if (row.current) badges.push({ key: 'badge', className: 'pl-badge playing', text: '正在播放' });
-    else if (row.next) badges.push({ key: 'badge', className: 'pl-badge next', text: '下一部' });
     if (row.locked) {
       badges.push({ key: 'lock', className: 'pl-lock', text: '🔒', attrs: { title: row.lockTitle || '', 'aria-label': row.lockTitle || '' } });
     }
 
+    // 「正在播放 / 下一部」放在右边状态栏的最上面，和传输状态上下排：
+    // 一行里播放状态和传输状态各占一处，不再和片名挤在一起
     const state = [];
+    if (row.current) state.push({ key: 'badge', className: 'pl-badge playing', text: '正在播放' });
+    else if (row.next) state.push({ key: 'badge', className: 'pl-badge next', text: '下一部' });
     if (row.transfer) {
       state.push({ key: 'transfer', className: `pl-transfer ${row.transfer.tone || ''}`, text: row.transfer.text });
       state.push(progressSpec(row.transfer.ratio));

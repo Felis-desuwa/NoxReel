@@ -54,6 +54,9 @@ function el() {
   e.blur = () => {
     e.blurred++;
   };
+  e.setAttribute = (name, value) => {
+    e[name] = String(value);
+  };
   e.classList = {
     toggle: (c, on) => {
       if (c === 'hidden') e.hidden = on === undefined ? !e.hidden : !!on;
@@ -64,6 +67,7 @@ function el() {
     remove: (c) => {
       if (c === 'hidden') e.hidden = false;
     },
+    contains: (c) => (c === 'hidden' ? e.hidden : false),
   };
   return e;
 }
@@ -813,7 +817,7 @@ test('后台扫的片切成当前项后，扫描已用时间会自己走起来',
     skippedLinks: new Set(),
     diskFull: new Set(),
   };
-  const ctx = sandbox(fns('renderStatus', 'setScanTicker', 'scanProgressLabel'), {
+  const ctx = sandbox(fns('renderStatus', 'renderNowKicker', 'updateStripTone', 'setScanTicker', 'scanProgressLabel'), {
     S,
     $,
     t: (s) => s,

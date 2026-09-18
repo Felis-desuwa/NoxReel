@@ -577,12 +577,13 @@ test('输入法弹出时窗口变矮而不是整体上顶（聊天输入条要�
   assert.match(layout, /android:id="@\+id\/web"[\s\S]*?android:layout_height="match_parent"/);
 });
 
-test('版本号升到 0.7.0（协议 v2，和 0.6.x 不互通）', () => {
+test('版本号在 0.7 线上（协议 v2，和 0.6.x 不互通）', () => {
   const gradle = read(GRADLE);
   const code = Number(/versionCode\s+(\d+)/.exec(gradle)[1]);
   const name = /versionName\s+"([^"]+)"/.exec(gradle)[1];
   assert.ok(code >= 16, `versionCode 要大于 0.6.8 的 15，现在是 ${code}`);
-  assert.equal(name, '0.7.0');
+  // 具体是 0.7 的第几版由 launcher.test 钉成和 package.json 一致，这里只管「协议 v2 这条线」
+  assert.match(name, /^0\.7\.\d+$/);
   assert.match(read('android/README.md'), /0\.7\.0/, 'README 还写着旧版本号');
 });
 

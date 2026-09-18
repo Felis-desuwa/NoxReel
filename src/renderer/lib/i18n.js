@@ -445,7 +445,6 @@ const EN = new Map(Object.entries({
   '显示区域': 'Display area',
   '上半屏': 'Top half',
   '全屏': 'Full screen',
-  '还没有人加入。去「邀请」页签生成邀请链接。': 'Nobody has joined yet. Open the Invite tab to create an invite link.',
   '还没有其他成员。': 'No other members yet.',
   '列表还是空的，点右上角加一部。': 'The playlist is empty. Add a video with the buttons at the top right.',
   '列表还是空的，等房主加片。': 'The playlist is empty. Waiting for the host to add a video.',
@@ -596,6 +595,51 @@ const EN = new Map(Object.entries({
     'Ctrl+Shift+D is taken by another program, so danmaku cannot be sent from inside the player',
   '这会儿弹不出输入条：播放器不在前台，或者正处于独占全屏':
     'The input bar cannot open right now: the player is not in the foreground, or it is in exclusive fullscreen',
+  // 房间页重排（0.7.1）
+  '角色': 'Role',
+  '状态': 'Status',
+  '已就绪': 'Ready',
+  '未就绪': 'Not ready',
+  '上行': 'Upload',
+  '即将开始': 'Starting soon',
+  '还没开始': 'Not started',
+  '点开对方发回的 NoxReel 应答链接，或粘贴 NR3-…': 'Open the NoxReel reply link they sent back, or paste NR3-…',
+  '还没有人加入：照下面的步骤把朋友拉进来，也可以自己先放':
+    'Nobody has joined yet: follow the steps below to bring friends in, or start watching on your own',
+  '邀请下一位': 'Invite someone else',
+  '收起': 'Hide',
+  '把朋友拉进房间': 'Bring friends into the room',
+  '人到齐后按播放': 'Press Play once everyone is here',
+  '还有人要来？这位连上后，成员表底下会出现「邀请下一位」。':
+    'More people coming? Once this one connects, “Invite someone else” appears under the member list.',
+  '+ 添加': '+ Add',
+  '本地视频…': 'Local video…',
+  '视频链接…': 'Video link…',
+  '在播放器里按 Ctrl+Shift+D 也能直接发弹幕': 'Inside the player, press Ctrl+Shift+D to send danmaku directly',
+  '白点是播放位置；绿色是从这里起不用等就能接着放的部分，用完之前还没补上，全员会暂停等你；深蓝是已经收到的部分，断开的地方还在补':
+    'The white dot is the playback position. Green is what can keep playing from here without waiting; if it runs out before more arrives, everyone pauses for you. Dark blue is what has been received; gaps are still being filled.',
+  '重新生成邀请链接': 'Generate a new invite link',
+  '复制邀请链接，发给其中一位': 'Copy the invite link and send it to one person',
+  '一条链接只给一个人用，几分钟内有效；过期了重新生成一条即可':
+    'Each link is for one person and works for a few minutes; generate a new one if it expires',
+  '对方发回应答链接后，直接点开或粘贴到这里': 'When they send back a reply link, open it or paste it here',
+  '复制邀请码，发给要来的人': 'Copy the invite code and send it to whoever is coming',
+  '这个码多人可用、可重复使用；房间会一直开着直到你离开。':
+    'This code works for several people and can be reused; the room stays open until you leave.',
+  '（你）': ' (you)',
+  '各自从原网站播放': 'Each plays from the original site',
+  '准备情况': 'Readiness',
+  '实时速率': 'Live rate',
+  '供片中': 'Seeding',
+  '整部都在本机，不用等': 'The whole file is here, no waiting',
+  '各自从原网站读取，不走 P2P': 'Everyone reads from the original site, not over P2P',
+  '还没人连上，没有流量': 'Nobody has connected yet, no traffic',
+  '现在没人在收': 'Nobody is receiving right now',
+  '这一部已经收完': 'This one is fully received',
+  '安全模式：收完才播': 'Safe mode: plays after the full download',
+  '还没开始收': 'Not receiving yet',
+  '下行刚好够码率，余量很薄': 'Download just matches the bitrate, very little margin',
+  '下行比码率低，边下边播可能会卡': 'Download is below the bitrate, progressive playback may stall',
 }));
 
 const trimEnd = (text) => String(text).replace(/[.。]+$/, '');
@@ -949,7 +993,26 @@ const EN_PATTERNS = [
   [/^会话不存在：(.*)$/, 'Session does not exist: $1'],
   [/^分片下标越界：(.*)$/, 'Chunk index out of range: $1'],
   [/^本地没有分片 (.*)$/, 'Chunk $1 is not available locally'],
-  [/^读取分片 (.*) 短读$/, 'Short read while reading chunk $1']
+  [/^读取分片 (.*) 短读$/, 'Short read while reading chunk $1'],
+  // 房间页重排（0.7.1）。放在最后：「持有 N% · 延迟 X」要排在上面三段式那条后面，不然会把它吞掉
+  [/^还能再来 (\d+) 人$/, (_all, n) => `Room for ${n} more`],
+  [
+    /^(已连接|等人加入) · (可信房间|安全模式) · (\d+) \/ (\d+) 人$/,
+    (_all, state, mode, n, max) =>
+      `${state === '已连接' ? 'Connected' : 'Waiting for people'} · ${mode === '可信房间' ? 'Trusted room' : 'Safe mode'} · ${n} / ${max} people`,
+  ],
+  [/^第 (\d+) \/ (\d+) 部$/, 'Item $1 of $2'],
+  [/^播放到 (.+)$/, 'Playing at $1'],
+  [/^不用等还能放 (.+)$/, '$1 playable without waiting'],
+  [/^从当前位置可连续播放 (.+)$/, 'Continuous from here: $1'],
+  [/^已收到 ([\d.]+)%（(\d+)\/(\d+) 片）$/, 'Received $1% ($2/$3 chunks)'],
+  [/^已收 (\d+)%$/, 'Received $1%'],
+  [/^未就绪 · (.+)$/, (_all, rest) => `Not ready · ${translate(rest, 'en')}`],
+  [/^持有 (\d+)% · 延迟 (.+)$/, 'Has $1% · Latency $2'],
+  [/^延迟 (.+)$/, 'Latency $1'],
+  [/^片子码率 (.+)$/, 'Video bitrate $1'],
+  [/^正在给 (\d+) 人供片$/, (_all, n) => `Seeding to ${n} ${n === '1' ? 'person' : 'people'}`],
+  [/^下行是码率的 ([\d.]+) 倍，够用$/, 'Download is $1× the bitrate, plenty'],
 ];
 
 let locale = readStoredLocale();

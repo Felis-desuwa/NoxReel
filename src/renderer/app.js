@@ -3152,6 +3152,8 @@ function initSwarmAndSync() {
 
   // 就绪变化：刷新等待名单；房主看看是不是该自动开播了
   S.sync.on('ready-change', () => {
+    // 成员表上每人的「未就绪 / 已就绪」要和状态带的等待名单一起换
+    renderPeers();
     renderReady();
     maybeAutoStart();
   });
@@ -3397,9 +3399,14 @@ async function enterRoom() {
   renderChat();
   ensureDanmakuControls();
   renderPlayerControls();
-  $('tab-invite').classList.toggle('hidden', S.role !== 'host');
-  // 房主进了空房间，先把邀请页摆出来；用户动过页签之后就不再替他切
-  if (S.role === 'host' && connectedPeerCount() === 0 && !tabTouched) selectRoomTab('invite');
+  // 顶栏：邀请只给房主；离开房间和房间药丸进房后一直在。
+  // 邀请不再单独占一个页签：空房间时成员页就是邀请流程，有人进来后收成一行「邀请下一位」。
+  $('btn-invite-top').classList.toggle('hidden', S.role !== 'host');
+  $('btn-leave').classList.remove('hidden');
+  $('pill-room').classList.remove('hidden');
+  renderRoomPill();
+  renderInviteArea();
+  startRateTicker();
   // 当前项在进房前就可能已经切好了（房主自己的片）；观众要等列表和清单到了，
   // 由 onPlaylistChanged → switchCurrent 那一路接着走。
 }
@@ -4044,11 +4051,21 @@ function renderReady() {
   const visible =
     roomEntered && !!S.sync && !!S.current && !S.playlist.started && !S.switchingMedia && S.sync.shared.paused;
   row.classList.toggle('hidden', !visible);
-  if (!visible) return;
+  if (!visible) {
+    // 「仍然开始」挪到了状态带的按钮区，不再跟着这一行一起藏起来，得自己收
+    $('btn-force-start').classList.add('hidden');
+    updateStripTone();
+    return;
+  }
   const waiting = readyWaiting();
   const canControl = S.sync.canIControl();
   row.classList.toggle('all', !waiting.length);
-  if (!waiting.length) {
+  // 房主一个人进了空房间：「所有人都准备好了」虽然不假，但这时候该做的是去拉人
+  const alone = S.role === 'host' && connectedPeerCount() === 0;
+  row.classList.toggle('alone', alone);
+  if (alone) {
+    replace('ready-text', make('span', { text: '还没有人加入：照下面的步骤把朋友拉进来，也可以自己先放' }));
+  } else if (!waiting.length) {
     const armed = autoStartArmed();
     replace(
       'ready-text',
@@ -4070,6 +4087,7 @@ function renderReady() {
     replace('ready-text', make('span', { text: `等待 ${waiting.length} 人准备好：` }), ...names);
   }
   $('btn-force-start').classList.toggle('hidden', !canControl || !waiting.length);
+  updateStripTone();
 }
 
 /** 开始放当前这一部（「仍然开始」，或者大家都准备好了）。 */
@@ -4117,6 +4135,8 @@ function refreshMediaUi() {
   renderProgress(S.swarm?.progress());
   $('btn-reveal').classList.toggle('hidden', S.sourceType !== 'file' || !S.filePath);
   $('btn-reveal').textContent = S.isSeeder ? '打开源文件位置' : '打开临时缓存位置';
+  // 按钮只画一个文件夹图标，文字放到悬停提示里
+  $('btn-reveal').title = t($('btn-reveal').textContent);
   $('buffer').classList.toggle('link-mode', S.sourceType === 'link');
   syncPlaylistEditUi();
   // 换了一部：这一部收没收完、是不是链接，都可能让「能不能用外部播放器」翻面
@@ -4879,6 +4899,7 @@ async function renderInvite() {
 
   if (S.role !== 'host') {
     replace(box, make('p', { text: '你是通过邀请加入的。要拉更多人进来，让发起者再生成一个邀请码。' }));
+    renderInviteArea();
     return;
   }
 
@@ -4887,27 +4908,26 @@ async function renderInvite() {
     attrs: { type: 'number', min: 2, max: 16 },
     props: { value: String(S.roomCapacity) },
   });
+  // 邀请链接和应答框在上面（inv-out，按步骤排），人数上限、连接方式这些少动的设置收在底下一行
   replace(
     box,
-    make('p', {
-      className: 'fine',
-      text: S.roomSecurityMode === 'trusted'
-        ? '当前：可信房间（边下边播，风险较高）。加入者也必须在本机选择可信房间。'
-        : '当前：安全模式。成员完整接收并扫描通过后才播放。',
-    }),
-    make('div', { className: 'capacity-row' }, [
-      make('label', { text: '房间人数上限', attrs: { for: 'room-capacity' } }),
-      capacityInput,
-      make('button', { className: 'ghost', id: 'capacity-apply', text: '应用' }),
-    ]),
-    make('p', { className: 'fine', id: 'capacity-status' }),
-    make('button', { className: 'primary', id: 'inv-manual', text: '生成零服务器邀请链接' }),
-    make('button', { className: 'ghost', id: 'inv-server', text: '改用信令服务器' }),
-    make('p', {
-      id: 'inv-hint',
-      text: '默认使用零服务器直连。双方直接点开邀请／应答链接即可，不再手动粘贴长码；跨网络仍需交换一次应答。',
-    }),
-    make('div', { id: 'inv-out' })
+    make('div', { id: 'inv-out' }),
+    make('div', { className: 'invite-settings' }, [
+      make('span', {
+        className: 'fine',
+        text: S.roomSecurityMode === 'trusted'
+          ? '当前：可信房间（边下边播，风险较高）。加入者也必须在本机选择可信房间。'
+          : '当前：安全模式。成员完整接收并扫描通过后才播放。',
+      }),
+      make('div', { className: 'capacity-row' }, [
+        make('label', { text: '房间人数上限', attrs: { for: 'room-capacity' } }),
+        capacityInput,
+        make('button', { className: 'ghost tiny', id: 'capacity-apply', text: '应用' }),
+      ]),
+      make('span', { className: 'fine', id: 'capacity-status' }),
+      make('button', { className: 'ghost tiny', id: 'inv-manual', text: '重新生成邀请链接' }),
+      make('button', { className: 'ghost tiny', id: 'inv-server', text: '改用信令服务器' }),
+    ])
   );
 
   $('inv-server').onclick = inviteViaServer;
@@ -4916,10 +4936,79 @@ async function renderInvite() {
   $('inv-manual').onclick = () => inviteViaManual();
   $('capacity-apply').onclick = applyRoomCapacity;
   renderCapacityStatus();
+  renderInviteArea();
   // 默认直接生成零服务器邀请，用户进入房间后不必再选择连接方式。
   inviteViaManual().catch((error) => {
     replace('inv-out', make('p', { text: error.message || String(error) }));
   });
+}
+
+/** 邀请区的一步：圆圈序号 + 标题 + 一句说明 + 一行控件。 */
+function inviteStep(no, title, hint, controls) {
+  return make('div', { className: `invite-step${no === 1 ? ' first' : ''}` }, [
+    make('span', { className: 'step-no', text: String(no) }),
+    make('div', { className: 'step-main' }, [
+      make('div', { className: 'step-title', text: title }),
+      ...(hint ? [make('div', { className: 'step-hint', text: hint })] : []),
+      make('div', { className: 'step-row' }, controls),
+    ]),
+  ]);
+}
+
+/*
+ * 邀请区在成员页里，不再单独占一个页签：
+ * - 房主、房间里还没别人：整页就是邀请流程（三步）。
+ * - 房主、已经有人：成员表底下常驻一行「还能再来 N 人 · 邀请下一位」，点开才展开邀请卡片。
+ *   极简模式一条链接只能进一个人，所以每点一次都现生成一条；信令模式的码多人可用，直接展开就行。
+ * - 观众：一句「让发起者再生成一个邀请码」。
+ */
+let inviteOpen = false;
+
+function renderInviteArea() {
+  const card = $('invite-card');
+  if (!card) return;
+  const host = S.role === 'host';
+  const others = connectedPeerCount();
+  const left = Math.max(0, S.roomCapacity - others - 1);
+  const lone = host && others === 0;
+  const open = host && (lone || inviteOpen);
+  card.classList.toggle('hidden', host && !open);
+  card.classList.toggle('lone', lone);
+  card.classList.toggle('guest', !host);
+  $('invite-title').textContent = lone ? '把朋友拉进房间' : '邀请下一位';
+  $('btn-invite-close').classList.toggle('hidden', !host || lone);
+  $('invite-next').classList.toggle('hidden', !host || open || left === 0);
+  $('invite-left').textContent = `还能再来 ${left} 人`;
+  // 大家都走了又剩房主一个人：屏幕上那条链接早已用掉，给下一位现生成一条
+  if (lone && roomEntered && !S.leaving && S.mode !== 'server' && !S.pendingManualPeer && $('inv-link')) {
+    inviteViaManual().catch((error) => replace('inv-out', make('p', { text: error.message || String(error) })));
+  }
+}
+
+function openInvite() {
+  if (S.role !== 'host') return;
+  selectRoomTab('peers', { byUser: true });
+  inviteOpen = true;
+  renderInviteArea();
+  // 极简模式的邀请链接一条只能进一个人：上一条用掉之后 pendingManualPeer 会清空，给下一位现生成一条
+  if (S.mode !== 'server' && !S.pendingManualPeer) {
+    inviteViaManual().catch((error) => replace('inv-out', make('p', { text: error.message || String(error) })));
+  }
+  $('invite-card').scrollIntoView?.({ block: 'nearest' });
+}
+
+function closeInvite() {
+  inviteOpen = false;
+  renderInviteArea();
+}
+
+/** 顶栏上的房间药丸：连接状态 · 房间模式 · 人数（含自己）/ 上限。 */
+function renderRoomPill(others = connectedPeerCount()) {
+  const pill = $('pill-room');
+  if (!pill) return;
+  const mode = S.roomSecurityMode === 'trusted' ? '可信房间' : '安全模式';
+  pill.textContent = `${others ? '已连接' : '等人加入'} · ${mode} · ${others + 1} / ${S.roomCapacity} 人`;
+  pill.classList.toggle('waiting', !others);
 }
 
 function renderCapacityStatus() {
@@ -4971,11 +5060,13 @@ async function inviteViaServer() {
       securityMode: S.roomSecurityMode,
     });
 
+    // 信令模式的邀请码谁都能用、用几次都行：只有一步，「邀请下一位」时也不用重新生成
     replace(
       out,
-      make('textarea', { id: 'inv-code', attrs: { readonly: '', rows: 4 } }),
-      make('button', { className: 'primary', id: 'inv-copy', text: '复制邀请码' }),
-      make('p', { text: `完整短码共 ${code.length} 字符，可重复使用。房间会一直开着直到你离开。` })
+      inviteStep(1, '复制邀请码，发给要来的人', '这个码多人可用、可重复使用；房间会一直开着直到你离开。', [
+        make('textarea', { id: 'inv-code', attrs: { readonly: '', rows: 2 } }),
+        make('button', { className: 'primary', id: 'inv-copy', text: '复制邀请码' }),
+      ])
     );
     $('inv-code').value = code;
     $('inv-copy').onclick = () => copyCode(code, $('inv-copy'));
@@ -5040,23 +5131,23 @@ async function inviteViaManual(notice = '') {
   const noticeNode = notice ? make('p', { id: 'inv-notice', text: notice }) : [];
   if (notice) noticeNode.style.color = 'var(--warn)';
 
+  // 一条链接只能进一个人，而且带着本机当前的网络地址，放久了会失效 —— 这两件事写在第一步上，
+  // 省得房主把同一条链接发给两个人，或者隔半小时才发出去。
   replace(
     out,
     noticeNode,
-    make('a', { id: 'inv-link', className: 'invite-link', text: 'NoxReel 一键加入链接' }),
-    make('button', { className: 'primary', id: 'inv-copy', text: '复制邀请链接' }),
-    make('p', { text: `已生成可点击的邀请链接；压缩握手数据 ${code.length} 字符。在对方真正连上前，不会计入成员列表。` }),
-    make('p', {
-      className: 'fine',
-      text: '链接里带着这台电脑当前的网络地址，放久了会失效 —— 尽量在几分钟内让对方点开。过期了重新生成一条即可。',
-    }),
-    make('p', {}, [make('b', { text: '第 2 步：' }), '对方发回应答链接后直接点开，或粘贴到这里：']),
-    make('textarea', {
-      id: 'inv-answer',
-      attrs: { rows: 3, placeholder: '点开对方发回的 NoxReel 应答链接，或粘贴 NR3-…' },
-    }),
-    make('button', { className: 'ghost', id: 'inv-accept', text: '完成连接' }),
-    make('p', { id: 'inv-status' })
+    inviteStep(1, '复制邀请链接，发给其中一位', '一条链接只给一个人用，几分钟内有效；过期了重新生成一条即可', [
+      make('a', { id: 'inv-link', className: 'invite-link', text: 'NoxReel 一键加入链接' }),
+      make('button', { className: 'primary', id: 'inv-copy', text: '复制邀请链接' }),
+    ]),
+    inviteStep(2, '对方发回应答链接后，直接点开或粘贴到这里', '', [
+      make('textarea', {
+        id: 'inv-answer',
+        attrs: { rows: 2, placeholder: '点开对方发回的 NoxReel 应答链接，或粘贴 NR3-…' },
+      }),
+      make('button', { className: 'ghost', id: 'inv-accept', text: '完成连接' }),
+    ]),
+    make('p', { className: 'fine', id: 'inv-status' })
   );
   $('inv-link').href = link;
   $('inv-link').onclick = (event) => { event.preventDefault(); copyCode(link, $('inv-copy'), '复制邀请链接'); };
@@ -5101,6 +5192,11 @@ function watchManualHandshake(peer, status) {
     const text = advice?.text ? `${rawText}\n诊断：${advice.text}` : rawText;
     if (!retry) {
       if (status?.isConnected) status.textContent = text;
+      // 连上了：这条链接已经用掉，邀请卡片收起来，换成成员表底下一行「邀请下一位」
+      if (peer.authenticated) {
+        inviteOpen = false;
+        renderInviteArea();
+      }
       return;
     }
     // 失效的连接留在 swarm 里只会占着成员位；清掉再生成一条新链接，
@@ -5210,6 +5306,11 @@ function kv(label, value) {
   return make('div', { className: 'kv-row' }, [make('span', { text: label }), make('span', { text: value })]);
 }
 
+/** 进度条下面的图例：色块 + 带数值的一句话。 */
+function legendItem(kind, text) {
+  return make('span', { className: `legend-item ${kind}` }, [make('i'), make('span', { text })]);
+}
+
 function renderProgress(p) {
   if (!p) return;
 
@@ -5238,7 +5339,13 @@ function renderProgress(p) {
   if (!S.manifest) return;
 
   $('buf-have').style.width = `${(p.ratio * 100).toFixed(2)}%`;
-  $('buf-safe').style.width = `${(p.contiguousRatio * 100).toFixed(2)}%`;
+  // 绿色画的是「从播放位置起不用等的那一段」（runBytes），不是从文件头起的完整度 ——
+  // 中途加入的人文件头往后是一大段空洞，按完整度画的话绿色永远贴在最左边，和他的处境对不上。
+  const size = S.manifest.size || 1;
+  const runStart = Math.max(0, Math.min(size, p.playbackByte ?? 0));
+  const runBytes = Math.max(0, Math.min(size - runStart, p.runBytes ?? p.contiguousBytes ?? 0));
+  $('buf-safe').style.left = `${((runStart / size) * 100).toFixed(2)}%`;
+  $('buf-safe').style.width = `${((runBytes / size) * 100).toFixed(2)}%`;
 
   const snap = S.sync?.lastTick;
   const playRatio =
@@ -5247,12 +5354,21 @@ function renderProgress(p) {
 
   drawChunkMap();
 
+  // 图例直接带上数：三种颜色各代表多少，不用读的人自己去猜
+  const bitrate = currentFileCtx()?.scheduler.bytesPerSecond || 0;
+  const position = S.sync?.status().position || 0;
   replace(
     'buffer-stats',
-    stat('已接收', `${(p.ratio * 100).toFixed(1)}%（${p.haveCount}/${p.chunkCount} 片）`),
-    stat('从当前位置可连续播放', fmtBytes(p.runBytes || 0)),
-    stat('在途', `${p.inflight} 片`),
-    stat('速度', fmtRate(p.downRate))
+    legendItem('play', position > 0 ? `播放到 ${fmtTime(position)}` : '还没开始'),
+    legendItem(
+      'safe',
+      p.complete
+        ? '整部都在本机，不用等'
+        : bitrate > 0
+        ? `不用等还能放 ${fmtTime(runBytes / bitrate)}`
+        : `从当前位置可连续播放 ${fmtBytes(runBytes)}`
+    ),
+    legendItem('have', `已收到 ${(p.ratio * 100).toFixed(1)}%（${p.haveCount}/${p.chunkCount} 片）`)
   );
 
   renderTransferVerdict(p);
@@ -5262,6 +5378,7 @@ function renderProgress(p) {
     kv('已收', fmtBytes(p.received)),
     kv('已发', fmtBytes(p.sent)),
     kv('下行', fmtRate(p.downRate)),
+    kv('在途', `${p.inflight} 片`),
     kv('连接数', S.swarm.peers.size),
     kv('模式', S.mode === 'manual' ? '极简（零服务器）' : '信令服务器')
   );
@@ -5398,7 +5515,8 @@ function drawChunkMap() {
 
   const ctx = cv.getContext('2d');
   ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = 'rgba(63, 185, 80, 0.28)';
+  // 深蓝：已经收到的分片。断开的地方就是还没收到的
+  ctx.fillStyle = '#2d5a80';
 
   const n = have.length;
   const scale = w / n;
@@ -5701,29 +5819,109 @@ function renderHostVerdict(list = S.swarm?.peerList() || []) {
   replace(node, ...parts);
 }
 
+const AVATAR_HUES = ['#7fb2ff', '#e3a857', '#6fd08c', '#f08a6c', '#c49bff', '#5fd4d4'];
+
+/** 头像：昵称的第一个字，颜色按 peerId 算，同一个人每次重画颜色不变。 */
+function avatarOf(key, name) {
+  let h = 0;
+  for (const ch of String(key || '')) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  const el = make('span', {
+    raw: true,
+    className: 'avatar',
+    text: [...String(name || '?')][0] || '?',
+    attrs: { 'aria-hidden': 'true' },
+  });
+  el.style.background = AVATAR_HUES[h % AVATAR_HUES.length];
+  return el;
+}
+
+/** 这一部还没开播时谁还没准备好 —— 成员表据此标「未就绪」。已经开播了返回 null。 */
+function notReadyIds() {
+  const pending =
+    roomEntered && !!S.sync && !!S.current && !S.playlist.started && !S.switchingMedia && S.sync.shared.paused;
+  if (!pending) return null;
+  return new Set(readyWaiting().map((w) => (w.self ? S.peerId : w.peerId)));
+}
+
+/** 本机速率：下行 = 从所有人那里收的合计，上行 = 发给所有人的合计（字节/秒）。 */
+function myRates(list = S.swarm?.peerList() || []) {
+  let down = 0;
+  let up = 0;
+  for (const p of list) {
+    down += p.downRate || 0;
+    up += p.upRate || 0;
+  }
+  return { down, up };
+}
+
+/** 成员表里「你」这一行：等不等得起，你自己也是其中一个。 */
+function selfPeerRow(waiting) {
+  const role = S.sync?.myRole() || (S.role === 'host' ? 'host' : 'guest');
+  const p = S.swarm?.progress();
+  const serving = servingCurrent();
+  const { down, up } = myRates();
+  let state = '—';
+  let tone = '';
+  if (S.sourceType === 'link') state = '各自从原网站播放';
+  else if (serving) state = '片源';
+  else if (p?.complete) state = '已收完';
+  else if (S.manifest) state = `已收 ${Math.round((p?.ratio || 0) * 100)}%`;
+  if (waiting) {
+    const ready = !waiting.has(S.peerId);
+    state = ready ? '已就绪' : `未就绪 · ${state}`;
+    tone = ready ? 'ok' : 'wait';
+  }
+  const speed = serving ? (up > 0 ? `↑ ${fmtMbps(up)}` : '供片中') : down > 0 ? `↓ ${fmtMbps(down)}` : '—';
+  return make('div', { className: 'peer self', attrs: { role: 'row' } }, [
+    make('div', { className: 'peer-who', attrs: { role: 'cell' } }, [
+      avatarOf(S.peerId, S.name),
+      make('span', { raw: true, className: 'peer-name', text: S.name || '' }),
+      make('span', { className: 'peer-platform', text: '（你）' }),
+    ]),
+    make('div', { attrs: { role: 'cell' } }, [
+      make('span', { className: `role-badge ${role}`, text: ROLE_LABEL[role] || '' }),
+    ]),
+    make('div', { className: 'peer-state', attrs: { role: 'cell' } }, [
+      make('div', { className: tone ? `peer-forecast ${tone}` : 'peer-forecast', text: state }),
+    ]),
+    make('div', { className: speed === '供片中' || speed === '—' ? 'peer-speed idle' : 'peer-speed', attrs: { role: 'cell' }, text: speed }),
+    make('div', { className: 'peer-act', attrs: { role: 'cell' } }),
+  ]);
+}
+
 function renderPeers(list) {
   list = list || S.swarm?.peerList() || [];
   list = list.filter((p) => p.state === 'connected' || p.state === 'completed');
-  if (list.length > Number($('peer-count').textContent || 0)) notePeersChanged();
-  $('peer-count').textContent = list.length;
+  // 页签上的人数算上自己，和成员表的行数对得上
+  if (list.length + 1 > Number($('peer-count').textContent || 0)) notePeersChanged();
+  $('peer-count').textContent = list.length + 1;
   renderCapacityStatus();
+  renderRoomPill(list.length);
+  renderInviteArea();
+  // 空房间和有人之间切换时，状态带那句「还没有人加入」要跟着换
+  renderReady();
   const forecasts = updatePeerForecasts(list);
   renderHostVerdict(list);
 
   if (!list.length) {
-    const empty = make('p', {
-      className: 'fine',
-      text: S.role === 'host' ? '还没有人加入。去「邀请」页签生成邀请链接。' : '还没有其他成员。',
-    });
-    empty.style.padding = '4px';
-    replace('peer-list', empty);
+    // 房主这边，空房间的成员页就是邀请流程（renderInviteArea）；观众这边说一句就好
+    replace('peer-list', S.role === 'host' ? [] : make('p', { className: 'peer-empty', text: '还没有其他成员。' }));
     return;
   }
 
   const iAmHost = S.sync?.myRole() === 'host';
-  replace(
-    'peer-list',
-    list.map((peer) => {
+  const waiting = notReadyIds();
+  const bitrate = S.sourceType === 'link' ? 0 : mediaBitrate();
+  replace('peer-list', [
+    make('div', { className: 'peer-head', attrs: { role: 'row' } }, [
+      make('span', { text: '成员' }),
+      make('span', { text: '角色' }),
+      make('span', { text: waiting ? '准备情况' : '状态' }),
+      make('span', { text: '实时速率' }),
+      make('span'),
+    ]),
+    selfPeerRow(waiting),
+    ...list.map((peer) => {
       const stalled = S.sync?.stalledPeers.has(peer.peerId);
       const candidateRole = S.sync?.roleOf(peer.peerId) || 'guest';
       const role = ROLE_LABEL[candidateRole] ? candidateRole : 'guest';
@@ -5734,47 +5932,62 @@ function renderPeers(list) {
               text: role === 'admin' ? '设为游客' : '设为管理员',
               attrs: { 'data-peer': peer.peerId, 'data-next': role === 'admin' ? 'guest' : 'admin' },
             })
-          : make('span', { className: `role-badge ${role}`, text: ROLE_LABEL[role] });
+          : null;
 
-      let mediaProgress;
+      let stateNodes;
+      let speed = '—';
+      let speedTone = 'idle';
       if (S.sourceType === 'link') {
-        mediaProgress = [
-          make('div', {
-            className: 'peer-sub',
-            text: `延迟 ${peer.rtt != null ? `${peer.rtt}ms` : '—'} · P2P 媒体速度 —（各自读取原网站）`,
-          }),
+        stateNodes = [
+          make('div', { className: 'peer-forecast', text: '各自从原网站播放' }),
+          make('div', { className: 'peer-sub', text: `延迟 ${peer.rtt != null ? `${peer.rtt}ms` : '—'}` }),
         ];
       } else {
         const ratio = Math.max(0, Math.min(1, Number(peer.remoteRatio) || 0));
-        const barValue = make('div');
-        barValue.style.width = `${(ratio * 100).toFixed(1)}%`;
         const forecast = forecasts.get(peer.peerId);
         const forecastText = forecastLabel(forecast);
         // 安全模式下不存在「会卡」，不上红黄色，免得把「要等」看成「出故障」。
         const tone = S.roomSecurityMode === 'trusted' ? forecast?.level || '' : '';
-        mediaProgress = [
-          make('div', { className: 'peer-bar' }, [barValue]),
+        const main = waiting?.has(peer.peerId)
+          ? make('div', { className: 'peer-forecast wait', text: forecastText ? `未就绪 · ${forecastText}` : '未就绪' })
+          : waiting
+          ? make('div', { className: 'peer-forecast ok', text: '已就绪' })
+          : forecastText
+          ? make('div', { className: `peer-forecast ${tone}`, text: forecastText })
+          : make('div', { className: 'peer-forecast', text: `持有 ${(ratio * 100).toFixed(0)}%` });
+        stateNodes = [
+          main,
           make('div', {
             className: 'peer-sub',
-            text: `持有 ${(ratio * 100).toFixed(0)}% · 延迟 ${peer.rtt != null ? `${peer.rtt}ms` : '—'} · 收片 ${fmtMbps(forecast?.rate)}`,
+            text: `持有 ${(ratio * 100).toFixed(0)}% · 延迟 ${peer.rtt != null ? `${peer.rtt}ms` : '—'}`,
           }),
-          ...(forecastText ? [make('div', { className: `peer-forecast ${tone}`, text: forecastText })] : []),
         ];
+        // 接收速率由对方位图随时间的增长算出（信令模式下他能从好几个人那里收，本机发的只是一份）
+        const rate = forecast?.rate || 0;
+        if (forecast?.level === 'source') speed = '供片中';
+        else if (forecast?.level !== 'done' && rate > 0) {
+          speed = `↓ ${fmtMbps(rate)}`;
+          speedTone = bitrate > 0 && rate < bitrate ? 'slow' : '';
+        }
       }
 
-      return make('div', { className: 'peer' }, [
-        make('div', { className: 'peer-top' }, [
+      return make('div', { className: 'peer', attrs: { role: 'row' } }, [
+        make('div', { className: 'peer-who', attrs: { role: 'cell' } }, [
+          avatarOf(peer.peerId, peer.name),
           make('span', { raw: true, className: `peer-name ${stalled ? 'stalled' : ''}`, text: peer.name }),
           // 手机加入的人标一下：他跟得上列表、能聊天看弹幕，但编辑不了列表，
           // 房主知道这一点才不会等他去调顺序。昵称是用户输入，标记单独一个元素，别拼进去。
           ...(peer.platform === 'android' ? [make('span', { className: 'peer-platform', text: '（手机）' })] : []),
-          make('span', { className: 'dot connected' }),
         ]),
-        make('div', { className: 'peer-role' }, [roleControl]),
-        ...mediaProgress,
+        make('div', { attrs: { role: 'cell' } }, [
+          make('span', { className: `role-badge ${role}`, text: ROLE_LABEL[role] }),
+        ]),
+        make('div', { className: 'peer-state', attrs: { role: 'cell' } }, stateNodes),
+        make('div', { className: speedTone ? `peer-speed ${speedTone}` : 'peer-speed', attrs: { role: 'cell' }, text: speed }),
+        make('div', { className: 'peer-act', attrs: { role: 'cell' } }, roleControl ? [roleControl] : []),
       ]);
-    })
-  );
+    }),
+  ]);
 }
 
 // 房主点「设为管理员/游客」—— 事件委托，省得每次重画都重新接线。
@@ -5783,6 +5996,89 @@ $('peer-list').addEventListener('click', (e) => {
   if (!btn || S.sync?.myRole() !== 'host') return;
   S.sync.setRole(btn.dataset.peer, btn.dataset.next);
 });
+
+/* ------------------------------ 实时速率 ------------------------------ */
+
+// 下行 = 本机从所有人那里收的合计，上行 = 发给所有人的合计。每秒取一个点，折线画最近 30 秒。
+const RATE_POINTS = 30;
+const rateHistory = { down: [], up: [] };
+let rateTimer = null;
+
+function startRateTicker() {
+  if (rateTimer) return;
+  rateTimer = setInterval(renderRates, 1000);
+  renderRates();
+}
+
+const mbpsNumber = (bytesPerSec) => ((Math.max(0, bytesPerSec || 0) * 8) / 1e6).toFixed(1);
+
+function renderRates() {
+  if (!roomEntered || !S.swarm) return;
+  const list = S.swarm.peerList() || [];
+  const { down, up } = myRates(list);
+  for (const [key, value] of [
+    ['down', down],
+    ['up', up],
+  ]) {
+    const history = rateHistory[key];
+    history.push(value);
+    if (history.length > RATE_POINTS) history.shift();
+  }
+  $('rate-down').textContent = mbpsNumber(down);
+  $('rate-up').textContent = mbpsNumber(up);
+  // 两条折线用同一个纵轴，上行和下行谁大谁小一眼能比
+  const peak = Math.max(1, ...rateHistory.down, ...rateHistory.up);
+  drawSpark($('spark-down'), rateHistory.down, peak, '#3fb950');
+  drawSpark($('spark-up'), rateHistory.up, peak, '#4c8dff');
+  const bitrate = S.sourceType === 'link' || !S.manifest ? 0 : mediaBitrate();
+  $('rate-bitrate').textContent = bitrate > 0 ? `片子码率 ${fmtMbps(bitrate)}` : '';
+  const verdict = rateVerdict(down, bitrate, list);
+  const node = $('rate-verdict');
+  node.className = verdict.tone ? `rate-verdict ${verdict.tone}` : 'rate-verdict';
+  node.textContent = verdict.text;
+}
+
+/** 速率那一行最右边的一句结论。只说这台电脑自己的情况，全房的汇总在房主面板和成员表里。 */
+function rateVerdict(down, bitrate, list) {
+  if (!S.current) return { text: '', tone: '' };
+  if (S.sourceType === 'link') return { text: '各自从原网站读取，不走 P2P', tone: '' };
+  if (servingCurrent()) {
+    const connected = list.filter((p) => p.authenticated).length;
+    const feeding = list.filter((p) => p.authenticated && (p.upRate || 0) > 0).length;
+    if (!connected) return { text: '还没人连上，没有流量', tone: '' };
+    return feeding ? { text: `正在给 ${feeding} 人供片`, tone: '' } : { text: '现在没人在收', tone: '' };
+  }
+  if (S.swarm?.progress().complete) return { text: '这一部已经收完', tone: 'ok' };
+  // 安全模式收完才播，速度只决定等多久，不存在「会卡」
+  if (S.roomSecurityMode !== 'trusted') return { text: '安全模式：收完才播', tone: '' };
+  if (!(bitrate > 0)) return { text: '', tone: '' };
+  if (!(down > 0)) return { text: '还没开始收', tone: '' };
+  const times = down / bitrate;
+  if (times >= 1.2) return { text: `下行是码率的 ${times.toFixed(1)} 倍，够用`, tone: 'ok' };
+  if (times >= 1) return { text: '下行刚好够码率，余量很薄', tone: 'warn' };
+  return { text: '下行比码率低，边下边播可能会卡', tone: 'bad' };
+}
+
+function drawSpark(canvas, data, peak, color) {
+  const ctx = canvas?.getContext?.('2d');
+  if (!ctx) return;
+  const { width: w, height: h } = canvas;
+  ctx.clearRect(0, 0, w, h);
+  if (data.length < 2) return;
+  // 靠右对齐：最新的点永远在最右边，刚进房、点还不满 30 个时从右往左长
+  const offset = RATE_POINTS - data.length;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  data.forEach((value, i) => {
+    const x = ((i + offset) / (RATE_POINTS - 1)) * (w - 1);
+    const y = h - 1.5 - (value / peak) * (h - 3);
+    if (i) ctx.lineTo(x, y);
+    else ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+}
 
 /** 更新「我是谁」的身份提示：房主/管理员可控场，游客只能管自己、不能跳转。 */
 function renderMyRole() {
@@ -5876,7 +6172,48 @@ function renderStatus() {
   pushMpvBanner(st.stalled ? banner.textContent : '');
 
   $('btn-playpause').textContent = st.intendedPaused ? '播放' : '暂停';
+  // 按钮上只画图标（文字留给读屏和翻译），画哪一个看这个属性
+  $('btn-playpause').setAttribute?.('data-state', st.intendedPaused ? 'play' : 'pause');
   $('time-display').textContent = `${fmtTime(st.position)} / ${fmtTime(st.duration)}`;
+  renderNowKicker(st);
+  updateStripTone();
+}
+
+/** 片名上面那一行：「正在播放 / 即将开始 / 已暂停」+「第 2 / 4 部」（已播放的也算进去）。 */
+function renderNowKicker(st) {
+  const badge = $('now-badge');
+  if (!badge) return;
+  const cur = S.current;
+  const played = S.playlist?.history?.length || 0;
+  const total = played + (S.playlist?.queue?.length || 0);
+  $('now-pos').textContent = cur && total ? `第 ${played + 1} / ${total} 部` : '';
+  let text = '';
+  let kind = '';
+  if (cur && st) {
+    if (!st.paused) text = '正在播放';
+    else if (!S.playlist?.started) {
+      text = '即将开始';
+      kind = 'wait';
+    } else text = '已暂停';
+  }
+  badge.textContent = text;
+  badge.className = `now-badge${kind ? ` ${kind}` : ''}${text ? '' : ' hidden'}`;
+}
+
+/** 状态带的颜色跟着情况走：同步在播 = 绿，有人卡住 / 有人没准备好 = 黄，扫出威胁 = 红，其余 = 蓝。 */
+function updateStripTone() {
+  const strip = $('status-strip');
+  if (!strip) return;
+  const banner = $('status-banner');
+  const ready = $('ready-row');
+  let tone = 'info';
+  if (banner?.classList.contains('playing')) tone = 'ok';
+  else if (banner?.classList.contains('waiting')) tone = 'warn';
+  if (ready && !ready.classList.contains('hidden')) {
+    tone = ready.classList.contains('alone') ? 'info' : ready.classList.contains('all') ? 'ok' : 'warn';
+  }
+  if (S.mediaSafety?.status === 'blocked') tone = 'bad';
+  strip.setAttribute('data-tone', tone);
 }
 
 /* ------------------------------ 播放器事件 ----------------------------- */
@@ -6002,6 +6339,26 @@ function submitRoomLink() {
 }
 
 $('btn-add-link-go').onclick = submitRoomLink;
+
+// 「+ 添加」点开一个小菜单：本地视频 / 视频链接。选了一项、点到别处或按 Esc 都收起
+function setAddMenu(open) {
+  $('add-menu').classList.toggle('hidden', !open);
+  $('btn-add').setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) $('btn-add-file').focus();
+}
+$('btn-add').onclick = (e) => {
+  e.stopPropagation();
+  setAddMenu($('add-menu').classList.contains('hidden'));
+};
+$('add-menu').addEventListener('click', () => setAddMenu(false));
+$('add-menu').addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  setAddMenu(false);
+  $('btn-add').focus();
+});
+document.addEventListener('click', (e) => {
+  if (!e.target.closest?.('#playlist-actions')) setAddMenu(false);
+});
 $('room-video-link').addEventListener('keydown', (e) => {
   // 拼音选词时按回车不算提交
   if (e.key === 'Enter' && !e.isComposing) submitRoomLink();
@@ -6084,6 +6441,9 @@ async function leaveRoom() {
 }
 
 $('btn-leave').onclick = leaveRoom;
+$('btn-invite-top').onclick = openInvite;
+$('btn-invite-next').onclick = openInvite;
+$('btn-invite-close').onclick = closeInvite;
 
 // 点进度条 seek —— 会同步给所有人。游客不允许跳转。
 $('buffer').onclick = (e) => {

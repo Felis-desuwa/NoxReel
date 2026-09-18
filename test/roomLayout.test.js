@@ -38,21 +38,35 @@ test('脚本里用到的元素 id 都在页面上（或由脚本自己创建）'
   assert.deepEqual(missing, [], `这些 id 页面上没有：${missing.map(([id, f]) => `${id}（${f}）`).join('、')}`);
 });
 
-test('页签和面板一一对应，邀请页签默认隐藏（只给房主）', () => {
+test('页签和面板一一对应；邀请不再单独一页，住在成员页里', () => {
   const html = read('src/renderer/index.html');
   const tabs = [...html.matchAll(/id="tab-([\w-]+)"[^>]*data-tab="([\w-]+)"/g)];
-  assert.deepEqual(tabs.map((m) => m[1]).sort(), ['invite', 'log', 'peers', 'transfer']);
+  assert.deepEqual(tabs.map((m) => m[1]).sort(), ['log', 'peers', 'transfer']);
   for (const [, id, dataTab] of tabs) {
     assert.equal(id, dataTab);
     assert.match(html, new RegExp(`id="panel-${id}"`), `缺少 panel-${id}`);
   }
-  assert.match(html, /class="room-tab hidden" id="tab-invite"/);
-  // 成员面板里装着成员列表，日志面板里装着事件日志 —— log() 和 renderPeers() 都按这两个 id 找
-  assert.match(html, /id="panel-peers"[\s\S]*?id="peer-list"/);
+  assert.doesNotMatch(html, /tab-invite|panel-invite/);
+  // 成员面板里依次是：成员表、「邀请下一位」、邀请卡片（里面装着 renderInvite 画的 invite-body）
+  assert.match(html, /id="panel-peers"[\s\S]*?id="peer-list"[\s\S]*?id="invite-next"[\s\S]*?id="invite-card"[\s\S]*?id="invite-body"/);
   assert.match(html, /id="panel-log"[\s\S]*?id="event-log"/);
+  // 顶栏：邀请（只给房主）和离开房间，进房前都藏着
+  const topbar = html.slice(html.indexOf('<header id="topbar"'), html.indexOf('</header>'));
+  assert.match(topbar, /class="ghost top-btn hidden" id="btn-invite-top"/);
+  assert.match(topbar, /class="ghost top-btn leave hidden" id="btn-leave"/);
+  assert.match(topbar, /class="pill room-pill hidden" id="pill-room"/);
   // 老的「增加 / 切换视频」块已经换成列表上的加片按钮
   assert.doesNotMatch(html, /media-switch-block|btn-switch-file|btn-switch-link/);
-  for (const id of ['playlist-panel', 'playlist-body', 'playlist-actions', 'btn-add-file', 'btn-add-link', 'chat-panel', 'chat-body']) {
+  for (const id of ['playlist-panel', 'playlist-body', 'playlist-actions', 'btn-add', 'add-menu', 'btn-add-file', 'btn-add-link', 'chat-panel', 'chat-body']) {
+    assert.match(html, new RegExp(`id="${id}"`), `缺少 ${id}`);
+  }
+  // 加片的两个入口收进「+ 添加」的菜单里；弹幕开关和设置挪到聊天标题上
+  assert.match(html, /id="add-menu"[^>]*>[\s\S]*?id="btn-add-file"[\s\S]*?id="btn-add-link"/);
+  assert.match(html, /id="chat-panel"[\s\S]*?id="danmaku-slot"[\s\S]*?id="chat-body"/);
+  // 状态带把横幅、就绪行、身份提示和情境按钮（含「仍然开始」）装在一起
+  assert.match(html, /id="status-strip"[\s\S]*?id="status-banner"[\s\S]*?id="ready-row"[\s\S]*?id="role-hint"[\s\S]*?id="btn-force-start"[\s\S]*?id="btn-skip-current"/);
+  // 实时速率一行
+  for (const id of ['rate-row', 'rate-down', 'rate-up', 'spark-down', 'spark-up', 'rate-bitrate', 'rate-verdict']) {
     assert.match(html, new RegExp(`id="${id}"`), `缺少 ${id}`);
   }
 });
@@ -60,19 +74,24 @@ test('页签和面板一一对应，邀请页签默认隐藏（只给房主）',
 test('房间固定高度、各块自己滚动；控制条用弹性占位而不是每个按钮 margin-left:auto', () => {
   const css = read('src/renderer/styles.css');
   assert.match(css, /#view-room\.active \{\s*display: flex;\s*overflow: hidden;/);
-  assert.match(css, /grid-template-columns: minmax\(0, 1fr\) minmax\(360px, 42%\);/);
+  assert.match(css, /grid-template-columns: minmax\(0, 1fr\) minmax\(380px, 34%\);/);
   assert.match(css, /\.tab-panel \{[^}]*overflow-y: auto;/);
   assert.match(css, /\.playlist-body,\s*\.chat-body \{[^}]*overflow-y: auto;/);
   assert.doesNotMatch(css, /\.controls \.ghost \{\s*margin-left: auto;/);
   assert.match(css, /\.controls-spacer \{\s*flex: 1;/);
   assert.doesNotMatch(css, /#media-switch-block/);
+  // 弹幕设置在聊天标题上，面板得往下展开，不然会顶出窗口
+  assert.match(css, /\.dm-panel \{[^}]*top: calc\(100% \+ 6px\);/);
 });
 
-test('房主进空房间先看到邀请页，用户动过页签后不再自动切；有人进来只点角标', () => {
+test('进房后顶栏亮出邀请（只给房主）和离开；有人进来只点角标，不抢页签', () => {
   const app = read('src/renderer/app.js');
   const enter = app.slice(app.indexOf('async function enterRoom()'), app.indexOf('function selectRoomTab('));
-  assert.match(enter, /\$\('tab-invite'\)\.classList\.toggle\('hidden', S\.role !== 'host'\)/);
-  assert.match(enter, /S\.role === 'host' && connectedPeerCount\(\) === 0 && !tabTouched\) selectRoomTab\('invite'\)/);
+  assert.match(enter, /\$\('btn-invite-top'\)\.classList\.toggle\('hidden', S\.role !== 'host'\)/);
+  assert.match(enter, /\$\('btn-leave'\)\.classList\.remove\('hidden'\)/);
+  assert.match(enter, /renderInviteArea\(\);/);
+  assert.match(enter, /startRateTicker\(\);/);
+  assert.doesNotMatch(enter, /selectRoomTab\('invite'\)/);
   const select = app.slice(app.indexOf('function selectRoomTab('), app.indexOf('function notePeersChanged('));
   assert.match(select, /if \(byUser\) tabTouched = true;/);
   assert.match(select, /if \(name === 'log'\) \$\('event-log'\)\.scrollTop = \$\('event-log'\)\.scrollHeight;/);
@@ -80,6 +99,8 @@ test('房主进空房间先看到邀请页，用户动过页签后不再自动�
   assert.match(peers, /notePeersChanged\(\)/);
   // 页签的点击是用户操作
   assert.match(app, /selectRoomTab\(tab\.dataset\.tab, \{ byUser: true \}\)/);
+  assert.match(app, /\$\('btn-invite-top'\)\.onclick = openInvite;/);
+  assert.match(app, /\$\('btn-invite-next'\)\.onclick = openInvite;/);
 });
 
 test('加片入口跟着权限走：房主和管理员可见，游客看不到', () => {
@@ -101,11 +122,21 @@ test('房间页上的中文静态文案都有英文', async () => {
   const untranslated = texts.filter((text) => translate(text, 'en') === text);
   assert.deepEqual(untranslated, []);
   // 换片入口删掉以后，它的词条也不能留着
-  for (const dead of ['增加 / 切换视频', '选择本地视频', '切换到视频链接', '成员保持连接，房主换片后会自动同步到全房。']) {
+  for (const dead of [
+    '增加 / 切换视频',
+    '选择本地视频',
+    '切换到视频链接',
+    '成员保持连接，房主换片后会自动同步到全房。',
+    '还没有人加入。去「邀请」页签生成邀请链接。',
+  ]) {
     assert.equal(translate(dead, 'en'), dead, `死翻译没删：${dead}`);
   }
   for (const line of [
-    '还没有人加入。去「邀请」页签生成邀请链接。',
+    '把朋友拉进房间',
+    '邀请下一位',
+    '还能再来 3 人',
+    '已连接 · 可信房间 · 4 / 8 人',
+    '第 2 / 4 部',
     '还没有其他成员。',
     '列表还是空的，点右上角加一部。',
     '列表还是空的，等房主加片。',

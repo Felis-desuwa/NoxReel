@@ -61,6 +61,9 @@ const LINK_INFO_TTL_MS = appConst('LINK_INFO_TTL_MS');
 
 function el() {
   const e = { className: '', textContent: '', value: '', hidden: false, disabled: false, checked: false };
+  e.setAttribute = (name, value) => {
+    e[name] = String(value);
+  };
   e.classList = {
     toggle: (c, on) => {
       if (c === 'hidden') e.hidden = on === undefined ? !e.hidden : !!on;
@@ -108,6 +111,8 @@ const LINK_FNS = [
   'linkNotice',
   'linkWaitText',
   'renderStatus',
+  'renderNowKicker',
+  'updateStripTone',
   'localReadyNow',
   'refreshNowLink',
 ];
