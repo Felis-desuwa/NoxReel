@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('sw', {
     pickVideos: () => ipcRenderer.invoke('dialog:pickVideos'),
     pickCacheDir: () => ipcRenderer.invoke('dialog:pickCacheDir'),
     approveDroppedVideo: (filePath) => ipcRenderer.invoke('dialog:approveDroppedVideo', filePath),
+    pickSubtitles: () => ipcRenderer.invoke('dialog:pickSubtitles'),
   },
 
   media: {
@@ -49,9 +50,13 @@ contextBridge.exposeInMainWorld('sw', {
     remux: (filePath, taskId) => ipcRenderer.invoke('media:remux', taskId ? { filePath, taskId } : filePath),
     slim: (filePath, { keepIndexes = null, toFlac = null, taskId = null } = {}) =>
       ipcRenderer.invoke('media:slim', { filePath, keepIndexes, toFlac, ...(taskId ? { taskId } : {}) }),
+    findSubtitles: (filePath) => ipcRenderer.invoke('media:findSubtitles', filePath),
+    convert: (filePath, { keepIndexes = null, toFlac = null, subtitles = [], taskId = null } = {}) =>
+      ipcRenderer.invoke('media:convert', { filePath, keepIndexes, toFlac, subtitles, ...(taskId ? { taskId } : {}) }),
     releaseTemp: (filePath) => ipcRenderer.invoke('media:releaseTemp', filePath),
     onRemuxProgress: on('media:remuxProgress'),
     onSlimProgress: on('media:slimProgress'),
+    onConvertProgress: on('media:convertProgress'),
   },
 
   store: {

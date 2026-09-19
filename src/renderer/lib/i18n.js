@@ -9,7 +9,8 @@ const EN = new Map(Object.entries({
   '和朋友一起看，本地视频和视频链接都能同步': 'Watch together with friends—local videos and video links stay in sync',
   '分享本地视频时边下边播；粘贴公开视频链接时，每个人从原网站播放，\n            播放、暂停和进度保持同步。': 'Share local videos over P2P, or paste a public video link so everyone streams from the original site. Playback, pause, and position stay synchronized.',
   '发起放映': 'Host a watch party',
-  '把 MP4 或 MKV 拖到这里，或者点击选择（可多选）': 'Drop MP4 or MKV files here, or click to choose (you can pick several)',
+  '把视频拖到这里，或者点击选择（可多选）。MP4、MKV、AVI、TS、WMV 等都行，同名的外挂字幕会一起带上':
+    'Drop videos here, or click to choose (you can pick several). MP4, MKV, AVI, TS, WMV and more are fine, and subtitles with the same name come along',
   '不限文件大小 · 只支持你自己合法拥有的内容': 'No file size limit · Only share content you are legally allowed to use',
   '解析视频链接': 'Open a video link',
   '粘贴单个视频页面或 MP4 / HLS 直链': 'Paste one video page, MP4 URL, or HLS URL',
@@ -371,7 +372,6 @@ const EN = new Map(Object.entries({
   '文件在计算校验值期间发生了变化，请重新选择': 'The file changed while hashes were being calculated. Select it again.',
   '会话正在关闭': 'The session is closing',
   '不能向只读片源写入分片': 'Cannot write chunks to a read-only source',
-  '只支持 MP4／MOV 和 MKV': 'Only MP4/MOV and MKV are supported',
   'MKV 是流式容器，可直接边下边播': 'MKV is streamable and supports progressive playback',
   '媒体文件头过短': 'The media header is too short',
   '检测到 Windows 可执行文件头': 'A Windows executable header was detected',
@@ -644,6 +644,35 @@ const EN = new Map(Object.entries({
   '还没开始收': 'Not receiving yet',
   '下行刚好够码率，余量很薄': 'Download just matches the bitrate, very little margin',
   '下行比码率低，边下边播可能会卡': 'Download is below the bitrate, progressive playback may stall',
+  // 更多格式与外挂字幕（0.7.3）
+  '不支持这种视频格式': 'This video format is not supported',
+  '只支持 ASS、SSA、SRT、VTT 字幕': 'Only ASS, SSA, SRT and VTT subtitles are supported',
+  '这个文件里没有能封进 MKV 的音视频轨': 'This file has no audio or video track that fits in MKV',
+  '读不出这个文件的轨道信息，没法封成 MKV': 'Could not read the tracks of this file, so it cannot be packed into MKV',
+  '字幕未经用户选择，已拒绝访问': 'Subtitle access was rejected because it was not selected by the user',
+  '无效的字幕列表': 'Invalid subtitle list',
+  '是空文件': 'the file is empty',
+  '不是文本字幕': 'it is not a text subtitle',
+  '里面没有 SRT 时间轴': 'it has no SRT timings',
+  '缺少 WEBVTT 文件头': 'it lacks the WEBVTT header',
+  '缺少 [Script Info] 段': 'it lacks a [Script Info] section',
+  '认不出文字编码': 'its text encoding could not be recognised',
+  '正在把字幕封进片子': 'Packing the subtitles into the video',
+  '正在封成 MKV': 'Packing into MKV',
+  '保留全部轨道': 'Keep all tracks',
+  '外挂字幕': 'External subtitles',
+  '片子旁边没找到外挂字幕。': 'No external subtitles were found next to the video.',
+  '添加字幕文件…': 'Add subtitle files…',
+  '勾上的字幕会封进片子一起传（只换容器、不重新编码），每个人在播放器里都能切换；第一条勾上的默认显示。':
+    'Checked subtitles are packed into the video and sent with it (container change only, nothing is re-encoded). Everyone can switch between them in their player; the first checked one shows by default.',
+  '要带外挂字幕，产物会是 MKV —— MP4 装不下 ASS 字幕。':
+    'To carry external subtitles the result will be an MKV — MP4 cannot hold ASS subtitles.',
+  简体中文: 'Simplified Chinese',
+  繁体中文: 'Traditional Chinese',
+  中文: 'Chinese',
+  英文: 'English',
+  日文: 'Japanese',
+  韩文: 'Korean',
 }));
 
 const trimEnd = (text) => String(text).replace(/[.。]+$/, '');
@@ -688,6 +717,8 @@ const INVALID_LABELS = {
   文件标识: 'file id',
   测速参数: 'speed test parameters',
   精简参数: 'slimming parameters',
+  转换参数: 'conversion parameters',
+  字幕路径: 'subtitle path',
   转封装参数: 'remux parameters',
   校验参数: 'validation parameters',
   缓存目录: 'cache folder',
@@ -961,7 +992,6 @@ const EN_PATTERNS = [
   [/^信令地址无效：(.*)$/, 'Invalid signaling URL: $1'],
   [/^连不上信令服务器：(.*)$/, 'Cannot connect to signaling server: $1'],
   [/^无法解析这个视频链接(?:：(.*))?$/, 'Unable to parse this video URL$1'],
-  [/^只支持 MP4／MOV 和 MKV，当前是 (.+)$/, 'Only MP4/MOV and MKV are supported; current type: $1'],
   [/^(.+) 索引已在文件头，可直接边下边播$/, '$1 index is at the beginning and supports progressive playback'],
   [/^(.+) 的 moov 索引在文件末尾，顺序下载时要等整个文件下完才能起播。转封装把索引挪到开头即可，无损且不重编码。$/, '$1 has its moov index at the end, so sequential download cannot start early. Remuxing moves it to the beginning without re-encoding or quality loss.'],
   [/^没找到 ffmpeg。请安装后重试（(.*)），或设置环境变量 (.*)$/, 'ffmpeg was not found. Install it ($1) or set $2.'],
@@ -1019,6 +1049,34 @@ const EN_PATTERNS = [
   [/^片子码率 (.+)$/, 'Video bitrate $1'],
   [/^正在给 (\d+) 人供片$/, (_all, n) => `Seeding to ${n} ${n === '1' ? 'person' : 'people'}`],
   [/^下行是码率的 ([\d.]+) 倍，够用$/, 'Download is $1× the bitrate, plenty'],
+  // 更多格式与外挂字幕（0.7.3）
+  [/^不支持这种视频格式：(.+)$/, 'This video format is not supported: $1'],
+  [
+    /^(.+) 要先无损封成 MKV 才能传：只换容器、不重新编码，画质音质都不变。$/,
+    '$1 has to be packed losslessly into MKV before it can be sent: only the container changes, nothing is re-encoded, picture and sound stay identical.',
+  ],
+  [
+    /^(.+) 要先无损封成 MKV 才能传，这一步需要 ffmpeg，但没找到。装上 ffmpeg 后重试。$/,
+    '$1 has to be packed losslessly into MKV before it can be sent, which needs ffmpeg, and ffmpeg was not found. Install ffmpeg and try again.',
+  ],
+  [
+    /^片子旁边有 (\d+) 个外挂字幕，但封进片子需要 ffmpeg，这次先不带字幕。$/,
+    (_all, n) =>
+      `Found ${n} external subtitle file${n === '1' ? '' : 's'} next to the video, but packing ${n === '1' ? 'it' : 'them'} in needs ffmpeg, so this time the video goes without them.`,
+  ],
+  // 带体积对比的那条必须排在上面，理由同「已精简到」
+  [/^已封成 MKV：(.*)，体积 (.*) → (.*)$/, 'Packed into MKV: $1 — size $2 → $3'],
+  [/^已封成 MKV：(.*)$/, 'Packed into MKV: $1'],
+  [
+    /^已把 (\d+) 条外挂字幕封进片子$/,
+    (_all, n) => `Packed ${n} external subtitle${n === '1' ? '' : 's'} into the video`,
+  ],
+  [
+    /^片子里有 (\d+) 条字幕 MKV 装不下，已略过（(.+)）$/,
+    (_all, n, codecs) => `${n} subtitle track${n === '1' ? '' : 's'} in the video cannot go into MKV and ${n === '1' ? 'was' : 'were'} skipped (${codecs})`,
+  ],
+  [/^字幕 (.+) 用不了：(.+)$/, (_all, name, reason) => `Subtitle ${name} cannot be used: ${translate(reason, 'en')}`],
+  [/^一部片最多封 (\d+) 条外挂字幕$/, 'At most $1 external subtitles can be packed into one video'],
 ];
 
 let locale = readStoredLocale();

@@ -283,7 +283,8 @@ test('main.js：dialog:pickVideos 多选、逐个批准、取消返回空数组'
   assert.match(body, /devPicks\.length\) return approveSources\(takeDevPick\(\)\)/);
   // 与单选用同一套过滤器
   assert.match(handlerBody(mainSrc, 'dialog:pickVideo'), /filters: VIDEO_FILTERS/);
-  assert.match(mainSrc, /const VIDEO_FILTERS = \[\{ name: '视频', extensions: \['mp4', 'm4v', 'mov', 'mkv'\] \}\]/);
+  // 房主能选的格式只来自 mediaGuard 那一张表（AVI、TS 这些会先封成 MKV），不在这里另写一份
+  assert.match(mainSrc, /const VIDEO_FILTERS = \[\{ name: '视频', extensions: \[\.\.\.SOURCE_EXTENSIONS\]\.map\(/);
 
   // 逐个 approveSource，单个出错只跳过它
   const approve = functionBody(mainSrc, 'async function approveSources(');

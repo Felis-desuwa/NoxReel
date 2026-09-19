@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析；一整晚的片单、飘过画面的弹幕和你自己惯用的播放器都在里面。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.2-7C5CFF?style=for-the-badge" alt="Version 0.7.2">
+    <img src="https://img.shields.io/badge/version-0.7.3-7C5CFF?style=for-the-badge" alt="Version 0.7.3">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -41,6 +41,8 @@
 - **可切换播放器**：控制条上的下拉框随时切换 mpv / PotPlayer / MPC-BE，立即生效，播放位置和暂停状态跟着过去，不用退房重来。详见[播放器支持](#播放器支持)。
 - **中途加入不拖停全房**：中途进来的人先收房间当前位置附近的内容，缺前半部不会让已经在看的人陪着暂停；缓冲余量按各自播放位置起算。
 - **不限文件大小**：支持 MP4、MOV、M4V、MKV 本地视频；接收前会先检查磁盘放不放得下，放不下时先淘汰已播放区的缓存。
+- **更多格式**（需自行安装 ffmpeg）：AVI、TS / M2TS / MTS、WMV / ASF、FLV / F4V、MPG / MPEG / VOB、WebM、OGV、3GP 会在房主本机**无损封成 MKV** 再进房 —— 只换容器、不重新编码，画质音质不变。朋友那边收到的就是一个普通的 MKV，0.7 的老版本和安卓观众端也能收。RM / RMVB 不支持（MKV 装不下 RealVideo，只能重编码）。安卓端能不能放取决于编码：WMV、MPEG-2、Theora 这类老编码多数手机解不了。
+- **外挂字幕随片走**（需自行安装 ffmpeg）：和片子放在同一个文件夹、文件名以片名开头的 ASS / SSA / SRT / VTT 字幕会被自动找到（文件夹里只有这一部片时，名字对不上也算），加片时也能手动再添。勾上的字幕无损封进 MKV 一起传，GBK、Big5、Shift-JIS 编码自动转成 UTF-8；每个人在播放器里都能切换字幕轨，第一条勾上的默认显示。外挂 ASS 用到的字体不会一起带过去，对方没装时用系统字体显示。
 - **卡顿预判**：房主选片时按文件码率和测得的上行带宽，估算最多能同时供几个人流畅边下边播，会卡就先问一句；房间里实时显示每位成员的收片速度和「还能流畅播多久」。
 - **一键邀请链接**：默认生成可点击的 `noxreel://` 零服务器邀请／应答链接；链接里带协议版本号，对方是旧版时当场说清楚。
 - **链接解析回退**：YouTube 使用专用匿名客户端策略；普通解析遇到 Cloudflare 403 时，自动在无权限、无持久化的隔离浏览器中捕获公开媒体流。
@@ -60,6 +62,9 @@
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!NOTE]
+> `v0.7.3` 新增**外挂字幕随片走**和**更多视频格式**。和片子放在一起、文件名以片名开头的 ASS / SSA / SRT / VTT 字幕会被自动找到，加片时也能手动添加；勾上的字幕无损封进 MKV 一起传，GBK、Big5、Shift-JIS 自动转成 UTF-8，第一条勾上的默认显示。AVI、TS、WMV、FLV、MPG / VOB、WebM 等格式同样在房主本机**无损封成 MKV**（只换容器、不重新编码）再进房。两件事都需要房主装有 ffmpeg；朋友那边收到的是普通 MKV，**协议没变，和 0.7.0–0.7.2 互通**。
+
+> [!NOTE]
 > `v0.7.2` 修了两个问题。**TURN 中继开着却没填用户名或密码**时，以前整个连接都建不起来（一进房就报错，「重新生成邀请链接」一直转圈）；现在这种中继会被跳过、只走直连，日志里提示一次，设置里保存时也会当场拦下。**切到 PotPlayer 放两秒就被关掉**：PotPlayer 刚启动时会先报一次它上次放过的文件，以前被误判成「有人在 PotPlayer 里打开了别的文件」；现在启动完成之前的文件名回报一律不算，MPC-BE 同样处理。
 
 > [!NOTE]
@@ -72,8 +77,8 @@
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.2.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.2.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.2.exe) |
+| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.3.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.3.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.3.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.3.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -136,7 +141,7 @@
 - 桌面端启用 Chromium sandbox、上下文隔离和严格 CSP；所有特权操作均通过白名单 IPC 完成。弹幕覆盖窗没有 Node 能力，只画 canvas 文字。
 - 昵称、片名、聊天内容和错误内容通过文本节点渲染，不作为 HTML 执行，也不进翻译表。
 - 外部播放器只能从主进程的对话框里按白名单文件名选择，参数经过校验，不经 shell 启动；桥接程序只向自己拉起的那个进程发消息。
-- 接收媒体仅允许 MP4、M4V、MOV、MKV 容器，并检查扩展名、文件头和每个分片哈希。安全模式在完整文件通过本机扫描后播放；可信房间会提前播放尚未完成扫描的内容。
+- 接收媒体仅允许 MP4、M4V、MOV、MKV 容器，并检查扩展名、文件头和每个分片哈希。房主那边的 AVI 等格式和外挂字幕都在本机封成 MKV 之后才进房，接收端这道白名单不放宽。安全模式在完整文件通过本机扫描后播放；可信房间会提前播放尚未完成扫描的内容。
 - NoxReel 不绕过登录、付费墙、地区限制或 DRM。
 - 本项目不提供内容搜索、资源索引或版权内容来源。
 

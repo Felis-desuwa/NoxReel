@@ -1754,6 +1754,36 @@ select:disabled {
   font-size: 13px;
   cursor: pointer;
 }
+/* 加片弹窗里的外挂字幕清单：一行一条，文件名可能很长，截断但留住后面的语言和大小 */
+.prep-subs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+/* 行本身是 label.check，但 .field label（display:block）优先级更高，这里要写得比它具体 */
+.field .prep-sub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  margin-bottom: 0;
+  font-size: 13px;
+  color: var(--text);
+}
+.prep-sub-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.prep-sub-meta {
+  flex: none;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
 .modal-box .fine {
   max-width: none;
 }

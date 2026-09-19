@@ -309,6 +309,7 @@ test('准备任务的收尾都记进 leechOpens / closing，离开房间时才�
       sw: {
         media: {
           inspect: () => Promise.resolve({ action: 'ok', size: 10, slim: {}, probe: {} }),
+          findSubtitles: () => Promise.resolve([]),
           releaseTemp: () => Promise.resolve(),
         },
         tasks: { cancel: () => Promise.resolve(true) },

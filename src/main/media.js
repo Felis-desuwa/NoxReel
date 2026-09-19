@@ -24,12 +24,27 @@ const fsp = require('fs/promises');
 const os = require('os');
 const path = require('path');
 const { findBin } = require('./findBin');
+const { CONVERT_EXTENSIONS } = require('./mediaGuard');
+const subtitles = require('./subtitles');
 
 // .mov 和 .mp4 是同一个容器格式（都是 ISOBMFF），box 结构完全一致 ——
 // 同一个解析器不加改动就能读两者，ffprobe 也把它们报成同一个 demuxer。
 // 所以按 MP4 的规则一视同仁：查 moov 位置，在末尾就转封装。
 const ISOBMFF_EXT = new Set(['.mp4', '.mov', '.m4v']);
 const SUPPORTED_EXT = new Set([...ISOBMFF_EXT, '.mkv']);
+
+// AVI、TS、WMV 这些不直接进房，先在房主本机无损封成 MKV（见 convert()）。
+// 这样接收方、安卓端和老版本客户端都只需要认 MKV，边下边播的那一整套
+// （片头片尾保留区、Cues、中途加入）也原样适用。
+const CONVERT_EXT = CONVERT_EXTENSIONS;
+
+// 能原样拷进 MKV 的字幕编码。mov_text（MP4 自带的文本字幕）Matroska 不收，
+// 要转成 SRT —— 那是文本到文本，时间轴和文字都不丢，只丢 MP4 那点样式。
+// 其余（图文电视、ARIB、608 隐藏字幕……）MKV 装不下，转换时略过并告诉用户。
+const MKV_COPY_SUB_CODECS = new Set([
+  'ass', 'ssa', 'subrip', 'webvtt', 'hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle',
+]);
+const MKV_TO_SRT_SUB_CODECS = new Set(['mov_text', 'text']);
 
 // 图形字幕是一帧帧位图，一集能占几十甚至上百 MB；文本字幕（ASS/SRT）只有几百 KB。
 // 所以只丢前者 —— 丢文本字幕省不下什么，观众却直接没字幕看了。
@@ -389,6 +404,9 @@ async function probeStreams(filePath, { sample = false } = {}) {
     sampleRate: parseInt(s.sample_rate, 10) || null,
     bitsPerRawSample: parseInt(s.bits_per_raw_sample, 10) || null,
     isDefault: s.disposition?.default === 1,
+    // MP4/MP3 里的封面图：ffprobe 报成一条只有一帧的视频轨。封进 MKV 会变成一条真的视频轨，
+    // 播放器可能选错，所以转 MKV 时略过它。
+    attachedPic: s.disposition?.attached_pic === 1,
   }));
 
   if (sample && streams.some((s) => s.codecType === 'audio' && !s.bitRate)) {
@@ -548,6 +566,7 @@ function slimPlan(probe, { toMkv = true } = {}) {
  * 返回 action：
  *   'ok'      —— 直接用
  *   'remux'   —— 需要转封装（无损，几十秒内搞定）
+ *   'convert' —— AVI、TS 这类，要先无损封成 MKV 才能进房
  *   'reject'  —— 格式不支持
  * 另外带一份 slim 方案，告诉上层「还能无损省掉多少」。
  */
@@ -555,12 +574,26 @@ async function inspect(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   const stat = await fsp.stat(filePath);
 
+  if (CONVERT_EXT.has(ext)) {
+    const probe = await probeStreams(filePath, { sample: true }).catch(() => null);
+    return {
+      action: 'convert',
+      ext,
+      label: formatLabel(ext),
+      size: stat.size,
+      probe,
+      // 反正要封成 MKV，精简方案按 MKV 算（FLAC 在 MKV 里才放行）
+      slim: slimPlan(probe, { toMkv: true }),
+      reason: `${formatLabel(ext)} 要先无损封成 MKV 才能传：只换容器、不重新编码，画质音质都不变。`,
+    };
+  }
+
   if (!SUPPORTED_EXT.has(ext)) {
     return {
       action: 'reject',
       ext,
       size: stat.size,
-      reason: `只支持 MP4／MOV 和 MKV，当前是 ${ext || '(无扩展名)'}`,
+      reason: `不支持这种视频格式：${ext || '(无扩展名)'}`,
     };
   }
 
@@ -682,6 +715,141 @@ async function slim(filePath, outDir, { keepIndexes, toFlac: toFlacIn, onProgres
   };
 }
 
+/** 界面上怎么称呼一种格式：扩展名大写，WebM 按惯例写。 */
+function formatLabel(ext) {
+  const bare = String(ext || '').replace(/^\./, '');
+  return bare.toLowerCase() === 'webm' ? 'WebM' : bare.toUpperCase();
+}
+
+/**
+ * 封进 MKV 时每条轨怎么处理：原样拷、改成 SRT、还是只能略过。
+ * keepIndexes 为空表示全留（没选精简）。
+ *
+ * 略过的有三类：数据轨（MP4 的时间码 tmcd、TS 里的各种私有数据，Matroska 一律不收，
+ * 带上就整个封装失败）、封面图、MKV 装不下的字幕编码。只有最后一类值得告诉用户。
+ */
+function mkvStreamPlan(streams, keepIndexes) {
+  const wanted = Array.isArray(keepIndexes) && keepIndexes.length ? new Set(keepIndexes) : null;
+  const plan = { map: [], toSrt: [], unpackBframes: [], droppedSubtitles: [] };
+  for (const s of streams || []) {
+    if (wanted && !wanted.has(s.index)) continue;
+    if (s.codecType === 'video') {
+      if (s.attachedPic) continue;
+      plan.map.push(s.index);
+      // DivX/XviD 的 AVI 常用「packed B-frames」存 B 帧，这是 AVI 专属的变通写法，
+      // 进了 MKV 就成了不合规的码流。这个比特流过滤器对没打包的码流什么也不做。
+      if (s.codecName === 'mpeg4') plan.unpackBframes.push(s.index);
+    } else if (s.codecType === 'audio' || s.codecType === 'attachment') {
+      // attachment 只有 MKV 源才有，通常是 ASS 字幕要用的字体，必须带上
+      plan.map.push(s.index);
+    } else if (s.codecType === 'subtitle') {
+      if (MKV_COPY_SUB_CODECS.has(s.codecName)) plan.map.push(s.index);
+      else if (MKV_TO_SRT_SUB_CODECS.has(s.codecName)) {
+        plan.map.push(s.index);
+        plan.toSrt.push(s.index);
+      } else plan.droppedSubtitles.push(s.codecName || '?');
+    }
+  }
+  return plan;
+}
+
+/**
+ * 按方案拼 ffmpeg 参数：片子是第 0 路输入，外挂字幕依次是第 1、2… 路。
+ * 抽出来单独测，不用真跑一遍 ffmpeg。
+ *
+ * -c:<n> / -disposition:<n> / -metadata:s:<n> 里的 n 都是**输出**流下标：
+ * 片子里留下的轨按 -map 顺序排在前面，外挂字幕接在后面。
+ */
+function convertArgs(filePath, outPath, { streams, keepIndexes = null, toFlac = [], subtitles: subs = [], genpts = false }) {
+  const plan = mkvStreamPlan(streams, keepIndexes);
+  const byIndex = new Map((streams || []).map((s) => [s.index, s]));
+  if (!plan.map.some((i) => ['video', 'audio'].includes(byIndex.get(i)?.codecType))) {
+    throw new Error('这个文件里没有能封进 MKV 的音视频轨');
+  }
+
+  // AVI、VOB、MPG 这类的时间戳常常不全，MKV 要求每个包都有，缺了让 ffmpeg 补上
+  const args = ['-y', ...(genpts ? ['-fflags', '+genpts'] : []), '-i', filePath];
+  for (const sub of subs) args.push('-i', sub.path);
+  for (const index of plan.map) args.push('-map', `0:${index}`);
+  subs.forEach((_, k) => args.push('-map', `${k + 1}:0`));
+  args.push('-c', 'copy');
+
+  const out = (inputIndex) => plan.map.indexOf(inputIndex);
+  for (const index of toFlac || []) if (out(index) >= 0) args.push(`-c:${out(index)}`, 'flac');
+  for (const index of plan.toSrt) args.push(`-c:${out(index)}`, 'srt');
+  for (const index of plan.unpackBframes) args.push(`-bsf:${out(index)}`, 'mpeg4_unpack_bframes');
+
+  if (subs.length) {
+    // 外挂字幕是房主特意加的，默认显示它（第一条）；片子里原有的字幕轨取消默认标记，
+    // 不然播放器可能照旧挑原来那条。
+    plan.map.forEach((index, o) => {
+      if (byIndex.get(index)?.codecType === 'subtitle') args.push(`-disposition:${o}`, '0');
+    });
+    subs.forEach((sub, k) => {
+      const o = plan.map.length + k;
+      args.push(`-disposition:${o}`, k === 0 ? 'default' : '0');
+      // WebVTT 进 MKV 的播放器支持面窄（安卓尤其），转成 SRT：时间轴和文字都不丢
+      if (sub.ext === '.vtt') args.push(`-c:${o}`, 'srt');
+      if (sub.language) args.push(`-metadata:s:${o}`, `language=${sub.language}`);
+      if (sub.title) args.push(`-metadata:s:${o}`, `title=${sub.title}`);
+    });
+  }
+  args.push(outPath);
+  return { args, droppedSubtitles: plan.droppedSubtitles };
+}
+
+/**
+ * 封成 MKV：AVI、TS 这类格式进房前的必经一步，也是外挂字幕随片走的方式。
+ * 可以顺带做无损精简（keepIndexes / toFlac 与 slim() 同义）。
+ *
+ * 全程 -c copy，画面和声音逐字节不变；唯一重编码的是用户在精简里点头的 PCM→FLAC，
+ * 以及 MP4 自带的 mov_text 字幕转 SRT（文本到文本）。
+ */
+async function convert(filePath, outDir, { keepIndexes, toFlac: toFlacIn, subtitles: subtitlePaths = [], onProgress, signal } = {}) {
+  const bin = requireFfmpeg();
+
+  const ext = path.extname(filePath).toLowerCase();
+  await fsp.mkdir(outDir, { recursive: true });
+  const outPath = path.join(outDir, `${path.basename(filePath, ext)}.mkv`);
+
+  // 与 slim() 同理：转不转 FLAC 取决于实测压缩比，必须带 sample:true 再判一次
+  const probe = await probeStreams(filePath, { sample: true }).catch(() => null);
+  if (!probe) throw new Error('读不出这个文件的轨道信息，没法封成 MKV');
+  const kept = Array.isArray(keepIndexes) && keepIndexes.length ? keepIndexes : null;
+  const byIndex = new Map(probe.streams.map((s) => [s.index, s]));
+  const toFlac = (Array.isArray(toFlacIn) ? toFlacIn : []).filter(
+    (i) => (!kept || kept.includes(i)) && canTranscodeToFlac(byIndex.get(i), { toMkv: true })
+  );
+
+  const subs = await subtitles.prepareForMux(subtitlePaths, outDir, filePath);
+  try {
+    const { args, droppedSubtitles } = convertArgs(filePath, outPath, {
+      streams: probe.streams,
+      keepIndexes: kept,
+      toFlac,
+      subtitles: subs,
+      genpts: CONVERT_EXT.has(ext),
+    });
+    await run(bin, args, { onStderr: progressWatcher(probe.duration || 0, onProgress), signal });
+
+    const [inputSize, outputSize] = await Promise.all([
+      fsp.stat(filePath).then((s) => s.size, () => 0),
+      fsp.stat(outPath).then((s) => s.size, () => 0),
+    ]);
+    return {
+      outPath,
+      inputSize,
+      outputSize,
+      subtitles: subs.length,
+      droppedSubtitles,
+      reencodesAudio: toFlac.length > 0,
+    };
+  } finally {
+    // 转好的 UTF-8 副本已经封进去了，别让它们跟着产物目录活到退房
+    await Promise.all(subs.map((s) => fsp.rm(s.path, { force: true }).catch(() => {})));
+  }
+}
+
 function toolStatus() {
   return {
     ffmpeg: findFfmpeg(),
@@ -694,6 +862,11 @@ module.exports = {
   remux,
   slim,
   slimArgs,
+  convert,
+  convertArgs,
+  mkvStreamPlan,
+  formatLabel,
+  CONVERT_EXT,
   slimPlan,
   cancelAll,
   canTranscodeToFlac,

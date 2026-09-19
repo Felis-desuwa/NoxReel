@@ -717,6 +717,21 @@ async function prepareLocalFile(filePath, reporter) {
     // 1. 兼容性检查
     const info = await window.sw.media.inspect(filePath);
     if (info.action === 'reject') throw new Error(info.reason);
+    // AVI、TS 这类不直接进房，先在本机无损封成 MKV —— 接收方永远只见到 MP4/MKV 那几种容器
+    const mustConvert = info.action === 'convert';
+    if (mustConvert && !S.env.ffmpeg) {
+      throw new Error(`${info.label} 要先无损封成 MKV 才能传，这一步需要 ffmpeg，但没找到。装上 ffmpeg 后重试。`);
+    }
+    if (cancelled()) return null;
+
+    // 外挂字幕随片走的办法是封进 MKV，所以同样要 ffmpeg。没有的话照原样传，说一声就好 ——
+    // 为了字幕拦下整场放映不值得。
+    const sidecars = await window.sw.media.findSubtitles(filePath).catch(() => []);
+    if (sidecars.length && !S.env.ffmpeg) {
+      const text = `片子旁边有 ${sidecars.length} 个外挂字幕，但封进片子需要 ffmpeg，这次先不带字幕。`;
+      reporter.note(text);
+      log(text, 'warn');
+    }
     if (cancelled()) return null;
 
     // 上行测速和后面的精简、转封装并行跑，等到要下结论时它多半已经测完了。
@@ -729,8 +744,9 @@ async function prepareLocalFile(filePath, reporter) {
     // 都不沾边就别拿一个只有一个选项的弹窗去烦人。
     const needsRemux = info.action === 'remux';
     const canSlim = info.slim?.available === true;
+    const offerSubtitles = Boolean(S.env.ffmpeg) && sidecars.length > 0;
 
-    if (needsRemux || canSlim) {
+    if (needsRemux || mustConvert || canSlim || offerSubtitles) {
       reporter.stage(1);
       reporter.note(info.reason);
 
@@ -739,14 +755,27 @@ async function prepareLocalFile(filePath, reporter) {
       }
 
       // 没有 ffmpeg 时「本来还能再省一点」不该拦住放映，照原样走就是了。
-      const choice = S.env.ffmpeg ? await choosePrepPlan(info, { needsRemux, canSlim, reporter }) : { plan: 'as-is' };
+      const choice = S.env.ffmpeg
+        ? await choosePrepPlan(info, { needsRemux, mustConvert, canSlim, subtitles: sidecars, reporter })
+        : { plan: 'as-is' };
       if (!choice || cancelled()) return null;
 
-      if (choice.plan !== 'as-is') {
+      const subtitlePaths = choice.subtitles || [];
+      // 封成 MKV：格式本身要求，或者要带外挂字幕（MP4 装不下 ASS）。精简可以在同一遍里做掉。
+      const converting = mustConvert || subtitlePaths.length > 0;
+      if (converting || choice.plan !== 'as-is') {
         const slimming = choice.plan === 'slim';
         slimmed = slimming;
         const reencoding = slimming && choice.toFlac?.length > 0;
-        reporter.title(slimming ? '正在无损精简' : '正在转封装');
+        reporter.title(
+          converting
+            ? subtitlePaths.length
+              ? '正在把字幕封进片子'
+              : '正在封成 MKV'
+            : slimming
+              ? '正在无损精简'
+              : '正在转封装'
+        );
         // 转码是分钟级、丢轨是秒级，这两件事的等待体感差一个数量级，得先说清楚。
         if (reencoding) {
           reporter.note('正在把未压缩的 PCM 音轨转成 FLAC（无损）。这一步要重新编码音频，长片可能要几分钟。');
@@ -754,17 +783,26 @@ async function prepareLocalFile(filePath, reporter) {
         const onProgress = ({ progress, taskId: owner }) => {
           if (owner === taskId) reporter.progress(progress);
         };
-        const off = slimming
-          ? window.sw.media.onSlimProgress(onProgress)
-          : window.sw.media.onRemuxProgress(onProgress);
+        const off = converting
+          ? window.sw.media.onConvertProgress(onProgress)
+          : slimming
+            ? window.sw.media.onSlimProgress(onProgress)
+            : window.sw.media.onRemuxProgress(onProgress);
         try {
-          const result = slimming
-            ? await window.sw.media.slim(filePath, {
-                keepIndexes: choice.keepIndexes,
-                toFlac: choice.toFlac,
+          const result = converting
+            ? await window.sw.media.convert(filePath, {
+                keepIndexes: slimming ? choice.keepIndexes : null,
+                toFlac: slimming ? choice.toFlac : null,
+                subtitles: subtitlePaths,
                 taskId,
               })
-            : await window.sw.media.remux(filePath, taskId);
+            : slimming
+              ? await window.sw.media.slim(filePath, {
+                  keepIndexes: choice.keepIndexes,
+                  toFlac: choice.toFlac,
+                  taskId,
+                })
+              : await window.sw.media.remux(filePath, taskId);
           filePath = result.outPath;
           temporaryPath = result.outPath;
           if (result.outputSize > 0) finalSize = result.outputSize;
@@ -772,7 +810,21 @@ async function prepareLocalFile(filePath, reporter) {
             result.inputSize > 0 && result.outputSize > 0
               ? `，体积 ${fmtBytes(result.inputSize)} → ${fmtBytes(result.outputSize)}`
               : '';
-          reporter.note(slimming ? `已精简到：${result.outPath}${saved}` : `已转封装到：${result.outPath}`);
+          reporter.note(
+            converting
+              ? `已封成 MKV：${result.outPath}${saved}`
+              : slimming
+                ? `已精简到：${result.outPath}${saved}`
+                : `已转封装到：${result.outPath}`
+          );
+          if (result.subtitles > 0) log(`已把 ${result.subtitles} 条外挂字幕封进片子`, 'good');
+          // 片子里原有的字幕（图文电视、ARIB 这类）MKV 装不下，只能略过 —— 得让人知道少了什么
+          if (result.droppedSubtitles?.length) {
+            log(
+              `片子里有 ${result.droppedSubtitles.length} 条字幕 MKV 装不下，已略过（${result.droppedSubtitles.join('、')}）`,
+              'warn'
+            );
+          }
         } finally {
           off();
         }
@@ -1975,7 +2027,9 @@ function trackLabel(s) {
  * 音轨必须能选而不是自动挑默认轨 —— 一部日语番剧的 default 轨常常是英配，
  * 自动挑的结果就是把大家真正要听的那条丢了，而这一步是不可逆的。
  *
- * @returns {Promise<{plan:'slim'|'remux'|'as-is', keepIndexes:number[]|null, toFlac:number[]|null}|null>}
+ * 第四件事是外挂字幕：勾上哪几条就封哪几条进 MKV。
+ *
+ * @returns {Promise<{plan:'slim'|'remux'|'convert'|'as-is', keepIndexes:number[]|null, toFlac:number[]|null, subtitles:string[]}|null>}
  */
 const UPLINK_FRESH_MS = 30 * 60 * 1000;
 
@@ -2071,14 +2125,20 @@ async function confirmStreamability({ size, duration, uplinkPromise, canSlimMore
   });
 }
 
-function choosePrepPlan(info, { needsRemux, canSlim, reporter }) {
+function choosePrepPlan(info, { needsRemux, mustConvert = false, canSlim, subtitles = [], reporter }) {
   const slim = info.slim || {};
   const streams = info.probe?.streams || [];
   const audioTracks = streams.filter((s) => s.codecType === 'audio');
   // 门槛由主进程定（省不到这个数就不值得让用户等重编码），别在这边另写一个。
   const minFlacSaving = typeof slim.minFlacSaving === 'number' ? slim.minFlacSaving : 0.08;
-  // 精简的输出容器跟着输入走：MKV 进 MKV 出，其余一律出 MP4（顺带加 +faststart）。
-  const toMkv = String(info.ext || '').toLowerCase() === '.mkv';
+  // 外挂字幕：默认全勾。勾上任何一条，产物就得是 MKV（MP4 装不下 ASS）。
+  const subs = subtitles.map((s) => ({ ...s, checked: true }));
+  const converting = () => mustConvert || subs.some((s) => s.checked);
+  // 输出容器：MKV 进 MKV 出；要封成 MKV 的（AVI 这类、或带外挂字幕）出 MKV；
+  // 其余出 MP4（顺带加 +faststart）。字幕勾选会改变它，所以是个函数。
+  const toMkv = () => String(info.ext || '').toLowerCase() === '.mkv' || converting();
+  // 不精简时那一项叫什么：封 MKV 时是「保留全部轨道」，否则是转封装或原样传
+  const baseValue = () => (converting() ? 'convert' : needsRemux ? 'remux' : 'as-is');
   let keepAudioIndex = slim.keepAudioIndex;
 
   // 换了要保留的音轨，丢掉的那批和能不能转 FLAC 都得跟着重算。
@@ -2102,7 +2162,7 @@ function choosePrepPlan(info, { needsRemux, canSlim, reporter }) {
     // 主进程的 canTranscodeToFlac 第一道判据就是它。这边漏掉的话，
     // MP4/MOV 源也会被提议转 FLAC，而产物是不可逆的。
     const flacOk = Boolean(
-      toMkv && chosen && typeof chosen.flacRatio === 'number' && chosen.flacRatio <= 1 - minFlacSaving
+      toMkv() && chosen && typeof chosen.flacRatio === 'number' && chosen.flacRatio <= 1 - minFlacSaving
     );
     const toFlac = flacOk ? [chosen.index] : [];
     let saved = 0;
@@ -2128,32 +2188,75 @@ function choosePrepPlan(info, { needsRemux, canSlim, reporter }) {
   };
 
   return new Promise((resolve) => {
-    let picked = canSlim ? 'slim' : needsRemux ? 'remux' : 'as-is';
+    let picked = canSlim ? 'slim' : baseValue();
     let current = recompute();
 
     const modal = openModal({
       title: '这一场要传哪个版本',
       body: () => {
-        const options = [];
-        if (canSlim) {
-          options.push(
-            make('option', { attrs: { value: 'slim' }, props: { selected: true }, text: '无损精简（推荐）' })
-          );
-        }
-        options.push(
-          needsRemux
-            ? make('option', {
-                attrs: { value: 'remux' },
-                props: { selected: !canSlim },
-                text: '仅转封装（保留全部轨道）',
-              })
-            : make('option', { attrs: { value: 'as-is' }, props: { selected: !canSlim }, text: '原样传输' })
-        );
-
-        const select = make('select', { id: 'prep-plan' }, options);
+        const baseText = { convert: '保留全部轨道', remux: '仅转封装（保留全部轨道）', 'as-is': '原样传输' };
+        // 勾掉或勾上字幕会改变「不精简」那一项是什么，选项要跟着重建
+        const buildOptions = () => [
+          ...(canSlim ? [make('option', { attrs: { value: 'slim' }, text: '无损精简（推荐）' })] : []),
+          make('option', { attrs: { value: baseValue() }, text: baseText[baseValue()] }),
+        ];
+        const select = make('select', { id: 'prep-plan' }, buildOptions());
         select.value = picked;
 
         const detail = make('div', { id: 'prep-plan-detail' });
+
+        // 外挂字幕：自动找到的默认全勾，也可以手动再加。排在最前的勾选项默认显示。
+        const subsBox = make('div', { id: 'prep-subs', className: 'prep-subs' });
+        const subsNote = make('div');
+        const langName = (s) =>
+          s.language === 'chi'
+            ? s.rank === 0
+              ? '简体中文'
+              : s.rank === 2
+                ? '繁体中文'
+                : '中文'
+            : { eng: '英文', jpn: '日文', kor: '韩文' }[s.language] || null;
+        const renderSubs = () => {
+          subsBox.replaceChildren();
+          for (const s of subs) {
+            const box = make('input', { attrs: { type: 'checkbox' }, props: { checked: s.checked } });
+            box.onchange = () => {
+              s.checked = box.checked;
+              subsChanged();
+            };
+            const meta = [langName(s) ? t(langName(s)) : null, fmtBytes(s.size)].filter(Boolean).join(' · ');
+            subsBox.appendChild(
+              make('label', { className: 'check prep-sub' }, [
+                box,
+                make('span', { raw: true, className: 'prep-sub-name', text: s.name }),
+                make('span', { raw: true, className: 'prep-sub-meta', text: meta }),
+              ])
+            );
+          }
+          if (!subs.length) subsBox.appendChild(hint('片子旁边没找到外挂字幕。'));
+          const add = make('button', { className: 'ghost', attrs: { type: 'button' }, text: '添加字幕文件…' });
+          add.onclick = async () => {
+            const picks = await window.sw.dialog.pickSubtitles().catch(() => []);
+            for (const p of picks) if (!subs.some((s) => s.path === p.path)) subs.push({ ...p, checked: true });
+            subsChanged();
+          };
+          subsBox.appendChild(add);
+
+          subsNote.replaceChildren(
+            hint('勾上的字幕会封进片子一起传（只换容器、不重新编码），每个人在播放器里都能切换；第一条勾上的默认显示。')
+          );
+          if (!mustConvert && subs.some((s) => s.checked) && String(info.ext || '').toLowerCase() !== '.mkv') {
+            subsNote.appendChild(hint('要带外挂字幕，产物会是 MKV —— MP4 装不下 ASS 字幕。'));
+          }
+        };
+        const subsChanged = () => {
+          if (picked !== 'slim') picked = baseValue();
+          select.replaceChildren(...buildOptions());
+          select.value = picked;
+          current = recompute();
+          renderSubs();
+          renderDetail();
+        };
 
         const renderDetail = () => {
           detail.replaceChildren();
@@ -2241,9 +2344,11 @@ function choosePrepPlan(info, { needsRemux, canSlim, reporter }) {
         const parts = [];
         // 房间里几部片排着准备时，得说清楚这是在问哪一部
         if (reporter?.label) parts.push(make('p', { raw: true, className: 'modal-name', text: reporter.label }));
-        if (needsRemux) parts.push(make('p', { className: 'fine', text: info.reason }));
+        if (needsRemux || mustConvert) parts.push(make('p', { className: 'fine', text: info.reason }));
         parts.push(field('这一场传哪个版本', select));
         parts.push(detail);
+        parts.push(field('外挂字幕', subsBox, subsNote));
+        renderSubs();
         parts.push(
           field(
             '不会做的事',
@@ -2258,10 +2363,11 @@ function choosePrepPlan(info, { needsRemux, canSlim, reporter }) {
       },
       okText: '按这个方案继续',
       onOk: () => {
+        const chosenSubs = subs.filter((s) => s.checked).map((s) => s.path);
         resolve(
           picked === 'slim'
-            ? { plan: 'slim', keepIndexes: current.keepIndexes, toFlac: current.toFlac }
-            : { plan: picked, keepIndexes: null, toFlac: null }
+            ? { plan: 'slim', keepIndexes: current.keepIndexes, toFlac: current.toFlac, subtitles: chosenSubs }
+            : { plan: picked, keepIndexes: null, toFlac: null, subtitles: chosenSubs }
         );
         return true;
       },

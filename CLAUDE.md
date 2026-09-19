@@ -71,7 +71,8 @@ npm test           # Node 自动测试（传输、安全、缓存、邀请码、
 - **地区策略是「告知不拦截」**：客户端 `geo.js` 探测到不在设计范围（`OUT_OF_SCOPE`，仅 CN）只弹可关闭提示，任何地区都能正常用。强制拦截机制保留在信令服务器（默认关），且只对信令模式有效（极简模式绕过服务器）。
 - **`.bat` 必须纯 ASCII，逻辑放 `.ps1`**：cmd.exe 按 OEM 代码页解析批处理，UTF-8 中文会变乱码被当命令执行。`.ps1` 必须存成 **UTF-8 带 BOM**（Windows PowerShell 5.1 没 BOM 会按 ANSI 读）。
 - **界面文案以简体中文为源语言**：桌面端翻译集中在 `src/renderer/lib/i18n.js`，Android 翻译集中在对应 assets 的 `js/i18n.js`；语言保存为 `sw.language`。新增用户可见文案时必须补英文翻译和动态模板测试，协议字段、邀请码和用户输入不得翻译。
-- **限制**：仅支持 MP4/MOV/M4V/MKV，**不限文件大小**，分片 2MB。房主可在 2–16 人范围内设置房间人数。
+- **限制**：接收方只收 MP4/MOV/M4V/MKV，**不限文件大小**，分片 2MB。房主可在 2–16 人范围内设置房间人数。
+- **更多格式和外挂字幕都靠「房主本机封成 MKV」**（`media.convert` / `subtitles.js`），不单独传字幕、不放宽接收白名单：`mediaGuard` 里 `SOURCE_EXTENSIONS`（房主能选）比 `ALLOWED_EXTENSIONS`（接收方收）宽，后者**不能跟着放宽** —— 放宽了就要改协议、改安卓，0.7.x 的老客户端也收不了。几个实测踩出来的坑：① `-c copy` 时 `-sub_charenc` 不生效，GBK 字幕会原样拷进 MKV 变乱码，所以编码必须在 Node 里认出来、转成 UTF-8 再交给 ffmpeg（`decodeSubtitle` 在 GB18030/Big5/Shift-JIS 里按常用字打分挑）；② MKV 不收 MP4 的 mov_text（要转 SRT）、数据轨（tmcd 等，带上就整个失败），封面图拷进去会变成一条真视频轨，都得在 `mkvStreamPlan` 里处理；③ MPG/VOB 的包缺时间戳，没有 `-fflags +genpts` 直接报「Can't write packet with unknown timestamp」（小分辨率的测试片一帧一个 PES 包测不出来）；④ RM/RMVB 不收：ffmpeg 的 Matroska 封装器不支持 RealVideo，只能重编码。外挂字幕默认显示第一条勾选的（`-disposition` 按**输出**流下标写），片子原有字幕轨同时取消默认标记，否则播放器照旧选原来那条。
 - **不限大小的两个隐藏前提**（改传输协议时别破坏）：① 清单哈希和分片位图都要按 DataChannel 单条 64KB 分段发 —— 位图整张一条发，约 38 万片（约 750GB）就超限，超限的 send() 会让整条通道断掉，表现成莫名掉线；② 接收前查磁盘余量（桌面 `fileStore.ensureFreeSpace`、安卓 `Store.openLeech`），不然 ext4/f2fs 上稀疏文件照样建成功，传到一半才写不进去。
 - **卡顿预判**（`lib/stallForecast.js`）：成员接收速度由对方位图随时间的增长算出（信令模式下能从多人收片，本机 upRate 只是其中一份）；「会不会卡」看播放头追上连续水位线之前水位线能否先推到文件尾，速度低于码率但缓冲够的人不报卡。房主选片时的上行带宽来自 `src/main/uplink.js` 往 Cloudflare 测速节点传随机字节，只是预估。
 - 注释和用户可见文案一律用简体中文，与现有代码保持一致。

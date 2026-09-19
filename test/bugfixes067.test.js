@@ -438,6 +438,8 @@ test('yt-dlp 之前会先走一遍跳转链预检，并且局限写在代码里'
 
 test('choosePrepPlan 重算 FLAC 时带上容器判断', () => {
   const app = read('src/renderer/app.js');
-  assert.match(app, /const toMkv = String\(info\.ext \|\| ''\)\.toLowerCase\(\) === '\.mkv'/);
-  assert.match(app, /toMkv && chosen && typeof chosen\.flacRatio === 'number'/, 'MP4/MOV 也会被提议转 FLAC');
+  // 输出是 MKV 的两种情况：源本来就是 MKV，或者这次要封成 MKV（AVI 这类、或带外挂字幕）
+  assert.match(app, /const toMkv = \(\) => String\(info\.ext \|\| ''\)\.toLowerCase\(\) === '\.mkv' \|\| converting\(\)/);
+  assert.match(app, /const converting = \(\) => mustConvert \|\| subs\.some\(\(s\) => s\.checked\)/);
+  assert.match(app, /toMkv\(\) && chosen && typeof chosen\.flacRatio === 'number'/, 'MP4/MOV 也会被提议转 FLAC');
 });

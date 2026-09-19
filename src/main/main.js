@@ -41,7 +41,8 @@ const validate = require('./security');
 const { CacheManager, cleanupLegacySidecars } = require('./cacheManager');
 const settings = require('./settings');
 const malwareScan = require('./malwareScan');
-const { validateManifestName } = require('./mediaGuard');
+const { validateSourceName, SOURCE_EXTENSIONS, SUBTITLE_EXTENSIONS } = require('./mediaGuard');
+const subtitles = require('./subtitles');
 
 let win = null;
 // 同一时刻只有一个播放器；换播放器或重开时旧的先彻底退掉，迟到的事件按代丢弃
@@ -85,6 +86,8 @@ let tempJobs = 0;
 // 可取消的长任务（算哈希 / 转封装 / 精简）：taskId -> AbortController，见 runTask()
 const tasks = new Map();
 const approvedSources = new Set();
+// 外挂字幕单列一张表：它们只能作为 media:convert 的字幕输入，不能被当成片源去算哈希、开会话
+const approvedSubtitles = new Set();
 const MAIN_PAGE = path.join(__dirname, '..', 'renderer', 'index.html');
 const MAIN_PAGE_URL = pathToFileURL(MAIN_PAGE).href;
 const DEEP_LINK_SCHEME = 'noxreel:';
@@ -167,7 +170,8 @@ const pathKey = (filePath) => path.resolve(filePath).toLowerCase();
 
 async function approveSource(filePath) {
   const target = validate.absolutePath(filePath);
-  validateManifestName(path.basename(target));
+  // 房主这边能选的格式比接收方宽：AVI、TS 这些会先在本机封成 MKV，进房的永远是那四种容器
+  validateSourceName(path.basename(target));
   const stat = await fsp.stat(target);
   if (!stat.isFile()) throw new Error('选择的路径不是文件');
   const realPath = await fsp.realpath(target);
@@ -180,6 +184,21 @@ async function requireAllowedLocalPath(filePath) {
   if (cache.owns(target)) return target;
   const realPath = await fsp.realpath(target);
   if (!approvedSources.has(pathKey(realPath))) throw new Error('文件未经用户选择，已拒绝访问');
+  return realPath;
+}
+
+/** 批准一个外挂字幕：用户在对话框里选的，或者是主进程自己在片子旁边找到的。 */
+async function approveSubtitle(filePath, videoPath = null) {
+  const target = validate.absolutePath(filePath, '字幕路径');
+  const realPath = await fsp.realpath(target);
+  const entry = await subtitles.describeFile(realPath, videoPath);
+  approvedSubtitles.add(pathKey(realPath));
+  return entry;
+}
+
+async function requireApprovedSubtitle(filePath) {
+  const realPath = await fsp.realpath(validate.absolutePath(filePath, '字幕路径'));
+  if (!approvedSubtitles.has(pathKey(realPath))) throw new Error('字幕未经用户选择，已拒绝访问');
   return realPath;
 }
 
@@ -562,7 +581,8 @@ secureHandle('net:estimateUplink', async (opts) => {
 
 /* --------------------------------- 文件相关 -------------------------------- */
 
-const VIDEO_FILTERS = [{ name: '视频', extensions: ['mp4', 'm4v', 'mov', 'mkv'] }];
+const VIDEO_FILTERS = [{ name: '视频', extensions: [...SOURCE_EXTENSIONS].map((ext) => ext.slice(1)) }];
+const SUBTITLE_FILTERS = [{ name: '字幕', extensions: [...SUBTITLE_EXTENSIONS].map((ext) => ext.slice(1)) }];
 
 /** 取出一个开发钩子条目，按 * 拆成路径列表。 */
 function takeDevPick() {
@@ -609,6 +629,28 @@ secureHandle('dialog:pickVideos', async () => {
 });
 
 secureHandle('dialog:approveDroppedVideo', async (filePath) => approveSource(filePath));
+
+// 手动补字幕（名字和片子对不上、或者放在别的文件夹里的）。某一个不合格只跳过它。
+secureHandle('dialog:pickSubtitles', async () => {
+  let picked;
+  if (devPicks.length) picked = takeDevPick();
+  else {
+    const r = await dialog.showOpenDialog(win, {
+      title: '选择外挂字幕',
+      properties: ['openFile', 'multiSelections'],
+      filters: SUBTITLE_FILTERS,
+    });
+    if (r.canceled) return [];
+    picked = r.filePaths;
+  }
+  const approved = [];
+  for (const filePath of picked.slice(0, subtitles.MAX_SUBTITLES)) {
+    try {
+      approved.push(await approveSubtitle(filePath));
+    } catch {}
+  }
+  return approved;
+});
 
 /**
  * 长任务的参数兼容两种形态：老调用直接传路径字符串，新调用传 { filePath, taskId }。
@@ -708,6 +750,59 @@ secureHandle('media:slim', async (payload) => {
         });
         remuxOutputs.set(outPath, ownedDir);
         return { outPath, plan, inputSize, outputSize };
+      } catch (error) {
+        await cache.removeOwned(ownedDir).catch(() => {});
+        throw error;
+      }
+    });
+  } finally {
+    tempJobs--;
+  }
+});
+
+// 片子旁边的外挂字幕。片子本身必须已经批准过；找到的字幕顺手批准，
+// 之后 media:convert 才肯读它们 —— 渲染进程自己拼一个路径塞进来是不行的。
+secureHandle('media:findSubtitles', async (filePath) => {
+  const source = await requireAllowedLocalPath(filePath);
+  const found = await subtitles.findSubtitles(source);
+  const approved = [];
+  for (const entry of found) {
+    try {
+      approved.push(await approveSubtitle(entry.path, source));
+    } catch {}
+  }
+  return approved;
+});
+
+// 封成 MKV（AVI、TS 这类进房前必须走；带外挂字幕时也走这里），可顺带无损精简。
+// 产物和转封装／精简走同一套生命周期：登记进 remuxOutputs。
+secureHandle('media:convert', async (payload) => {
+  const { filePath, keepIndexes, toFlac, subtitles: subtitleList, taskId: rawTaskId } = validate.plainObject(
+    payload,
+    '转换参数'
+  );
+  const opts = validate.slimOptions({ keepIndexes, toFlac });
+  const taskId = validate.taskId(rawTaskId);
+  if (subtitleList != null && (!Array.isArray(subtitleList) || subtitleList.length > subtitles.MAX_SUBTITLES)) {
+    throw new Error('无效的字幕列表');
+  }
+  tempJobs++;
+  try {
+    return await runTask(taskId, async (signal) => {
+      const source = await requireAllowedLocalPath(filePath);
+      const subtitlePaths = [];
+      for (const item of subtitleList || []) subtitlePaths.push(await requireApprovedSubtitle(item));
+      const ownedDir = await cache.createOwnedDir('convert');
+      try {
+        const result = await media.convert(source, ownedDir, {
+          keepIndexes: opts.keepIndexes,
+          toFlac: opts.toFlac,
+          subtitles: subtitlePaths,
+          onProgress: (p) => send('media:convertProgress', { progress: p, taskId }),
+          signal,
+        });
+        remuxOutputs.set(result.outPath, ownedDir);
+        return result;
       } catch (error) {
         await cache.removeOwned(ownedDir).catch(() => {});
         throw error;
