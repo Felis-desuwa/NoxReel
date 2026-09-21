@@ -43,6 +43,7 @@ const settings = require('./settings');
 const malwareScan = require('./malwareScan');
 const { validateSourceName, SOURCE_EXTENSIONS, SUBTITLE_EXTENSIONS } = require('./mediaGuard');
 const subtitles = require('./subtitles');
+const { DiscordPresence, sanitizeActivity } = require('./discordPresence');
 
 let win = null;
 // 同一时刻只有一个播放器；换播放器或重开时旧的先彻底退掉，迟到的事件按代丢弃
@@ -62,6 +63,17 @@ const TEST_MUTE = !app.isPackaged && process.env.NOXREEL_TEST_MUTE === '1';
 const DEV_HOOKS = !app.isPackaged && process.env.NOXREEL_DEV_HOOKS === '1';
 const devPicks = DEV_HOOKS && process.env.NOXREEL_DEV_PICK ? process.env.NOXREEL_DEV_PICK.split('|').filter(Boolean) : [];
 const DEV_UPLINK_BPS = DEV_HOOKS ? Number(process.env.NOXREEL_DEV_UPLINK_BPS) || 0 : 0;
+//  - NOXREEL_DISCORD_PIPE：Discord 状态只连这一个管道（测试用的假 Discord），不去碰本机真的 Discord；
+//  - NOXREEL_DISCORD_CLIENT_ID：临时换一个 Discord 应用 ID。
+const DEV_DISCORD_PIPE = DEV_HOOKS ? process.env.NOXREEL_DISCORD_PIPE || null : null;
+// Discord 应用 ID：公开信息，不是密钥（Discord 上显示为「正在观看 NoxReel」的那个应用）。
+const DISCORD_CLIENT_ID = (DEV_HOOKS && process.env.NOXREEL_DISCORD_CLIENT_ID) || '1551684816993390722';
+// 懒连接：构造时不碰管道、不起定时器，第一次有状态要显示时才去连本机 Discord
+const discordPresence = new DiscordPresence({
+  clientId: DISCORD_CLIENT_ID,
+  pipePath: DEV_DISCORD_PIPE,
+  onStatus: (status) => send('discord:status', status),
+});
 
 const LEGACY_DOWNLOAD_DIR = path.join(app.getPath('downloads'), 'NoxReel');
 const DEFAULT_CACHE_ROOT = path.join(app.getPath('temp'), 'NoxReel');
@@ -295,6 +307,8 @@ let reclaiming = null;
 function reclaimAfterRendererGone() {
   if (reclaiming) return reclaiming;
   reclaiming = (async () => {
+    // 退房会刷新页面：Discord 上的「正在观看」要跟着撤掉。断开 IPC，Discord 自己就清了
+    discordPresence.disconnect();
     for (const controller of tasks.values()) controller.abort();
     malwareScan.cancelAll();
     media.cancelAll();
@@ -503,6 +517,7 @@ async function cleanup() {
   cleanupPromise = (async () => {
     send('app:shutdownRequested');
     await delay(50);
+    discordPresence.destroy();
     malwareScan.cancelAll();
     // 还在算哈希的任务也一起停掉，别在退出途中继续读整部片
     for (const controller of tasks.values()) controller.abort();
@@ -759,6 +774,20 @@ secureHandle('media:slim', async (payload) => {
     tempJobs--;
   }
 });
+
+// Discord 状态显示。内容在主进程再校验一遍（sanitizeActivity）：按钮只放行我们自己的 https 链接。
+secureHandle('discord:setActivity', async (payload) => {
+  const activity = sanitizeActivity(validate.plainObject(payload, 'Discord 状态'));
+  if (activity) discordPresence.setActivity(activity);
+  return discordPresence.status;
+});
+
+secureHandle('discord:clear', async () => {
+  discordPresence.clear();
+  return discordPresence.status;
+});
+
+secureHandle('discord:status', async () => discordPresence.status);
 
 // 片子旁边的外挂字幕。片子本身必须已经批准过；找到的字幕顺手批准，
 // 之后 media:convert 才肯读它们 —— 渲染进程自己拼一个路径塞进来是不行的。

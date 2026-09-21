@@ -1761,6 +1761,29 @@ select:disabled {
   gap: 6px;
   align-items: flex-start;
 }
+/* 设置页里的勾选行（TURN、Discord）：.field label 的 display:block 优先级更高，会把勾和字挤在一起 */
+.field label.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  font-size: 13px;
+  color: var(--text);
+}
+/* 房间链接底下那行：说明文字 + 「换一条链接」，按钮不再单独占一整行 */
+.relay-extra {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+.relay-extra .fine {
+  flex: 1;
+  margin: 0;
+}
+.relay-extra button {
+  flex: none;
+}
 /* 行本身是 label.check，但 .field label（display:block）优先级更高，这里要写得比它具体 */
 .field .prep-sub {
   display: flex;

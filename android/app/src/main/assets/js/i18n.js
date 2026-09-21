@@ -44,6 +44,8 @@ const EN = new Map(Object.entries({
   '请填写信令地址和房间号': 'Enter the signaling URL and room ID',
   '已进入房间，等待房主供片…': 'Joined the room. Waiting for the host…',
   '这不是一个房主邀请码': 'This is not a host invite code',
+  '这是房间链接，目前只有电脑端 NoxReel 能用，手机端下个版本支持。请让房主给你发一条「一对一邀请」。':
+    'This is a room link, which only the desktop NoxReel can open for now; phones will get it in the next version. Ask the host for a one-to-one invite.',
   '正在生成应答码，收集网络候选中…（几秒）': 'Generating an answer code and collecting network candidates…',
   '正在生成应答链接，收集网络候选中…（几秒）': 'Generating an answer link and collecting network candidates…',
   '应答码已生成，发回给房主': 'Answer code generated. Send it back to the host.',

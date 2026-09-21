@@ -821,6 +821,7 @@ test('后台扫的片切成当前项后，扫描已用时间会自己走起来',
   const ctx = sandbox(fns('renderStatus', 'renderNowKicker', 'updateStripTone', 'setScanTicker', 'scanProgressLabel'), {
     S,
     $,
+    updatePresence: () => {}, // Discord 状态显示：这里不关心
     t: (s) => s,
     fmtTime: () => '3:12',
     stallBannerText: () => '',

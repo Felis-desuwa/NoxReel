@@ -299,7 +299,7 @@ test('重排后的动态文案都有英文，昵称和片名照旧不翻', async
     ['下行是码率的 2.6 倍，够用', 'Download is 2.6× the bitrate, plenty'],
     ['（你）', ' (you)'],
     // 应答框的占位文字以前就漏了英文，邀请区重排时一起补上
-    ['点开对方发回的 NoxReel 应答链接，或粘贴 NR3-…', 'Open the NoxReel reply link they sent back, or paste NR3-…'],
+    ['点开对方发回的 NoxReel 应答链接，或粘贴到这里', 'Open the NoxReel reply link they sent back, or paste it here'],
   ];
   for (const [zh, en] of cases) assert.equal(translate(zh, 'en'), en, zh);
   // 三段式的老模板不能被新加的两段式吞掉

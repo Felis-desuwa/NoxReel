@@ -164,6 +164,7 @@ async function linkRoom({ peerId = 'victim-peer', inspect, isHost = false, pause
   const ctx = sandbox(LINK_FNS, {
     S,
     URL,
+    updatePresence: () => {}, // Discord 状态显示：这里不关心
     Date: FakeDate,
     LINK_INFO_TTL_MS,
     FALLBACK_CONFIRM_MS,

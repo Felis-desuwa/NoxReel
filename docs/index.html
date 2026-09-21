@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <!-- 静态跳转页：邀请在 # 后面，浏览器不会把它发给服务器，这里也不上报、不记录任何东西。 -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>来 NoxReel 一起看</title>
+  <meta name="description" content="点开用 NoxReel 加入放映。视频在朋友之间点对点直传，不经过任何服务器。">
+  <meta property="og:site_name" content="NoxReel">
+  <meta property="og:title" content="来 NoxReel 一起看">
+  <meta property="og:description" content="点开用 NoxReel 加入放映。视频在朋友之间点对点直传，不经过任何服务器。">
+  <meta property="og:image" content="https://felis-desuwa.github.io/NoxReel/icon.png">
+  <meta property="og:type" content="website">
+  <meta name="theme-color" content="#7C5CFF">
+  <link rel="icon" href="icon.png">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body>
+  <main class="card">
+    <img class="logo" src="icon.png" alt="" width="72" height="72">
+    <h1 id="title">来 NoxReel 一起看</h1>
+    <p id="lead">正在打开 NoxReel…</p>
+    <a id="open" class="primary hidden" href="#">用 NoxReel 打开</a>
+    <p id="hint" class="fine hidden">浏览器问「要打开 NoxReel 吗」时，选允许。</p>
+    <div class="row">
+      <a id="download" class="ghost" href="https://github.com/Felis-desuwa/NoxReel/releases/latest">还没装？下载 NoxReel</a>
+      <button id="copy" class="ghost hidden" type="button">复制邀请链接</button>
+    </div>
+    <p id="copied" class="fine hidden">已复制，打开 NoxReel 粘贴到「加入放映」里。</p>
+    <p class="fine" id="privacy">这是一张静态页：邀请内容只在你的浏览器里，不会发给任何服务器。</p>
+  </main>
+  <script src="open.js"></script>
+</body>
+</html>

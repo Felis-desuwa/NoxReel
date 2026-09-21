@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析；一整晚的片单、飘过画面的弹幕和你自己惯用的播放器都在里面。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.3-7C5CFF?style=for-the-badge" alt="Version 0.7.3">
+    <img src="https://img.shields.io/badge/version-0.7.4-7C5CFF?style=for-the-badge" alt="Version 0.7.4">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -44,7 +44,9 @@
 - **更多格式**（需自行安装 ffmpeg）：AVI、TS / M2TS / MTS、WMV / ASF、FLV / F4V、MPG / MPEG / VOB、WebM、OGV、3GP 会在房主本机**无损封成 MKV** 再进房 —— 只换容器、不重新编码，画质音质不变。朋友那边收到的就是一个普通的 MKV，0.7 的老版本和安卓观众端也能收。RM / RMVB 不支持（MKV 装不下 RealVideo，只能重编码）。安卓端能不能放取决于编码：WMV、MPEG-2、Theora 这类老编码多数手机解不了。
 - **外挂字幕随片走**（需自行安装 ffmpeg）：和片子放在同一个文件夹、文件名以片名开头的 ASS / SSA / SRT / VTT 字幕会被自动找到（文件夹里只有这一部片时，名字对不上也算），加片时也能手动再添。勾上的字幕无损封进 MKV 一起传，GBK、Big5、Shift-JIS 编码自动转成 UTF-8；每个人在播放器里都能切换字幕轨，第一条勾上的默认显示。外挂 ASS 用到的字体不会一起带过去，对方没装时用系统字体显示。
 - **卡顿预判**：房主选片时按文件码率和测得的上行带宽，估算最多能同时供几个人流畅边下边播，会卡就先问一句；房间里实时显示每位成员的收片速度和「还能流畅播多久」。
-- **一键邀请链接**：默认生成可点击的 `noxreel://` 零服务器邀请／应答链接；链接里带协议版本号，对方是旧版时当场说清楚。
+- **房间链接：一条链接拉一群人**：邀请卡默认给一条房间链接，发到 Discord 群里谁点谁进，直到坐满人数上限。不需要你架服务器：连接信息加密后经公共 Nostr 中继交换，视频照旧点对点直传；房主身份由链接里的签名公钥担保，中继伪造不了。连不上任何中继时自动退回一对一邀请。
+- **在 Discord 里能直接点**：所有邀请、应答和房间链接都发 `https://felis-desuwa.github.io/NoxReel/#…` 形式 —— Discord 会把它变成能点的链接，点开由一张静态跳转页转给 NoxReel。邀请内容在 `#` 后面，浏览器不会把它发给任何服务器。链接里带协议版本号，对方是旧版时当场说清楚。
+- **Discord 状态显示**（默认关）：打开后好友能在你的 Discord 资料上看到「正在观看 NoxReel · 房间 3/8 人」，用房间链接时还有「加入放映」按钮；片名默认不显示。需要电脑上开着 Discord 客户端。
 - **链接解析回退**：YouTube 使用专用匿名客户端策略；普通解析遇到 Cloudflare 403 时，自动在无权限、无持久化的隔离浏览器中捕获公开媒体流。
 - **无损精简**（需自行安装 ffmpeg）：发片前可丢掉这一场用不上的音轨与图形字幕，并自选保留哪条音轨；未压缩的 PCM 音轨会转成 FLAC。全程不重编码视频，画质零损失，压缩比对每个文件实测后才提议。安装包携带的第三方媒体程序只有 mpv 和 yt-dlp —— ffmpeg 的官方完整构建两个可执行文件加起来约 460MB，打进来会让下载量翻一倍多，所以交给你用 `winget install Gyan.FFmpeg` 自行安装（软件内的依赖提示里有一键复制的命令）。
 - **断线自动重连**：信令模式下直连中断（NAT 映射老化、Wi-Fi 漫游、运营商重拨）会自动重新协商，不用退房重走邀请流程；连不上时会指出是 STUN 不通、中继凭据有误还是双方都在严格 NAT 后面。
@@ -62,6 +64,9 @@
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!NOTE]
+> `v0.7.4` 让 Discord 上的朋友一眼看到、一点就进。**房间链接**成了默认的邀请方式：一条链接发到群里谁点谁进，直到坐满人数上限 —— 不需要你架服务器，连接信息加密后经公共 Nostr 中继交换，视频照旧点对点直传，房主身份由链接里的签名公钥担保。**所有链接在 Discord 里都能直接点**（https 跳转页，邀请内容在 `#` 后面、不发给任何服务器）。**Discord 状态显示**（默认关）：好友能在你的资料上看到「正在观看 NoxReel · 房间 3/8 人」，用房间链接时还有「加入放映」按钮。房间链接这一版只有电脑端支持，手机端下个版本；一对一邀请照常能用，**P2P 协议没变，和 0.7.x 互通**。
+
+> [!NOTE]
 > `v0.7.3` 新增**外挂字幕随片走**和**更多视频格式**。和片子放在一起、文件名以片名开头的 ASS / SSA / SRT / VTT 字幕会被自动找到，加片时也能手动添加；勾上的字幕无损封进 MKV 一起传，GBK、Big5、Shift-JIS 自动转成 UTF-8，第一条勾上的默认显示。AVI、TS、WMV、FLV、MPG / VOB、WebM 等格式同样在房主本机**无损封成 MKV**（只换容器、不重新编码）再进房。两件事都需要房主装有 ffmpeg；朋友那边收到的是普通 MKV，**协议没变，和 0.7.0–0.7.2 互通**。
 
 > [!NOTE]
@@ -77,8 +82,8 @@
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.3.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.3.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.3.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.3.exe) |
+| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.4.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.4.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.4.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.4.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -93,7 +98,7 @@
 2. 默认是可信房间（边下边播）；需要先完整扫描时，可在设置中切换安全模式。房主与成员必须选择相同模式。
 3. 创建房间，设置人数上限。
 4. 在右侧播放列表里加片：本地视频（可多选）或受支持的视频链接。列表顺序就是播放顺序，也是传输顺序。
-5. 把自动生成的 NoxReel 邀请链接发给成员；成员点开后，再把应答链接发回房主点开。
+5. 把邀请卡里的房间链接发到群里（比如 Discord），成员点开就进房；想完全不经过第三方，就改用「一对一邀请」：成员点开后再把应答链接发回房主点开。
 6. 等所有人准备好后开播。房主和管理员统一控制播放、暂停和跳转，也能随时排片；所有人都能发弹幕聊天。
 
 ```text
@@ -123,18 +128,24 @@
 - **播放器以管理员身份运行时遥控不了**（UIPI 会拦掉消息），同样会提示并退回 mpv。
 - PotPlayer 和 MPC-BE 只在 Windows 上可用，并依赖安装包自带的桥接程序；从源码运行时用 `npm run build:bridge` 构建一次。
 
-## 两种连接方式
+## 三种连接方式
 
-| 模式 | 操作 | 是否需要服务器 | 适合场景 |
+| 模式 | 操作 | 是否需要你架服务器 | 适合场景 |
 |---|---|---:|---|
-| 零服务器链接（默认） | 双方各点一次邀请／应答链接 | 不需要 | 默认使用；一次邀请连接一位成员 |
-| 信令房间（可选） | 成员点一次可复用房间邀请 | 需要轻量信令服务 | 多人频繁加入 |
+| 房间链接（默认） | 成员点一次同一条链接 | 不需要（经公共 Nostr 中继） | 发到群里，多人随进随出 |
+| 一对一邀请 | 双方各点一次邀请／应答链接 | 不需要，也不经过任何第三方 | 只拉一个人，或者所在网络连不上公共中继 |
+| 信令房间（可选） | 成员点一次可复用房间邀请 | 需要轻量信令服务 | 自己有服务器、想完全自己掌控 |
 
-零服务器 WebRTC 必须交换 offer 和 answer，因此跨设备仍需要把应答链接发回一次；现在不再需要手动粘贴长码。信令服务器只交换 SDP、ICE 和房间状态，不读取或保存视频内容。严格 NAT、CGNAT 或防火墙环境可能需要自行配置 TURN 中继。
+- **房间链接**经公共 Nostr 中继交换连接信息：内容用链接里的房间密钥加密，每条消息都有签名，房主放行的才算进房、房主身份由链接里的签名公钥担保。中继看得到连接者的 IP 和消息的大小时间，看不到内容和片名；视频不经过它们。默认同时连 8 个中继，挂几个不影响。**房间链接目前只有电脑端能用**，手机端下个版本支持（手机请用一对一邀请）。
+- **一对一邀请**：零服务器 WebRTC 必须交换 offer 和 answer，因此仍需要把应答链接发回一次。
+- **信令服务器**只交换 SDP、ICE 和房间状态，不读取或保存视频内容。
+- 严格 NAT、CGNAT 或防火墙环境可能需要自行配置 TURN 中继。
 
 ## 隐私与内容边界
 
 - 本地视频分片通过加密的 WebRTC 连接在成员之间传输。
+- 房间链接模式下，连接信息（SDP）用房间密钥加密后经公共 Nostr 中继交换；中继能看到连接者的 IP，看不到内容。邀请跳转页是一张静态页，邀请内容只在 `#` 后面，不会发给 GitHub。
+- Discord 状态显示默认关闭；打开后只经本机 Discord 客户端的本地管道发送，片名默认不显示。
 - 聊天与弹幕也只走同一批加密的 P2P 连接，不经过任何服务器，不落盘；房主只在内存里保留最近 50 条用于补发历史。
 - 视频链接由每位成员直接从原始网站读取，不经过 NoxReel 信令服务器；Android 所需的短时效播放地址仅通过已认证的房间连接发送，并剔除 Cookie 与 Authorization。
 - 用户选择的源视频始终保持原样；软件生成的接收缓存不会保留在“下载”文件夹，也不提供跨重启断点续传。

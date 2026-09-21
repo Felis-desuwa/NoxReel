@@ -47,15 +47,15 @@ npm test           # Node 自动测试（传输、安全、缓存、邀请码、
 
 6. **权限：房主 / 管理员 / 游客**（`syncEngine.js`，`ROLE` 消息）。房主（发起放映者）是角色的唯一权威，给每个人分「管理员」或「游客」并 `ROLE` 广播全场。管理员/房主的播放·暂停·跳转同步全员（原有行为）；**游客只能播放/暂停自己这一路——不广播、不影响他人，且不许跳转**；游客的缓冲不足也只暂停自己，不触发全员 stall。三条易踩的不变量：① **hostId 是「谁是房主」的信任锚点**，绝不能默认成自身 peerId（否则不知情的加入者会错认自己是房主、短暂拿到控场权）——房主传自身 id，加入者从邀请码 `payload.from` 拿到，都不知道时传 `null` 先当游客，靠首条 ROLE「首认为准」钉死。② **游客必须在 `roles` 表里显式登记**（而非留作默认），否则无法把「已知游客」和「角色表还没同步到的陌生人」区分开。③ **纵深防御**：除了游客自己不广播，收到 SYNC/STALL 的一方还会忽略「已知是游客」的发送者——改一版客户端也控不了场。UI 侧房主在成员列表切换角色，游客的进度条禁用。
 
-## 两种连接方式（`app.js` 编排）
+## 连接方式（`app.js` 编排）
 
-| | 极简模式 `manual` | 信令服务器 `server` |
-|---|---|---|
-| 服务器 | 完全不需要 | 只转发 SDP/ICE，不碰视频 |
-| 拓扑 | 星型（都只连发起者） | 网状（谁都能给谁供片） |
-| ICE | `trickle=false`（等候选集齐，SDP 自包含可粘贴） | `trickle=true` |
+| | 极简模式 `manual`（一对一邀请） | 房间链接（`server` + `relay` 传输，默认） | 信令服务器（`server` + `ws` 传输） |
+|---|---|---|---|
+| 服务器 | 完全不需要 | 公共 Nostr 中继只转加密后的握手 | 只转发 SDP/ICE，不碰视频 |
+| 拓扑 | 星型（都只连发起者） | 网状 | 网状（谁都能给谁供片） |
+| ICE | `trickle=false`（等候选集齐，SDP 自包含可粘贴） | `trickle=false` | `trickle=true` |
 
-两种都不让视频内容经过任何服务器。
+三种都不让视频内容经过任何服务器。房间链接和信令服务器**共用同一套编排**：`S.mode` 都是 `'server'`，传输另记在 `S.signalTransport`（`'relay'` / `'ws'`），`connectSignaling()` 按它建 `RelaySignaling` 或 `WsSignaling`，两者接口一致。**别给房间链接单开一个 `S.mode` 取值** —— 好几处靠 `S.mode !== 'server'` 判断「要不要重新生成一对一邀请」，新取值会让它们误判。建连时的 trickle 一律跟 `sig.trickle` 走。
 
 **极简模式的 renamePeer 不变量**（`swarm.js`）：发起者生成 offer 时还不知道对面是谁，先用占位 id 建 Peer，拿到应答码才知道真实身份。每个 peer 在 swarm 里有**三张按 peerId 索引的表**（`peers` / `_serving` / `_serveQueue`）加 `inflight` 记录。换 id 必须走 `swarm.renamePeer()` 统一迁移所有表——只改 `peers` 会让发片第一步 `_serveQueue.get(peerId)` 拿到 undefined 静默返回，表现是「连上了、清单也收到了，但进度永远 0%」。这是曾经的真 bug，别退回去。
 
@@ -73,6 +73,9 @@ npm test           # Node 自动测试（传输、安全、缓存、邀请码、
 - **界面文案以简体中文为源语言**：桌面端翻译集中在 `src/renderer/lib/i18n.js`，Android 翻译集中在对应 assets 的 `js/i18n.js`；语言保存为 `sw.language`。新增用户可见文案时必须补英文翻译和动态模板测试，协议字段、邀请码和用户输入不得翻译。
 - **限制**：接收方只收 MP4/MOV/M4V/MKV，**不限文件大小**，分片 2MB。房主可在 2–16 人范围内设置房间人数。
 - **更多格式和外挂字幕都靠「房主本机封成 MKV」**（`media.convert` / `subtitles.js`），不单独传字幕、不放宽接收白名单：`mediaGuard` 里 `SOURCE_EXTENSIONS`（房主能选）比 `ALLOWED_EXTENSIONS`（接收方收）宽，后者**不能跟着放宽** —— 放宽了就要改协议、改安卓，0.7.x 的老客户端也收不了。几个实测踩出来的坑：① `-c copy` 时 `-sub_charenc` 不生效，GBK 字幕会原样拷进 MKV 变乱码，所以编码必须在 Node 里认出来、转成 UTF-8 再交给 ffmpeg（`decodeSubtitle` 在 GB18030/Big5/Shift-JIS 里按常用字打分挑）；② MKV 不收 MP4 的 mov_text（要转 SRT）、数据轨（tmcd 等，带上就整个失败），封面图拷进去会变成一条真视频轨，都得在 `mkvStreamPlan` 里处理；③ MPG/VOB 的包缺时间戳，没有 `-fflags +genpts` 直接报「Can't write packet with unknown timestamp」（小分辨率的测试片一帧一个 PES 包测不出来）；④ RM/RMVB 不收：ffmpeg 的 Matroska 封装器不支持 RealVideo，只能重编码。外挂字幕默认显示第一条勾选的（`-disposition` 按**输出**流下标写），片子原有字幕轨同时取消默认标记，否则播放器照旧选原来那条。
+- **房间链接的信任锚点是房主的签名公钥**（`lib/relaySignaling.js`）。信令服务器替我们做的四件事 —— 发信人是谁（服务器填 `from`）、谁是房主、限人数、进出通知 —— 在公共中继上没人做，全部改由房主签名来做：链接里带房间密钥（派生话题标签和 AES-GCM 密钥）和房主的 Schnorr 公钥；新人发 `hello`，房主放行才广播签名的 `welcome {seq, peerId, pubkey}`，之后署名某 peerId 的消息必须是登记的那把公钥签的。几条踩过的坑：① **中继上都是临时事件、不落盘**，新人永远收不到老成员当初的 welcome —— 名册必须随新人的 welcome 一起给，否则老成员的 offer 全被当冒名丢掉；② **谁发 offer 按 welcome 的 `seq` 定**（老成员向新人发），两人同时进房才不会互发 offer 撞车、互相拆掉对方刚建的连接；③ 同一事件会从几个中继各来一份，**按事件 id 去重**，重复的 offer 会拆掉活连接；④ **收件人自己验签**，不能指望中继 —— 恶意中继可以原样转发签名对不上的事件；⑤ 中继路径不 trickle，避开「候选比 offer 先到被丢」和中继限流。默认中继是实测挑的（`DEFAULT_RELAYS` 的注释里有日期和标准），damus 这类会对临时事件限流的别加回去。房间链接这一版只有桌面端支持，安卓拿到会提示用一对一邀请。
+- **发到聊天里的一律是 https 跳转链接**（`signaling.js` 的 `shareLink`，跳转页在 `docs/`，GitHub Pages 从 main 的 `/docs` 发布）：Discord 不把 `noxreel://` 变成可点的链接。邀请放在 `#` 后面，浏览器不发给服务器；**末尾的 `/` 是结束符**，Discord 生成可点链接时会切掉结尾的 `.`，而 `.` 是码字母表成员。解析时 https 形式不绑死域名。深链接仍只接 `noxreel://`，跳转页负责转过去（安卓走 `intent://…;package=app.noxreel.android`）。
+- **Discord 状态显示**（`src/main/discordPresence.js` + `ui/discordPresence.js`）：主进程经 `\\.\pipe\discord-ipc-N` 连本机 Discord，**懒连接**（构造时不碰管道、不起定时器，`appExit` 测试会加载 main.js），至少间隔 15 秒更新一次并合并中间的变化；内容在主进程再校验一遍，按钮只放行我们自己的 https 前缀。隐私默认值：总开关关、片名不显示、「加入放映」按钮只在房间链接模式出现（一对一邀请只能给一个人）。退房会刷新页面，由 `reclaimAfterRendererGone` 断开 IPC（Discord 自己清状态）。Discord 应用 ID 写在 `main.js` 的 `DISCORD_CLIENT_ID`，是公开信息。
 - **不限大小的两个隐藏前提**（改传输协议时别破坏）：① 清单哈希和分片位图都要按 DataChannel 单条 64KB 分段发 —— 位图整张一条发，约 38 万片（约 750GB）就超限，超限的 send() 会让整条通道断掉，表现成莫名掉线；② 接收前查磁盘余量（桌面 `fileStore.ensureFreeSpace`、安卓 `Store.openLeech`），不然 ext4/f2fs 上稀疏文件照样建成功，传到一半才写不进去。
 - **卡顿预判**（`lib/stallForecast.js`）：成员接收速度由对方位图随时间的增长算出（信令模式下能从多人收片，本机 upRate 只是其中一份）；「会不会卡」看播放头追上连续水位线之前水位线能否先推到文件尾，速度低于码率但缓冲够的人不报卡。房主选片时的上行带宽来自 `src/main/uplink.js` 往 Cloudflare 测速节点传随机字节，只是预估。
 - 注释和用户可见文案一律用简体中文，与现有代码保持一致。

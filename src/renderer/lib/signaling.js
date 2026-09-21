@@ -108,6 +108,11 @@ function compactPayload(payload) {
   if (payload?.k === 'answer') {
     return ['a', payload.from, sdpText(payload.sdp), packSecurityMode(payload.securityMode), PROTOCOL_VERSION];
   }
+  if (payload?.k === 'relay') {
+    // 房间链接（经公共中继）：房间密钥、房主签名公钥、房主 peerId。中继列表只有房主改过才带。
+    const relays = Array.isArray(payload.relays) && payload.relays.length ? payload.relays : 0;
+    return ['l', payload.key, payload.hk, payload.from, Number(payload.maxMembers) || 0, packSecurityMode(payload.securityMode), relays, PROTOCOL_VERSION];
+  }
   return payload;
 }
 
@@ -127,6 +132,18 @@ function expandPayload(value, version = 3) {
       maxMembers: Number(value[4]) || 0,
       securityMode: expandSecurityMode(value[5]),
       protocolVersion: expandVersion(value[6]),
+    };
+  }
+  if (value[0] === 'l') {
+    return {
+      k: 'relay',
+      key: String(value[1] || ''),
+      hk: String(value[2] || ''),
+      from: value[3],
+      maxMembers: Number(value[4]) || 0,
+      securityMode: expandSecurityMode(value[5]),
+      relays: Array.isArray(value[6]) ? value[6].filter((u) => typeof u === 'string').slice(0, 12) : null,
+      protocolVersion: expandVersion(value[7]),
     };
   }
   if (value[0] === 'o') {
@@ -176,10 +193,33 @@ export function inviteLink(code, action = 'join') {
   return `noxreel://${kind}/${compact}`;
 }
 
+/**
+ * 发到聊天里的形式：一个 https 跳转页，Discord 这类聊天软件才会把它变成能点的链接
+ * （它们不认 noxreel:// 这种自定义协议）。跳转页再把人送回 noxreel://。
+ *
+ * 邀请放在 # 后面：浏览器从不把 # 后面的内容发给服务器，所以跳转页只是一张静态页，
+ * 看不到、也存不下任何握手信息。
+ *
+ * 末尾的 '/' 是结束符。Discord 生成可点链接时会把结尾的 . , : ; 这类标点切出去，
+ * 而 '.' 恰好是码的字母表成员 —— 码尾是 '.' 的时候，点开的链接就少一个字符。
+ * （眼下的码碰巧不会以 '.' 结尾：gzip 末尾是原文长度、高位全 0，R 码以 ']' 收尾；
+ * 结束符防的是以后任何一种码。）
+ */
+export const SHARE_BASE = 'https://felis-desuwa.github.io/NoxReel/';
+
+export function shareLink(code, action = 'join') {
+  const kind = action === 'answer' ? 'a' : 'j';
+  const compact = String(code).trim().replace(/^NR3-/, '');
+  return `${SHARE_BASE}#${kind}/${compact}/`;
+}
+
 // 正文字符集要同时容得下新旧两套字母表：'.' 是现在用的，'_' 是旧版本发出来的码里的。
 // '%' 也放进来，好接住某些客户端会把链接百分号编码一遍的情况。
 const BODY_CHARS = '[A-Za-z0-9._%-]';
 const LINK_RE = new RegExp(`noxreel://([jaJA])/(${BODY_CHARS}+)`, 'i');
+// https 形式不绑死域名：将来跳转页换了地址，旧版本发出去的链接照样能贴进来。
+// 只认 https://…#j/… 或 #a/… 这一种形状，正文后面的 '/' 结束符不在字母表里，自然截断。
+const WEB_LINK_RE = new RegExp(`https?://[^\\s#<>"'\`]+#([jaJA])/(${BODY_CHARS}+)`, 'i');
 const BARE_RE = new RegExp(`(?:NR3|NR2|SW2|SW1)-${BODY_CHARS}+`);
 
 /**
@@ -206,7 +246,7 @@ export function unwrapInviteInput(input) {
   const text = cleaned.replace(/\s+/g, '');
   const segments = cleaned.split(/\s+/).filter(Boolean);
 
-  const link = LINK_RE.exec(text);
+  const link = LINK_RE.exec(text) || WEB_LINK_RE.exec(text);
   if (link) {
     let body = link[2];
     if (body.includes('%')) {

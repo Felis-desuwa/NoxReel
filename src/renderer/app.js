@@ -2,7 +2,8 @@ import { Peer } from './lib/peer.js';
 import { Swarm } from './lib/swarm.js';
 import { SyncEngine } from './lib/syncEngine.js';
 import { MSG, PROTOCOL_VERSION, randomId } from './lib/protocol.js';
-import { encodeCode, decodeCode, inviteLink, WsSignaling, randomRoomId, randomPeerId } from './lib/signaling.js';
+import { encodeCode, decodeCode, shareLink, WsSignaling, randomRoomId, randomPeerId } from './lib/signaling.js';
+import { RelaySignaling, DEFAULT_RELAYS, newRoomSecret } from './lib/relaySignaling.js';
 import { currentLocale, setLocale, startI18n, translate as t } from './lib/i18n.js';
 import {
   applyOp,
@@ -26,6 +27,7 @@ import { ChatGate, ChatHistory, ChatSender, parseHistory, trustsRelay } from './
 import { DanmakuEngine } from './lib/danmaku.js';
 import { $, make, rawText, replace } from './ui/dom.js';
 import { createPlaylistPanel } from './ui/playlistPanel.js';
+import { buildActivity, activityKey, loadPresenceSettings, savePresenceSettings } from './ui/discordPresence.js';
 import {
   DANMAKU_CANVAS,
   VIEW_LIMIT,
@@ -91,6 +93,11 @@ const S = {
   peerId: randomPeerId(),
   name: (localStorage.getItem('sw.name') || t(`观众-${randomInt(100, 999)}`)).slice(0, 40),
   mode: null, // 'manual' | 'server'
+  // 有信令时走哪种传输：'ws' 自建信令服务器，'relay' 房间链接（公共 Nostr 中继）
+  signalTransport: null,
+  roomLink: null, // 房间链接模式下那条 https 链接（房主生成的；观众进房后按同样内容重建）
+  discord: loadPresenceSettings(), // Discord 状态显示的本机设置，默认关
+  discordStatus: 'idle',
   role: null, // 'host' | 'guest'（发起 or 加入，跟权限角色是两回事）
   hostId: null, // 房主的 peerId —— 角色权威只认它，从邀请码得来
   env: null,
@@ -212,6 +219,8 @@ const S = {
     language: currentLocale(),
     securityMode: localStorage.getItem('sw.securityMode') === 'safe' ? 'safe' : 'trusted',
     signalUrl: localStorage.getItem('sw.signalUrl') || 'ws://localhost:8080',
+    // 房间链接用的公共中继；空串表示用内置那一组（lib/relaySignaling.js 的 DEFAULT_RELAYS）
+    relays: localStorage.getItem('sw.relays') || '',
     stun: localStorage.getItem('sw.stun') || 'stun:stun.l.google.com:19302',
     turnUrl: localStorage.getItem('sw.turnUrl') || '',
     turnUser: localStorage.getItem('sw.turnUser') || '',
@@ -362,7 +371,7 @@ function collectDiagnostics() {
     `NoxReel ${env.version || '未知版本'} · ${env.platform || '未知平台'}`,
     `mpv=${env.mpv ? '有' : '无'} ffmpeg=${env.ffmpeg ? '有' : '无'} ffprobe=${env.ffprobe ? '有' : '无'} yt-dlp=${env.ytDlp ? '有' : '无'}`,
     `Defender=${env.defender ? '有' : '无'} 运行中=${env.defenderRunning === null ? '未知' : env.defenderRunning ? '是' : '否'}`,
-    `连接方式=${S.mode === 'manual' ? '极简（零服务器）' : '信令服务器'} 安全模式=${S.roomSecurityMode || S.settings.securityMode}`,
+    `连接方式=${connectionModeLabel()} 安全模式=${S.roomSecurityMode || S.settings.securityMode}`,
     `TURN=${S.settings.turnEnabled ? (S.settings.turnUrl ? '已配置' : '勾了但地址为空') : '未启用'}`,
     `候选类型=${[...new Set(candidates.map((c) => c.type))].join(',') || '无'}`,
     `对称NAT判定=${symmetric ? symmetric.kind : '未检出'}`,
@@ -2407,6 +2416,7 @@ async function handleJoinInput(rawInput) {
     const payload = await decodeCode(raw);
 
     if (payload.k === 'room') return joinViaServer(payload);
+    if (payload.k === 'relay') return joinViaRelay(payload);
     if (payload.k === 'offer') return joinViaManual(payload);
     if (payload.k === 'answer') {
       if (S.role === 'host' && S.pendingManualPeer) return acceptManualAnswer(raw);
@@ -2536,7 +2546,8 @@ async function joinViaManual(payload) {
     sdp: answer,
     securityMode: S.roomSecurityMode,
   });
-  const answerLink = inviteLink(code, 'answer');
+  // 发出去的是 https 跳转页：Discord 这类聊天软件只会把 https 变成能点的链接
+  const answerLink = shareLink(code, 'answer');
 
   setSteps([
     { label: '解析邀请码', state: 'done' },
@@ -2621,16 +2632,135 @@ async function joinViaServer(payload) {
   }
 }
 
+/**
+ * 房间链接（经公共中继）加入。和 joinViaServer 同一套前置检查，区别只在信令走公共中继：
+ * 房主放行（签名的 welcome）才算进房，房主身份由链接里的签名公钥担保。
+ */
+async function joinViaRelay(payload) {
+  const inviteMode = normalizeSecurityMode(payload.securityMode);
+  if (inviteMode !== normalizeSecurityMode(S.settings.securityMode)) {
+    $('join-err').textContent = `房间使用${securityModeLabel(inviteMode)}，你的本机设置是${securityModeLabel(S.settings.securityMode)}。请先在设置中切换为相同模式，再重新打开房间链接。`;
+    return;
+  }
+  if (payload.protocolVersion !== PROTOCOL_VERSION) {
+    $('join-err').textContent = inviteVersionText(payload.protocolVersion);
+    return;
+  }
+  if (!payload.key || !/^[0-9a-f]{64}$/.test(String(payload.hk || '')) || !payload.from) {
+    $('join-err').textContent = '这个房间链接不完整，请让房主重新复制一次。';
+    return;
+  }
+  S.role = 'guest';
+  S.hostId = payload.from; // 链接里带着房主身份（和它的签名公钥），认它做角色权威
+  S.mode = 'server';
+  S.isSeeder = false;
+  S.roomSecurityMode = inviteMode;
+  S.roomCapacity = clampCapacity(payload.maxMembers || S.roomCapacity);
+
+  show('view-prepare');
+  $('prep-title').textContent = '正在通过公共中继找房主';
+  $('prep-file').textContent = '';
+  setSteps([
+    { label: '解析房间链接', state: 'done' },
+    { label: '等房主放行', state: 'active' },
+    { label: '建立点对点连接', state: '' },
+  ]);
+  $('prep-bar').style.width = '35%';
+
+  initSwarmAndSync();
+
+  try {
+    await connectSignaling(null, null, {
+      secret: payload.key,
+      hostKey: payload.hk,
+      hostId: payload.from,
+      relays: payload.relays,
+    });
+    setSteps([
+      { label: '解析房间链接', state: 'done' },
+      { label: '等房主放行', state: 'done' },
+      { label: '建立点对点连接', state: 'active' },
+    ]);
+    $('prep-bar').style.width = '70%';
+    $('prep-note').textContent = '房主已放行，正在和房间里的人打洞…';
+    // 观众也记下这条房间链接：开了 Discord 状态显示时，「加入放映」按钮用的就是它
+    S.relayInvite = {
+      k: 'relay',
+      key: payload.key,
+      hk: payload.hk,
+      from: payload.from,
+      maxMembers: payload.maxMembers,
+      securityMode: payload.securityMode,
+      relays: payload.relays,
+    };
+    await refreshRoomLink();
+  } catch (e) {
+    S.signaling?.close();
+    S.signaling = null;
+    return prepFail(relayJoinError(e));
+  }
+}
+
+/** 观众手上的房间链接按最新的房间密钥重建（房主换过链接之后旧的就进不来了）。 */
+async function refreshRoomLink() {
+  if (!S.relayInvite) return;
+  S.roomLink = shareLink(await encodeCode(S.relayInvite), 'join');
+  updatePresence();
+}
+
+/** 房间链接加入失败时，按原因说人话。 */
+function relayJoinError(e) {
+  if (e?.code === 'HOST_OFFLINE') {
+    return '找不到房主：他可能已经离开房间，或者换过房间链接。请让房主重新发一条。';
+  }
+  if (e?.code === 'RELAY_UNREACHABLE') {
+    return '连不上公共中继（所在网络可能拦了它们）。请让房主改发「一对一邀请」，那个不经过任何第三方。';
+  }
+  return e?.message || String(e);
+}
+
+/** 诊断和日志里怎么称呼这一场的连接方式。 */
+function connectionModeLabel() {
+  if (S.mode === 'manual') return '极简（零服务器）';
+  return S.signalTransport === 'relay' ? '房间链接（公共中继）' : '信令服务器';
+}
+
+/** 用户在设置里自己填的中继（每行一个 wss:// 地址）；没填返回 null。房主填了会写进房间链接。 */
+function customRelays() {
+  const list = String(S.settings.relays || '')
+    .split(/\s+/)
+    .map((s) => s.trim())
+    .filter((s) => /^wss:\/\/[^\s/]+/i.test(s));
+  return list.length ? [...new Set(list)].slice(0, 12) : null;
+}
+
+function relayList() {
+  return customRelays() || DEFAULT_RELAYS;
+}
+
 /* ------------------------------ 信令连接 ------------------------------ */
 
-async function connectSignaling(url, roomId) {
-  const sig = new WsSignaling({
-    url,
-    roomId,
-    peerId: S.peerId,
-    name: S.name,
-    maxMembers: S.role === 'host' ? S.roomCapacity : 0,
-  });
+/**
+ * 连信令。两种传输接口一样：WsSignaling（自建信令服务器）和 RelaySignaling（房间链接，
+ * 经公共 Nostr 中继）。传了 relay 就走中继，下面的建连、重协商、房主离开判定全部共用。
+ * S.mode 两种都是 'server'（好几处判断靠它区分「极简」和「有信令」），传输另记在 S.signalTransport。
+ */
+async function connectSignaling(url, roomId, relay = null) {
+  const maxMembers = S.role === 'host' ? S.roomCapacity : 0;
+  const sig = relay
+    ? new RelaySignaling({
+        ...relay,
+        hostId: relay.hostId ?? S.hostId,
+        peerId: S.peerId,
+        name: S.name,
+        maxMembers,
+        relays: relay.relays || relayList(),
+        protocolVersion: PROTOCOL_VERSION,
+        // 满员判定把一对一邀请进来的人也算上（他们不经中继，中继那边看不到）
+        occupied: () => connectedPeerCount() + 1,
+      })
+    : new WsSignaling({ url, roomId, peerId: S.peerId, name: S.name, maxMembers });
+  S.signalTransport = relay ? 'relay' : 'ws';
   // 这里就赋值是为了让事件处理器能拿到它；但连接失败时必须置回 null，
   // 否则 inviteViaServer 的 if (!S.signaling) 守卫会短路跳过重连，
   // 而 S.roomId 只在连接成功后才写 —— 结果是拿一个 undefined 的房间号去编码，
@@ -2642,7 +2772,8 @@ async function connectSignaling(url, roomId) {
     // 这次会话里因为版本不符断开过的人，不再和他建连
     if (S.swarm.versionRejected.has(peerId)) return;
     log(`${name} 加入了房间`, 'good');
-    const peer = new Peer({ peerId, name, initiator: true, iceServers: iceServers(), trickle: true });
+    // 中继信令不 trickle（候选打包进 SDP）；信令服务器照旧边收集边发
+    const peer = new Peer({ peerId, name, initiator: true, iceServers: iceServers(), trickle: sig.trickle !== false });
     wirePeer(peer, sig);
     S.swarm.addPeer(peer);
     const offer = await peer.createOffer();
@@ -2661,7 +2792,7 @@ async function connectSignaling(url, roomId) {
       // setRemoteDescription，ICE 会在一条已经废掉的 pc 上重来一遍，双方都以为在协商，
       // 实际再也连不上 —— 表现就是信令一抖，传输永久停在原地。
       if (peer) S.swarm.removePeer(from);
-      peer = new Peer({ peerId: from, name, initiator: false, iceServers: iceServers(), trickle: true });
+      peer = new Peer({ peerId: from, name, initiator: false, iceServers: iceServers(), trickle: sig.trickle !== false });
       wirePeer(peer, sig);
       S.swarm.addPeer(peer);
       const answer = await peer.acceptOffer(payload.sdp);
@@ -2716,6 +2847,12 @@ async function connectSignaling(url, roomId) {
     S.roomCapacity = clampCapacity(maxMembers);
     renderCapacityStatus();
     log(`房间人数上限已设为 ${S.roomCapacity}`, 'good');
+  });
+  // 房主换了房间链接：观众手上那条（Discord 状态里的「加入放映」）跟着换
+  sig.on('rekey', ({ secret }) => {
+    if (S.role === 'host' || !S.relayInvite) return;
+    S.relayInvite = { ...S.relayInvite, key: secret };
+    refreshRoomLink().catch(() => {});
   });
   sig.on('reconnecting', ({ in: ms }) => log(`信令断开，${Math.round(ms / 1000)} 秒后重连（已建立的直连不受影响）`, 'warn'));
   sig.on('error', (e) => log(`信令错误：${e.message}`, 'bad'));
@@ -2829,7 +2966,7 @@ async function reconnectPeer(peerId, name, sig) {
       name: name || peerId,
       initiator: true,
       iceServers: iceServers(),
-      trickle: true,
+      trickle: sig.trickle !== false,
     });
     wirePeer(peer, sig);
     S.swarm.addPeer(peer);
@@ -3522,8 +3659,63 @@ async function enterRoom() {
   renderRoomPill();
   renderInviteArea();
   startRateTicker();
+  updatePresence();
   // 当前项在进房前就可能已经切好了（房主自己的片）；观众要等列表和清单到了，
   // 由 onPlaylistChanged → switchCurrent 那一路接着走。
+}
+
+/* ------------------------------ Discord 状态 ------------------------------ */
+
+// 上一次交给主进程的内容的比对键。'off' 表示没在显示（初始就是这个，进房前不会平白发一条清空）
+let presenceKey = 'off';
+
+/** 现在该在 Discord 上显示什么；没变就什么也不发。主进程那边另有 15 秒限频。 */
+function updatePresence() {
+  if (!window.sw?.discord) return;
+  const inRoom = roomEntered && !S.leaving;
+  const activity = inRoom ? buildActivity(presenceState(), S.discord, t) : null;
+  const key = activityKey(activity);
+  if (key === presenceKey) return;
+  presenceKey = key;
+  const call = activity ? window.sw.discord.setActivity(activity) : window.sw.discord.clear();
+  call.then(setDiscordStatus, () => {});
+}
+
+function presenceState() {
+  const st = S.sync?.status?.() || {};
+  S.presenceParty ||= randomPeerId(); // 这个房间的随机标识，不含任何能拿来进房的东西
+  return {
+    title: S.sourceType === 'link' ? S.linkInfo?.title || S.current?.title : S.manifest?.name || S.current?.name,
+    // 看的是全房的状态，不是游客自己那一路的暂停
+    paused: S.sync?.shared?.paused !== false,
+    started: S.playlist?.started === true,
+    position: S.sync?.sharedPositionNow?.(),
+    duration: st.duration || S.current?.durationSec,
+    members: connectedPeerCount() + 1,
+    capacity: S.roomCapacity,
+    roomLink: S.signalTransport === 'relay' ? S.roomLink : null,
+    partyId: S.presenceParty,
+  };
+}
+
+const DISCORD_STATUS_TEXT = {
+  unconfigured: '这个版本没有配置 Discord 应用，状态显示用不了',
+  ready: '已连上 Discord',
+  connecting: '正在连接 Discord…',
+  unavailable: '没检测到 Discord 客户端（开着 Discord 时会自动连上）',
+};
+
+function discordStatusText() {
+  const text = DISCORD_STATUS_TEXT[S.discordStatus];
+  if (text) return text;
+  return S.discord.enabled ? '进入房间后会显示' : '没有打开';
+}
+
+function setDiscordStatus(status) {
+  if (typeof status !== 'string') return;
+  S.discordStatus = status;
+  const el = $('set-discord-status');
+  if (el) el.textContent = discordStatusText();
 }
 
 /* ------------------------------ 房间页签 ------------------------------ */
@@ -5040,11 +5232,13 @@ async function renderInvite() {
         make('button', { className: 'ghost tiny', id: 'capacity-apply', text: '应用' }),
       ]),
       make('span', { className: 'fine', id: 'capacity-status' }),
-      make('button', { className: 'ghost tiny', id: 'inv-manual', text: '重新生成邀请链接' }),
+      make('button', { className: 'ghost tiny', id: 'inv-relay', text: '房间链接（谁点谁进）' }),
+      make('button', { className: 'ghost tiny', id: 'inv-manual', text: '一对一邀请（不经过第三方）' }),
       make('button', { className: 'ghost tiny', id: 'inv-server', text: '改用信令服务器' }),
     ])
   );
 
+  $('inv-relay').onclick = () => inviteViaRelay();
   $('inv-server').onclick = inviteViaServer;
   // 包一层再调：直接当处理器挂上去的话，第一个实参就是 PointerEvent，
   // 会被当成 notice 原样渲染成「[object PointerEvent]」贴在邀请区顶上。
@@ -5052,8 +5246,8 @@ async function renderInvite() {
   $('capacity-apply').onclick = applyRoomCapacity;
   renderCapacityStatus();
   renderInviteArea();
-  // 默认直接生成零服务器邀请，用户进入房间后不必再选择连接方式。
-  inviteViaManual().catch((error) => {
+  // 默认给房间链接：一条链接发到群里谁点谁进。连不上公共中继时它自己会退回一对一邀请。
+  inviteViaRelay().catch((error) => {
     replace('inv-out', make('p', { text: error.message || String(error) }));
   });
 }
@@ -5146,11 +5340,92 @@ function applyRoomCapacity() {
   renderCapacityStatus();
 }
 
+/**
+ * 房间链接（默认的邀请方式）：一条链接谁点都能进，直到坐满。经公共 Nostr 中继交换握手，
+ * 不需要自建服务器；视频照旧点对点直传。连不上任何中继时退回一对一邀请，这场照样能开。
+ */
+async function inviteViaRelay() {
+  const out = $('inv-out');
+  if (!out) return;
+  replace(out, make('p', { text: '正在连接公共中继…' }));
+  try {
+    if (!S.signaling || S.signalTransport !== 'relay') {
+      // 从信令服务器切过来：老的那条先关掉（已经建好的直连不受影响）
+      S.signaling?.close();
+      S.signaling = null;
+      S.mode = 'server';
+      try {
+        await connectSignaling(null, null, { secret: newRoomSecret(), isHost: true, hostId: S.peerId });
+      } catch (e) {
+        S.signaling?.close();
+        S.signaling = null;
+        S.signalTransport = null;
+        throw e;
+      }
+    }
+    S.mode = 'server';
+    await renderRelayInvite(out);
+  } catch (e) {
+    const reason = e?.message || String(e);
+    log(`连不上公共中继（${reason}），改用一对一邀请`, 'warn');
+    return inviteViaManual(`连不上公共中继（${reason}），先用一对一邀请：一条链接只给一个人。`);
+  }
+}
+
+async function renderRelayInvite(out) {
+  const sig = S.signaling;
+  const code = await encodeCode({
+    k: 'relay',
+    key: sig.secret,
+    hk: sig.publicKey,
+    from: S.peerId,
+    maxMembers: S.roomCapacity,
+    securityMode: S.roomSecurityMode,
+    relays: customRelays(),
+  });
+  const link = shareLink(code, 'join');
+  S.roomLink = link;
+  replace(
+    out,
+    inviteStep(1, '复制房间链接，发到群里', '谁点开都能进，直到坐满人数上限；你离开房间后链接就失效了。', [
+      make('textarea', { id: 'inv-code', attrs: { readonly: '', rows: 2 } }),
+      make('button', { className: 'primary', id: 'inv-copy', text: '复制房间链接' }),
+    ]),
+    make('div', { className: 'relay-extra' }, [
+      make('p', {
+        className: 'fine',
+        text: '经公共中继交换连接信息（加密），视频仍在你们之间直传。中继能看到连接者的 IP，看不到内容和片名。',
+      }),
+      make('button', { className: 'ghost tiny', id: 'inv-rekey', text: '换一条链接（旧的作废）' }),
+    ])
+  );
+  // 房间链接只有一步，底下那步「人到齐后按播放」就是第 2 步
+  setFinalInviteStep(2, '还有人要来？同一条链接接着发就行，不用重新生成。');
+  $('inv-code').value = link;
+  $('inv-copy').onclick = () => copyCode(link, $('inv-copy'), '复制房间链接');
+  $('inv-rekey').onclick = async () => {
+    try {
+      await S.signaling.rekey(newRoomSecret());
+      await renderRelayInvite(out);
+      log('房间链接换好了，旧链接已作废（已经在房里的人不受影响）', 'good');
+    } catch (e) {
+      log(`换链接失败：${e.message}`, 'bad');
+    }
+  };
+  updatePresence();
+}
+
 async function inviteViaServer() {
   const out = $('inv-out');
   replace(out, make('p', { text: '正在连接信令服务器…' }));
 
   try {
+    // 手上那条若是房间链接（公共中继）的，先关掉：S.roomId 只有信令服务器才有，
+    // 复用它会拿一个 undefined 房间号编出一条谁也进不来的邀请码
+    if (S.signaling && S.signalTransport !== 'ws') {
+      S.signaling.close();
+      S.signaling = null;
+    }
     if (!S.signaling) {
       S.mode = 'server';
       const room = randomRoomId();
@@ -5183,8 +5458,11 @@ async function inviteViaServer() {
         make('button', { className: 'primary', id: 'inv-copy', text: '复制邀请码' }),
       ])
     );
-    $('inv-code').value = code;
-    $('inv-copy').onclick = () => copyCode(code, $('inv-copy'));
+    setFinalInviteStep(2, '还有人要来？这个邀请码接着发就行，不用重新生成。');
+    // 发 https 跳转页形式：贴进 Discord 就是一条能点的链接，点开由 NoxReel 接住
+    const link = shareLink(code, 'join');
+    $('inv-code').value = link;
+    $('inv-copy').onclick = () => copyCode(link, $('inv-copy'));
     log(`房间已开：${S.roomId}`, 'good');
   } catch (e) {
     const error = make('p', { text: e.message });
@@ -5255,7 +5533,7 @@ async function createManualInvite(out, notice) {
     maxMembers: S.roomCapacity,
     securityMode: S.roomSecurityMode,
   });
-  const link = inviteLink(code, 'join');
+  const link = shareLink(code, 'join');
 
   // 上一轮打洞失败时把原因带过来，别让用户对着一个「又生成了一条链接」发懵。
   // replace() 不过滤 null，所以空的时候给一个空数组，flat 之后自然消失。
@@ -5274,7 +5552,7 @@ async function createManualInvite(out, notice) {
     inviteStep(2, '对方发回应答链接后，直接点开或粘贴到这里', '', [
       make('textarea', {
         id: 'inv-answer',
-        attrs: { rows: 2, placeholder: '点开对方发回的 NoxReel 应答链接，或粘贴 NR3-…' },
+        attrs: { rows: 2, placeholder: '点开对方发回的 NoxReel 应答链接，或粘贴到这里' },
       }),
       make('button', { className: 'ghost', id: 'inv-accept', text: '完成连接' }),
     ]),
@@ -5285,6 +5563,16 @@ async function createManualInvite(out, notice) {
   $('inv-copy').onclick = () => copyCode(link, $('inv-copy'), '复制邀请链接');
 
   $('inv-accept').onclick = () => acceptManualAnswer($('inv-answer').value);
+  setFinalInviteStep(3, '还有人要来？这位连上后，成员表底下会出现「邀请下一位」。');
+}
+
+/** 邀请卡最底下那步「人到齐后按播放」的序号和说明：一对一邀请是第 3 步，房间链接、信令码只有一步在前面。 */
+function setFinalInviteStep(no, hintText) {
+  const step = $('invite-step3');
+  const num = step?.querySelector?.('.step-no');
+  const hintEl = step?.querySelector?.('.step-hint');
+  if (num) num.textContent = String(no);
+  if (hintEl) hintEl.textContent = hintText;
 }
 
 const MANUAL_HANDSHAKE_TIMEOUT_MS = 45_000;
@@ -5462,7 +5750,7 @@ function renderProgress(p) {
       kv('视频传输', '原网站 → 每位成员'),
       kv('房间消息', 'P2P 加密直连'),
       kv('连接数', S.swarm.peers.size),
-      kv('模式', S.mode === 'manual' ? '极简（零服务器）' : '信令服务器')
+      kv('模式', connectionModeLabel())
     );
     return;
   }
@@ -5511,7 +5799,7 @@ function renderProgress(p) {
     kv('下行', fmtRate(p.downRate)),
     kv('在途', `${p.inflight} 片`),
     kv('连接数', S.swarm.peers.size),
-    kv('模式', S.mode === 'manual' ? '极简（零服务器）' : '信令服务器')
+    kv('模式', connectionModeLabel())
   );
 
   // 播放位置告诉调度器，它据此决定先下哪些片。播放器还没起来时用房间位置 ——
@@ -6026,6 +6314,7 @@ function renderPeers(list) {
   // 页签上的人数算上自己，和成员表的行数对得上
   if (list.length + 1 > Number($('peer-count').textContent || 0)) notePeersChanged();
   $('peer-count').textContent = list.length + 1;
+  updatePresence();
   renderCapacityStatus();
   renderRoomPill(list.length);
   renderInviteArea();
@@ -6308,6 +6597,8 @@ function renderStatus() {
   $('time-display').textContent = `${fmtTime(st.position)} / ${fmtTime(st.duration)}`;
   renderNowKicker(st);
   updateStripTone();
+  // 每个播放器 tick 都会跑到这里：updatePresence 自己比对，没变就不发
+  updatePresence();
 }
 
 /** 片名上面那一行：「正在播放 / 即将开始 / 已暂停」+「第 2 / 4 部」（已播放的也算进去）。 */
@@ -6757,6 +7048,38 @@ $('btn-settings').onclick = () => {
           hint('只转发连接地址，不接触视频内容。自己跑一个：', make('code', { text: 'npm run signal' }))
         ),
         field(
+          '公共中继（房间链接用）',
+          make('textarea', {
+            id: 'set-relays',
+            attrs: { rows: 2, placeholder: DEFAULT_RELAYS.slice(0, 3).join('\n') + '\n…' },
+            props: { value: S.settings.relays },
+          }),
+          hint(
+            '房间链接经这些公共 Nostr 中继交换加密后的连接信息，视频不经过它们。',
+            '留空用内置的一组；想换就每行写一个 wss:// 地址，你当房主时这份列表会写进房间链接。'
+          )
+        ),
+        make('div', { className: 'field' }, [
+          make('label', { text: 'Discord 状态' }),
+          make('label', { className: 'check' }, [
+            make('input', { id: 'set-discord-on', attrs: { type: 'checkbox' }, props: { checked: S.discord.enabled } }),
+            '在 Discord 上显示我在放映',
+          ]),
+          make('label', { className: 'check' }, [
+            make('input', { id: 'set-discord-title', attrs: { type: 'checkbox' }, props: { checked: S.discord.showTitle } }),
+            '显示片名',
+          ]),
+          make('label', { className: 'check' }, [
+            make('input', { id: 'set-discord-join', attrs: { type: 'checkbox' }, props: { checked: S.discord.showJoin } }),
+            '显示「加入放映」按钮（用房间链接时）',
+          ]),
+          hint(
+            '你所有的 Discord 好友都能在你的资料上看到，点「加入放映」就能进房。',
+            '需要电脑上开着 Discord 客户端，网页版不行。'
+          ),
+          make('p', { className: 'fine', id: 'set-discord-status', text: discordStatusText() }),
+        ]),
+        field(
           '新房间默认人数上限（2–16）',
           make('input', {
             id: 'set-capacity',
@@ -6845,6 +7168,13 @@ $('btn-settings').onclick = () => {
         errorBox.classList.remove('hidden');
         return false;
       }
+      const relayLines = $('set-relays').value.split(/\s+/).filter(Boolean);
+      const badRelays = relayLines.filter((line) => !/^wss:\/\/[^\s/]+/i.test(line));
+      if (badRelays.length) {
+        errorBox.textContent = t(`这些中继地址认不出来：${badRelays.join('、')}。地址要形如 wss://relay.example.com`);
+        errorBox.classList.remove('hidden');
+        return false;
+      }
       errorBox.classList.add('hidden');
       // 漏了 turn: 前缀是最常见的写法错误，意思很清楚，直接补上
       if (turnCheck.fixed.length) $('set-turn-url').value = turnCheck.urls.join(' ');
@@ -6860,6 +7190,7 @@ $('btn-settings').onclick = () => {
         if (S.role === 'host') S.roomSecurityMode = S.settings.securityMode;
       }
       S.settings.signalUrl = $('set-signal').value.trim();
+      S.settings.relays = relayLines.join('\n');
       S.roomCapacity = clampCapacity($('set-capacity').value);
       S.settings.stun = $('set-stun').value.trim();
       S.settings.turnEnabled = $('set-turn-on').checked;
@@ -6870,6 +7201,14 @@ $('btn-settings').onclick = () => {
       localStorage.setItem('sw.name', S.name);
       localStorage.setItem('sw.securityMode', S.settings.securityMode);
       localStorage.setItem('sw.signalUrl', S.settings.signalUrl);
+      localStorage.setItem('sw.relays', S.settings.relays);
+      S.discord = {
+        enabled: $('set-discord-on').checked,
+        showTitle: $('set-discord-title').checked,
+        showJoin: $('set-discord-join').checked,
+      };
+      savePresenceSettings(S.discord);
+      updatePresence();
       localStorage.setItem('sw.roomCapacity', String(S.roomCapacity));
       localStorage.setItem('sw.stun', S.settings.stun);
       localStorage.setItem('sw.turnEnabled', S.settings.turnEnabled ? '1' : '0');
@@ -6988,6 +7327,9 @@ async function openInviteLink(raw) {
 }
 
 window.sw.app.onDeepLink(openInviteLink);
+
+window.sw.discord?.onStatus?.(setDiscordStatus);
+window.sw.discord?.status?.().then(setDiscordStatus, () => {});
 
 boot()
   .then(async () => {

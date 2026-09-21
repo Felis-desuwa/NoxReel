@@ -17,9 +17,9 @@ const EN = new Map(Object.entries({
   '解析并发起': 'Open and host',
   '支持范围由 yt-dlp 与原网站决定；不绕过登录、付费或 DRM。': 'Support depends on yt-dlp and the source website; login, paywalls, and DRM are not bypassed.',
   '加入放映': 'Join a watch party',
-  '粘贴朋友给你的邀请码': 'Paste the invite code from your friend',
+  '粘贴朋友给你的邀请链接（在 Discord 里直接点开也行）': 'Paste the invite link from your friend (or just click it in Discord)',
   'NR2-…（兼容旧版 SW2 / SW1）': 'NR2-… (also accepts legacy SW2 / SW1)',
-  'noxreel://j/… 或 NR3-…（兼容旧版）': 'noxreel://j/… or NR3-… (legacy formats are also accepted)',
+  'https://…#j/… 或 noxreel://j/…（也认旧版的 NR3-…）': 'https://…#j/… or noxreel://j/… (older NR3-… codes also work)',
   '加入': 'Join',
   '本软件仅用于观看你自有的合法内容，不提供任何内容搜索或资源索引功能。\n            使用即表示你确认对所分享文件拥有合法权利。': 'This app is only for watching content you are legally allowed to use. It does not provide content search or resource indexing. By using it, you confirm that you have the rights to share the selected files.',
   '软件仅针对北美网络环境设计与测试，其他地区未做适配，P2P 直连可能无法建立。': 'The app is designed and tested for North American networks. P2P connections may not work in other regions.',
@@ -607,7 +607,7 @@ const EN = new Map(Object.entries({
     'The TURN relay is on but has no username or password, so it is skipped this time and only direct connections are tried. Complete it in Settings, or turn the relay off.',
   'TURN 中继要填用户名和密码（中继服务器靠它们认人）。没有的话把「启用 TURN 中继」的勾去掉。':
     'A TURN relay needs a username and password (the relay server uses them to authenticate you). If you do not have them, uncheck “Enable TURN relay”.',
-  '点开对方发回的 NoxReel 应答链接，或粘贴 NR3-…': 'Open the NoxReel reply link they sent back, or paste NR3-…',
+  '点开对方发回的 NoxReel 应答链接，或粘贴到这里': 'Open the NoxReel reply link they sent back, or paste it here',
   '还没有人加入：照下面的步骤把朋友拉进来，也可以自己先放':
     'Nobody has joined yet: follow the steps below to bring friends in, or start watching on your own',
   '邀请下一位': 'Invite someone else',
@@ -667,6 +667,61 @@ const EN = new Map(Object.entries({
     'Checked subtitles are packed into the video and sent with it (container change only, nothing is re-encoded). Everyone can switch between them in their player; the first checked one shows by default.',
   '要带外挂字幕，产物会是 MKV —— MP4 装不下 ASS 字幕。':
     'To carry external subtitles the result will be an MKV — MP4 cannot hold ASS subtitles.',
+  // 可点的链接、房间链接、Discord 状态（0.7.4）
+  '正在连接公共中继…': 'Connecting to public relays…',
+  '复制房间链接，发到群里': 'Copy the room link and post it in your group',
+  '谁点开都能进，直到坐满人数上限；你离开房间后链接就失效了。':
+    'Anyone who opens it can join until the room is full; the link stops working once you leave.',
+  '复制房间链接': 'Copy room link',
+  '经公共中继交换连接信息（加密），视频仍在你们之间直传。中继能看到连接者的 IP，看不到内容和片名。':
+    'Connection details go through public relays (encrypted); the video still streams directly between you. Relays can see who connects (IP addresses), not what you watch.',
+  '换一条链接（旧的作废）': 'New link (old one stops working)',
+  '房间链接换好了，旧链接已作废（已经在房里的人不受影响）':
+    'The room link was replaced and the old one no longer works (people already in the room are unaffected)',
+  '房间链接（谁点谁进）': 'Room link (anyone can join)',
+  '一对一邀请（不经过第三方）': 'One-to-one invite (no third party)',
+  '这个房间链接不完整，请让房主重新复制一次。': 'This room link is incomplete. Ask the host to copy it again.',
+  '正在通过公共中继找房主': 'Finding the host through public relays',
+  '解析房间链接': 'Read the room link',
+  '等房主放行': 'Wait for the host to let you in',
+  '房主已放行，正在和房间里的人打洞…': 'The host let you in; connecting to the people in the room…',
+  '找不到房主：他可能已经离开房间，或者换过房间链接。请让房主重新发一条。':
+    'Could not find the host: they may have left the room or replaced the room link. Ask the host for a new one.',
+  '连不上公共中继（所在网络可能拦了它们）。请让房主改发「一对一邀请」，那个不经过任何第三方。':
+    'Could not reach the public relays (your network may block them). Ask the host for a one-to-one invite instead; it involves no third party.',
+  '房主不在线，或者这个房间链接已经失效': 'The host is offline, or this room link no longer works',
+  '连不上任何公共中继': 'Could not reach any public relay',
+  '双方 NoxReel 版本不一致，请都升级到最新版': 'Your NoxReel versions differ; both of you should update to the latest version',
+  '这个身份已经在房间里了': 'That identity is already in the room',
+  '这个身份是房主的': 'That identity belongs to the host',
+  '房主拒绝了加入': 'The host declined the join',
+  '房间链接里的房主公钥不对': 'The host key in this room link is invalid',
+  '房间密钥格式不对': 'The room key is malformed',
+  '只有房主能换房间链接': 'Only the host can replace the room link',
+  '房间链接（公共中继）': 'Room link (public relays)',
+  '公共中继（房间链接用）': 'Public relays (for room links)',
+  '房间链接经这些公共 Nostr 中继交换加密后的连接信息，视频不经过它们。':
+    'Room links exchange encrypted connection details through these public Nostr relays; video never goes through them.',
+  '留空用内置的一组；想换就每行写一个 wss:// 地址，你当房主时这份列表会写进房间链接。':
+    'Leave empty to use the built-in set; to change it, write one wss:// address per line. When you host, this list is included in the room link.',
+  'Discord 状态': 'Discord status',
+  '在 Discord 上显示我在放映': 'Show on Discord that I’m hosting or watching',
+  '显示片名': 'Show the title',
+  '显示「加入放映」按钮（用房间链接时）': 'Show a “Join” button (when using a room link)',
+  '你所有的 Discord 好友都能在你的资料上看到，点「加入放映」就能进房。':
+    'All your Discord friends can see this on your profile and join with the “Join” button.',
+  '需要电脑上开着 Discord 客户端，网页版不行。': 'Needs the Discord desktop app running; Discord in a browser won’t work.',
+  '这个版本没有配置 Discord 应用，状态显示用不了': 'This build has no Discord application configured, so status display is unavailable',
+  '已连上 Discord': 'Connected to Discord',
+  '正在连接 Discord…': 'Connecting to Discord…',
+  '没检测到 Discord 客户端（开着 Discord 时会自动连上）': 'Discord app not detected (it connects automatically when Discord is running)',
+  '进入房间后会显示': 'Shown once you’re in a room',
+  '没有打开': 'Off',
+  '和朋友一起看片': 'Watching with friends',
+  '还有人要来？同一条链接接着发就行，不用重新生成。': 'More people coming? Just send the same link again; no need to make a new one.',
+  '还有人要来？这个邀请码接着发就行，不用重新生成。': 'More people coming? Just send the same invite code again; no need to make a new one.',
+  '等待开播': 'Waiting to start',
+  '下载 NoxReel': 'Download NoxReel',
   简体中文: 'Simplified Chinese',
   繁体中文: 'Traditional Chinese',
   中文: 'Chinese',
@@ -718,6 +773,7 @@ const INVALID_LABELS = {
   测速参数: 'speed test parameters',
   精简参数: 'slimming parameters',
   转换参数: 'conversion parameters',
+  'Discord 状态': 'Discord status',
   字幕路径: 'subtitle path',
   转封装参数: 'remux parameters',
   校验参数: 'validation parameters',
@@ -1077,6 +1133,27 @@ const EN_PATTERNS = [
   ],
   [/^字幕 (.+) 用不了：(.+)$/, (_all, name, reason) => `Subtitle ${name} cannot be used: ${translate(reason, 'en')}`],
   [/^一部片最多封 (\d+) 条外挂字幕$/, 'At most $1 external subtitles can be packed into one video'],
+  // 房间链接、Discord 状态（0.7.4）
+  [
+    /^连不上公共中继（(.+)），改用一对一邀请$/,
+    (_all, why) => `Could not reach public relays (${translate(why, 'en')}); using a one-to-one invite instead`,
+  ],
+  [
+    /^连不上公共中继（(.+)），先用一对一邀请：一条链接只给一个人。$/,
+    (_all, why) => `Could not reach public relays (${translate(why, 'en')}), so here is a one-to-one invite: one link per person.`,
+  ],
+  [/^换链接失败：(.+)$/, (_all, why) => `Could not replace the link: ${translate(why, 'en')}`],
+  [
+    /^房间使用(.+)，你的本机设置是(.+)。请先在设置中切换为相同模式，再重新打开房间链接。$/,
+    'The room uses $1, while your local setting is $2. Select the same mode in Settings, then open the room link again.',
+  ],
+  [/^房间已满（上限 (\d+) 人）$/, 'The room is full (limit $1)'],
+  [
+    /^这些中继地址认不出来：(.+)。地址要形如 wss:\/\/relay\.example\.com$/,
+    'These relay addresses are not recognised: $1. Use the form wss://relay.example.com',
+  ],
+  [/^在看《(.+)》$/, 'Watching “$1”'],
+  [/^房间 (\d+)\/(\d+) 人$/, 'Room $1/$2'],
 ];
 
 let locale = readStoredLocale();

@@ -895,6 +895,11 @@ async function joinManual(hostCode) {
     log('邀请码无效：' + e.message, 'bad');
     return;
   }
+  // 房间链接（经公共中继、谁点谁进）这一版只有电脑端能用：说清楚该怎么办，别只报「不是邀请码」
+  if (payload.k === 'relay') {
+    log('这是房间链接，目前只有电脑端 NoxReel 能用，手机端下个版本支持。请让房主给你发一条「一对一邀请」。', 'bad');
+    return;
+  }
   if (payload.k !== 'offer' || !payload.sdp) {
     log('这不是一个房主邀请码', 'bad');
     return;

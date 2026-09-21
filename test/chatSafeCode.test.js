@@ -170,6 +170,60 @@ impl('聊天里的各种贴法都能认出邀请码', async (dir) => {
   }
 });
 
+/**
+ * Discord 把一段文字里的 URL 变成可点链接时，会把结尾的标点切出可点区域
+ * （不然「看这个 https://x.com.」点开会带上句号）。切掉的正是 . , : ; " ' ) ] 这些。
+ * 而 '.' 是码字母表的成员 —— 码尾恰好是 '.' 时，点开的链接就少一个字符。
+ */
+const discordClickable = (url) => url.replace(/[.,:;"')\]]+$/, '');
+
+impl('https 跳转链接：Discord 可点的那一截不丢码尾，markdown 也改不动它', async (dir) => {
+  const { encodeCode, decodeCode, shareLink, SHARE_BASE } = await import(dir + 'signaling.js');
+  assert.equal(SHARE_BASE, 'https://felis-desuwa.github.io/NoxReel/');
+  for (let i = 0; i < 200; i++) {
+    const code = await offerFor(encodeCode, 3 + (i % 20));
+    const link = shareLink(code, 'join');
+    assert.match(link, /^https:\/\/felis-desuwa\.github\.io\/NoxReel\/#j\/[RG][A-Za-z0-9.-]+\/$/);
+    assert.equal(discordRender(link), link, 'markdown 改了链接里的字符');
+    assert.equal(discordClickable(link), link, '结尾的 / 结束符没有挡住 Discord 切标点');
+    assert.deepEqual(await decodeCode(discordClickable(link)), await decodeCode(code));
+  }
+  // 眼下的码实际上不会以 '.' 结尾：gzip 末尾 4 字节是原文长度，几十 KB 以内高位全是 0；
+  // 不压缩的 R 码以 JSON 的 ']' 收尾。结束符防的是往后任何一种以 '.' 收尾的码 ——
+  // 这里直接拿一个以 '.' 结尾的码体对照：没有结束符时 Discord 可点的那一截会少一个字符。
+  const dotted = shareLink('NR3-Rabc.def.', 'join');
+  assert.equal(discordClickable(dotted), dotted);
+  assert.notEqual(discordClickable(dotted.slice(0, -1)), dotted.slice(0, -1));
+  const answer = shareLink('NR3-Rabc', 'answer');
+  assert.equal(answer, 'https://felis-desuwa.github.io/NoxReel/#a/Rabc/');
+});
+
+impl('https 跳转链接在聊天里的各种贴法都认，老的 noxreel:// 也照认', async (dir) => {
+  const { encodeCode, decodeCode, shareLink, inviteLink } = await import(dir + 'signaling.js');
+  const code = await offerFor(encodeCode, 6);
+  const web = shareLink(code, 'join');
+  const want = await decodeCode(code);
+  const cases = [
+    ['https 链接', web],
+    ['去掉结束符', web.slice(0, -1)],
+    ['Discord 抑制预览的 <>', `<${web}>`],
+    ['markdown 链接', `[点我加入](${web})`],
+    ['反引号', '`' + web + '`'],
+    ['前后闲话', `快来 ${web} 等你`],
+    ['句尾句号', `${web}。`],
+    ['中文引号', `“${web}”`],
+    ['换了域名的跳转页', web.replace('felis-desuwa.github.io/NoxReel/', 'noxreel.example.org/')],
+    ['百分号编码过', web.replace(/\./g, (m, i) => (i > web.indexOf('#') ? '%2E' : m))],
+    ['老的 noxreel:// 链接', inviteLink(code, 'join')],
+  ];
+  for (const [label, input] of cases) {
+    const got = await decodeCode(input).catch((e) => assert.fail(`${label} 解不开：${e.message}`));
+    assert.deepEqual(got, want, `${label} 解出来的内容不对`);
+  }
+  // 网址里没有 #j/ 或 #a/ 的，照旧报「不像是邀请码」
+  await assert.rejects(decodeCode('https://felis-desuwa.github.io/NoxReel/'), /这不像是一个 NoxReel 邀请码/);
+});
+
 impl('认不出来的输入仍然失败，且报错指对方向', async (dir) => {
   const { encodeCode, decodeCode } = await import(dir + 'signaling.js');
   const code = await offerFor(encodeCode, 6);

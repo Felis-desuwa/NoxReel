@@ -44,6 +44,13 @@ contextBridge.exposeInMainWorld('sw', {
     pickSubtitles: () => ipcRenderer.invoke('dialog:pickSubtitles'),
   },
 
+  discord: {
+    setActivity: (activity) => ipcRenderer.invoke('discord:setActivity', activity),
+    clear: () => ipcRenderer.invoke('discord:clear'),
+    status: () => ipcRenderer.invoke('discord:status'),
+    onStatus: on('discord:status'),
+  },
+
   media: {
     inspect: (filePath) => ipcRenderer.invoke('media:inspect', filePath),
     inspectLink: (url) => ipcRenderer.invoke('media:inspectLink', url),
