@@ -20,10 +20,14 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|uiMode|fontScale|fontWeightAdjustment|locale|layoutDirection|keyboard|keyboardHidden|navigation|touchscreen|colorMode|mcc|mnc"
             android:screenOrientation="fullUser"
             android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize">
+            <!-- configChanges：这些配置一变，系统默认要销毁并重建 Activity —— 重建会删光接收缓存、
+                 丢掉房间和直连（见 MainActivity 的类注释）。深色模式、字体大小/粗体、语言、
+                 显示大小、接蓝牙键盘、换 SIM 卡都在这里声明成自己处理；界面全在 WebView 里，
+                 它和播放画面会按新尺寸自己重排。安卓 14 的 grammaticalGender 要 compileSdk 34 才能写。 -->
             <!-- adjustResize：0.7 加了聊天输入条，默认的 adjustPan 会把整个窗口往上顶，
                  输入条被键盘盖住、聊天记录也跟着跑出屏幕。改成 resize 后窗口自己变矮，
                  输入条稳稳贴在键盘上方。主题不是全屏窗口，resize 才生效。 -->

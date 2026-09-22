@@ -117,13 +117,21 @@ export class ChunkAssembler {
     });
   }
 
+  /**
+   * 这一帧会不会被收下：正在等这一片、帧下标没越界也没收过、长度正好。
+   * 调用方拿它决定这一帧算不算有效流量（计入对方的速率），push 里用的是同一个判据。
+   */
+  accepts(chunkIndex, frameIndex, length) {
+    const st = this.pending.get(chunkIndex);
+    if (!st || !Number.isSafeInteger(frameIndex) || frameIndex < 0) return false;
+    if (frameIndex >= st.need || st.frames[frameIndex]) return false; // 越界或重复帧
+    return length === Math.min(FRAME_PAYLOAD_BYTES, st.length - frameIndex * FRAME_PAYLOAD_BYTES);
+  }
+
   /** @returns {Uint8Array|null} 分片齐了返回完整内容，否则 null。 */
   push(chunkIndex, frameIndex, payload) {
+    if (!this.accepts(chunkIndex, frameIndex, payload?.length)) return null;
     const st = this.pending.get(chunkIndex);
-    if (!st) return null;
-    if (frameIndex >= st.need || st.frames[frameIndex]) return null; // 越界或重复帧
-    const expected = Math.min(FRAME_PAYLOAD_BYTES, st.length - frameIndex * FRAME_PAYLOAD_BYTES);
-    if (payload.length !== expected) return null;
 
     st.frames[frameIndex] = payload;
     st.got++;

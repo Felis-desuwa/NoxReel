@@ -40,7 +40,8 @@ contextBridge.exposeInMainWorld('sw', {
     pickVideo: () => ipcRenderer.invoke('dialog:pickVideo'),
     pickVideos: () => ipcRenderer.invoke('dialog:pickVideos'),
     pickCacheDir: () => ipcRenderer.invoke('dialog:pickCacheDir'),
-    approveDroppedVideo: (filePath) => ipcRenderer.invoke('dialog:approveDroppedVideo', filePath),
+    // 这里**不**暴露「按路径批准片源」：页面传一个字符串就能批准本机任意视频（连同旁边的字幕）
+    // 去做种，approvedSources 这道白名单就形同虚设了。拖进来的文件只走下面的 pathForFile(File)。
     pickSubtitles: () => ipcRenderer.invoke('dialog:pickSubtitles'),
   },
 
@@ -127,7 +128,8 @@ contextBridge.exposeInMainWorld('sw', {
   },
 
   // 拖拽进来的 File 对象在 Electron 里拿不到 .path 了（安全策略变更），
-  // 得走 webUtils 这个官方替代品。
+  // 得走 webUtils 这个官方替代品。路径由 preload 从真实的 File 取出来，页面给不了任意字符串 ——
+  // 页面自己 new File([...], 'C:\\x.mp4') 造出来的对象不落在磁盘上，取到的是空串。
   pathForFile: async (file) => {
     try {
       const filePath = webUtils.getPathForFile(file);

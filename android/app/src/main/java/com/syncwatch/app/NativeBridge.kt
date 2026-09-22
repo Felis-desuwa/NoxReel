@@ -5,6 +5,7 @@ import android.webkit.JavascriptInterface
 import org.json.JSONObject
 import java.net.InetAddress
 import java.net.URI
+import java.net.URL
 
 /**
  * JS ↔ 原生 的唯一通道，对应 PC 端 preload.js 暴露的 window.sw。
@@ -113,6 +114,8 @@ class NativeBridge(
     fun playerLoadUrl(rawUrl: String, headersJson: String): Int {
         return try {
             val url = requirePublicHttpUrl(rawUrl)
+            // 合法的请求头最多五条、每条 2KB，整串不可能比这长；超长的不去解析
+            require(headersJson.length <= MAX_HEADERS_JSON_CHARS)
             val headersObject = JSONObject(headersJson.ifBlank { "{}" })
             val allowed = setOf("accept", "accept-language", "origin", "referer", "user-agent")
             val headers = mutableMapOf<String, String>()
@@ -133,8 +136,12 @@ class NativeBridge(
     @JavascriptInterface
     fun playerSetPause(paused: Boolean) = player.setPause(paused)
 
+    /** 位置来自同步消息：NaN、无穷大、负数一律不往播放器里送。 */
     @JavascriptInterface
-    fun playerSeek(seconds: Double) = player.seek(seconds)
+    fun playerSeek(seconds: Double) {
+        if (!seconds.isFinite()) return
+        player.seek(seconds.coerceAtLeast(0.0))
+    }
 
     /**
      * @return 播放快照 JSON：{generation, position, duration, paused, idle, eof}（位置单位秒）。
@@ -148,46 +155,61 @@ class NativeBridge(
     @JavascriptInterface
     fun playerRelease(): Int = player.release()
 
+    /* ------------------------------ 房间 ------------------------------ */
+
+    /**
+     * 离开房间：播放器释放、所有接收会话关掉（缓存跟着删）。页面随后自己整页重载 ——
+     * 只重载页面的话，原生这边的会话和播放器没人收，缓存要一直躺到下次冷启动。
+     */
+    @JavascriptInterface
+    fun leaveRoom() {
+        player.release()
+        store.closeAll()
+    }
+
+    /** 安装包版本号（build.gradle 的 versionName），大厅里显示成「v0.7.4」。 */
+    @JavascriptInterface
+    fun appVersion(): String = BuildConfig.VERSION_NAME
+
     /* ------------------------------ 杂项 ------------------------------ */
 
+    /** logcat 单条本来就只显示 4KB 左右，超长的截掉，别让一条日志拖着几 MB 的字符串过桥。 */
     @JavascriptInterface
-    fun log(msg: String) { Log.d(TAG, msg) }
+    fun log(msg: String) { Log.d(TAG, if (msg.length > MAX_LOG_CHARS) msg.take(MAX_LOG_CHARS) + "…" else msg) }
 
+    /**
+     * 只看字面，不查 DNS：这个方法在 JS 桥线程上跑，JS 那边同步等着返回，
+     * 一次慢吞吞的 DNS（房主完全可以挑一个故意拖着不答的域名）就能把整页卡住好几秒。
+     * 真正的地址检查在播放器每一次建连时做（[NetGuard.open]），那里挡得住重定向、
+     * HLS/DASH 子资源和 DNS 重绑定；这里只把一眼就能看出来的内网地址提前拒掉。
+     */
     private fun requirePublicHttpUrl(raw: String): String {
         require(raw.length in 1..16384)
         val uri = URI(raw)
         require(uri.scheme.equals("http", true) || uri.scheme.equals("https", true))
         require(uri.userInfo == null && !uri.host.isNullOrBlank())
-        val host = uri.host
-        require(!host.equals("localhost", true) && !host.endsWith(".localhost", true))
-        val addresses = InetAddress.getAllByName(host)
-        require(addresses.isNotEmpty())
-        require(addresses.none(::isPrivateAddress))
-        return uri.toASCIIString()
+        val ascii = uri.toASCIIString()
+        NetGuard.checkUrlShape(URL(ascii))
+        literalAddress(NetGuard.bareHost(uri.host))?.let { require(!NetGuard.isPrivateAddress(it)) }
+        return ascii
     }
 
-    private fun isPrivateAddress(address: InetAddress): Boolean {
-        if (address.isAnyLocalAddress || address.isLoopbackAddress || address.isLinkLocalAddress ||
-            address.isSiteLocalAddress || address.isMulticastAddress) return true
-        val bytes = address.address.map { it.toInt() and 0xff }
-        if (bytes.size == 4) {
-            val (a, b, c) = bytes
-            return a == 0 || a == 10 || a == 127 ||
-                (a == 100 && b in 64..127) || (a == 169 && b == 254) ||
-                (a == 172 && b in 16..31) || (a == 192 && (b == 168 || (b == 0 && c in 0..2))) ||
-                (a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100))) ||
-                (a == 203 && b == 0 && c == 113) || a >= 224
+    /** 主机名本身就是 IP 字面量时直接换成地址（不经 DNS）；是域名就返回 null。 */
+    private fun literalAddress(host: String): InetAddress? {
+        if (IPV4_LITERAL.matches(host)) {
+            val octets = host.split('.').map { it.toInt() }
+            if (octets.any { it > 255 }) return null
+            return InetAddress.getByAddress(ByteArray(4) { octets[it].toByte() })
         }
-        if (bytes.size == 16) {
-            if ((bytes[0] and 0xfe) == 0xfc || bytes[0] == 0xff) return true
-            val mappedV4 = bytes.take(10).all { it == 0 } && bytes[10] == 0xff && bytes[11] == 0xff
-            if (mappedV4) return isPrivateAddress(InetAddress.getByAddress(bytes.takeLast(4).map(Int::toByte).toByteArray()))
-        }
-        return false
+        // URI 只放行语法正确的 IPv6 字面量，按字面解析，不会去查 DNS
+        return if (host.contains(':')) InetAddress.getByName(host) else null
     }
 
     companion object {
         const val NAME = "Native"
         private const val TAG = "NoxReel"
+        private const val MAX_LOG_CHARS = 4000
+        private const val MAX_HEADERS_JSON_CHARS = 16 * 1024
+        private val IPV4_LITERAL = Regex("""^\d{1,3}(\.\d{1,3}){3}$""")
     }
 }

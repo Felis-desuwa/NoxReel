@@ -6,6 +6,7 @@ const net = require('net');
 const dns = require('dns/promises');
 const { CHUNK_SIZE } = require('./fileStore');
 const { validateManifestName } = require('./mediaGuard');
+const { isPublicIp } = require('./ipGuard');
 // 弹幕的各种上限由覆盖层那一侧定义（它还要按同一个数截断播放器里发回来的文本），
 // 这里只负责把关。两边各写一份就迟早会对不上。
 const {
@@ -50,40 +51,9 @@ function httpUrl(value, label = '链接') {
   return parsed.href;
 }
 
+// 判据统一在 ipGuard：过滤代理、跳转链预检、隔离浏览器用的都是这一份
 function isPrivateAddress(address) {
-  const ip = String(address || '').toLowerCase().split('%')[0];
-  if (net.isIPv4(ip)) {
-    const parts = ip.split('.').map(Number);
-    const [a, b, c] = parts;
-    return (
-      a === 0 || a === 10 || a === 127 ||
-      (a === 100 && b >= 64 && b <= 127) ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && ((b === 0 && c === 0) || b === 168 || (b === 0 && c === 2))) ||
-      (a === 198 && (b === 18 || b === 19)) ||
-      (a === 198 && b === 51 && c === 100) ||
-      (a === 203 && b === 0 && c === 113) ||
-      a >= 224
-    );
-  }
-  if (net.isIPv6(ip)) {
-    if (ip === '::' || ip === '::1') return true;
-    if (
-      ip.startsWith('fc') || ip.startsWith('fd') || /^fe[89ab]/.test(ip) ||
-      ip.startsWith('ff') || ip.startsWith('2001:db8:')
-    ) return true;
-    const mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-    if (mapped) return isPrivateAddress(mapped[1]);
-    const mappedHex = ip.match(/^::ffff:([a-f0-9]{1,4}):([a-f0-9]{1,4})$/);
-    if (mappedHex) {
-      const high = Number.parseInt(mappedHex[1], 16);
-      const low = Number.parseInt(mappedHex[2], 16);
-      return isPrivateAddress(`${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`);
-    }
-    return false;
-  }
-  return true;
+  return !isPublicIp(address);
 }
 
 async function publicHttpUrl(value, label = '链接') {

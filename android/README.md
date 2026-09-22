@@ -45,6 +45,8 @@ android/
       GrowingDataSource.kt   只读到当前连续区末尾的 ExoPlayer 数据源
       SyncPlayer.kt          ExoPlayer 包装，对齐同步引擎期望的接口
       NativeBridge.kt        JS↔原生 唯一通道（对应 PC 的 preload.js）
+      NetGuard.kt            在线链接的建连守卫：逐跳跟重定向、每条 TCP 连接都核对对端不是内网
+      PublicHttpDataSource.kt  代替 DefaultHttpDataSource 的数据源，清单/分片/密钥全经 NetGuard
     assets/
       index.html             界面
       js/
@@ -82,6 +84,18 @@ android/
 **③ 输入法。** Activity 设了 `windowSoftInputMode="adjustResize"`：键盘弹出时窗口自己变矮，
 聊天输入条贴在键盘上方，WebView 会收到新的视口高度。别给主题加 `windowFullscreen`，
 全屏窗口会让 `adjustResize` 失效。
+
+**④ 配置变更不重建 Activity。** `AndroidManifest.xml` 的 `configChanges` 列全了深色模式、字体大小、
+语言、键盘、旋转等：重建会让观众退房、接收缓存被删。界面全在 WebView 里会自己重排，
+新加带限定符的资源之前先想清楚这一点。
+
+**⑤ `Native.leaveRoom()` / `Native.appVersion()`。** 在房间里再点一条邀请时，页面先问
+「留在当前房间 / 离开并加入」；选离开就调 `leaveRoom()`（释放播放器、删掉接收缓存），
+把邀请记进 sessionStorage 后整页重载，重载完再处理它。`appVersion()` 返回
+`BuildConfig.VERSION_NAME`，大厅标题旁的版本号就从这里来。
+
+**⑥ 在线视频不走系统代理。** `NetGuard` 用 `Proxy.NO_PROXY` 直连：走代理时看不到真正的对端地址，
+就没法在建连那一刻判断是不是内网。VPN 类 App 不受影响。
 
 ## 环境（一次性）
 

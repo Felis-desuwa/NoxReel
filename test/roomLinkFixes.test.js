@@ -846,6 +846,7 @@ test('当前这部在补一段时，收到新片就重算传输目标（补完�
     renderPlaylistSoon: () => {},
     renderStatus: () => {},
     renderPeers: () => {},
+    renderPeersSoon: () => {},
     maybeLaunchPlayer: () => {},
     renderProgress: () => {},
     updateLocalReady: () => {},

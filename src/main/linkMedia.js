@@ -8,11 +8,13 @@
  */
 
 const { spawn } = require('child_process');
+const http = require('http');
+const https = require('https');
 const path = require('path');
 const os = require('os');
 const net = require('net');
-const dns = require('dns').promises;
 const { findBin } = require('./findBin');
+const { isPublicIp, resolvePublic, publicLookup } = require('./ipGuard');
 
 const DIRECT_MEDIA_RE = /\.(?:mp4|m4v|mov|mkv|webm|m3u8|mpd)(?:$|[?#])/i;
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
@@ -74,59 +76,69 @@ function sanitizePlaybackHeaders(value) {
   return safe;
 }
 
-function isPrivateIp(address) {
-  const v = net.isIP(address);
-  if (v === 4) {
-    const [a, b] = address.split('.').map(Number);
-    return (
-      a === 0 || a === 10 || a === 127 ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 100 && b >= 64 && b <= 127) ||
-      a >= 224
-    );
-  }
-  if (v === 6) {
-    const s = address.toLowerCase();
-    if (s === '::' || s === '::1') return true;
-    if (s.startsWith('fe80') || s.startsWith('fc') || s.startsWith('fd')) return true;
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(s);
-    if (mapped) return isPrivateIp(mapped[1]);
-    return false;
-  }
-  return true; // 解析不出来的一律当私网处理
-}
-
+// 私网判定统一用 ipGuard：这里原来自己写了一份，认不出 WHATWG URL 规范化之后的
+// [::ffff:7f00:1] 这种十六进制映射地址，也漏了 fe90–febf 那一段链路本地地址。
 async function hostIsPublic(hostname) {
-  const host = String(hostname || '').replace(/^\[|\]$/g, '').toLowerCase();
-  if (!host || host === 'localhost' || host.endsWith('.localhost')) return false;
-  if (net.isIP(host)) return !isPrivateIp(host);
   try {
-    const addrs = await dns.lookup(host, { all: true, verbatim: true });
-    return addrs.length > 0 && !addrs.some(({ address }) => isPrivateIp(address));
+    await resolvePublic(hostname);
+    return true;
   } catch {
     return false;
   }
 }
 
+/**
+ * 发一个 HEAD，不跟随跳转，返回 { status, location }。
+ *
+ * 不用 fetch：它自己解析 DNS，而上一步 hostIsPublic 判定时解析的是另一次 ——
+ * 两次之间换个答案（DNS 重绑定），这一发 HEAD 就打到内网去了。这里改成连接那一刻才解析、
+ * 才判定（publicLookup），IP 字面量 Node 不会走 lookup，先自己判一遍。
+ */
+function headOnce(url, { timeoutMs = 8000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const host = target.hostname.replace(/^\[|\]$/g, '');
+    if (net.isIP(host) && !isPublicIp(host)) {
+      const error = new Error('拒绝访问非公网地址');
+      error.code = 'ENOTPUBLIC';
+      return reject(error);
+    }
+    const lib = target.protocol === 'https:' ? https : http;
+    const req = lib.request(target, {
+      method: 'HEAD',
+      lookup: publicLookup,
+      agent: false,
+      timeout: timeoutMs,
+      headers: { 'user-agent': 'Mozilla/5.0' },
+    });
+    const timer = setTimeout(() => req.destroy(new Error('跳转预检超时')), timeoutMs);
+    req.on('response', (res) => {
+      clearTimeout(timer);
+      res.resume();
+      resolve({ status: res.statusCode, location: res.headers.location || '' });
+      req.destroy();
+    });
+    req.on('timeout', () => req.destroy(new Error('跳转预检超时')));
+    req.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    req.end();
+  });
+}
+
 /** 手动走一遍跳转链，任何一跳指向私网就拒绝。见调用处对局限性的说明。 */
-async function assertRedirectChainIsPublic(startUrl) {
+async function assertRedirectChainIsPublic(startUrl, { head = headOnce } = {}) {
   let current = startUrl;
   for (let hop = 0; hop < MAX_REDIRECT_HOPS; hop++) {
     let res;
     try {
-      res = await fetch(current, {
-        method: 'HEAD',
-        redirect: 'manual',
-        signal: AbortSignal.timeout(8000),
-        headers: { 'user-agent': 'Mozilla/5.0' },
-      });
+      res = await head(current);
     } catch {
       return; // 探不动就放行，交给 yt-dlp —— 这一层是加固，不是准入门槛
     }
     if (res.status < 300 || res.status >= 400) return;
-    const location = res.headers.get('location');
+    const location = res.location;
     if (!location) return;
 
     let next;
@@ -182,10 +194,20 @@ function playbackFromInfo(info, fallbackUrl) {
   };
 }
 
+/** 子进程环境去掉 no_proxy：命中它的主机会绕过 --proxy，私网过滤也就跟着失效了。 */
+function childEnv(base = process.env) {
+  const env = { ...base };
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === 'no_proxy') delete env[key];
+  }
+  return env;
+}
+
 function runJson(bin, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-    let stdout = '';
+    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env: childEnv() });
+    const chunks = [];
+    let stdoutBytes = 0;
     let stderr = '';
     let settled = false;
 
@@ -201,12 +223,16 @@ function runJson(bin, args) {
       finish(reject, new Error('解析视频链接超时，请检查网络或换一个链接重试'));
     }, PARSE_TIMEOUT_MS);
 
+    // 按字节累计：原来每来一块都把整段已收的字符串重新量一遍长度，8MB 的输出要白扫上百遍
     child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString('utf8');
-      if (Buffer.byteLength(stdout) > MAX_OUTPUT_BYTES) {
+      if (settled) return;
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > MAX_OUTPUT_BYTES) {
         child.kill();
         finish(reject, new Error('链接返回的媒体信息过大，可能是播放列表而不是单个视频'));
+        return;
       }
+      chunks.push(chunk);
     });
     child.stderr.on('data', (chunk) => {
       stderr += chunk.toString('utf8');
@@ -224,7 +250,7 @@ function runJson(bin, args) {
         return;
       }
       try {
-        finish(resolve, JSON.parse(stdout));
+        finish(resolve, JSON.parse(Buffer.concat(chunks).toString('utf8')));
       } catch {
         finish(reject, new Error('视频链接解析器返回了无法识别的数据'));
       }
@@ -232,7 +258,7 @@ function runJson(bin, args) {
   });
 }
 
-function ytDlpArgs(url, extractorArgs = null) {
+function ytDlpArgs(url, extractorArgs = null, proxy = null) {
   const args = [
     '--ignore-config',
     '--dump-single-json',
@@ -243,6 +269,9 @@ function ytDlpArgs(url, extractorArgs = null) {
     '--socket-timeout',
     '20',
   ];
+  // 本机过滤代理（publicProxy.js）：yt-dlp 的每个请求、每一跳跳转都在代理那里按「连接那一刻」
+  // 解析出的 IP 判定，私网一律 403。这才是真正堵住 SSRF 的那一道，下面的跳转链预检只是提前报错。
+  if (proxy) args.push('--proxy', proxy);
   if (extractorArgs) args.push('--extractor-args', extractorArgs);
   args.push(
     // Android 端不能像 mpv 一样把独立音视频流现场合并，因此优先选择同时含
@@ -276,7 +305,7 @@ function resultFromInfo(info, url) {
   };
 }
 
-async function inspectLink(rawUrl, { browserFallback } = {}) {
+async function inspectLink(rawUrl, { browserFallback, proxy = null } = {}) {
   const url = normalizeHttpUrl(rawUrl);
   const ytDlp = findYtDlp();
 
@@ -305,10 +334,10 @@ async function inspectLink(rawUrl, { browserFallback } = {}) {
   // 成员的机器就替攻击者对自己的局域网发了一次请求。
   //
   // **这只是部分缓解，不是根治。** 服务器完全可以对预检和 yt-dlp 返回不同的
-  // 跳转目标（按 User-Agent 或请求次数区分），预检就被绕过了。要真正堵死，
-  // 得让 yt-dlp 的每个请求都过一遍校验（比如走一个本地校验代理），
-  // 那是隔离浏览器路径已经在做的事（见 browserMediaResolver 的 isPublicRequest）。
-  // 这一层挡住的是「站点被入侵后无差别 302」这类非针对性的情况。
+  // 跳转目标（按 User-Agent 或请求次数区分），预检就被绕过了。真正堵死它的是
+  // 本机过滤代理（proxy，见 publicProxy.js）：yt-dlp 的每个请求都经过它，
+  // 在连接那一刻按解析出的 IP 判定。这里保留预检，只是为了在常见情况下
+  // 给出一句「跳转到了内网地址」，而不是 yt-dlp 那句笼统的 HTTP 403。
   await assertRedirectChainIsPublic(url);
 
   const attempts = isYouTubeUrl(url)
@@ -319,7 +348,7 @@ async function inspectLink(rawUrl, { browserFallback } = {}) {
   let lastError;
   for (const extractorArgs of attempts) {
     try {
-      return resultFromInfo(await runJson(ytDlp, ytDlpArgs(url, extractorArgs)), url);
+      return resultFromInfo(await runJson(ytDlp, ytDlpArgs(url, extractorArgs, proxy)), url);
     } catch (error) {
       lastError = error;
     }
@@ -363,4 +392,7 @@ module.exports = {
   isYouTubeUrl,
   ytDlpArgs,
   toolStatus,
+  hostIsPublic,
+  headOnce,
+  childEnv,
 };

@@ -20,7 +20,7 @@ function fnSource(name) {
 }
 
 function sandbox(names, globals) {
-  const ctx = { console, Promise, ...globals };
+  const ctx = { console, Promise, inviteGen: 0, ...globals };
   vm.createContext(ctx);
   vm.runInContext(names.map(fnSource).join('\n\n'), ctx);
   return ctx;
@@ -196,6 +196,13 @@ function relayGuest({ fail = null, settingsMode = 'trusted' } = {}) {
     show: () => {},
     setSteps: () => {},
     initSwarmAndSync: () => calls.push(['init']),
+    // 加入的代次（换代、重复点开的去重）另见 appHardening.test.js，这里只看一次加入本身
+    inviteKey: () => 'relay-key',
+    joiningWith: () => false,
+    beginAttempt: () => 1,
+    attemptLive: () => true,
+    replace: () => {},
+    cancelJoinButton: () => null,
     updatePresence: () => calls.push(['presence']),
     encodeCode: async () => 'NR3-Rlink',
     shareLink: (code) => `https://felis-desuwa.github.io/NoxReel/#j/${code.slice(4)}/`,
@@ -280,4 +287,99 @@ test('新文案都有英文', async () => {
   ]) {
     assert.notEqual(en(line), line, line);
   }
+});
+
+// 进房后邀请卡默认先连公共中继（一两秒）。这期间房主点了「一对一」或「信令服务器」：
+// 晚到的中继结果不许盖掉新的邀请卡，中继失败时也不许去关人家新建的连接（0.7.5 端到端测出来的竞态）。
+function inviteRace() {
+  const calls = [];
+  const pend = [];
+  const els = new Map();
+  const el = (id) => {
+    if (!els.has(id)) els.set(id, { id, value: '', onclick: null, textContent: '' });
+    return els.get(id);
+  };
+  const S = {
+    signaling: null, signalTransport: null, mode: null, peerId: 'host1', name: '房主', roomCapacity: 6,
+    roomSecurityMode: 'safe', settings: { relays: '', signalUrl: 'ws://sig.example:8080' },
+  };
+  const ctx = sandbox(['inviteViaRelay', 'renderRelayInvite', 'inviteViaServer', 'customRelays', 'setFinalInviteStep'], {
+    S,
+    $: el,
+    make: (tag, o = {}, kids = []) => ({ tag, ...o, kids, style: {} }),
+    replace: (target, ...nodes) => calls.push(['replace', nodes.flat().map((n) => n?.text || n?.id || '').join('|')]),
+    inviteStep: (no, title, hint, controls) => ({ text: title, controls }),
+    log: (text, kind) => calls.push(['log', text, kind]),
+    copyCode: () => {},
+    updatePresence: () => {},
+    newRoomSecret: () => 'SECRET',
+    randomRoomId: () => 'ROOM1',
+    inviteMediaInfo: () => null,
+    encodeCode: async (p) => {
+      calls.push(['encode', p.k]);
+      return 'NR3-Xcode';
+    },
+    shareLink: (code) => `https://felis-desuwa.github.io/NoxReel/#j/${code.slice(4)}/`,
+    // 和真的一样：第一个 await 之前就把新连接挂上 S.signaling，并关掉手上那条
+    connectSignaling: (url, room, relay) => {
+      let resolve;
+      let reject;
+      const promise = new Promise((a, b) => ((resolve = a), (reject = b)));
+      const sig = {
+        transport: relay ? 'relay' : 'ws',
+        closed: false,
+        secret: relay?.secret,
+        publicKey: 'b'.repeat(64),
+        close() {
+          this.closed = true;
+          reject(Object.assign(new Error('连不上任何公共中继'), { code: 'RELAY_UNREACHABLE' }));
+        },
+      };
+      const previous = S.signaling;
+      S.signaling = sig;
+      S.signalTransport = sig.transport;
+      if (previous && previous !== sig) previous.close();
+      pend.push({ sig, resolve });
+      return promise;
+    },
+    // 真的 inviteViaManual 开头会领一个新代次、把 S.mode 改成 manual
+    inviteViaManual: async (notice = '') => {
+      ctx.inviteGen++;
+      S.mode = 'manual';
+      calls.push(['manual', notice]);
+    },
+  });
+  return { ctx, S, calls, pend };
+}
+
+const settle = async () => {
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+};
+
+test('连中继那几秒里改点「一对一」：晚到的房间链接不盖掉一对一邀请', async () => {
+  const r = inviteRace();
+  const relayRun = r.ctx.inviteViaRelay();
+  await r.ctx.inviteViaManual(); // 房主手快，中继还没连上就点了「一对一邀请」
+  r.pend[0].resolve({ hostId: 'host1' }); // 中继这时才连上
+  await relayRun;
+  await settle();
+  assert.equal(r.S.mode, 'manual', '房间链接晚到后把 S.mode 改回了 server');
+  assert.ok(!r.calls.some((c) => c[0] === 'encode'), '晚到的中继结果还是编出了房间链接、盖掉了邀请卡');
+  assert.equal(r.calls.filter((c) => c[0] === 'manual').length, 1, '不该再退回一次一对一');
+});
+
+test('连中继那几秒里改点「信令服务器」：中继那条失败时不去关新建的信令连接', async () => {
+  const r = inviteRace();
+  const relayRun = r.ctx.inviteViaRelay();
+  const serverRun = r.ctx.inviteViaServer(); // 这一步会关掉中继那条，它的 connect 随即失败
+  const ws = r.pend[1].sig;
+  await relayRun;
+  r.pend[1].resolve({ hostId: 'host1' });
+  await serverRun;
+  await settle();
+  assert.equal(ws.closed, false, '中继失败的收尾把信令服务器那条新连接关掉了');
+  assert.equal(r.S.signaling, ws);
+  assert.equal(r.S.signalTransport, 'ws');
+  assert.ok(!r.calls.some((c) => c[0] === 'manual'), '中继失败后还退回了一对一，盖掉了信令邀请码');
+  assert.deepEqual(r.calls.filter((c) => c[0] === 'encode').map((c) => c[1]), ['room']);
 });

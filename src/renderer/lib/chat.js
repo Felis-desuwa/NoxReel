@@ -35,6 +35,20 @@ export const SEEN_LIMIT = 512;
 export const SEEN_TTL_MS = 120_000;
 /** 令牌桶按 origin 分开记；上限防的是房主转发时塞进海量假 origin。 */
 export const MAX_BUCKETS = 64;
+/**
+ * 再按「这条连接」限一道总量。普通成员的 origin 就是他自己，这一道管不着他；
+ * 管的是房主那条连接 —— 他替所有人转发，origin 可以随便换，每换一个就是一只满的新桶。
+ * 量级按 15 个成员同时说话来留：突发每人 5 条、之后每人每秒 1 条，再加房主自己的。
+ */
+export const SENDER_BURST_TOKENS = 80;
+export const SENDER_REFILL_PER_SECOND = 16;
+/**
+ * 线上原文的长度上限（UTF-16 码元）。发端一律先清洗、截到 200 字再发，合法消息到不了这里；
+ * 更长的直接判无效，不用对着几十 KB 的字符串跑一遍清洗。
+ */
+export const MAX_WIRE_TEXT = 2048;
+// 昵称清洗前先截到这么长。合法昵称最多 40 字，截到这么长绰绰有余
+const NAME_SCAN_LIMIT = MAX_NAME * 8;
 
 /** 消息 id：12 位随机十六进制。 */
 export const MSG_ID_RE = /^[0-9a-f]{12}$/;
@@ -73,7 +87,13 @@ export function sanitizeText(raw) {
 /** 昵称清洗：同样去控制字符、并空白，截断到 40 字。 */
 export function clampName(raw) {
   if (typeof raw !== 'string' || !raw) return '';
-  const text = raw.replace(CONTROL_RE, '').replace(LONE_SURROGATE_RE, '').replace(/\s+/g, ' ').trim();
+  // 昵称来自对方，可能是几十 KB 的字符串，而且在限速之前就要算 —— 先截短再清洗
+  const text = raw
+    .slice(0, NAME_SCAN_LIMIT)
+    .replace(CONTROL_RE, '')
+    .replace(LONE_SURROGATE_RE, '')
+    .replace(/\s+/g, ' ')
+    .trim();
   return sliceCodePoints(text, MAX_NAME).trim();
 }
 
@@ -219,29 +239,38 @@ export class ChatGate {
     seenLimit = SEEN_LIMIT,
     seenTtlMs = SEEN_TTL_MS,
     maxBuckets = MAX_BUCKETS,
+    senderCapacity = SENDER_BURST_TOKENS,
+    senderRefillPerSecond = SENDER_REFILL_PER_SECOND,
   } = {}) {
     this.now = now;
     this.capacity = capacity;
     this.refillPerSecond = refillPerSecond;
     this.maxBuckets = maxBuckets;
+    this.senderCapacity = senderCapacity;
+    this.senderRefillPerSecond = senderRefillPerSecond;
     this.seen = new SeenIds({ limit: seenLimit, ttlMs: seenTtlMs, now });
     this.buckets = new Map(); // origin -> TokenBucket
+    this.senderBuckets = new Map(); // 连接的 peerId -> TokenBucket
   }
 
   _bucket(origin) {
-    let bucket = this.buckets.get(origin);
+    return this._bucketIn(this.buckets, origin, this.capacity, this.refillPerSecond);
+  }
+
+  _bucketIn(map, key, capacity, refillPerSecond) {
+    let bucket = map.get(key);
     if (bucket) {
       // 命中就挪到队尾，挤人时挤掉最久没说话的
-      this.buckets.delete(origin);
-      this.buckets.set(origin, bucket);
+      map.delete(key);
+      map.set(key, bucket);
       return bucket;
     }
-    bucket = new TokenBucket({ capacity: this.capacity, refillPerSecond: this.refillPerSecond, now: this.now });
-    this.buckets.set(origin, bucket);
-    while (this.buckets.size > this.maxBuckets) {
-      const oldest = this.buckets.keys().next();
+    bucket = new TokenBucket({ capacity, refillPerSecond, now: this.now });
+    map.set(key, bucket);
+    while (map.size > this.maxBuckets) {
+      const oldest = map.keys().next();
       if (oldest.done) break;
-      this.buckets.delete(oldest.value);
+      map.delete(oldest.value);
     }
     return bucket;
   }
@@ -255,7 +284,13 @@ export class ChatGate {
   accept(msg, ctx = {}) {
     const t = this.now();
     const m = msg && typeof msg === 'object' && !Array.isArray(msg) ? msg : null;
-    if (!m || typeof m.id !== 'string' || !MSG_ID_RE.test(m.id) || typeof m.text !== 'string') {
+    if (
+      !m ||
+      typeof m.id !== 'string' ||
+      !MSG_ID_RE.test(m.id) ||
+      typeof m.text !== 'string' ||
+      m.text.length > MAX_WIRE_TEXT
+    ) {
       return { ok: false, reason: 'invalid' };
     }
     const from = originOfChat(m, ctx);
@@ -266,6 +301,12 @@ export class ChatGate {
 
     // 先去重，再扣令牌 —— 顺序反过来会让网状模式下的有效速率减半
     if (this.seen.has(m.id, t)) return { ok: false, reason: 'duplicate', id: m.id, origin: from.origin };
+
+    // 先按连接限总量，再按说话的人限（见 SENDER_BURST_TOKENS）
+    const sender = this._bucketIn(this.senderBuckets, from.senderId, this.senderCapacity, this.senderRefillPerSecond);
+    if (!sender.take(t)) {
+      return { ok: false, reason: 'rate', origin: from.origin, retryAfterMs: sender.retryAfterMs(t) };
+    }
 
     const bucket = this._bucket(from.origin);
     if (!bucket.take(t)) {
@@ -291,10 +332,12 @@ export class ChatGate {
   /** removePeer 时清掉按 peerId 记的状态。 */
   forget(peerId) {
     this.buckets.delete(peerId);
+    this.senderBuckets.delete(peerId);
   }
 
   clear() {
     this.buckets.clear();
+    this.senderBuckets.clear();
     this.seen.clear();
   }
 }

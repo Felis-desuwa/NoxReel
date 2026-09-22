@@ -57,6 +57,46 @@ const PEER_ID_RE = /^[A-Za-z0-9._-]{6,128}$/;
 const HASH_RE = /^[a-f0-9]{64}$/;
 const FILE_ID_RE = /^[a-f0-9]{32}$/;
 
+// ── 请求超时 ──
+// 超时按对方的往返时延和实测速率估，而这两个数都受对方影响（速率是他发多少我收多少，
+// 往返时延是他回 PONG 回得多快）。不设上限的话，一个故意慢吞吞的人能把超时拉到几十天，
+// 分到他名下的关键片就一直挂着，也不会改派给别人。
+const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
+const MIN_REQUEST_TIMEOUT_MS = 6000;
+const MAX_REQUEST_TIMEOUT_MS = 120_000;
+const MAX_SANE_RTT_MS = 30_000; // 和 peer.js 收 PONG 的上限一致
+const MIN_SANE_RATE = 1024; // 每秒不到 1KB 的「速率」只是零星几帧的噪声，按测不出处理
+const MAX_SANE_RATE = 1.25e9; // 10Gbps
+
+// ── 上游信誉：超时、坏片 ──
+// 按 peerId 记，断线重连也还在（同一个人换条连接不能洗白）；只给出过事的人建档，最多记这么多人
+const REP_MAX = 256;
+// 请求超时后冷却一段时间：有别的上游可用时不再向他要，时长随连续超时翻倍
+const TIMEOUT_COOLDOWN_BASE_MS = 5_000;
+const TIMEOUT_COOLDOWN_MAX_MS = 120_000;
+// 坏片按「哪几片」记，不按次数：同一片反复坏（比如他磁盘上那一片坏了）只算一次，不会把诚实的人拉黑
+const BAD_CHUNK_BAN = 4; // 不同的坏片攒到这么多，这个人就不再向他要任何片
+const BAD_CHUNK_FORGIVE = 32; // 之后每收到这么多片好片，抵消一片旧账
+const BAD_CHUNK_RETRY_BASE_MS = 15_000; // 同一片在他那里坏过两次起，隔这么久才再向他要这一片，逐次翻倍
+const BAD_CHUNK_RETRY_MAX_MS = 300_000;
+// 已经不向他要了还在往数据通道里灌帧：灌过这么多就断开。留出余量给拉黑那一刻他正在发的一两片
+const BANNED_FRAME_ALLOWANCE = 16 * 1024 * 1024;
+
+// ── 防刷 ──
+// 位图正常只在握手、加片、收齐时各来一次，每条都要把位图解一遍、刷新成员表
+const BITFIELD_BURST = 256;
+const BITFIELD_PER_SEC = 8;
+// 同一条连接上，每部片最多给他发「两遍全片 + 这么多片」。诚实的人每片只要一次（超时、坏片重要几次），
+// 不设上限的话，一个人反复要同一批片就能让本机一直给他发，还一直占着「当前这部优先」的份额
+const SERVE_BUDGET_SLACK = 64;
+// 成员表刷新合并到这么久一次：位图、往返时延都是对方能随时推过来的，每条都整张重算一遍太贵
+const PEERS_COALESCE_MS = 200;
+const VERSION_REJECTED_MAX = 256;
+// 同一条连接上同一份清单，每 MANIFEST_SERVE_WINDOW_MS 最多发这么多次。
+// 诚实的人要一次，慢链路上超时重要也就再来一两次
+const MAX_MANIFEST_SERVES = 4;
+const MANIFEST_SERVE_WINDOW_MS = 10 * 60_000;
+
 const keyOf = (slot, index) => `${slot}:${index}`;
 
 /**
@@ -230,6 +270,9 @@ export class Swarm extends Emitter {
     this._manifestWaiters = new Map();
     /** 本次会话里因为协议版本不符断开过的人，上层据此不再和他建连 */
     this.versionRejected = new Set();
+    /** peerId -> 上游信誉（超时冷却、坏片记录、是否拉黑）。见 _noteTimeout / _noteBad */
+    this._rep = new Map();
+    this._peersTimer = null;
 
     this._timer = null;
     this._pingTimer = null;
@@ -474,6 +517,9 @@ export class Swarm extends Emitter {
         sending: new Map(), // fileId -> 正在发的那一轮分段清单的代号
         manifestParts: new Map(), // fileId -> 分段清单拼装
         unknown: [], // [{msg, at}]
+        bitfields: { tokens: BITFIELD_BURST, at: Date.now() }, // 位图限速
+        servedChunks: new Map(), // slot -> 这条连接上已经给他发出去的片数
+        manifestServes: new Map(), // fileId -> 这条连接上已经给他发过几次清单
       };
       this._peerState.set(peer.peerId, st);
     }
@@ -510,7 +556,7 @@ export class Swarm extends Emitter {
     };
     peer.on('close', forgetSelf);
     peer.on('failed', forgetSelf);
-    peer.on('rtt', () => this.emit('peers', this.peerList()));
+    peer.on('rtt', () => this._peersChanged());
 
     this.emit('peers', this.peerList());
     return peer;
@@ -540,6 +586,11 @@ export class Swarm extends Emitter {
     if (this._peerState.has(oldId)) {
       this._peerState.set(newId, this._peerState.get(oldId));
       this._peerState.delete(oldId);
+    }
+    // 信誉按身份记：占位 id 名下的记录迁过去；真实身份自己已有记录（比如之前被拉黑过）就以它为准
+    if (this._rep.has(oldId)) {
+      if (!this._rep.has(newId)) this._rep.set(newId, this._rep.get(oldId));
+      this._rep.delete(oldId);
     }
 
     // 在途记录和清单请求也是按 peerId 记的，一并迁过去
@@ -665,11 +716,26 @@ export class Swarm extends Emitter {
       // 于是每个人都被判成「从这里一路能播到尾」，成员面板全体显示「已收完」。
       remoteRunEndBytes: remote ? runEndFrom(remote.have, meta, playbackByte) : 0,
       inflight: peer.inflight.size,
+      // 给过太多坏片、本机已经不再向他要片的人
+      banned: this._rep.get(peer.peerId)?.banned === true,
     };
   }
 
   peerList() {
     return [...this.peers.values()].map((p) => this._peerInfo(p));
+  }
+
+  /**
+   * 对方推过来的东西（位图、往返时延）引起的成员表刷新，合并到 PEERS_COALESCE_MS 一次。
+   * peerList() 要把每个人的位图整张数一遍，上层还要重画成员表；逐条刷的话，
+   * 一个人连着灌位图就能把渲染进程拖住。本机自己引起的变化（进出、换片）照旧立刻刷新。
+   */
+  _peersChanged() {
+    if (this._peersTimer) return;
+    this._peersTimer = setTimeout(() => {
+      this._peersTimer = null;
+      this.emit('peers', this.peerList());
+    }, PEERS_COALESCE_MS);
   }
 
   /* --------------------------- 控制消息 --------------------------- */
@@ -709,6 +775,9 @@ export class Swarm extends Emitter {
         break;
 
       case MSG.BITFIELD:
+        // 只限已知槽位：那一路要把整张位图解一遍、通知上层重算来源、刷新成员表；
+        // 未知槽位只进有条数和字数上限的暂存，补放时不再限
+        if (this._chunkCountOf(msg.s) && !this._takeBitfield(peer)) break;
         this._onBitfield(peer, msg);
         break;
 
@@ -745,6 +814,9 @@ export class Swarm extends Emitter {
     // 版本排在最前：0.6 的数据帧头和消息都对不上，模式一致也没法互通。
     if (msg.ver !== PROTOCOL_VERSION) {
       this.versionRejected.add(peer.peerId);
+      if (this.versionRejected.size > VERSION_REJECTED_MAX) {
+        this.versionRejected.delete(this.versionRejected.values().next().value);
+      }
       this.emit('version-mismatch', {
         peer,
         peerId: peer.peerId,
@@ -883,7 +955,18 @@ export class Swarm extends Emitter {
     }
     peer.ready = true;
     this._sourcesChanged(slot);
-    this.emit('peers', this.peerList());
+    this._peersChanged();
+  }
+
+  /** 位图限速。合法的量远在上限以内（每部片握手、加片、收齐各一次，大文件多几段）。 */
+  _takeBitfield(peer) {
+    const b = this._stateOf(peer).bitfields;
+    const now = Date.now();
+    if (now > b.at) b.tokens = Math.min(BITFIELD_BURST, b.tokens + ((now - b.at) / 1000) * BITFIELD_PER_SEC);
+    b.at = now;
+    if (b.tokens < 1) return false;
+    b.tokens -= 1;
+    return true;
   }
 
   _onHave(peer, msg) {
@@ -952,6 +1035,13 @@ export class Swarm extends Emitter {
     const now = Date.now();
     const last = st.served.get(fileId);
     if (last !== undefined && now - last < MANIFEST_RESERVE_MS) return;
+    // 大文件的清单有几十 MB：一条几十字节的 MANIFEST_GET 换本机几十 MB 上行，
+    // 光靠 30 秒一次的间隔，一个人每半分钟要一遍就能一直这么耗着。每条连接每份清单在一段时间里只给这么多次
+    let times = st.manifestServes.get(fileId);
+    if (!times || now - times.since > MANIFEST_SERVE_WINDOW_MS) times = { count: 0, since: now };
+    if (times.count >= MAX_MANIFEST_SERVES) return;
+    times.count++;
+    st.manifestServes.set(fileId, times);
     st.served.set(fileId, now);
     if (st.served.size > 64) st.served.delete(st.served.keys().next().value);
     this._sendManifest(peer, manifest).catch((e) => console.warn('[swarm] 发送清单失败：', e.message));
@@ -1032,13 +1122,17 @@ export class Swarm extends Emitter {
     const prev = w.current;
     w.current = null;
     w.deadline = null;
-    if (prev !== null) this._peerState.get(prev)?.manifestParts.delete(w.fileId);
+    if (prev !== null) {
+      this._peerState.get(prev)?.manifestParts.delete(w.fileId);
+      this._refreshBulk(prev);
+    }
     while (w.queue.length) {
       const id = w.queue.shift();
       const peer = this.peers.get(id);
       if (!peer?.authenticated) continue;
       w.current = id;
       w.askedAt = Date.now();
+      peer.bulkManifest = true;
       // 拼到一半的旧分段作废，免得和这次的混在一起
       this._peerState.get(id)?.manifestParts.delete(w.fileId);
       // 先设定时器再发：对方可能在 send 里同步就回了 START 并续了期，
@@ -1049,6 +1143,20 @@ export class Swarm extends Emitter {
     }
     this._manifestWaiters.delete(w.fileId);
     w.reject(new Error('没有人能提供这部片的清单'));
+  }
+
+  /** 还有没有正在向这个人要的清单。有才让他的清单分段在 Peer 那一层免预算放行。 */
+  _refreshBulk(peerId) {
+    const peer = this.peers.get(peerId);
+    if (!peer) return;
+    let bulk = false;
+    for (const w of this._manifestWaiters.values()) {
+      if (w.current === peerId) {
+        bulk = true;
+        break;
+      }
+    }
+    peer.bulkManifest = bulk;
   }
 
   /**
@@ -1146,7 +1254,12 @@ export class Swarm extends Emitter {
     const pending = typeof msg.fileId === 'string' ? st.manifestParts.get(msg.fileId) : null;
     const w = pending ? this._waiterFor(peer, msg.fileId) : null;
     const index = Number(msg.index);
-    if (!w || !Number.isInteger(index) || index < 0 || index >= pending.totalParts || pending.parts[index]) return;
+    if (!w || !Number.isInteger(index) || index < 0 || index >= pending.totalParts || pending.parts[index]) {
+      // 清单分段在 Peer 那一层是免预算放行的（我方点名要的，几十 MB 一口气到很正常）。
+      // 没用上的（不请自来、重复的）按单条消息的上限补记一笔，免得有人借这个口子灌大 JSON
+      peer.chargeCtrl?.(64 * 1024);
+      return;
+    }
     // 每段的条数是定死的：除了最后一段都是满的。每一项都得是哈希 ——
     // 不然一段能塞 256KB 的任意字符串，要等全部收齐才发现不对
     const expected =
@@ -1190,6 +1303,7 @@ export class Swarm extends Emitter {
     }
     clearTimeout(w.timer);
     this._manifestWaiters.delete(w.fileId);
+    this._refreshBulk(peer.peerId);
     w.resolve(this._trustedManifestOf(manifest, expect));
   }
 
@@ -1260,14 +1374,24 @@ export class Swarm extends Emitter {
       peer.send({ t: MSG.DENY, s: slot, index });
       return;
     }
-    // 排满了只是「现在忙」，不是「没有」—— 对方不能因此把这片从我的位图里抹掉
-    if (q.length >= MAX_SERVE_QUEUE) {
+    // 排满了只是「现在忙」，不是「没有」—— 对方不能因此把这片从我的位图里抹掉。
+    // 这条连接上这部片已经发够了（两遍全片还多）也按「忙」回：诚实的人要不了这么多，
+    // 再发下去只是被人拿来反复白要，还一直占着「当前这部优先」的份额，别人的后几部发不出去
+    if (q.length >= MAX_SERVE_QUEUE || this._servedCount(peer, slot) >= this._serveBudget(ctx)) {
       peer.send({ t: MSG.DENY, s: slot, index, busy: true });
       return;
     }
     if (q.some((r) => r.slot === slot && r.index === index)) return;
     q.push({ slot, index });
     this._pumpServe(peer);
+  }
+
+  _servedCount(peer, slot) {
+    return this._stateOf(peer).servedChunks.get(slot) || 0;
+  }
+
+  _serveBudget(ctx) {
+    return ctx.manifest.chunkCount * 2 + SERVE_BUDGET_SLACK;
   }
 
   /** 有没有人在等当前播放那部的片，或者正在给谁发。 */
@@ -1291,6 +1415,8 @@ export class Swarm extends Emitter {
       const i = pickServeIndex(q, this.playingSlot, this._priorityDemand());
       if (i < 0) return;
       const [req] = q.splice(i, 1);
+      const served = this._stateOf(peer).servedChunks;
+      served.set(req.slot, (served.get(req.slot) || 0) + 1);
       const priority = req.slot === this.playingSlot;
       if (priority) this._priorityServing.set(peer, (this._priorityServing.get(peer) || 0) + 1);
       this._serving.set(peer.peerId, (this._serving.get(peer.peerId) || 0) + 1);
@@ -1328,13 +1454,43 @@ export class Swarm extends Emitter {
 
   /* ---------------------------- 接收侧 ---------------------------- */
 
-  _onFrame(peer, { slot, chunkIndex, frameIndex, payload }) {
+  /**
+   * 一帧数据。只收这一片当前登记的上游（inflight 记录里的那个人）发来的帧，其余一律丢掉，
+   * 也不参与拼片。
+   *
+   * 以前只看「这一片是不是正在要」：拼装器按帧下标谁先到用谁的，网状拓扑下任何成员
+   * （游客也行）从 HAVE 就能猜出我缺哪几片，抢先往里塞长度正确的垃圾帧，这一片就永远
+   * 校验不过，关键窗口收不齐，全房一直停着；坏片还会记到诚实的上游头上。
+   * 收下的帧打上 accepted 标记，Peer 只把这些计入对方的速率。
+   */
+  _onFrame(peer, frame) {
+    const { slot, chunkIndex, frameIndex, payload } = frame;
     if (!peer.authenticated) return;
     const ctx = this.files.get(slot);
-    if (!ctx || ctx.isSeeder) return;
+    const info = ctx && !ctx.isSeeder ? this.inflight.get(keyOf(slot, chunkIndex)) : null;
+    if (!info || info.peerId !== peer.peerId || this.peers.get(peer.peerId) !== peer) {
+      this._unsolicitedFrame(peer, payload);
+      return;
+    }
+    if (!ctx.assembler.accepts(chunkIndex, frameIndex, payload.length)) return;
+    frame.accepted = true;
     const full = ctx.assembler.push(chunkIndex, frameIndex, payload);
     if (!full) return;
     this._commitChunk(peer, ctx, chunkIndex, full);
+  }
+
+  /**
+   * 不请自来的帧。诚实的上游也会有一点（超时撤回时他正在发的那一两片），丢掉就是了；
+   * 已经拉黑的人还在不停地灌，说明他是故意的，灌够了就断开。
+   */
+  _unsolicitedFrame(peer, payload) {
+    const rep = this._rep.get(peer.peerId);
+    if (!rep?.banned) return;
+    rep.bannedBytes += payload?.length || 0;
+    if (rep.bannedBytes <= BANNED_FRAME_ALLOWANCE || this.peers.get(peer.peerId) !== peer) return;
+    console.warn(`[swarm] ${peer.name} 已被停止供片，仍在持续发送数据，断开连接`);
+    this.emit('peer-banned', { peerId: peer.peerId, name: peer.name, reason: 'flood', disconnected: true });
+    this.removePeer(peer.peerId);
   }
 
   async _commitChunk(peer, ctx, index, bytes) {
@@ -1352,6 +1508,8 @@ export class Swarm extends Emitter {
     this.inflight.delete(key);
     if (owner) this.peers.get(owner.peerId)?.inflight.delete(key);
     peer.inflight.delete(key); // 送达方那边也清一次，两者相同时等价
+    // 这一片的好坏记在登记的上游名下。_onFrame 只收他的帧，所以一定就是他发的
+    const source = owner?.peerId ?? peer.peerId;
 
     // 从「在途」到「已有」中间隔着一整个写盘往返：2MB 过 IPC、算 SHA-256、落盘。
     // 这段时间里这片既不在 inflight 里、have 也还是 0，调度器只能判定它还缺，
@@ -1368,12 +1526,15 @@ export class Swarm extends Emitter {
       if (!res.ok) {
         // 校验没过。这片作废重下 —— 这就是渐进式校验的意义：
         // 坏数据当场拦住，不会等到播放的时候才发现花屏。
+        // 同时记他一笔：退避期内不再向他要这一片，坏的片数攒够了就不再向他要任何片
         console.warn(`[swarm] 分片 ${slot}:${index} 校验失败（${res.reason}），来自 ${peer.name}`);
-        this.emit('chunk-bad', { slot, index, from: peer.peerId, reason: res.reason });
+        this.emit('chunk-bad', { slot, index, from: source, reason: res.reason });
+        this._noteBad(source, slot, index);
         return;
       }
 
       this._totalReceived += bytes.length;
+      this._noteGood(source);
 
       if (!res.duplicate) {
         ctx.have[index] = 1;
@@ -1432,22 +1593,138 @@ export class Swarm extends Emitter {
     this._timer = this._pingTimer = null;
   }
 
-  /** 调度器看到的 peer：只含这个槽位的位图。scheduler.js 两端共用，不为多文件改它。 */
+  /**
+   * 调度器看到的 peer：只含这个槽位的位图。scheduler.js 两端共用，不为多文件改它。
+   *
+   * 信誉在这里折算成调度器认得的几个标记：
+   *  - 拉黑的人不出现；冷却中的人，只要还有别的上游可用也不出现；
+   *  - 观察期（超时过、还没送来新的好片，或者冷却中却没别人可用）标 probation：
+   *    一次只欠一片，排在正常上游后面，关键窗口里别人有的片不给他；
+   *  - 他送坏过的片：坏过一次的进 avoid（有别人能给就不找他），同一片坏过两次以上、
+   *    还在退避期里的进 blocked（不向他要）。
+   */
   _peerViews(slot) {
-    const views = [];
+    const now = performance.now();
+    const candidates = [];
     for (const p of this.peers.values()) {
       const remote = p.authenticated ? p.remote?.get(slot) : null;
       if (!remote) continue;
-      views.push({
+      const rep = this._rep.get(p.peerId) || null;
+      if (rep?.banned) continue;
+      candidates.push({ p, remote, rep, cooling: !!rep && now < rep.coolUntil });
+    }
+    const anyFresh = candidates.some((c) => !c.cooling);
+    const views = [];
+    for (const { p, remote, rep, cooling } of candidates) {
+      if (cooling && anyFresh) continue;
+      const view = {
         peerId: p.peerId,
         ready: true,
         remoteHave: remote.have,
         inflight: p.inflight,
         downRate: p.downRate || 0,
         rtt: p.rtt || 0,
-      });
+      };
+      if (rep) {
+        if (cooling || rep.timeouts > 0) view.probation = true;
+        for (const entry of rep.bad.values()) {
+          if (entry.slot !== slot) continue;
+          const key = now < entry.until ? 'blocked' : 'avoid';
+          if (!view[key]) view[key] = new Set();
+          view[key].add(entry.index);
+        }
+      }
+      views.push(view);
     }
     return views;
+  }
+
+  /* ---------------------------- 上游信誉 ---------------------------- */
+
+  _repOf(peerId) {
+    let rep = this._rep.get(peerId);
+    if (rep) return rep;
+    rep = { timeouts: 0, coolUntil: 0, bad: new Map(), good: 0, banned: false, bannedBytes: 0 };
+    this._rep.set(peerId, rep);
+    if (this._rep.size > REP_MAX) {
+      // 满了先挤没被拉黑的里最老的；全是拉黑的才挤最老的
+      let victim = null;
+      for (const [id, r] of this._rep) {
+        if (!r.banned && id !== peerId) {
+          victim = id;
+          break;
+        }
+      }
+      this._rep.delete(victim ?? this._rep.keys().next().value);
+    }
+    return rep;
+  }
+
+  /**
+   * 向他要的片超时了。冷却一段时间，时长随连续超时翻倍；冷却结束后仍在观察期，直到他送来一片好片。
+   * 同一次卡住的几片会在几轮 tick 里陆续到期，冷却期内再到期的不重复计数。
+   */
+  _noteTimeout(peerId) {
+    const rep = this._repOf(peerId);
+    const now = performance.now();
+    if (now < rep.coolUntil) return;
+    rep.timeouts++;
+    rep.coolUntil = now + Math.min(TIMEOUT_COOLDOWN_MAX_MS, TIMEOUT_COOLDOWN_BASE_MS * 2 ** (rep.timeouts - 1));
+  }
+
+  /** 他送来的一片通过了校验。没出过事的人不建档。 */
+  _noteGood(peerId) {
+    const rep = this._rep.get(peerId);
+    if (!rep) return;
+    rep.timeouts = 0;
+    rep.coolUntil = 0;
+    if (rep.bad.size && ++rep.good >= BAD_CHUNK_FORGIVE) {
+      rep.good = 0;
+      rep.bad.delete(rep.bad.keys().next().value);
+    }
+  }
+
+  /**
+   * 他送来的一片没通过校验。按「哪一片」记：
+   *  - 第一次坏：这一片有别人能给就不找他，只有他有就照样马上重要（偶发损坏重要一次就好了）；
+   *  - 同一片再坏：这一片退避一段时间再向他要，逐次翻倍 —— 他磁盘上那一片坏了的话，
+   *    别按往返的速度一遍遍白要；但不多算一片坏账，诚实的人不会因为一片坏盘被整个拉黑。
+   * 不同的坏片攒够 BAD_CHUNK_BAN 片，就不再向他要任何片。
+   */
+  _noteBad(peerId, slot, index) {
+    const rep = this._repOf(peerId);
+    const now = performance.now();
+    rep.good = 0;
+    const key = keyOf(slot, index);
+    let entry = rep.bad.get(key);
+    if (!entry) {
+      entry = { slot, index, count: 0, until: 0 };
+      rep.bad.set(key, entry);
+    }
+    entry.count++;
+    if (entry.count > 1) {
+      entry.until = now + Math.min(BAD_CHUNK_RETRY_MAX_MS, BAD_CHUNK_RETRY_BASE_MS * 2 ** (entry.count - 2));
+    }
+    if (!rep.banned && rep.bad.size >= BAD_CHUNK_BAN) this._ban(peerId, 'bad-chunks');
+  }
+
+  /** 不再向他要任何片：撤回他名下的在途。连接留着（他可能是房主，同步、聊天照常）。 */
+  _ban(peerId, reason) {
+    const rep = this._repOf(peerId);
+    rep.banned = true;
+    const peer = this.peers.get(peerId);
+    for (const [key, info] of this.inflight) {
+      if (info.peerId !== peerId) continue;
+      this.inflight.delete(key);
+      this.files.get(info.slot)?.assembler.drop(info.index);
+      if (peer) {
+        peer.inflight.delete(key);
+        peer.send({ t: MSG.CANCEL, s: info.slot, index: info.index });
+      }
+    }
+    console.warn(`[swarm] ${peer?.name || peerId} 送来的坏片太多，不再向他要片`);
+    this.emit('peer-banned', { peerId, name: peer?.name || peerId, reason, disconnected: false });
+    this._peersChanged();
   }
 
   _tick() {
@@ -1487,22 +1764,31 @@ export class Swarm extends Emitter {
    * 四选一的窗口等于凭空少了四分之一吞吐，而且关键窗口里的那一片迟到 20 秒
    * 足够让全员暂停触发一次。按对方的往返延迟和实测速率估「这片本来该多久到」，
    * 再留三倍余量。测不出速率（刚连上、或者对方一直没吐东西）就退回 20 秒。
+   *
+   * 往返时延和速率都是对方能左右的数，所以两头都要钳住：离谱的往返时延按上限算，
+   * 每秒不到 1KB 的速率当作测不出；最后的结果封顶在 MAX_REQUEST_TIMEOUT_MS。
+   * 慢链路上窗口已经按速率收窄（scheduler 的 WINDOW_DRAIN_SECONDS），正常送达用不到这么久。
    */
   _requestTimeout(peer, chunkSize) {
-    const rtt = peer?.rtt > 0 ? peer.rtt : 0;
-    const rate = peer?.downRate > 0 ? peer.downRate : 0;
-    if (!rtt || !rate || !chunkSize) return 20000;
+    const rtt = peer?.rtt > 0 ? Math.min(MAX_SANE_RTT_MS, peer.rtt) : 0;
+    const rate = peer?.downRate >= MIN_SANE_RATE ? Math.min(MAX_SANE_RATE, peer.downRate) : 0;
+    if (!rtt || !rate || !chunkSize) return DEFAULT_REQUEST_TIMEOUT_MS;
     // 他手上欠我的片是排队发的，最后一片要等前面都发完。
     const queued = Math.max(1, peer.inflight?.size || 1);
     const expected = rtt + ((queued * chunkSize) / rate) * 1000;
     // 上限不能一刀切在 20 秒：窗口放深之后（跨境链路会涨到 12 片），慢链路上
     // expected 本身就可能超过 20 秒，那样队尾那片必然在能到达之前就被判超时，
     // 于是无限重派、永远收不齐。上限至少要给到期望送达时间本身留出余量。
-    const ceiling = Math.max(20000, expected * 1.5 + 2000);
-    return Math.max(6000, Math.min(ceiling, expected * 3 + 2000));
+    const ceiling = Math.max(DEFAULT_REQUEST_TIMEOUT_MS, expected * 1.5 + 2000);
+    const timeout = Math.max(MIN_REQUEST_TIMEOUT_MS, Math.min(ceiling, expected * 3 + 2000));
+    return Math.min(MAX_REQUEST_TIMEOUT_MS, timeout);
   }
 
-  /** 要了半天不给的片，超时收回重新分配。对面可能网卡了或者悄悄挂了。 */
+  /**
+   * 要了半天不给的片，超时收回重新分配。对面可能网卡了或者悄悄挂了。
+   * 超时的上游进入冷却：有别人可用时先不找他，不然他测不出速率、按「最乐观」算，
+   * 每一轮又会被当成最快的那个把同一批关键片领走。
+   */
   _expireStale() {
     const now = performance.now();
     for (const [key, info] of this.inflight) {
@@ -1515,6 +1801,7 @@ export class Swarm extends Emitter {
         peer.inflight.delete(key);
         // 告诉他别发了：他那边的队列里还排着这一条，不撤的话会越攒越多
         peer.send({ t: MSG.CANCEL, s: info.slot, index: info.index });
+        this._noteTimeout(info.peerId);
       }
     }
   }
@@ -1534,6 +1821,8 @@ export class Swarm extends Emitter {
 
   destroy() {
     this.stop();
+    clearTimeout(this._peersTimer);
+    this._peersTimer = null;
     for (const p of [...this.peers.values()]) p.close();
     this.peers.clear();
     for (const ctx of this.files.values()) {
@@ -1543,6 +1832,7 @@ export class Swarm extends Emitter {
     this.files.clear();
     this.inflight.clear();
     this._peerState.clear();
+    this._rep.clear();
     this._priorityServing.clear();
     for (const w of this._manifestWaiters.values()) {
       clearTimeout(w.timer);

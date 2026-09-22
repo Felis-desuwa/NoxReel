@@ -54,6 +54,12 @@ const CHAT_TIMEOUT_MS = 30000;
 /** 有状态、页面加载完要补发的字段。弹幕帧不在其列：转瞬即逝，丢了就丢了。 */
 const STICKY_KEYS = ['banner', 'settings', 'chat'];
 
+/**
+ * 纯弹幕帧（不带上面那几样）两帧之间的最小间隔。渲染进程按每秒 30 帧发，这里放到 60 帧还有富余；
+ * 再密就是有人在拿这条路灌覆盖窗 —— 主进程到覆盖窗这一段没有任何背压，发多少它就得处理多少。
+ */
+const MIN_FRAME_INTERVAL_MS = 15;
+
 /* ============================== 纯函数 ============================== */
 
 /**
@@ -240,8 +246,10 @@ class OverlayController extends EventEmitter {
    * @param {object} [opts.electron]  测试里换成假的
    * @param {() => void} [opts.focusPlayer]  输入条关掉之后把前台还给播放器（由桥接程序执行）
    */
-  constructor({ electron = null, focusPlayer = null, chatTimeoutMs = CHAT_TIMEOUT_MS } = {}) {
+  constructor({ electron = null, focusPlayer = null, chatTimeoutMs = CHAT_TIMEOUT_MS, now = () => Date.now() } = {}) {
     super();
+    this._now = now;
+    this._lastFrameAt = -Infinity;
     this.electron = electron || require('electron');
     this.focusPlayer = typeof focusPlayer === 'function' ? focusPlayer : null;
     this.win = null;
@@ -289,11 +297,20 @@ class OverlayController extends EventEmitter {
     if (!payload || typeof payload !== 'object') return false;
     // 有状态的那几样单独记着：只留「最后一帧」是不够的，横幅后面紧跟着一帧弹幕，
     // 横幅就被顶掉了 —— 那一场直到下次横幅变化之前都不会再有人提起它。
+    let sticky = false;
     for (const key of STICKY_KEYS) {
-      if (payload[key] !== undefined) this._sticky[key] = payload[key];
+      if (payload[key] === undefined) continue;
+      this._sticky[key] = payload[key];
+      sticky = true;
     }
     if (!this.win || this.win.isDestroyed()) return false;
     if (!this.ready) return false;
+    // 纯弹幕帧限频（见 MIN_FRAME_INTERVAL_MS）。有状态的帧不受限：丢了会一直错下去
+    if (!sticky) {
+      const now = this._now();
+      if (now - this._lastFrameAt < MIN_FRAME_INTERVAL_MS) return false;
+      this._lastFrameAt = now;
+    }
     this.win.webContents.send(FRAME_CHANNEL, payload);
     return true;
   }
@@ -369,6 +386,9 @@ class OverlayController extends EventEmitter {
    */
   handleSubmit(event, payload) {
     if (!this._isOverlaySender(event)) throw new Error('已拒绝不受信任页面的请求');
+    // 只在输入条开着的时候收：一次按键（Ctrl+Shift+D）换一条弹幕。输入条关着还在往回发的，
+    // 只能是覆盖窗页面出了问题（它渲染的是房间里别人发的弹幕），不能让它替用户在房间里连发。
+    if (!this.chatOpen) return { sent: false };
     const raw = payload && typeof payload === 'object' ? payload.text : payload;
     const result = sanitizeChatText(raw);
     if (!result.ok) {
@@ -591,6 +611,7 @@ module.exports = {
   MAX_CHAT_TEXT,
   MAX_SUBMIT_CHARS,
   CHAT_TIMEOUT_MS,
+  MIN_FRAME_INTERVAL_MS,
   rectToBounds,
   toDipBounds,
   decideOverlay,

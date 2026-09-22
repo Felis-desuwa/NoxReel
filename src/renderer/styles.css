@@ -401,6 +401,18 @@ select:disabled {
   border-top: 1px solid var(--line);
   padding-top: 16px;
 }
+/* 首页右下角的版本号，报问题时一眼能看到 */
+.home-version {
+  margin-top: 10px;
+  text-align: right;
+  color: var(--dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  user-select: text;
+}
+.home-version:empty {
+  display: none;
+}
 
 /* ------------------------------ 准备中 ------------------------------ */
 
@@ -460,6 +472,7 @@ select:disabled {
   font-size: 12px;
   margin-top: 14px;
   line-height: 1.6;
+  overflow-wrap: anywhere;
 }
 .prep-actions {
   margin-top: 20px;
@@ -550,6 +563,7 @@ select:disabled {
   margin-top: 2px;
   color: var(--muted);
   font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 /* 状态带：现在在发生什么，外加最多一个该按的按钮。颜色跟着情况走 */
@@ -606,6 +620,8 @@ select:disabled {
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
+  /* 横幅和等待名单里有别人的昵称：一长串不带空格的名字不能把状态带撑出屏幕 */
+  overflow-wrap: anywhere;
 }
 .status-banner.waiting {
   color: #e3b341;
@@ -634,6 +650,7 @@ select:disabled {
 }
 .ready-text {
   min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* 进度条就是缓冲条：白点 = 播放位置，绿 = 从这里起不用等的一段，深蓝 = 已收到（分片图，空洞一眼可见） */
@@ -978,6 +995,11 @@ select:disabled {
   color: #4d5763;
   flex-shrink: 0;
 }
+/* 日志正文里有昵称、片名、对方报来的错误：不带空格的长串照样折行，不撑出横向滚动条 */
+.log-line > span:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .log-line.warn {
   color: var(--warn);
 }
@@ -1100,6 +1122,7 @@ select:disabled {
   padding: 2px 0;
   font-size: 11px;
   color: var(--dim);
+  overflow-wrap: anywhere;
 }
 .chat-divider {
   display: flex;
@@ -1721,6 +1744,7 @@ select:disabled {
   width: 480px;
   max-height: 80vh;
   overflow-y: auto;
+  overflow-wrap: anywhere;
 }
 .modal-box h3 {
   font-size: 16px;

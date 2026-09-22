@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links — now with a playlist for the whole evening, danmaku comments over the picture, and your own preferred player.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.4-7C5CFF?style=for-the-badge" alt="Version 0.7.4">
+    <img src="https://img.shields.io/badge/version-0.7.5-7C5CFF?style=for-the-badge" alt="Version 0.7.5">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -64,6 +64,9 @@
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
 
 > [!NOTE]
+> `v0.7.5` is a broad security-hardening and anti-DoS release. A malicious member can no longer stall the whole room with bad chunks, by accepting requests and never sending, or by flooding messages; someone holding a room link can no longer fill every seat with fake identities (a seat that has not linked up with the host directly within 60 seconds is reclaimed); every network connection for an online link is checked at connect time, so redirects and segment playlists cannot be used to reach devices on your local network; and the self-hosted signaling server no longer crashes on a single malformed message and now enforces limits on connections, message rate, and join frequency (set `TRUST_PROXY=1` behind a reverse proxy). It also fixes leftover state after a failed join, duplicate connections from clicking a link twice, an invite being overwritten when you switch invite type right after entering a room, and a long first write for large files on NTFS; the home screen now shows the version. Behavior change: **online links play in mpv only** (external players cannot go through the filtering proxy). **The P2P protocol is unchanged, so 0.7.5 works with other 0.7.x builds**.
+
+> [!NOTE]
 > `v0.7.4` lets your Discord friends see you are watching and join in one click. **Room links** are now the default invite: post one link in a group and anyone who clicks it joins until the room is full — no server of your own, since connection details are encrypted and exchanged through public Nostr relays while the video still streams directly between members, and the host's identity is vouched for by a signing key inside the link. **Every link is clickable in Discord** (an https redirect page; the invite sits after the `#` and is never sent to any server). **Discord status** (off by default): friends see “Watching NoxReel · Room 3/8” on your profile, plus a “Join” button when you use a room link. Room links are desktop-only in this version (phones next version); one-to-one invites still work everywhere, and **the P2P protocol is unchanged, so 0.7.4 works with other 0.7.x builds**.
 
 > [!NOTE]
@@ -82,8 +85,8 @@
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.4.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.4.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.4.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.4.exe) |
+| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.5.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.5.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -226,6 +229,39 @@ The full installer bundles mpv, yt-dlp, and the player bridge. Source builds can
 - `SYNCWATCH_MPV_PATH`
 - `SYNCWATCH_YTDLP_PATH`
 - `SYNCWATCH_FFMPEG_PATH`
+
+### Self-hosted signaling server
+
+A signaling room needs your own signaling server: `npm run signal` (or double-click `NoxReel-Signal.exe` on Windows). It relays SDP / ICE only and is configured entirely through environment variables, for example:
+
+```bash
+PORT=8080 BLOCKED_COUNTRIES=CN ALLOW_UNKNOWN=0 MAXMIND_DB=./GeoLite2-Country.mmdb npm run signal
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `8080` | Listening port |
+| `MAX_ROOM_SIZE` | `16` | Hard cap on members per room (2–64) |
+| `BLOCKED_COUNTRIES` | empty | Comma-separated country codes; region blocking is on only when set |
+| `ALLOW_UNKNOWN` | `1` | Set to `0` to reject clients whose region cannot be determined |
+| `MAXMIND_DB` | empty | Path to a GeoLite2-Country database; without it only CDN region headers are used |
+| `TRUST_PROXY` | off | Set to `1` to trust `X-Forwarded-For` / `X-Real-IP` / `CF-IPCountry` from your reverse proxy; rate limits and the LAN exemption then use the client address the proxy reports |
+| `MAX_CONNECTIONS` | `800` | Concurrent connections server-wide |
+| `MAX_CONN_PER_IP` | `32` | Concurrent connections per IP (IPv6 grouped by /64) |
+| `MAX_ROOMS` | `400` | Rooms that may exist at once |
+| `JOINS_PER_MIN` | `60` | Room joins per IP per minute (rejected attempts count too) |
+| `ROOMS_PER_MIN` | `20` | New rooms per IP per minute |
+| `MSG_RATE` | `50` | Message tokens refilled per connection per second: 1 per message plus 1 per full KB |
+| `MSG_BURST` | `max(1000, 60 × MAX_ROOM_SIZE)` | Message token bucket size; a connection that runs dry is closed |
+| `MAX_MSG_BYTES` | `65536` | Maximum size of one WebSocket message (bytes) |
+| `MAX_SIGNAL_BYTES` | `32768` | Maximum size of one SDP / ICE message (bytes); larger ones are not relayed |
+| `JOIN_TIMEOUT_MS` | `10000` | How long a connection may stay without joining a room |
+| `HEARTBEAT_MS` | `30000` | Heartbeat interval; a connection that does not answer within one interval is closed |
+| `HTTP_TIMEOUT_MS` | `10000` | Deadline for receiving request headers (including the WebSocket upgrade), against slow-connection attacks |
+
+- Set a count or rate limit to `0` to disable it (`MSG_RATE=0` turns off message rate limiting); sizes and durations cannot be `0` and fall back to their defaults. The defaults leave ample room for several devices of one household behind the same NAT and for a 16-person room exchanging SDP/ICE all at once.
+- Behind nginx, Caddy, or a CDN, always set `TRUST_PROXY=1` and make the proxy **append** to `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`). Otherwise every client appears to come from the proxy itself and shares one per-IP limit.
+- When raising `MAX_CONNECTIONS`, raise the process file descriptor limit as well (`ulimit -n` on Linux is often 1024 by default).
 
 ## Contributing
 

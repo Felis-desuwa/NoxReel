@@ -380,7 +380,6 @@ const PLAYER_FNS = [
   'launchPlayer',
   'desiredPlayerKind',
   'externalPlaybackReady',
-  'linkNeedsHeaders',
   'errCode',
   'errText',
   'reportLaunchFailure',
@@ -539,23 +538,19 @@ test('这一部还没收完时照旧交给 mpv，原因说得出来', async () =
   assert.equal(box.ctx.playerActualText(), '当前实际使用：mpv（原因：这一部还没收完）');
 });
 
-test('片源和链接不受「还没收完」限制 —— 它们手上就是完整的一路', () => {
+test('片源不受「还没收完」限制 —— 它手上就是完整的一路', () => {
   const seeder = playerBox({ choice: 'pot', complete: false });
   seeder.S.isSeeder = true;
   assert.deepEqual(plain(seeder.ctx.desiredPlayerKind()), { kind: 'pot', reason: '' });
-
-  const link = playerBox({ choice: 'pot', complete: false, sourceType: 'link' });
-  assert.deepEqual(plain(link.ctx.desiredPlayerKind()), { kind: 'pot', reason: '' });
 });
 
-test('MPC-BE 传不了请求头：这种链接退回 mpv，PotPlayer 不受影响', () => {
-  const mpc = playerBox({ choice: 'mpc', sourceType: 'link' });
-  mpc.S.linkInfo.playback.headers = { referer: 'https://site.example/' };
-  assert.deepEqual(plain(mpc.ctx.desiredPlayerKind()), { kind: 'mpv', reason: 'no-headers' });
-
-  const pot = playerBox({ choice: 'pot', sourceType: 'link' });
-  pot.S.linkInfo.playback.headers = { referer: 'https://site.example/' };
-  assert.deepEqual(plain(pot.ctx.desiredPlayerKind()), { kind: 'pot', reason: '' }, 'PotPlayer 有 /referer=');
+test('在线链接一律交给 mpv：外部播放器不走过滤代理，会跟着跳转去连内网', () => {
+  for (const choice of ['pot', 'mpc']) {
+    const link = playerBox({ choice, sourceType: 'link' });
+    assert.deepEqual(plain(link.ctx.desiredPlayerKind()), { kind: 'mpv', reason: 'link' }, choice);
+  }
+  const main = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'main.js'), 'utf8');
+  assert.match(main, /if \(remote && want !== 'mpv'\) throw new Error\('在线链接只能用 mpv 播放'\);/, '主进程也得拒');
 });
 
 test('选中的播放器本机没有时退回 mpv，原因用主进程给的代号', () => {

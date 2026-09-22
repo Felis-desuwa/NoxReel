@@ -41,6 +41,7 @@ function room({ peerThrows = true, previous = null } = {}) {
     connectedPeerCount: () => 0,
     iceServers: () => [],
     log: (text, level) => logs.push([text, level]),
+    inviteGen: 0,
   });
   vm.createContext(ctx);
   vm.runInContext([fnSource('inviteViaManual'), fnSource('createManualInvite')].join('\n\n'), ctx);

@@ -37,6 +37,15 @@ const MANUAL_JOIN_WAIT_TIMEOUT_MS = 180_000;
 const MANIFEST_RETRY_MS = 5000;
 // 清单拿到了、本机却开不了接收会话（多半是存储不够）时，隔这么久用手里的清单再试一次
 const RECEIVE_RETRY_MS = 30_000;
+// 邀请链接/邀请码的长度上限，和原生 MainActivity.MAX_INVITE_LINK_CHARS 一致。
+// 正常的一对一邀请只有一两千字；码是 gzip 压过的，几百 KB 的码解压出来能在页面里撑出上百 MB。
+const MAX_INVITE_CHARS = 32 * 1024;
+// 「离开并加入」要整页重载，重载前把那条邀请记在这里，重载完接着处理
+const PENDING_INVITE_KEY = 'sw.pendingInvite';
+// 页面上的日志最多留这么多行（再多就丢最老的）
+const LOG_VIEW_LIMIT = 200;
+// 加入流程里单独一步（生成应答、连信令）最多等这么久，超时就当失败，放开「正在加入」的闸门
+const JOIN_STEP_TIMEOUT_MS = 30_000;
 const normalizeSecurityMode = (mode) => (mode === 'trusted' ? 'trusted' : 'safe');
 const securityModeLabel = (mode) => (normalizeSecurityMode(mode) === 'trusted' ? '可信房间' : '安全模式');
 
@@ -71,6 +80,12 @@ const S = {
   midJoinBlindNoted: false,
   prog: { contiguousBytes: 0, runBytes: 0, runEndBytes: 0, playbackByte: 0, complete: false },
   entered: false,
+  // 加入流程正在跑（解码邀请、收集候选、连信令）：这期间再来的邀请一律不收
+  joining: false,
+  // 信令模式已经进了房（首连成功）。之后信令断线重连期间也还算在房间里
+  serverJoined: false,
+  // 极简模式上一次还没连上的尝试：{cancel()}，新的一次开始前把它的定时器和监听收掉
+  manualAttempt: null,
   securityMode: localStorage.getItem('sw.securityMode') === 'safe' ? 'safe' : 'trusted',
   // 站点授权对话框正在弹着（同一时间只弹一次）
   askingSite: false,
@@ -120,8 +135,29 @@ function log(msg, level) {
   if (level) line.className = 'log-' + level;
   line.textContent = msg;
   box.appendChild(line);
+  // 有些日志是别人发的消息触发的（比如非房主发来的列表），不设上限就是一直涨的 DOM。
+  // 超出时一次砍掉一截，别每来一行都重排一遍
+  if (box.children.length > LOG_VIEW_LIMIT + 50) box.replaceChildren(...[...box.children].slice(-LOG_VIEW_LIMIT));
   box.scrollTop = box.scrollHeight;
   console.log('[app]', msg);
+}
+
+/** 给一个 Promise 加时限：到点还没结果就按 message 失败。原来那个 Promise 不受影响。 */
+function withTimeout(promise, ms, message) {
+  let timer = null;
+  const expiry = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
+}
+
+// 对端能反复触发的警告：同一句一段时间内只记一次，别让人拿它刷屏（键是固定文案，数量有限）
+const noisyLoggedAt = new Map();
+function logThrottled(msg, level, windowMs = 10_000) {
+  const now = Date.now();
+  if (now - (noisyLoggedAt.get(msg) ?? -Infinity) < windowMs) return;
+  noisyLoggedAt.set(msg, now);
+  log(msg, level);
 }
 
 function fmtBytes(n) {
@@ -261,7 +297,7 @@ function fromHost(peer) {
 /* ------------------------- 播放列表 → 当前项 ------------------------- */
 function onPlaylist(msg, peer) {
   if (!fromHost(peer)) {
-    log('已忽略非房主发来的播放列表', 'warn');
+    logThrottled('已忽略非房主发来的播放列表', 'warn');
     return;
   }
   const snap = validateSnapshot(msg.state);
@@ -461,7 +497,7 @@ function safePlaybackFromMessage(msg) {
 /** 房主解析好的播放地址（手机自己解析不了网页，全靠这一条）。 */
 function onNowLink(msg, peer) {
   if (!fromHost(peer)) {
-    log('已忽略非房主发来的视频链接', 'warn');
+    logThrottled('已忽略非房主发来的视频链接', 'warn');
     return;
   }
   if (!Number.isSafeInteger(msg.seq) || msg.seq < S.playlist.seq) return;
@@ -887,7 +923,70 @@ function wirePeer(peer, sig) {
 }
 
 /* ------------------------------ 极简粘贴 ------------------------------ */
+
+/** 已经进了房间（收到过房主的列表），或者已经和谁握过手。 */
+function roomConnected() {
+  if (S.entered) return true;
+  for (const p of S.swarm?.peers.values() || []) if (p.authenticated) return true;
+  return false;
+}
+
+/**
+ * 在房间里（含已经用信令服务器进了某个房间、人还没来）。这时再按一条邀请走加入流程，
+ * 会拿同一个房主 id 新建连接顶掉手上那条活的（swarm.addPeer 遇到同 id 先拆旧的），
+ * 或者把 S.hostId 换成陌生人，真房主之后发来的列表、链接全被当成「非房主」丢掉。
+ */
+function roomBusy() {
+  return S.serverJoined || roomConnected();
+}
+
+/**
+ * 深链接和「生成应答链接」按钮都从这里进。已经在房间里：不动手上的连接，先问要不要离开；
+ * 上一条还在处理：这条不收（深链接谁都能发，连着来几十条也只处理一条）。
+ */
+function openInvite(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return;
+  if (text.length > MAX_INVITE_CHARS) {
+    log('邀请链接异常过长，已忽略', 'bad');
+    return;
+  }
+  if (S.joining) {
+    log('上一条邀请还在处理，请稍候再试', 'warn');
+    return;
+  }
+  if (roomBusy()) {
+    askLeaveForInvite(text);
+    return;
+  }
+  $('tab-manual').click();
+  $('host-code').value = text;
+  joinManual(text);
+}
+
+/** 按房主的邀请生成应答。同一时间只跑一个，进了房间就不再跑（见 openInvite）。 */
 async function joinManual(hostCode) {
+  // 调用方已经挡过一遍，这里再守一道，别让任何入口绕过去
+  if (S.joining) {
+    log('上一条邀请还在处理，请稍候再试', 'warn');
+    return;
+  }
+  if (roomBusy()) {
+    log('你已经在房间里了。要加入新的房间，请先离开当前房间。', 'warn');
+    return;
+  }
+  S.joining = true;
+  try {
+    // 候选收集自己有 8 秒上限，这里再兜一层：哪一步卡死了，闸门也得放开，不然之后的邀请全被挡在外面
+    await withTimeout(joinManualNow(hostCode), JOIN_STEP_TIMEOUT_MS, '生成应答链接超时');
+  } catch (e) {
+    log('生成应答链接失败：' + e.message, 'bad');
+  } finally {
+    S.joining = false;
+  }
+}
+
+async function joinManualNow(hostCode) {
   let payload;
   try {
     payload = await decodeCode(hostCode);
@@ -917,7 +1016,15 @@ async function joinManual(hostCode) {
     );
     return;
   }
+  // 上一次还没连上的尝试作废：定时器、监听和那条等不到应答的连接都收掉。
+  // 不收的话，换了房主之后旧房主要是又点开了旧应答，连上来的是一个「非房主」。
+  // 能走到这里说明还没有任何人连上（roomBusy 挡着），摘掉的只可能是这种残骸。
+  S.manualAttempt?.cancel();
+  S.manualAttempt = null;
+  if (S.swarm) for (const p of [...S.swarm.peers.values()]) if (!p.authenticated) S.swarm.removePeer(p.peerId);
   S.hostId = payload.from; // 邀请码带着房主身份，认它做角色权威
+  // 同步引擎可能是上一次尝试时建的：房主身份跟着换（这时还没人连上，换它不影响谁）
+  if (S.sync) S.sync.hostId = payload.from;
   initSwarmAndSync();
 
   const peer = new Peer({
@@ -953,17 +1060,28 @@ async function joinManual(hostCode) {
       finishJoin('等了几分钟还是没连上房主。应答链接已经发回去的话多半是打洞没成功，双方都要配同一个 TURN 中继；房主还没打开的话，就重新粘一次邀请码生成新的应答链接。'),
     MANUAL_JOIN_WAIT_TIMEOUT_MS
   );
-  S.swarm.on('peer-authenticated', (authenticatedPeer) => {
+  const offAuthenticated = S.swarm.on('peer-authenticated', (authenticatedPeer) => {
     if (authenticatedPeer !== peer) return;
     joinSettled = true;
     clearTimeout(joinWaitTimer);
   });
+  // 每重粘一次邀请码就多一个监听和一个三分钟的定时器：下一次开始前由它收掉
+  const attempt = {
+    cancel() {
+      joinSettled = true;
+      clearTimeout(joinWaitTimer);
+      offAuthenticated();
+    },
+  };
+  S.manualAttempt = attempt;
 
   log('正在生成应答链接，收集网络候选中…（几秒）', 'warn');
   const answer = await peer.acceptOffer(payload.sdp);
   const code = await encodeCode({
     k: 'answer', from: S.peerId, name: S.name, sdp: answer, securityMode: S.securityMode,
   });
+  // 这一轮超时被放弃、后面又开了新的一轮：迟到的旧应答别把新的那条盖掉
+  if (S.manualAttempt !== attempt) return;
 
   $('answer-out').value = inviteLink(code, 'answer');
   show($('answer-wrap'), true);
@@ -1533,20 +1651,36 @@ $('join').addEventListener('click', async () => {
   const url = $('url').value.trim();
   const room = $('room').value.trim();
   if (!url || !room) { log('请填写信令地址和房间号', 'bad'); return; }
+  // 连着点两下会建两条信令、用同一个身份进同一个房间；和人连上之后再点就是把自己挤掉
+  if (S.joining) { log('正在加入房间，请稍候', 'warn'); return; }
+  if (roomConnected()) { log('你已经在房间里了。要加入新的房间，请先离开当前房间。', 'warn'); return; }
+  S.joining = true;
   initSwarmAndSync();
   log(`正在连接 ${url} …`);
   try {
-    await connectSignaling(url, room);
+    // 还没和任何人连上时允许换个房间号重进（或者上一次压根没连上）：
+    // 旧信令和它牵出来、还没连上的连接先收掉，别叠两条信令
+    S.signaling?.close();
+    S.signaling = null;
+    S.serverJoined = false;
+    for (const p of [...S.swarm.peers.values()]) if (!p.authenticated) S.swarm.removePeer(p.peerId);
+    // 连上了却一直不回「已进房」的服务器会让这一步永远挂着，「正在加入」的闸门也就再没人放开
+    await withTimeout(connectSignaling(url, room), JOIN_STEP_TIMEOUT_MS, '信令服务器一直没有回应');
+    S.serverJoined = true;
     log('已进入房间，等待房主供片…', 'good');
   } catch (e) {
+    S.signaling?.close();
+    S.signaling = null;
     log('连接失败：' + e.message, 'bad');
+  } finally {
+    S.joining = false;
   }
 });
 
 $('gen-answer').addEventListener('click', () => {
   const code = $('host-code').value.trim();
   if (!code) { log('请先粘贴房主的邀请码', 'bad'); return; }
-  joinManual(code);
+  openInvite(code);
 });
 $('copy-answer').addEventListener('click', () => {
   $('answer-out').select();
@@ -1615,8 +1749,60 @@ $('language').addEventListener('change', () => {
 });
 log('准备就绪。默认使用零服务器邀请链接，也可以切换到信令服务器。');
 
-window.noxreelOpenInvite = (link) => {
-  $('tab-manual').click();
-  $('host-code').value = String(link || '');
-  joinManual(link);
-};
+// 大厅标题旁的小字版本号（安装包的 versionName），反馈问题时一眼能看出是哪一版
+const appVersion = String(window.sw.appVersion?.() || '');
+if (/^[0-9A-Za-z.+-]{1,32}$/.test(appVersion)) $('app-version').textContent = `v${appVersion}`;
+
+/* ------------------------- 已在房间里又来一条邀请 ------------------------- */
+// 连着来好几条只留最后一条，对话框也只弹一个
+let pendingInvite = '';
+
+function askLeaveForInvite(link) {
+  pendingInvite = link;
+  $('invite-ask').classList.add('on');
+}
+
+function closeInviteAsk() {
+  pendingInvite = '';
+  $('invite-ask').classList.remove('on');
+}
+
+/**
+ * 离开当前房间，再处理这条邀请。和桌面端退房一样整页重载：原生那边先收掉播放器和
+ * 接收缓存（只重载页面的话它们没人管），邀请记在 sessionStorage 里，重载完接着处理。
+ */
+function leaveRoomAndOpen(link) {
+  try {
+    sessionStorage.setItem(PENDING_INVITE_KEY, link);
+  } catch {
+    /* 存不进去就只离开，不自动加入：用户再点一次链接即可 */
+  }
+  try {
+    S.signaling?.close();
+  } catch {}
+  window.sw.leaveRoom();
+  location.reload();
+}
+
+$('invite-stay').addEventListener('click', () => {
+  closeInviteAsk();
+  log('已留在当前房间，新收到的邀请没有处理', 'warn');
+});
+$('invite-leave').addEventListener('click', () => {
+  const link = pendingInvite;
+  closeInviteAsk();
+  if (link) leaveRoomAndOpen(link);
+});
+
+// 原生收到 noxreel:// 深链接后调这里（MainActivity.deliverInviteLink）
+window.noxreelOpenInvite = (link) => openInvite(link);
+
+// 「离开并加入」整页重载前留下的那条邀请：重载完接着处理，只处理这一次
+let resumedInvite = '';
+try {
+  resumedInvite = sessionStorage.getItem(PENDING_INVITE_KEY) || '';
+  sessionStorage.removeItem(PENDING_INVITE_KEY);
+} catch {
+  resumedInvite = '';
+}
+if (resumedInvite) openInvite(resumedInvite);

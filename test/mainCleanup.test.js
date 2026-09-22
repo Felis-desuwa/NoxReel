@@ -62,6 +62,8 @@ const webContents = {
 };
 
 let windowCreated = false;
+// 下一次「选择目录」对话框要返回的路径（null 表示用户取消）
+let nextDialogPick = null;
 let readyResolve;
 const ready = new Promise((resolve) => (readyResolve = resolve));
 
@@ -103,7 +105,13 @@ const fakeElectron = {
     }
   },
   ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) },
-  dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+  dialog: {
+    showOpenDialog: async () => {
+      const picked = nextDialogPick;
+      nextDialogPick = null;
+      return picked ? { canceled: false, filePaths: [picked] } : { canceled: true, filePaths: [] };
+    },
+  },
   shell: { openExternal: async () => {}, showItemInFolder() {} },
   clipboard: { writeText() {} },
   screen: { getPrimaryDisplay: () => ({ workAreaSize: { width: 1920, height: 1080 } }) },
@@ -152,10 +160,14 @@ test.after(() => {
 
 /* ============================ 清理残留（cacheManager） ============================ */
 
+// 片子放在 createOwnedDir 建的那种子目录里，和真实的 run 目录一样。
+// 没有 run.json 的旧目录只能靠这个布局认出是本软件建的，布局对不上就当成用户的东西不碰。
+const FILM = path.join('media-0-0123456789', 'film.part');
+
 async function makeRunDir(root, name, marker) {
   const dir = path.join(root, name);
-  await fsp.mkdir(dir, { recursive: true });
-  await fsp.writeFile(path.join(dir, 'film.part'), 'x'.repeat(4096));
+  await fsp.mkdir(path.join(dir, path.dirname(FILM)), { recursive: true });
+  await fsp.writeFile(path.join(dir, FILM), 'x'.repeat(4096));
   if (marker) await fsp.writeFile(path.join(dir, 'run.json'), JSON.stringify(marker));
   return dir;
 }
@@ -206,7 +218,7 @@ test('「清理残留」不碰别的实例或别的机器正在用的 run 目录
   assert.equal(await manager.purgeStale(), 0, '没有可回收的就一个都不该删');
   assert.equal(fs.existsSync(foreign), true, '别的机器正在接收的片子不能删');
   assert.equal(fs.existsSync(live), true, '另一个实例正在接收的片子不能删');
-  assert.equal(fs.existsSync(path.join(live, 'film.part')), true);
+  assert.equal(fs.existsSync(path.join(live, FILM)), true);
   assert.equal(fs.existsSync(trash), false, 'trash- 是明确标好的垃圾，启动时就该收掉');
 });
 
@@ -385,6 +397,9 @@ test('渲染进程刷新后主进程自己收干净转封装产物和没人管�
   await waitFor(async () => !fs.existsSync(outPath), '转封装产物被回收');
 
   // 会话也收掉了：这正是「退了房还换不了缓存目录」的那条链子
+  // 换缓存目录只认用户在对话框里挑的目录
+  nextDialogPick = path.join(TMP, 'after-reload');
+  assert.equal(await invoke('dialog:pickCacheDir'), path.join(TMP, 'after-reload'));
   const moved = await invoke('settings:setCacheRoot', { dir: path.join(TMP, 'after-reload') });
   assert.equal(moved.cacheDir, path.join(TMP, 'after-reload'));
 });

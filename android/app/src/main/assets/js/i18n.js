@@ -118,6 +118,26 @@ const EN = new Map(Object.entries({
   '允许': 'Allow',
   '拒绝': 'Decline',
   '关闭': 'Close',
+  // 已在房间里又点开一条邀请
+  '你已经在房间里了。要离开当前房间，加入新收到的邀请吗？': 'You are already in a room. Leave it and join the invite you just opened?',
+  '留在当前房间': 'Stay in this room',
+  '离开并加入': 'Leave and join',
+  '已留在当前房间，新收到的邀请没有处理': 'Stayed in the current room; the new invite was not opened',
+  '你已经在房间里了。要加入新的房间，请先离开当前房间。': 'You are already in a room. Leave it before joining another one.',
+  '上一条邀请还在处理，请稍候再试': 'Still processing the previous invite. Try again in a moment.',
+  '邀请链接异常过长，已忽略': 'The invite link is unexpectedly long and was ignored',
+  '正在加入房间，请稍候': 'Joining the room, please wait',
+  '信令服务器一直没有回应': 'The signaling server never responded',
+  '生成应答链接超时': 'Generating the answer link timed out',
+  // 原生层核对清单时给出的原因（接在「打开接收会话失败：」「没法接收这一部：」后面）
+  '同时打开的接收会话太多': 'Too many receive sessions are open at once',
+  '清单里的文件大小不对': 'The manifest has an invalid file size',
+  '清单里的分片大小不对': 'The manifest has an invalid chunk size',
+  '清单里的分片数和文件大小对不上': 'The manifest chunk count does not match the file size',
+  '清单里的分片哈希条数不对': 'The manifest has the wrong number of chunk hashes',
+  '清单里的分片哈希格式不对': 'The manifest has malformed chunk hashes',
+  '非法的 fileId': 'Invalid file ID',
+  '接收缓存路径越界': 'The receive cache path is outside the cache folder',
 }));
 
 const PATTERNS = [
@@ -133,6 +153,9 @@ const PATTERNS = [
     /^打开接收会话失败：磁盘空间不够：这部片子需要 ([\d.]+)GB，手机只剩 ([\d.]+)GB$/,
     'Could not open the receive session: not enough storage. This video needs $1 GB, but the phone has only $2 GB free',
   ],
+  // 其余打不开会话的原因（清单不对、会话太多……）：原因本身另有词条
+  [/^打开接收会话失败：(.*)$/, (_all, detail) => `Could not open the receive session: ${translate(detail, 'en')}`],
+  [/^生成应答链接失败：(.*)$/, (_all, detail) => `Could not generate the answer link: ${translate(detail, 'en')}`],
   // 状态栏：本机收不下当前这一部（原因多半是下面这条存储不够）
   [/^没法接收这一部：(.*)$/, (_all, detail) => `Cannot receive this video: ${translate(detail, 'en')}`],
   [

@@ -29,6 +29,9 @@ const RTT_PER_EXTRA_CHUNK_MS = 25; // 每多 25ms 往返延迟，窗口加一片
 const COLD_START_RATE = 1; // 还没测出速率的新 peer 先按最乐观处理，好让它尽快被采样到
 const DEFAULT_HEAD_RESERVE_BYTES = 8 * 1024 * 1024; // 容器头。实测 mpv 只要前 1.2MB，这里和起播门槛取同一个数
 const DEFAULT_TAIL_RESERVE_BYTES = 4 * 1024 * 1024; // MKV 的 Cues，两片足够盖住常见体积
+// 一个上游欠我的片，按他实测的速率最多攒够这么多秒的量。请求超时有硬上限（swarm 里 120 秒），
+// 慢链路上窗口开得比这还深，队尾那几片必然在到达之前就被判超时、撤回、重新要，永远收不齐。
+const WINDOW_DRAIN_SECONDS = 60;
 
 /**
  * 一个 peer 该同时欠我几片。
@@ -206,14 +209,21 @@ export class Scheduler {
    * @param {Array<{peerId:string, remoteHave:Uint8Array, inflight:Set<number>, downRate:number, ready:boolean}>} peers
    * @returns {Array<{peerId:string, index:number}>}
    */
-  /** 这个 peer 现在的在途窗口。构造时显式指定了就用固定值（测试要的确定性）。 */
+  /**
+   * 这个 peer 现在的在途窗口。构造时显式指定了就用固定值（测试要的确定性）。
+   *
+   * 观察期（probation，由 swarm 标记：刚超时过、刚送过坏片）的上游一次只欠一片 ——
+   * 他要是故意收了请求不发，最多也只压住一片。
+   */
   windowFor(peer) {
+    if (peer?.probation === true) return 1;
     if (this.fixedWindow) return this.maxInflightPerPeer;
-    return inflightWindow({
-      downRate: peer?.downRate || 0,
-      rtt: peer?.rtt || 0,
-      chunkSize: this.manifest?.chunkSize || 0,
-    });
+    const chunkSize = this.manifest?.chunkSize || 0;
+    const w = inflightWindow({ downRate: peer?.downRate || 0, rtt: peer?.rtt || 0, chunkSize });
+    // 测出速率之后，欠的片不超过他 WINDOW_DRAIN_SECONDS 秒能送完的量（至少一片）。
+    // 局域网、正常跨境链路上这一项远大于上面算出的窗口，不起作用；只有真慢的上游会被它收窄。
+    if (!(peer?.downRate > 0) || !(chunkSize > 0)) return w;
+    return Math.min(w, Math.max(1, Math.floor((peer.downRate * WINDOW_DRAIN_SECONDS) / chunkSize)));
   }
 
   plan({ have, playbackByte, inflight, peers }) {
@@ -232,7 +242,8 @@ export class Scheduler {
 
     // 还没测出速率的 peer 先按已知最快处理。给 0 会让它永远排在最后，
     // 于是永远拿不到片、也就永远测不出速率 —— 新来的上游会被活活饿死。
-    const known = usable.map((p) => p.downRate || 0).filter((r) => r > 0);
+    // 观察期的人不参与「已知最快」的估计：他的速率是他自己能左右的。
+    const known = usable.filter((p) => p.probation !== true).map((p) => p.downRate || 0).filter((r) => r > 0);
     const optimistic = known.length ? Math.max(...known) : COLD_START_RATE;
     const rateOf = (p) => (p.downRate > 0 ? p.downRate : optimistic);
     const chunkSize = this.manifest.chunkSize;
@@ -242,15 +253,36 @@ export class Scheduler {
     // 整个关键窗口就被拖到他的速度上。跨境房间里这种速度差是常态。
     const eta = (p) => ((load.get(p.peerId) + 1) * chunkSize) / rateOf(p);
     const capacity = usable.reduce((sum, p) => sum + windows.get(p.peerId), 0);
+    // swarm 按信誉给 peer 打的两类标记（没有标记的 peer 行为和以前完全一样）：
+    //  - probation（观察期）：排在所有正常上游后面；关键窗口里的片，只要有正常上游手里有
+    //    （哪怕他这一轮名额满了、等下一轮），就不交给观察期的人 —— 关键片压在一个
+    //    可能故意不发的人手里，全房就得跟着停。窗口外的片、只有他有的片照常给他。
+    //  - avoid / blocked：他送坏过的那几片。blocked 是退避期内，不向他要；avoid 是坏过一次，
+    //    有别人能给就不找他，只有他有时照样向他要（偶发损坏重要一次就好了）。
+    const clean = peers.filter((p) => p.ready && p.remoteHave && p.probation !== true);
+    const cleanHas = (index) =>
+      clean.some((p) => p.remoteHave[index] === 1 && !p.blocked?.has(index) && !p.avoid?.has(index));
 
-    for (const index of queue) {
+    for (let q = 0; q < queue.length; q++) {
+      const index = queue[q];
       let pick = null;
       let best = Infinity;
+      let bestTier = Infinity;
+      let othersHave = null;
       for (const p of usable) {
         if (p.remoteHave[index] !== 1) continue;
+        if (p.blocked?.has(index)) continue;
         if (load.get(p.peerId) >= windows.get(p.peerId)) continue;
+        const avoided = p.avoid?.has(index) === true;
+        const probation = p.probation === true;
+        if (avoided || (probation && q < critical.length)) {
+          if (othersHave === null) othersHave = cleanHas(index);
+          if (othersHave) continue;
+        }
+        const tier = (avoided ? 2 : 0) + (probation ? 1 : 0);
         const score = eta(p);
-        if (score < best) {
+        if (tier < bestTier || (tier === bestTier && score < best)) {
+          bestTier = tier;
           best = score;
           pick = p;
         }
@@ -273,5 +305,6 @@ export {
   MAX_INFLIGHT_CEILING,
   DEFAULT_HEAD_RESERVE_BYTES,
   DEFAULT_TAIL_RESERVE_BYTES,
+  WINDOW_DRAIN_SECONDS,
   inflightWindow,
 };

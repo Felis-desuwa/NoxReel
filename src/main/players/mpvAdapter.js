@@ -31,8 +31,9 @@ class MpvAdapter extends EventEmitter {
     return findMpv();
   }
 
-  launch({ source, startPaused = true, startAt = 0, headers = {}, muted = false, chatPrompt = '' }) {
-    return this.ctl.launch(source, { startPaused, startAt, headers, muted, chatPrompt });
+  // proxy：主进程那个只放行公网目标的本机过滤代理，见 publicProxy.js / mpv.js 的 networkArgs
+  launch({ source, startPaused = true, startAt = 0, headers = {}, muted = false, chatPrompt = '', proxy = null }) {
+    return this.ctl.launch(source, { startPaused, startAt, headers, muted, chatPrompt, proxy });
   }
 
   setPause(paused) {

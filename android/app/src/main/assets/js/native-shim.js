@@ -92,11 +92,30 @@ window.swPlayer = {
   },
 };
 
-// 把 console 也送一份到 logcat，方便 adb logcat 里看
+// 离开房间：原生那边释放播放器、关掉所有接收会话（缓存跟着删）。调用方随后整页重载。
+window.sw.leaveRoom = () => {
+  try {
+    Native.leaveRoom();
+  } catch (e) {}
+};
+
+// 安装包版本号（build.gradle 的 versionName）。拿不到就是空串。
+window.sw.appVersion = () => {
+  try {
+    return String(Native.appVersion?.() ?? '');
+  } catch (e) {
+    return '';
+  }
+};
+
+// 把 console 也送一份到 logcat，方便 adb logcat 里看。
+// logcat 单条本来就只显示 4KB 左右：超长的先在这边截掉，别拖着几 MB 的字符串过桥。
+const MAX_NATIVE_LOG_CHARS = 4000;
 const _log = console.log.bind(console);
 console.log = (...args) => {
   try {
-    Native.log(args.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' '));
+    const line = args.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ');
+    Native.log(line.length > MAX_NATIVE_LOG_CHARS ? line.slice(0, MAX_NATIVE_LOG_CHARS) + '…' : line);
   } catch (e) {}
   _log(...args);
 };

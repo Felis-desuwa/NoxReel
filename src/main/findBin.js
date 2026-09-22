@@ -87,12 +87,15 @@ function defaultCandidates(name) {
 
 /**
  * @param {string} name 程序名，不带扩展名（'mpv' / 'ffmpeg'）
- * @param {{envVar?: string, candidates?: string[]}} opts
- *   envVar     用户指定路径的环境变量名，优先级最高
- *   candidates 该程序特有的安装位置，插在通用候选之前
+ * @param {{envVar?: string, candidates?: string[], fallbackCandidates?: string[]}} opts
+ *   envVar             用户指定路径的环境变量名，优先级最高
+ *   candidates         该程序特有的安装位置，插在通用候选之前
+ *   fallbackCandidates 普通用户就能写进去的公共位置（比如 C:\ffmpeg\bin）。放在最后，连 winget
+ *                      目录都扫过、哪儿都没有时才用 —— C:\ 根目录下的文件夹本机任何账户都能建，
+ *                      排在前面就等于让别人替我们挑要运行的程序
  * @returns {string|null} 可执行文件绝对路径
  */
-function findBin(name, { envVar, candidates = [] } = {}) {
+function findBin(name, { envVar, candidates = [], fallbackCandidates = [] } = {}) {
   if (envVar && process.env[envVar] && exists(process.env[envVar])) {
     return process.env[envVar];
   }
@@ -105,7 +108,13 @@ function findBin(name, { envVar, candidates = [] } = {}) {
   }
 
   // 最后才扫 winget 目录 —— 有 IO 开销，前面命中就不用走到这
-  return fromWingetPackages(name);
+  const fromWinget = fromWingetPackages(name);
+  if (fromWinget) return fromWinget;
+
+  for (const p of fallbackCandidates) {
+    if (exists(p)) return p;
+  }
+  return null;
 }
 
 module.exports = { findBin, exists };

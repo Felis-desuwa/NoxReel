@@ -267,9 +267,18 @@ export class DanmakuEngine {
     this.banner = flag === true;
   }
 
-  /** 排进下一帧。msg: {id, text, self} */
+  /**
+   * 排进下一帧。msg: {id, text, self}
+   * 帧循环停着的时候（播放器正忙着跳转、窗口被节流）新消息会一直攒在这里。排队上限本来就是
+   * MAX_PENDING 条、出场时只留最新的，所以这里也只留最新的这么多条，别让刷屏把内存越攒越大。
+   */
   push(msg) {
     this._incoming.push(msg);
+    if (this._incoming.length > MAX_PENDING) {
+      const over = this._incoming.length - MAX_PENDING;
+      this._incoming.splice(0, over);
+      this.dropped += over;
+    }
   }
 
   /** @returns {Array} 这一帧每条弹幕的位置 */

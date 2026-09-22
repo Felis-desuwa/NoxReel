@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析；一整晚的片单、飘过画面的弹幕和你自己惯用的播放器都在里面。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.4-7C5CFF?style=for-the-badge" alt="Version 0.7.4">
+    <img src="https://img.shields.io/badge/version-0.7.5-7C5CFF?style=for-the-badge" alt="Version 0.7.5">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -64,6 +64,9 @@
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!NOTE]
+> `v0.7.5` 是一次全面的安全加固和防 DoS 更新。房间里的恶意成员不能再用坏分片、收了请求不发片、刷消息把全房拖停；拿到房间链接的人不能再用一堆假身份占满名额（放行后 60 秒内没和房主直连上的名额会被收回）；在线链接的每一次网络连接都会在连接那一刻检查目标地址，跳转和分片列表都没法被用来访问你局域网里的设备；自建信令服务器补上了一条消息就能打崩的漏洞，并加了连接数、消息速率、加入频率等上限（放在反向代理后面记得设 `TRUST_PROXY=1`）。另外修了加入失败后状态残留、重复点链接叠出两套连接、刚进房就改邀请方式被盖掉、NTFS 上大文件首次写入卡顿等问题；大厅会显示版本号。行为变化：**在线链接只用 mpv 播放**（外部播放器没法走过滤代理）。**P2P 协议没变，和 0.7.x 互通**。
+
+> [!NOTE]
 > `v0.7.4` 让 Discord 上的朋友一眼看到、一点就进。**房间链接**成了默认的邀请方式：一条链接发到群里谁点谁进，直到坐满人数上限 —— 不需要你架服务器，连接信息加密后经公共 Nostr 中继交换，视频照旧点对点直传，房主身份由链接里的签名公钥担保。**所有链接在 Discord 里都能直接点**（https 跳转页，邀请内容在 `#` 后面、不发给任何服务器）。**Discord 状态显示**（默认关）：好友能在你的资料上看到「正在观看 NoxReel · 房间 3/8 人」，用房间链接时还有「加入放映」按钮。房间链接这一版只有电脑端支持，手机端下个版本；一对一邀请照常能用，**P2P 协议没变，和 0.7.x 互通**。
 
 > [!NOTE]
@@ -82,8 +85,8 @@
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.4.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.4.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.4.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.4.exe) |
+| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.5.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.5.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -226,6 +229,39 @@ npm run dist:web      # 构建 Windows 联网安装器
 - `SYNCWATCH_MPV_PATH`
 - `SYNCWATCH_YTDLP_PATH`
 - `SYNCWATCH_FFMPEG_PATH`
+
+### 自建信令服务器
+
+「信令房间」需要自己跑一个信令服务器：`npm run signal`（Windows 也可以双击 `NoxReel-Signal.exe`）。它只转发 SDP / ICE，配置全部走环境变量，例如：
+
+```bash
+PORT=8080 BLOCKED_COUNTRIES=CN ALLOW_UNKNOWN=0 MAXMIND_DB=./GeoLite2-Country.mmdb npm run signal
+```
+
+| 变量 | 默认值 | 作用 |
+|---|---|---|
+| `PORT` | `8080` | 监听端口 |
+| `MAX_ROOM_SIZE` | `16` | 单个房间的人数硬上限（2–64） |
+| `BLOCKED_COUNTRIES` | 空 | 逗号分隔的国家码，填了才开启地区拦截 |
+| `ALLOW_UNKNOWN` | `1` | 设为 `0` 时查不到地区就拒绝 |
+| `MAXMIND_DB` | 空 | GeoLite2-Country 数据库路径；不填只看 CDN 给的地区头 |
+| `TRUST_PROXY` | 关 | 设为 `1` 时信任反代写入的 `X-Forwarded-For` / `X-Real-IP` / `CF-IPCountry`，限流和局域网豁免都按反代转述的客户端地址算 |
+| `MAX_CONNECTIONS` | `800` | 全服同时在线的连接数 |
+| `MAX_CONN_PER_IP` | `32` | 同一 IP 同时在线的连接数（IPv6 按 /64 合并计） |
+| `MAX_ROOMS` | `400` | 全服同时存在的房间数 |
+| `JOINS_PER_MIN` | `60` | 同一 IP 每分钟加入房间的次数（被拒的也算） |
+| `ROOMS_PER_MIN` | `20` | 同一 IP 每分钟新建房间的次数 |
+| `MSG_RATE` | `50` | 每条连接每秒补充的消息令牌：每条消息 1 个，每满 1 KB 再加 1 个 |
+| `MSG_BURST` | `max(1000, 60 × MAX_ROOM_SIZE)` | 消息令牌桶容量，用光即断开 |
+| `MAX_MSG_BYTES` | `65536` | 单条 WebSocket 消息上限（字节） |
+| `MAX_SIGNAL_BYTES` | `32768` | 单条 SDP / ICE 消息上限（字节），超了不转发 |
+| `JOIN_TIMEOUT_MS` | `10000` | 连上后多久不加入房间就断开 |
+| `HEARTBEAT_MS` | `30000` | 心跳间隔，一个间隔内没有回应就断开 |
+| `HTTP_TIMEOUT_MS` | `10000` | 请求头（含 WebSocket 升级请求）必须在多久内收完，防慢速连接占坑 |
+
+- 数量和速率类的上限填 `0` 表示不限（`MSG_RATE=0` 即不限速）；大小和时长类填 `0` 无效，按默认值处理。默认值按「一家人在同一个 NAT 后面开几台设备」「16 人房间一口气交换 SDP/ICE」留足了余量。
+- 放在 nginx、Caddy 或 CDN 后面时务必设 `TRUST_PROXY=1`，并让反代**追加**写 `X-Forwarded-For`（nginx：`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`）。否则所有人都会被当成来自反代自己，共用一份每 IP 上限。
+- 调大 `MAX_CONNECTIONS` 时，记得同时调高进程的文件句柄上限（Linux 上的 `ulimit -n` 默认常是 1024）。
 
 ## 参与项目
 

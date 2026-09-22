@@ -2,7 +2,9 @@ package com.syncwatch.app
 
 import android.net.Uri
 import com.google.android.exoplayer2.C
+import com.google.android.exoplayer2.PlaybackException
 import com.google.android.exoplayer2.upstream.DataSource
+import com.google.android.exoplayer2.upstream.DataSourceException
 import com.google.android.exoplayer2.upstream.DataSpec
 import com.google.android.exoplayer2.upstream.TransferListener
 
@@ -34,8 +36,14 @@ class GrowingDataSource(private val session: Store.Session) : DataSource {
     }
 
     override fun open(dataSpec: DataSpec): Long {
+        // 读哪儿由容器里的索引决定，而片子是对端给的：索引指到文件尾以外时照 FileDataSource
+        // 的做法报「位置越界」，不能算出一个负的剩余长度交回给播放器。
+        if (dataSpec.position < 0 || dataSpec.position > session.size) {
+            throw DataSourceException(PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE)
+        }
         uri = dataSpec.uri
         position = dataSpec.position
+        // 指定了长度就原样认（DataSource 的约定）；读到文件尾时 awaitData 自会报 -1
         bytesRemaining = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
             dataSpec.length
         } else {

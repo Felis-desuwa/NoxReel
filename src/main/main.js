@@ -44,6 +44,7 @@ const malwareScan = require('./malwareScan');
 const { validateSourceName, SOURCE_EXTENSIONS, SUBTITLE_EXTENSIONS } = require('./mediaGuard');
 const subtitles = require('./subtitles');
 const { DiscordPresence, sanitizeActivity } = require('./discordPresence');
+const { sharedProxy, closeSharedProxy } = require('./publicProxy');
 
 let win = null;
 // 同一时刻只有一个播放器；换播放器或重开时旧的先彻底退掉，迟到的事件按代丢弃
@@ -100,6 +101,9 @@ const tasks = new Map();
 const approvedSources = new Set();
 // 外挂字幕单列一张表：它们只能作为 media:convert 的字幕输入，不能被当成片源去算哈希、开会话
 const approvedSubtitles = new Set();
+// 用户在「选择缓存目录」对话框里挑过的目录。settings:setCacheRoot 只认这里面的 ——
+// 缓存根下的 run-* 目录会被回收，由页面随手给一个路径（甚至 \\某台机器\共享）是不行的。
+const approvedCacheDirs = new Set();
 const MAIN_PAGE = path.join(__dirname, '..', 'renderer', 'index.html');
 const MAIN_PAGE_URL = pathToFileURL(MAIN_PAGE).href;
 const DEEP_LINK_SCHEME = 'noxreel:';
@@ -129,6 +133,14 @@ function deepLinkFromArgv(argv) {
   return null;
 }
 
+/** 把主窗口拉到用户眼前：最小化的还原，被挡住的提到前台。 */
+function revealMainWindow() {
+  if (!win || win.isDestroyed()) return;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+}
+
 function dispatchDeepLink(raw) {
   const link = normalizeDeepLink(raw);
   if (!link) return;
@@ -136,17 +148,21 @@ function dispatchDeepLink(raw) {
   if (win && !win.isDestroyed() && !win.webContents.isLoadingMainFrame()) {
     win.webContents.send('app:deepLink', link);
     pendingDeepLink = null;
-    if (win.isMinimized()) win.restore();
-    win.show();
-    win.focus();
   }
+  // 页面还在加载时链接先存着（加载完由 app:takeDeepLink 取走），窗口照样要拉到前面
+  revealMainWindow();
 }
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
 else {
   pendingDeepLink = deepLinkFromArgv(process.argv);
-  app.on('second-instance', (_event, argv) => dispatchDeepLink(deepLinkFromArgv(argv)));
+  // 已经开着一个 NoxReel 时再双击图标：第二个进程拿不到锁直接退出，这边必须把窗口唤出来 ——
+  // 不带深链接也一样，不然用户看到的就是「点了没反应」
+  app.on('second-instance', (_event, argv) => {
+    revealMainWindow();
+    dispatchDeepLink(deepLinkFromArgv(argv));
+  });
   app.on('open-url', (event, url) => {
     event.preventDefault();
     dispatchDeepLink(url);
@@ -528,6 +544,7 @@ async function cleanup() {
     // WM_CLOSE 了），然后销毁覆盖窗，最后才关会话删缓存。
     await players.quit().catch(() => {});
     await closeSharedBridge().catch(() => {});
+    await closeSharedProxy();
     overlay.destroy();
     if (globalShortcut) {
       try {
@@ -850,9 +867,63 @@ secureHandle('media:releaseTemp', async (filePath) => {
   return cache.removeOwned(ownedDir);
 });
 
+/**
+ * 本机过滤代理（见 publicProxy.js）。mpv、yt-dlp、隔离浏览器的每个请求都经它按「连接那一刻」
+ * 解析出的 IP 判定，私网一律拦下 —— publicHttpUrl 只能查第一跳，跳转、HLS 分段、DNS 重绑定都管不到。
+ * 起不来就返回 null，由调用方决定是拒绝（远程源）还是照常（本地文件另有 --access-references=no）。
+ */
+async function publicProxyInfo() {
+  const proxy = sharedProxy();
+  try {
+    await proxy.start();
+    return proxy.info;
+  } catch {
+    return null;
+  }
+}
+
+async function requireProxyInfo() {
+  const info = await publicProxyInfo();
+  if (!info) throw new Error('本机网络过滤代理启动失败，为防访问内网已拒绝打开在线链接');
+  return info;
+}
+
+/**
+ * 链接解析的并发上限。每次解析都要起 yt-dlp（最长两轮各 60 秒），失败了还要开一个隐藏的浏览器窗口
+ * 跑 35 秒；而解析是房主切换当前项时每个成员自动触发的 —— 不设上限的话，有人连着切片子就能让
+ * 成员机器上同时挂着几十个 yt-dlp 和隐藏窗口。超出的排队，队也排满了就直接拒。
+ */
+const LINK_INSPECT_CONCURRENCY = 2;
+const LINK_INSPECT_QUEUE = 6;
+let linkInspectRunning = 0;
+const linkInspectWaiting = [];
+
+async function withLinkInspectSlot(work) {
+  if (linkInspectRunning >= LINK_INSPECT_CONCURRENCY) {
+    if (linkInspectWaiting.length >= LINK_INSPECT_QUEUE) throw new Error('正在解析的链接太多，稍后再试');
+    await new Promise((resolve) => linkInspectWaiting.push(resolve));
+  } else {
+    linkInspectRunning++;
+  }
+  try {
+    return await work();
+  } finally {
+    // 名额直接交给排队的下一个（计数不变）；没人排队才真的归还
+    const next = linkInspectWaiting.shift();
+    if (next) next();
+    else linkInspectRunning--;
+  }
+}
+
 secureHandle('media:inspectLink', async (url) => {
   const safeUrl = await validate.publicHttpUrl(url, '视频链接');
-  const result = await linkMedia.inspectLink(safeUrl, { browserFallback: browserMediaResolver.resolveInBrowser });
+  const result = await withLinkInspectSlot(async () => {
+    const proxy = await requireProxyInfo();
+    return linkMedia.inspectLink(safeUrl, {
+      proxy: proxy.url,
+      browserFallback: (target) => browserMediaResolver.resolveInBrowser(target, { proxy }),
+    });
+  });
   if (result.playback?.url) {
     result.playback.url = await validate.publicHttpUrl(result.playback.url, '播放地址');
     result.playback.headers = validate.mediaHeaders(result.playback.headers);
@@ -943,10 +1014,16 @@ secureHandle('player:launch', async (payload) => {
   const { filePath, startPaused, headers, startAt = 0, chatPrompt = '', kind = 'mpv' } = validate.plainObject(payload, '播放器启动参数');
   // 只认登记过的 id：这个字符串最终会变成 new ADAPTERS[kind]()
   const want = validate.playerId(kind, players.kinds);
-  const source = /^https?:\/\//i.test(filePath)
-    ? await validate.publicHttpUrl(filePath, '媒体链接')
-    : await requireAllowedLocalPath(filePath);
+  // 先卡类型再跑正则：正则会把任意对象 String() 一遍，一个巨大的数组就能白白吃掉一大块内存
+  validate.string(filePath, '文件路径', { max: 32_768 });
+  const remote = /^https?:\/\//i.test(filePath);
+  // 外部播放器没有按次指定代理的参数，会跟着跳转去连内网；远程源只交给经过滤代理的 mpv
+  if (remote && want !== 'mpv') throw new Error('在线链接只能用 mpv 播放');
+  const source = remote ? await validate.publicHttpUrl(filePath, '媒体链接') : await requireAllowedLocalPath(filePath);
   const safeHeaders = /^https?:\/\//i.test(source) ? validate.mediaHeaders(headers) : {};
+  // mpv 的网络请求全部经过滤代理。远程源没有代理就不开；本地文件另有 --access-references=no 兜底，
+  // 代理起不来也照常播放
+  const proxy = want === 'mpv' ? (remote ? await requireProxyInfo() : await publicProxyInfo()) : null;
   if (typeof startPaused !== 'boolean') throw new TypeError('无效的暂停参数');
   const start = validate.finiteNumber(startAt, '起播位置', { min: 0, max: 10 ** 9 });
   // 播放器内那个弹幕输入框的提示语。主进程不做 i18n，文案由渲染进程按界面语言生成，
@@ -964,7 +1041,7 @@ secureHandle('player:launch', async (payload) => {
       return info;
     }
     // PlayerManager 会先摘掉旧播放器的监听器、等它退干净，再拉起新的。
-    return await players.launch('mpv', { source, startPaused, startAt: start, headers: safeHeaders, muted: TEST_MUTE, chatPrompt: prompt }, ticket);
+    return await players.launch('mpv', { source, startPaused, startAt: start, headers: safeHeaders, muted: TEST_MUTE, chatPrompt: prompt, proxy: proxy && proxy.url }, ticket);
   } catch (error) {
     throw withPlayerCode(error);
   }
@@ -1062,7 +1139,10 @@ secureHandle('dialog:pickCacheDir', async () => {
     title: '选择缓存目录',
     properties: ['openDirectory', 'createDirectory'],
   });
-  return r.canceled ? null : r.filePaths[0];
+  if (r.canceled || !r.filePaths || !r.filePaths[0]) return null;
+  const picked = validate.absolutePath(r.filePaths[0], '缓存目录');
+  approvedCacheDirs.add(pathKey(picked));
+  return picked;
 });
 
 /**
@@ -1079,6 +1159,11 @@ secureHandle('settings:setCacheRoot', async (payload) => {
   if (tempJobs) throw new Error('正在转封装或精简，完成后再换缓存目录');
   if (remuxOutputs.size) throw new Error('还有临时文件没回收，退出房间后再改');
   const target = validate.absolutePath(dir, '缓存目录');
+  // 只认用户刚在对话框里挑的目录（或者默认目录）：页面自己拼的路径不行，理由同 approvedSources
+  const key = pathKey(target);
+  if (!approvedCacheDirs.has(key) && key !== pathKey(DEFAULT_CACHE_ROOT)) {
+    throw new Error('缓存目录未经用户选择，已拒绝');
+  }
   // 先试着真的写一下。指到一个只读目录或者没插的盘上，得当场知道。
   await fsp.mkdir(target, { recursive: true });
   const probe = path.join(target, `.noxreel-write-test-${process.pid}`);
@@ -1097,5 +1182,7 @@ secureHandle('settings:setCacheRoot', async (payload) => {
 });
 
 secureHandle('clipboard:writeText', async (text) => {
-  clipboard.writeText(validate.string(String(text ?? ''), '剪贴板文本', { max: 2 * 1024 * 1024, allowEmpty: true }));
+  // 只收字符串（空值当空串）：String() 一个巨大的数组或对象本身就要吃掉一大块内存
+  const value = text === undefined || text === null ? '' : typeof text === 'number' ? String(text) : text;
+  clipboard.writeText(validate.string(value, '剪贴板文本', { max: 2 * 1024 * 1024, allowEmpty: true }));
 });

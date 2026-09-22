@@ -19,6 +19,7 @@
   /* -------- 大厅 -------- */
   #lobby { position:fixed; inset:0; overflow:auto; background:var(--bg); padding:24px 20px 40px; }
   #lobby h1 { font-size:22px; margin:8px 0 2px; }
+  #app-version { font-size:12px; font-weight:400; color:var(--dim); margin-left:6px; }
   #lobby .sub { color:var(--dim); font-size:13px; margin-bottom:18px; }
   .tabs { display:flex; gap:8px; margin:18px 0 4px; }
   .tabs button { flex:1; background:transparent; border:1px solid #332f47; color:var(--dim); }
@@ -109,16 +110,22 @@
   #site-ask { position:absolute; inset:0; display:none; align-items:center; justify-content:center;
               padding:24px; background:#000a; pointer-events:auto; z-index:4; }
   #site-ask.on { display:flex; }
-  #site-ask .box { max-width:420px; padding:18px; border-radius:14px; border:1px solid #332f47; background:var(--panel); }
-  #site-ask .row { display:flex; gap:10px; margin-top:16px; }
-  #site-ask .row button { flex:1; }
+  #site-ask .box, #invite-ask .box { max-width:420px; padding:18px; border-radius:14px; border:1px solid #332f47; background:var(--panel); }
+  #site-ask .row, #invite-ask .row { display:flex; gap:10px; margin-top:16px; }
+  #site-ask .row button, #invite-ask .row button { flex:1; }
+
+  /* -------- 已在房间里又点开一条邀请：先问，再决定离不离开 -------- */
+  /* 放在 #stage 外面：大厅（还没收到列表时）和播放层上都得能弹出来 */
+  #invite-ask { position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+                padding:24px; background:#000a; z-index:10; }
+  #invite-ask.on { display:flex; }
 </style>
 </head>
 <body>
 
   <!-- 大厅：加入房间 -->
   <div id="lobby">
-    <h1>NoxReel</h1>
+    <h1>NoxReel<span id="app-version" data-i18n-skip></span></h1>
     <div class="sub">P2P 同步观影 · 手机作为观众加入（不做房主）</div>
 
     <label>界面语言</label>
@@ -253,6 +260,17 @@
           <button id="site-deny">拒绝</button>
           <button class="primary" id="site-allow">允许</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 已在房间里又点开一条邀请：直接处理会拆掉手上的连接，先问清楚 -->
+  <div id="invite-ask">
+    <div class="box">
+      <div>你已经在房间里了。要离开当前房间，加入新收到的邀请吗？</div>
+      <div class="row">
+        <button id="invite-stay">留在当前房间</button>
+        <button class="primary" id="invite-leave">离开并加入</button>
       </div>
     </div>
   </div>

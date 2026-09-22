@@ -13,6 +13,32 @@ const MAX_PENDING_CANDIDATES = 128; // 排队上限，别让对面用候选把�
 // DataChannel 单条消息的安全上限。超过它的 send() 会让整条通道断掉，
 // 表现成莫名其妙的掉线 —— 宁可这里拒发并留下日志。大消息要走 PART 分段。
 const MAX_CTRL_BYTES = 60 * 1024;
+// 收端单条控制消息的长度上限（UTF-16 码元）。发端（0.7.0 起）按 UTF-8 字节拒发超过 60KB 的，
+// 码元数不会多于字节数，所以合法消息一定在这以内；更长的只会是有人专门喂来的大 JSON。
+const MAX_CTRL_IN_CHARS = 64 * 1024;
+
+/**
+ * 控制消息的收端预算（按连接记，令牌桶）。
+ *
+ * ctrl 上的每条消息都要 JSON.parse，再交给上层处理 —— 渲染进程只有一个线程，
+ * 一个成员按链路速度灌消息，就能把界面和调度一起拖住。合法流量的量级：
+ * 千兆局域网上每秒几十条 HAVE / REQUEST，进房那一下几百条位图和列表分段；
+ * 这里的上限留了十倍以上的余量，超出的直接丢掉、不解析。
+ * 分段清单是例外：它是我方点名要的，几十 MB 一口气到是正常的（大文件的哈希表），
+ * 只在 swarm 正向这个人要清单（bulkManifest）时放行，且上层会把没用上的分段补记进预算。
+ */
+const CTRL_MSG_BURST = 4000;
+const CTRL_MSG_PER_SEC = 500;
+const CTRL_BYTES_BURST = 32 * 1024 * 1024;
+const CTRL_BYTES_PER_SEC = 4 * 1024 * 1024;
+const MANIFEST_PART_PREFIX = `{"t":"${MSG.MANIFEST_PART}"`;
+// PING 正常三秒一条。回 PONG 按这个节奏限一下，别让人拿 PING 把我方的 ctrl 通道当回声墙
+const PONG_BURST = 4;
+const PONG_PER_SEC = 1;
+// 只认自己发出去的 PING 的回声，最多记这么多条还没回的
+const MAX_OUTSTANDING_PINGS = 4;
+// 往返时延超过这个数的样本不收：真实链路到不了，只可能是伪造或者积压得不成样子
+const MAX_RTT_MS = 30_000;
 
 /**
  * 单个 P2P 连接。
@@ -63,6 +89,13 @@ export class Peer extends Emitter {
     this._lastSendSample = { t: performance.now(), bytes: 0 };
     this.downRate = 0;
     this.upRate = 0;
+    // 控制消息收端预算，见 CTRL_MSG_BURST 的说明
+    this._ctrlBudget = { msgs: CTRL_MSG_BURST, bytes: CTRL_BYTES_BURST, at: performance.now() };
+    this.ctrlDropped = 0;
+    // swarm 正在向他要分段清单：这段时间里清单分段不占预算
+    this.bulkManifest = false;
+    this._pongBudget = { tokens: PONG_BURST, at: performance.now() };
+    this._outstandingPings = [];
 
     this.pc = new RTCPeerConnection({
       iceServers,
@@ -142,7 +175,9 @@ export class Peer extends Emitter {
 
     if (kind === 'ctrl') {
       ch.onmessage = (e) => {
-        if (typeof e.data !== 'string' || e.data.length > 256 * 1024) return;
+        if (typeof e.data !== 'string' || e.data.length > MAX_CTRL_IN_CHARS) return;
+        const bulk = this.bulkManifest && e.data.startsWith(MANIFEST_PART_PREFIX);
+        if (!bulk && !this.chargeCtrl(e.data.length)) return;
         let msg;
         try {
           msg = JSON.parse(e.data);
@@ -156,11 +191,36 @@ export class Peer extends Emitter {
       ch.onmessage = (e) => {
         const f = decodeFrame(e.data);
         if (!f) return;
+        this.emit('frame', f);
+        // 只有被 swarm 收下的帧（正向他要的那一片、帧号和长度都对）才算他的速率。
+        // 不然谁都能灌几个 12 字节的空帧把速率撑成一个很小的正数 —— 请求超时按速率估，
+        // 速率越小超时越长，那几片就一直挂在他名下，别人也不会去要。
+        if (f.accepted !== true) return;
         this.bytesReceived += e.data.byteLength;
         this._sampleRate();
-        this.emit('frame', f);
       };
     }
+  }
+
+  /**
+   * 从控制消息预算里扣一笔（一条消息 + 它的字节数）。不够就返回 false，调用方把消息丢掉。
+   * 上层发现某条放行过的消息其实没用（比如不请自来的清单分段）时也会来补扣。
+   */
+  chargeCtrl(bytes, msgs = 1) {
+    const b = this._ctrlBudget;
+    const now = performance.now();
+    const elapsed = now > b.at ? (now - b.at) / 1000 : 0;
+    b.at = now;
+    b.msgs = Math.min(CTRL_MSG_BURST, b.msgs + elapsed * CTRL_MSG_PER_SEC);
+    b.bytes = Math.min(CTRL_BYTES_BURST, b.bytes + elapsed * CTRL_BYTES_PER_SEC);
+    const n = Math.max(0, Number(bytes) || 0);
+    if (b.msgs < msgs || b.bytes < n) {
+      if (this.ctrlDropped++ === 0) console.warn(`[peer] ${this.name} 的控制消息太密，超出的先丢掉`);
+      return false;
+    }
+    b.msgs -= msgs;
+    b.bytes -= n;
+    return true;
   }
 
   _sampleRate() {
@@ -181,15 +241,33 @@ export class Peer extends Emitter {
 
   _onCtrl(msg) {
     if (msg.t === MSG.PING) {
-      this.send({ t: MSG.PONG, ts: msg.ts });
+      // ts 原样回过去，所以只回数字，而且按 PING 的正常节奏限速
+      if (Number.isFinite(msg.ts) && this._takePong()) this.send({ t: MSG.PONG, ts: msg.ts });
       return;
     }
     if (msg.t === MSG.PONG) {
-      this.rtt = performance.now() - msg.ts;
+      // 只认自己发出去的那几条 PING 的回声。ts 是对方填回来的：不核对的话，
+      // 一条 ts=-1e13 的 PONG 就能把往返时延报成几百年，请求超时和在途窗口都跟着失真
+      const i = this._outstandingPings.indexOf(msg.ts);
+      if (i === -1) return;
+      this._outstandingPings.splice(0, i + 1); // 比它早发的那几条也不用再等了
+      const rtt = performance.now() - msg.ts;
+      if (!(rtt >= 0 && rtt <= MAX_RTT_MS)) return;
+      this.rtt = rtt;
       this.emit('rtt', this.rtt);
       return;
     }
     this.emit('ctrl', msg);
+  }
+
+  _takePong() {
+    const b = this._pongBudget;
+    const now = performance.now();
+    if (now > b.at) b.tokens = Math.min(PONG_BURST, b.tokens + ((now - b.at) / 1000) * PONG_PER_SEC);
+    b.at = now;
+    if (b.tokens < 1) return false;
+    b.tokens -= 1;
+    return true;
   }
 
   /* ------------------------------ 信令握手 ------------------------------ */
@@ -319,7 +397,10 @@ export class Peer extends Emitter {
   ping() {
     this._sampleRate();
     this._sampleUploadRate();
-    this.send({ t: MSG.PING, ts: performance.now() });
+    const ts = performance.now();
+    if (!this.send({ t: MSG.PING, ts })) return;
+    this._outstandingPings.push(ts);
+    if (this._outstandingPings.length > MAX_OUTSTANDING_PINGS) this._outstandingPings.shift();
   }
 
   /**

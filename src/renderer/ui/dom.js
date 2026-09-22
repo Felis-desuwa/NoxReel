@@ -21,7 +21,12 @@ function applyOptions(node, options) {
   if (options.raw) node.setAttribute(SKIP_ATTR, '');
   if (options.id) node.id = options.id;
   if (options.className || node.className) node.className = options.className || '';
-  if (options.text !== undefined) node.textContent = tr(options.text);
+  if (options.text !== undefined) {
+    // 文字没变就不写：patch() 每次重画都会把整列（聊天最多 300 行）过一遍，照写的话每一行都是一次
+    // DOM 改动，英文界面下还要让自动翻译的 MutationObserver 把整列再翻一遍
+    const text = tr(options.text);
+    if (node.textContent !== text) node.textContent = text;
+  }
   const owned = new Set();
   if (options.attrs) {
     for (const [name, value] of Object.entries(options.attrs)) {

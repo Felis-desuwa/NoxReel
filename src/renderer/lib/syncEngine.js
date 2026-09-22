@@ -69,7 +69,28 @@ const LAMPORT_WINDOW = 2 ** 20;
 // 自己发的指令最多比基准领先这么多（窗口的一半，别人一定收得下）。
 // 时钟、甚至本机采信的状态被离谱的直连消息顶高了，也不至于从此发出去的每条都被拒。
 const LAMPORT_LEAD = LAMPORT_WINDOW / 2;
+// READY 不查控制权（游客也得报），房主还会把每一条转发给全场，每一条又会让所有人重画成员表和就绪栏。
+// 一个游客反复切换就绪状态就能把全房拖住，所以按发送者限速：超出的状态照记，
+// 事件和转发合并到 READY_FLUSH_MS 之后再发一次 —— 最终状态一条都不会丢。
+const READY_BURST = 20;
+const READY_PER_SEC = 4;
+const READY_FLUSH_MS = 500;
+// 按发送者记的表的上限。房间最多 16 人，这些数留足了人来人往的余量；
+// 超出的只可能是房主转发时塞进来的假 origin。
+const MAX_READY_PEERS = 64;
+const MAX_SEEN_IDS = 256;
+// 房主的角色表最多记这么多人。进过房的游客都会登记一笔、走了也不删，不设上限的话，
+// 有人换着身份反复进出就能把表撑大，大到 ROLE 超过单条消息上限发不出去，新人再也拿不到角色表。
+// 超了先挤掉最早登记的游客：游客本来就是默认角色，挤掉不改变任何人的权限。
+const MAX_ROLE_ENTRIES = 128;
 const clampName = (v) => (typeof v === 'string' ? v.slice(0, MAX_NAME) : '');
+
+/** 按插入顺序封顶的 Map.set：超了挤掉最早的。 */
+function setCapped(map, key, value, max) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > max) map.delete(map.keys().next().value);
+}
 
 export class SyncEngine extends Emitter {
   constructor({ peerId, name, isSeeder, hostId }) {
@@ -114,6 +135,10 @@ export class SyncEngine extends Emitter {
     this.readyPeers = new Map();
     this._readySeqOut = 0;
     this._readySeen = new Map();
+    // READY 按发送者限速（见 READY_BURST）：令牌桶，和超速时攒着等合并发出的最新一条
+    this._readyBuckets = new Map(); // origin -> {tokens, at}
+    this._readyDeferred = new Map(); // origin -> {msg, from}
+    this._readyTimer = null;
     // 房间时钟。shared.position 只是「最后一次有人操作时」的位置，房间一直在播的话它早就过时了 ——
     // 新人入房、重开播放器、换播放器都要的是「现在」房间播到哪。这里记下起点，按需外推。
     this._clock = { base: 0, at: 0, running: false };
@@ -190,6 +215,7 @@ export class SyncEngine extends Emitter {
     // 就绪是针对某一部的，换片后谁都得重新报。编号不清：它按发送者全局单调。
     this.localReady = null;
     this.readyPeers.clear();
+    this._readyDeferred.clear(); // 攒着的是上一部的
     this.intendedPaused = true;
     const willBroadcast = broadcast && this.canIControl();
     // 不广播的一方把这份状态的时间戳置成 -1：这一部的任何一条合法 SYNC 都比它新。
@@ -384,6 +410,12 @@ export class SyncEngine extends Emitter {
   hostEnsureKnown(peerId) {
     if (this.myRole() !== 'host' || peerId === this.hostId || this.roles.has(peerId)) return;
     this.roles.set(peerId, 'guest');
+    if (this.roles.size > MAX_ROLE_ENTRIES) {
+      for (const [id, role] of this.roles) {
+        if (this.roles.size <= MAX_ROLE_ENTRIES) break;
+        if (role === 'guest' && id !== peerId) this.roles.delete(id);
+      }
+    }
     this._broadcastRoles();
     this.emit('roles', this.roleSnapshot());
   }
@@ -907,16 +939,52 @@ export class SyncEngine extends Emitter {
     }
     // 两条路径到达的先后不定，旧的「没好」不能盖掉新的「好了」
     if (msg.readySeq <= (this._readySeen.get(id) ?? -1)) return true;
-    this._readySeen.set(id, msg.readySeq);
+    // 表满了不再收新人（只可能是房主转发时塞进来的一堆假 origin）
+    if (!this.readyPeers.has(id) && this.readyPeers.size >= MAX_READY_PEERS) return true;
+    setCapped(this._readySeen, id, msg.readySeq, MAX_SEEN_IDS);
 
     this.readyPeers.set(id, { name: from.name, ready: msg.ready });
+    if (!this._takeReadyToken(id)) {
+      // 超速：状态已经记下，事件和转发攒着，合并到一起晚一点发
+      this._readyDeferred.set(id, { msg, from });
+      if (!this._readyTimer) this._readyTimer = setTimeout(() => this._flushReady(), READY_FLUSH_MS);
+      return true;
+    }
+    this._readyDeferred.delete(id); // 这一条就是最新的，攒着的那条作废
     this._relay(msg, from);
     this.emit('ready-change', { who: id, name: from.name, ready: msg.ready, self: false });
     return true;
   }
 
+  _takeReadyToken(id) {
+    const now = this.now();
+    let b = this._readyBuckets.get(id);
+    if (!b) b = { tokens: READY_BURST, at: now };
+    else if (now > b.at) b.tokens = Math.min(READY_BURST, b.tokens + ((now - b.at) / 1000) * READY_PER_SEC);
+    b.at = now;
+    setCapped(this._readyBuckets, id, b, MAX_READY_PEERS);
+    if (b.tokens < 1) return false;
+    b.tokens -= 1;
+    return true;
+  }
+
+  /** 把超速时攒着的就绪状态合并发出去：每个人只发最新的那一条。 */
+  _flushReady() {
+    this._readyTimer = null;
+    const pending = [...this._readyDeferred];
+    this._readyDeferred.clear();
+    for (const [id, { msg, from }] of pending) {
+      const entry = this.readyPeers.get(id);
+      // 期间换了片，或者人已经走了（peerGone 已经替他撤销过）
+      if (msg.seq !== this.seq || !entry) continue;
+      this._relay(msg, from);
+      this.emit('ready-change', { who: id, name: entry.name, ready: entry.ready, self: false });
+    }
+  }
+
   peerGone(peerId) {
     this._direct.delete(peerId);
+    this._readyDeferred.delete(peerId);
     for (const key of [...this._stash.keys()]) {
       if (key.endsWith(`:${peerId}`)) this._stash.delete(key);
     }

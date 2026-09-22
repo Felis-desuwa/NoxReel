@@ -217,6 +217,7 @@ class BridgeClient extends EventEmitter {
     this._nextId = 1;
     this._pending = new Map();
     this._buffer = '';
+    this._skipLine = false;
     this._stderr = '';
   }
 
@@ -251,9 +252,24 @@ class BridgeClient extends EventEmitter {
     const child = this.spawn(exe, [], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     this.proc = child;
     this._buffer = '';
+    this._skipLine = false;
     this._stderr = '';
     this.ready = null;
 
+    // 桥意外退出、exit 事件还没到的那几毫秒里写 stdin，EPIPE 会作为 stdin 上的异步 'error' 抛出来。
+    // 没人接的话就是主进程的未捕获异常（Electron 会弹「A JavaScript error occurred」）。
+    // 当成桥退出处理：在途请求一起失败，下一次 call() 按重启逻辑重新拉起。
+    if (child.stdin && typeof child.stdin.on === 'function') {
+      child.stdin.on('error', (error) => {
+        if (this.proc !== child) return;
+        try {
+          child.kill();
+        } catch {
+          /* 已经没了 */
+        }
+        this._onExit(null, error);
+      });
+    }
     if (child.stdout) {
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', (chunk) => this._onData(chunk));
@@ -292,14 +308,25 @@ class BridgeClient extends EventEmitter {
   }
 
   _onData(chunk) {
+    // 超长的一行：丢掉它剩下的部分，直到下一个换行。原来是把缓冲清空了事 ——
+    // 于是这一行的后半截会被当成一行新的来解析，而且完整的行也可能跟着被一起丢掉。
+    if (this._skipLine) {
+      const nl = chunk.indexOf('\n');
+      if (nl < 0) return;
+      this._skipLine = false;
+      chunk = chunk.slice(nl + 1);
+    }
     this._buffer += chunk;
-    if (this._buffer.length > MAX_LINE_BYTES) this._buffer = '';
     let index = this._buffer.indexOf('\n');
     while (index >= 0) {
       const line = this._buffer.slice(0, index).trim();
       this._buffer = this._buffer.slice(index + 1);
-      if (line) this._onLine(line);
+      if (line && line.length <= MAX_LINE_BYTES) this._onLine(line);
       index = this._buffer.indexOf('\n');
+    }
+    if (this._buffer.length > MAX_LINE_BYTES) {
+      this._buffer = '';
+      this._skipLine = true;
     }
   }
 

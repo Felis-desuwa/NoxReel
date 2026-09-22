@@ -96,6 +96,13 @@ const PCM_TO_FLAC_CODECS = new Set([
 const FLAC_SAMPLE_SECONDS = 20;
 const MIN_FLAC_SAVING = 0.08; // 省不到 8% 就不值得让用户等这几分钟
 
+// 探测类子进程的上限。正常文件 ffprobe 一两秒就完，试压 20 秒 PCM 也就几秒；
+// 这些数只是挡住畸形文件把 ffprobe 卡死、或者让它吐出几百 MB 输出。
+const PROBE_TIMEOUT_MS = 60_000;
+const FLAC_PROBE_TIMEOUT_MS = 120_000;
+const PROBE_MAX_OUTPUT = 16 * 1024 * 1024;
+const SAMPLE_MAX_OUTPUT = 64 * 1024 * 1024;
+
 /**
  * ffmpeg / ffprobe 的候选位置。
  *
@@ -111,16 +118,27 @@ function toolCandidates(name, { resourcesPath = process.resourcesPath, dirname =
   return [
     ...(resourcesPath ? [path.join(resourcesPath, 'bin', exe)] : []),
     path.join(dirname, '..', '..', 'vendor', 'bin', exe),
-    ...(platform === 'win32'
-      ? [path.join('C:\\ffmpeg\\bin\\', exe), path.join('C:\\Program Files\\ffmpeg\\bin\\', exe)]
-      : []),
+    ...(platform === 'win32' ? [path.join('C:\\Program Files\\ffmpeg\\bin\\', exe)] : []),
   ];
+}
+
+/**
+ * 普通用户就能写进去的公共位置，排在所有包管理器落点（连 winget 目录扫描）之后。
+ *
+ * C:\ 根目录的默认权限允许任何已登录账户在下面建文件夹，建的人就是所有者 ——
+ * 同一台电脑上的另一个账户放一个 C:\ffmpeg\bin\ffprobe.exe，选片时我们就会以当前用户的身份
+ * 运行它。老用户确实有把 ffmpeg 解压在这里的，所以不删，只是挪到最后。
+ */
+function toolFallbackCandidates(name, { platform = process.platform } = {}) {
+  const exe = platform === 'win32' ? `${name}.exe` : name;
+  return platform === 'win32' ? [path.join('C:\\ffmpeg\\bin\\', exe)] : [];
 }
 
 const findTool = (name) =>
   findBin(name, {
     envVar: `SYNCWATCH_${name.toUpperCase()}_PATH`,
     candidates: toolCandidates(name),
+    fallbackCandidates: toolFallbackCandidates(name),
   });
 
 const findFfmpeg = () => findTool('ffmpeg');
@@ -156,12 +174,23 @@ function cancelAll() {
  * 调用方接着要删输出目录，Windows 上 ffmpeg 还攥着写句柄时删不掉。
  * 被取消的进程退出码没有意义，不再报「退出码」。
  */
-function run(bin, args, { onStderr, signal } = {}) {
+function run(bin, args, { onStderr, signal, timeoutMs = 0, maxStdout = Infinity } = {}) {
   if (signal?.aborted) return Promise.reject(new Error('操作已取消'));
   return new Promise((resolve, reject) => {
     const p = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     activeProcesses.add(p);
     let cancelled = false;
+    // 探测类的调用（ffprobe、试压 FLAC）要有上限：畸形文件能让 ffprobe 卡住不退，
+    // 也能让它吐出几百 MB 的包列表。转封装这种分钟级的长任务不设超时，靠用户取消。
+    let failure = null;
+    const stop = (reason) => {
+      if (failure || cancelled) return;
+      failure = reason;
+      try {
+        p.kill();
+      } catch {}
+    };
+    const timer = timeoutMs > 0 ? setTimeout(() => stop(`${path.basename(bin)} 超过 ${Math.round(timeoutMs / 1000)} 秒没有结束，已停止`), timeoutMs) : null;
     const onAbort = () => {
       cancelled = true;
       try {
@@ -170,12 +199,19 @@ function run(bin, args, { onStderr, signal } = {}) {
     };
     signal?.addEventListener('abort', onAbort, { once: true });
     const cleanup = () => {
+      clearTimeout(timer);
       activeProcesses.delete(p);
       signal?.removeEventListener('abort', onAbort);
     };
-    let out = '';
+    // 按字节收、最后再解码：逐块 toString() 会把跨块的多字节字符劈坏（片名、轨道标题里的中文）
+    const chunks = [];
+    let outBytes = 0;
     let err = '';
-    p.stdout.on('data', (d) => (out += d.toString()));
+    p.stdout.on('data', (d) => {
+      outBytes += d.length;
+      if (outBytes > maxStdout) return stop(`${path.basename(bin)} 的输出超过 ${Math.round(maxStdout / 1024 / 1024)} MB，已停止`);
+      chunks.push(d);
+    });
     p.stderr.on('data', (d) => {
       const s = d.toString();
       err += s;
@@ -189,7 +225,8 @@ function run(bin, args, { onStderr, signal } = {}) {
     p.on('close', (code) => {
       cleanup();
       if (cancelled) reject(new Error('操作已取消'));
-      else if (code === 0) resolve({ stdout: out, stderr: err });
+      else if (failure) reject(new Error(failure));
+      else if (code === 0) resolve({ stdout: Buffer.concat(chunks).toString('utf8'), stderr: err });
       else reject(new Error(`${path.basename(bin)} 退出码 ${code}：${err.slice(-600)}`));
     });
   });
@@ -297,7 +334,7 @@ async function sampleBitRates(filePath, { seconds = 120 } = {}) {
     '-show_entries', 'packet=stream_index,size,duration_time',
     '-of', 'json',
     filePath,
-  ]).catch(() => ({ stdout: '' }));
+  ], { timeoutMs: PROBE_TIMEOUT_MS, maxStdout: SAMPLE_MAX_OUTPUT }).catch(() => ({ stdout: '' }));
 
   let packets;
   try {
@@ -358,7 +395,7 @@ async function measureFlacRatio(filePath, stream, duration) {
       '-map', `0:${stream.index}`,
       '-c:a', 'flac',
       tmp,
-    ]);
+    ], { timeoutMs: FLAC_PROBE_TIMEOUT_MS });
     const encoded = (await fsp.stat(tmp)).size;
     // ffmpeg 实际编到的时长可能比要求的短（比如文件到头了），用产物里的时长会更准，
     // 但那要再跑一次 ffprobe。这里直接用理论值：偏差只影响两边共同的分母。
@@ -386,7 +423,7 @@ async function probeStreams(filePath, { sample = false } = {}) {
     '-show_format',
     '-show_streams',
     filePath,
-  ]);
+  ], { timeoutMs: PROBE_TIMEOUT_MS, maxStdout: PROBE_MAX_OUTPUT });
   const data = JSON.parse(stdout);
   const raw = data.streams || [];
   const video = raw.find((s) => s.codec_type === 'video') || null;
@@ -880,7 +917,9 @@ module.exports = {
   findFfmpeg,
   findFfprobe,
   toolCandidates,
+  toolFallbackCandidates,
   toolStatus,
+  PROBE_TIMEOUT_MS,
   SUPPORTED_EXT,
   GRAPHIC_SUB_CODECS,
   PCM_TO_FLAC_CODECS,

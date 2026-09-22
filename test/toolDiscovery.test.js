@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { toolCandidates } = require('../src/main/media');
+const { toolCandidates, toolFallbackCandidates } = require('../src/main/media');
 
 const root = path.join(__dirname, '..');
 const read = (...p) => fs.readFileSync(path.join(root, ...p), 'utf8');
@@ -26,9 +26,11 @@ test('打包后的 resources/bin 和源码树的 vendor/bin 排在最前', () =>
   });
   assert.equal(got[0], path.join('C:\\App\\resources', 'bin', 'ffmpeg.exe'));
   assert.equal(got[1], path.join('C:\\App\\resources\\app', 'vendor', 'bin', 'ffmpeg.exe'));
-  // 原有的两条固定路径不能丢，老用户就是把 ffmpeg 装在那儿的
-  assert.ok(got.includes(path.join('C:\\ffmpeg\\bin\\', 'ffmpeg.exe')));
+  // 原有的两条固定路径不能丢，老用户就是把 ffmpeg 装在那儿的。
+  // 但 C:\ffmpeg\bin 任何本机账户都能建，只能排在包管理器落点之后（toolFallbackCandidates）
   assert.ok(got.includes(path.join('C:\\Program Files\\ffmpeg\\bin\\', 'ffmpeg.exe')));
+  assert.ok(!got.includes(path.join('C:\\ffmpeg\\bin\\', 'ffmpeg.exe')));
+  assert.deepEqual(toolFallbackCandidates('ffmpeg', { platform: 'win32' }), [path.join('C:\\ffmpeg\\bin\\', 'ffmpeg.exe')]);
 });
 
 test('没打包时不会凭空造出一条 undefined 路径', () => {

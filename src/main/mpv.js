@@ -60,6 +60,9 @@ const MAX_OVERLAY_SIZE = 16_384;
 const CHAT_SCRIPT_FILE = 'noxreel-chat.lua';
 const CHAT_MESSAGE_NAME = 'noxreel-chat';
 
+/** mpv JSON IPC 一行的上限。正常的回包和事件都是几百字节，1MB 已经宽松得离谱。 */
+const MAX_IPC_LINE = 1024 * 1024;
+
 /**
  * 覆盖层文本的清洗。这一步不是排版，是防注入。
  *
@@ -155,9 +158,59 @@ const MPV_CANDIDATES = [
   'C:\\Program Files (x86)\\MPV Player\\mpv.exe',
   'C:\\Program Files\\mpv\\mpv.exe',
   'C:\\Program Files (x86)\\mpv\\mpv.exe',
-  'C:\\mpv\\mpv.exe',
   path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'mpv', 'mpv.exe'),
 ];
+
+// C:\ 根目录下的文件夹任何本机账户都能建，别人放一个冒名的 mpv.exe 进去，我们就会以当前用户身份
+// 运行它。所以这类位置排在所有包管理器落点之后，只在别处都找不到时才用（见 findBin 的 fallbackCandidates）。
+const MPV_FALLBACK_CANDIDATES = ['C:\\mpv\\mpv.exe'];
+
+/**
+ * 远程源允许 ffmpeg 用到的协议。tcp / tls / httpproxy 是 http(s) 经代理时的底层，crypto 是加密 HLS。
+ * 不在里面的（ftp、rtmp、rtsp……）一律打不开 —— 它们不走 HTTP 代理，放行就等于绕过了私网过滤。
+ * mpv 的 ytdl_hook 会把 yt-dlp 给的 ftp / rtmp 地址原样交给 ffmpeg（实测会直连局域网）。
+ */
+const REMOTE_PROTOCOLS = 'http,https,tls,tcp,crypto,httpproxy,data';
+
+/**
+ * 和网络有关的启动参数。
+ *
+ * 远程源：
+ *  - --http-proxy 让 ffmpeg 的每个 http(s) 请求（含跳转、HLS 分段）都经过本机过滤代理；
+ *  - ytdl_hook **不会**把 --http-proxy 转给 yt-dlp（mpv v0.41 实测：不加这一条时 yt-dlp 直连内网），
+ *    要经 ytdl-raw-options 单独给它一个 --proxy；
+ *  - 协议白名单堵住不走 HTTP 代理的那些协议。
+ * 本地文件：
+ *  - --access-references=no：收到的「片子」可以是改了扩展名的 m3u / pls / EDL / HLS 播放列表，
+ *    mpv 会照着里面的地址去连（实测连 ftp:// 都会发起 TCP 连接）。正常的 MKV / MP4 不受影响；
+ *  - 代理照样挂上（有的话），多一道兜底。
+ */
+function networkArgs({ isRemote, proxy }) {
+  const args = [];
+  if (proxy) args.push(`--http-proxy=${proxy}`);
+  if (!isRemote) {
+    args.push('--access-references=no');
+    return args;
+  }
+  if (proxy) args.push(`--ytdl-raw-options-append=proxy=${proxy}`);
+  args.push(
+    `--stream-lavf-o-append=protocol_whitelist=${REMOTE_PROTOCOLS}`,
+    `--demuxer-lavf-o-append=protocol_whitelist=${REMOTE_PROTOCOLS}`
+  );
+  return args;
+}
+
+/**
+ * 子进程的环境：去掉 no_proxy。ffmpeg 会读它，命中的主机直接绕过 --http-proxy ——
+ * 用户环境里一句 no_proxy=* 就能让整道私网过滤失效。
+ */
+function childEnv(base = process.env) {
+  const env = { ...base };
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === 'no_proxy') delete env[key];
+  }
+  return env;
+}
 
 function buildLaunchArgs({
   ipcPath,
@@ -169,6 +222,7 @@ function buildLaunchArgs({
   headers = {},
   chatScript = null,
   chatPrompt = '',
+  proxy = null,
 } = {}) {
   const isRemote = /^https?:\/\//i.test(source);
   return [
@@ -230,6 +284,7 @@ function buildLaunchArgs({
     ...(isRemote
       ? Object.entries(headers).map(([name, value]) => `--http-header-fields-append=${name}: ${value}`)
       : []),
+    ...networkArgs({ isRemote, proxy }),
     // 播放器内发弹幕的脚本。只许这一条，而且必须是绝对路径：--load-scripts=no 仍然在，
     // 用户配置目录里的脚本一个都不会被加载，能进来的只有我们自己这一个文件。
     ...(chatScript && path.isAbsolute(chatScript)
@@ -269,6 +324,7 @@ function findMpv() {
   return findBin('mpv', {
     envVar: 'SYNCWATCH_MPV_PATH',
     candidates: process.platform === 'win32' ? MPV_CANDIDATES : [],
+    fallbackCandidates: process.platform === 'win32' ? MPV_FALLBACK_CANDIDATES : [],
   });
 }
 
@@ -280,6 +336,7 @@ class MpvController extends EventEmitter {
     this.reqId = 1;
     this.pending = new Map();
     this.buf = '';
+    this._skipLine = false;
     this.props = Object.create(null);
     this.running = false;
     // 每个覆盖层上一次发过去的文本，用来去重，见 setOverlay
@@ -306,7 +363,7 @@ class MpvController extends EventEmitter {
    *  --cache=yes        让 mpv 自己也缓冲一层
    *  --pause=yes        先暂停，等同步引擎决定什么时候放
    */
-  async launch(filePath, { startPaused = true, startAt = 0, muted = false, headers = {}, chatPrompt = '' } = {}) {
+  async launch(filePath, { startPaused = true, startAt = 0, muted = false, headers = {}, chatPrompt = '', proxy = null } = {}) {
     if (this.running) await this.quit();
 
     const bin = findMpv();
@@ -329,9 +386,10 @@ class MpvController extends EventEmitter {
       headers,
       chatScript: findChatScript(),
       chatPrompt,
+      proxy,
     });
 
-    this.proc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: false });
+    this.proc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: false, env: childEnv() });
     this.running = true;
     // 新进程身上没有任何覆盖层，缓存必须跟着清零，否则重开播放器后
     // setOverlay 会以为「文本没变」而不再发送，横幅再也不出现。
@@ -399,6 +457,8 @@ class MpvController extends EventEmitter {
   }
 
   _wireSocket() {
+    this.buf = '';
+    this._skipLine = false;
     this.sock.setEncoding('utf8');
     this.sock.on('data', (d) => this._onData(d));
     this.sock.on('close', () => this._failAllPending(new Error('mpv IPC 连接已关闭')));
@@ -406,12 +466,20 @@ class MpvController extends EventEmitter {
   }
 
   _onData(data) {
+    // 一行都没凑齐就已经超过上限：丢掉这一行剩下的部分，直到下一个换行。
+    // 我们要的回包和事件都是几百字节；不设限的话，一行没有尽头的输出会让缓冲一直涨到内存耗尽。
+    if (this._skipLine) {
+      const nl = data.indexOf('\n');
+      if (nl === -1) return;
+      this._skipLine = false;
+      data = data.slice(nl + 1);
+    }
     this.buf += data;
     let idx;
     while ((idx = this.buf.indexOf('\n')) !== -1) {
       const line = this.buf.slice(0, idx).trim();
       this.buf = this.buf.slice(idx + 1);
-      if (!line) continue;
+      if (!line || line.length > MAX_IPC_LINE) continue;
       let msg;
       try {
         msg = JSON.parse(line);
@@ -419,6 +487,10 @@ class MpvController extends EventEmitter {
         continue;
       }
       this._dispatch(msg);
+    }
+    if (this.buf.length > MAX_IPC_LINE) {
+      this.buf = '';
+      this._skipLine = true;
     }
   }
 
@@ -654,4 +726,8 @@ module.exports = {
   MAX_OVERLAY_SIZE,
   CHAT_SCRIPT_FILE,
   CHAT_MESSAGE_NAME,
+  MAX_IPC_LINE,
+  REMOTE_PROTOCOLS,
+  networkArgs,
+  childEnv,
 };

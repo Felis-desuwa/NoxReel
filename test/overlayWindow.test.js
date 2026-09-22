@@ -562,6 +562,7 @@ test('overlay:submit 只认覆盖窗自己发来的请求', () => {
   const chats = [];
   controller.on('chat', (c) => chats.push(c.text));
 
+  controller.openChat({ prompt: '弹幕：' });
   assert.deepEqual(controller.handleSubmit(submitEvent(controller), { text: '这段真好看' }), {
     sent: true,
     text: '这段真好看',
@@ -597,14 +598,19 @@ test('提交的正文：空串是「取消」，控制字符换成空格，超�
   assert.equal(focused.length, 1);
   assert.equal(win().ignoreMouse, true);
 
+  // 每一次提交都对应一次按快捷键弹出的输入条（提交之后输入条就关了）
+  const submit = (payload) => {
+    controller.openChat({ prompt: '弹幕：' });
+    return controller.handleSubmit(submitEvent(controller), payload);
+  };
   // 换行是弹幕帧里的分隔符，不能由正文带进来
-  assert.equal(controller.handleSubmit(submitEvent(controller), { text: ' 前\n后\t ' }).text, '前 后');
+  assert.equal(submit({ text: ' 前\n后\t ' }).text, '前 后');
   // 截断按码点：不能把 emoji 劈成半个代理对
   const long = '好'.repeat(MAX_CHAT_TEXT + 50);
-  assert.equal(Array.from(controller.handleSubmit(submitEvent(controller), { text: long }).text).length, MAX_CHAT_TEXT);
+  assert.equal(Array.from(submit({ text: long }).text).length, MAX_CHAT_TEXT);
   // 一次灌几万字：不是截断，是拒
-  assert.throws(() => controller.handleSubmit(submitEvent(controller), { text: 'a'.repeat(9000) }), /无效/);
-  assert.throws(() => controller.handleSubmit(submitEvent(controller), { text: { evil: true } }), /无效/);
+  assert.throws(() => submit({ text: 'a'.repeat(9000) }), /无效/);
+  assert.throws(() => submit({ text: { evil: true } }), /无效/);
 });
 
 test('正文清洗是纯函数，单独也能用', () => {

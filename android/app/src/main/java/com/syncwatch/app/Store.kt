@@ -59,13 +59,19 @@ class Store(private val context: Context) {
         chunkCount: Int,
         hashesJson: String,
     ): String {
-        val hashes = JSONArray(hashesJson).let { arr ->
-            Array(arr.length()) { arr.getString(it) }
-        }
         // fileId 来自对端的 MANIFEST 控制消息，直接拼进文件名等于把路径交给对方。
         // 含 ".." 的 fileId 会让接收缓存落到 media 目录之外，既不受清理管辖，
         // 内容还完全由对方决定。桌面端主进程有 FILE_ID_RE 挡这一层，这边一直没有。
         require(FILE_ID_RE.matches(fileId)) { "非法的 fileId" }
+        require(sessions.size < MAX_SESSIONS) { "同时打开的接收会话太多" }
+        val hashes = JSONArray(hashesJson).let { arr ->
+            Array(arr.length()) { arr.getString(it) }
+        }
+        // 清单的尺寸全由对端给出，这里自己再核一遍，别把后面的分配和按片写盘交给对方决定：
+        // 片长 1 字节的「100MB 文件」要分配上亿个元素，直接把 App 撑爆；哈希条数不够时
+        // 写到后面的片会越界崩掉；片数比文件大小算出来的多，多出来的片会写到文件尾之外。
+        manifestProblem(size, chunkSize, chunkCount, hashes.size)?.let { throw IllegalArgumentException(it) }
+        require(hashes.all { HASH_RE.matches(it) }) { "清单里的分片哈希格式不对" }
         val dataFile = File(mediaDir(), "$fileId.dat")
         val partFile = File(mediaDir(), "$fileId.swpart")
         require(dataFile.canonicalPath.startsWith(mediaDir().canonicalPath + File.separator)) {
@@ -114,6 +120,8 @@ class Store(private val context: Context) {
     fun writeChunk(sessionId: String, index: Int, b64: String): String {
         val s = sessions[sessionId] ?: return err("no-session")
         if (index < 0 || index >= s.chunkCount) return err("bad-index")
+        // 解码要先按串长分配整块内存：长度已经不对的串，别等解出来再拦
+        if (b64.length > base64Chars(s.chunkLen(index))) return err("bad-length")
         val bytes = Base64.decode(b64, Base64.NO_WRAP)
         return s.write(index, bytes)
     }
@@ -167,6 +175,34 @@ class Store(private val context: Context) {
     private fun err(reason: String): String =
         JSONObject().put("ok", false).put("reason", reason).toString()
 
+    companion object {
+        /** 同时开着的接收会话上限。JS 最多开两个（当前项 + 下一项），多留一点余量。 */
+        const val MAX_SESSIONS = 4
+
+        /** 片长范围。桌面端固定 2MB；上下各留足余量，只挡明显不对的清单。 */
+        const val MIN_CHUNK_SIZE = 64 * 1024
+        const val MAX_CHUNK_SIZE = 16 * 1024 * 1024
+
+        private val HASH_RE = Regex("^[a-f0-9]{64}$")
+
+        /**
+         * 清单的尺寸信息说得通吗？说得通返回 null，否则返回原因（会原样显示给用户）。
+         * 与 swarm.js 的 manifestShapeOk 同一套判据，外加片长的上下限。
+         */
+        fun manifestProblem(size: Long, chunkSize: Int, chunkCount: Int, hashCount: Int): String? {
+            if (size <= 0) return "清单里的文件大小不对"
+            if (chunkSize < MIN_CHUNK_SIZE || chunkSize > MAX_CHUNK_SIZE) return "清单里的分片大小不对"
+            if (chunkCount.toLong() != Math.floorDiv(size + chunkSize - 1, chunkSize.toLong())) {
+                return "清单里的分片数和文件大小对不上"
+            }
+            if (hashCount != chunkCount) return "清单里的分片哈希条数不对"
+            return null
+        }
+
+        /** [bytes] 个字节编成不换行的 base64 有多少个字符。 */
+        fun base64Chars(bytes: Int): Int = Math.floorDiv(bytes + 2, 3) * 4
+    }
+
     /* ------------------------------------------------------------------ */
 
     class Session(
@@ -212,7 +248,7 @@ class Store(private val context: Context) {
             }
         }
 
-        private fun chunkLen(index: Int): Int =
+        fun chunkLen(index: Int): Int =
             minOf(chunkSize.toLong(), size - index.toLong() * chunkSize).toInt()
 
         fun write(index: Int, bytes: ByteArray): String {

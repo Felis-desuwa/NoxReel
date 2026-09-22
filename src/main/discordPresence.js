@@ -25,6 +25,14 @@ const OP_PONG = 4;
 const MIN_INTERVAL_MS = 15000;
 const RETRY_MS = 20000;
 const CONNECT_TIMEOUT_MS = 3000;
+// 连上管道之后等 READY 的上限。管道那头不一定是 Discord（本机任何程序都能先占住 discord-ipc-0），
+// 握手之后一声不吭的话，这条连接会一直挂着，状态也永远发不出去。
+const HANDSHAKE_TIMEOUT_MS = 10000;
+// Discord 回的帧都是几 KB 的 JSON（READY 带一点用户信息）。长度字段是对方填的，
+// 原来放到 1MB，一个恶意的管道服务端就能让我们每收一个字节都把整块缓冲拷贝一遍。
+const MAX_FRAME_BYTES = 64 * 1024;
+// 对方狂发 PING 却不读我们回的 PONG 时，写缓冲会一直涨。超过这个数就断开
+const MAX_PENDING_WRITE = 256 * 1024;
 
 // 按钮只许指向这两处：房间链接的跳转页、发布页。别的 URL 一律丢掉。
 const BUTTON_URL_PREFIXES = ['https://felis-desuwa.github.io/NoxReel/', 'https://github.com/Felis-desuwa/NoxReel/'];
@@ -37,21 +45,44 @@ function encodeFrame(op, payload) {
   return Buffer.concat([head, json]);
 }
 
-/** 把字节流切成一帧帧。半帧留着等下一块。 */
+/**
+ * 把字节流切成一帧帧。半帧留着等下一块。
+ *
+ * 半帧期间只把块攒进列表，凑够一整帧才拼一次：原来每来一块都把已收的全部拼接一遍，
+ * 对方把一个大帧一字节一字节地发，拷贝量就是帧长的平方。
+ */
 class FrameReader {
-  constructor() {
-    this.buf = Buffer.alloc(0);
+  constructor({ maxFrame = MAX_FRAME_BYTES } = {}) {
+    this.maxFrame = maxFrame;
+    this.chunks = [];
+    this.length = 0;
+  }
+  _take(n) {
+    const out = this.chunks.length === 1 ? this.chunks[0] : Buffer.concat(this.chunks, this.length);
+    const head = out.subarray(0, n);
+    const rest = out.subarray(n);
+    this.chunks = rest.length ? [rest] : [];
+    this.length = rest.length;
+    return head;
+  }
+  _peekHeader() {
+    const first = this.chunks[0];
+    if (first.length >= 8) return first;
+    return (this.chunks = [Buffer.concat(this.chunks, this.length)])[0];
   }
   push(chunk) {
-    this.buf = Buffer.concat([this.buf, chunk]);
+    if (chunk.length) {
+      this.chunks.push(chunk);
+      this.length += chunk.length;
+    }
     const frames = [];
-    while (this.buf.length >= 8) {
-      const op = this.buf.readInt32LE(0);
-      const len = this.buf.readInt32LE(4);
-      if (len < 0 || len > 1024 * 1024) throw new Error('Discord IPC 帧长度不对');
-      if (this.buf.length < 8 + len) break;
-      const body = this.buf.subarray(8, 8 + len).toString('utf8');
-      this.buf = this.buf.subarray(8 + len);
+    while (this.length >= 8) {
+      const head = this._peekHeader();
+      const op = head.readInt32LE(0);
+      const len = head.readInt32LE(4);
+      if (len < 0 || len > this.maxFrame) throw new Error('Discord IPC 帧长度不对');
+      if (this.length < 8 + len) break;
+      const body = this._take(8 + len).subarray(8).toString('utf8');
       let data = null;
       try {
         data = JSON.parse(body);
@@ -68,8 +99,11 @@ function pipeCandidates() {
   return Array.from({ length: 10 }, (_, i) => `${base.replace(/\/$/, '')}/discord-ipc-${i}`);
 }
 
+// 只收字符串和数字，而且先按 UTF-16 长度截一刀再做别的：渲染进程给个几十 MB 的字符串
+// （或者一个 String() 起来就是几十 MB 的大数组），原来会被整个 Array.from 成一个同样长的数组。
 const clip = (value, max) => {
-  const s = String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
+  const raw = typeof value === 'string' ? value : typeof value === 'number' && Number.isFinite(value) ? String(value) : '';
+  const s = raw.slice(0, max * 4).replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
   return Array.from(s).slice(0, max).join('');
 };
 
@@ -94,7 +128,7 @@ function sanitizeActivity(raw) {
     if (sane(end) && end > start) activity.timestamps.end = end;
   }
 
-  const size = Array.isArray(raw.partySize) ? raw.partySize.map(Number) : null;
+  const size = Array.isArray(raw.partySize) && raw.partySize.length === 2 ? raw.partySize.map(Number) : null;
   const partyId = clip(raw.partyId, 64);
   if (partyId && size && size.length === 2 && size.every((n) => Number.isSafeInteger(n) && n >= 1 && n <= 64) && size[0] <= size[1]) {
     activity.party = { id: partyId, size };
@@ -105,7 +139,7 @@ function sanitizeActivity(raw) {
   const buttons = [];
   for (const b of Array.isArray(raw.buttons) ? raw.buttons.slice(0, 2) : []) {
     const label = clip(b?.label, 32);
-    const url = String(b?.url || '');
+    const url = typeof b?.url === 'string' ? b.url : '';
     if (!label || url.length > 512 || /\s/.test(url)) continue;
     if (!BUTTON_URL_PREFIXES.some((p) => url.startsWith(p))) continue;
     buttons.push({ label, url });
@@ -121,12 +155,20 @@ class DiscordPresence {
    * @param {string} [o.pipePath]         只连这一个管道（开发期测试用）
    * @param {(status: string) => void} [o.onStatus]  idle / connecting / ready / unavailable / unconfigured
    */
-  constructor({ clientId, pipePath = null, onStatus = () => {}, minIntervalMs = MIN_INTERVAL_MS, retryMs = RETRY_MS } = {}) {
+  constructor({
+    clientId,
+    pipePath = null,
+    onStatus = () => {},
+    minIntervalMs = MIN_INTERVAL_MS,
+    retryMs = RETRY_MS,
+    handshakeTimeoutMs = HANDSHAKE_TIMEOUT_MS,
+  } = {}) {
     this.clientId = String(clientId || '');
     this.pipePath = pipePath;
     this.onStatus = onStatus;
     this.minIntervalMs = minIntervalMs;
     this.retryMs = retryMs;
+    this.handshakeTimeoutMs = handshakeTimeoutMs;
     this.status = this.clientId ? 'idle' : 'unconfigured';
     this.socket = null;
     this.ready = false;
@@ -199,6 +241,9 @@ class DiscordPresence {
 
   _kick() {
     if (this.ready) return this._scheduleFlush();
+    // 已经连上、正在等 READY：什么都不用做，READY 一到就会按最新的 target 发。
+    // 原来这里会再开一条连接，旧连接没人关、它的 READY 还会借新连接把状态发出去（串线）。
+    if (this.socket) return;
     if (!this.connecting && !this.retryTimer) this._connect();
   }
 
@@ -222,9 +267,15 @@ class DiscordPresence {
     this.lastSentAt = Date.now();
   }
 
-  _write(op, payload) {
+  _write(op, payload, sock = this.socket) {
+    if (!sock || sock.destroyed) return;
+    // 对方不读我们写的东西（比如狂发 PING 却不收 PONG）：别让写缓冲无限涨，断掉这条连接
+    if (sock.writableLength > MAX_PENDING_WRITE) {
+      sock.destroy();
+      return;
+    }
     try {
-      this.socket?.write(encodeFrame(op, payload));
+      sock.write(encodeFrame(op, payload));
     } catch {}
   }
 
@@ -274,7 +325,17 @@ class DiscordPresence {
   _adopt(sock) {
     this.socket = sock;
     const reader = new FrameReader();
+    // 握手之后迟迟等不到 READY：当成连不上，断开后按老规矩过一阵再试
+    const handshakeTimer = setTimeout(() => {
+      if (this.socket === sock && !this.ready) sock.destroy();
+    }, this.handshakeTimeoutMs);
+    if (handshakeTimer.unref) handshakeTimer.unref();
     sock.on('data', (chunk) => {
+      // 不是当前这条连接的数据一概不认：它的 READY / CLOSE 不能拿去动当前连接的状态
+      if (this.socket !== sock) {
+        sock.destroy();
+        return;
+      }
       let frames;
       try {
         frames = reader.push(chunk);
@@ -282,10 +343,14 @@ class DiscordPresence {
         sock.destroy();
         return;
       }
-      for (const f of frames) this._onFrame(f);
+      for (const f of frames) {
+        if (this.socket !== sock) break;
+        this._onFrame(f, sock);
+      }
     });
     sock.on('error', () => {});
     sock.on('close', () => {
+      clearTimeout(handshakeTimer);
       if (this.socket !== sock) return;
       this.socket = null;
       this.ready = false;
@@ -296,14 +361,17 @@ class DiscordPresence {
       if (!this.destroyed && this.target) this._scheduleRetry();
       else this._setStatus('idle');
     });
-    this._write(OP_HANDSHAKE, { v: 1, client_id: this.clientId });
+    this._write(OP_HANDSHAKE, { v: 1, client_id: this.clientId }, sock);
   }
 
-  _onFrame({ op, data }) {
-    if (op === OP_PING) return this._write(OP_PONG, data || {});
-    if (op === OP_CLOSE) return this.socket?.destroy();
+  /** 一帧只作用于收到它的那条连接（sock），不去碰 this.socket 指向的别的连接。 */
+  _onFrame({ op, data }, sock = this.socket) {
+    if (!sock || sock !== this.socket) return;
+    if (op === OP_PING) return this._write(OP_PONG, data || {}, sock);
+    if (op === OP_CLOSE) return sock.destroy();
     if (op !== OP_FRAME || !data) return;
     if (data.cmd === 'DISPATCH' && data.evt === 'READY') {
+      if (this.ready) return;
       this.ready = true;
       this._setStatus('ready');
       this._scheduleFlush();
@@ -312,7 +380,7 @@ class DiscordPresence {
     if (data.evt === 'ERROR' && !this.ready) {
       // 应用 ID 不对之类：再连也没用，别循环
       this._setStatus('unavailable');
-      this.socket?.destroy();
+      sock.destroy();
     }
   }
 
@@ -338,6 +406,9 @@ module.exports = {
   FrameReader,
   pipeCandidates,
   BUTTON_URL_PREFIXES,
+  MAX_FRAME_BYTES,
+  MAX_PENDING_WRITE,
+  OP_PING,
   OP_HANDSHAKE,
   OP_FRAME,
   OP_CLOSE,

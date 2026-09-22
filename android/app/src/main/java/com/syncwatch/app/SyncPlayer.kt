@@ -3,15 +3,16 @@ package com.syncwatch.app
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import com.google.android.exoplayer2.C
 import com.google.android.exoplayer2.ExoPlayer
 import com.google.android.exoplayer2.MediaItem
+import com.google.android.exoplayer2.PlaybackException
 import com.google.android.exoplayer2.Player
 import com.google.android.exoplayer2.source.ProgressiveMediaSource
 import com.google.android.exoplayer2.ui.StyledPlayerView
 import com.google.android.exoplayer2.source.DefaultMediaSourceFactory
 import com.google.android.exoplayer2.source.MediaSource
-import com.google.android.exoplayer2.upstream.DefaultHttpDataSource
 import java.util.concurrent.atomic.AtomicInteger
 import org.json.JSONObject
 
@@ -77,16 +78,15 @@ class SyncPlayer(private val context: Context) {
 
     /**
      * 播放网页解析出的临时直链；HLS/DASH/渐进式 MP4 由 ExoPlayer 自动选择。
+     *
+     * 数据源是 [PublicHttpDataSource]：清单、分片、每一跳重定向在真正建连时都会查一遍
+     * 是不是公网地址。加载前 NativeBridge 那道检查只看字面，挡不住重定向、子资源和 DNS 重绑定。
      * @return 这次换片的快照代号。
      */
     fun loadRemote(url: String, headers: Map<String, String>): Int {
         val generation = generationSeq.incrementAndGet()
         main.post {
-            val http = DefaultHttpDataSource.Factory()
-                .setAllowCrossProtocolRedirects(false)
-                .setConnectTimeoutMs(15_000)
-                .setReadTimeoutMs(30_000)
-                .setDefaultRequestProperties(headers)
+            val http = PublicHttpDataSource.Factory(headers)
             val source = DefaultMediaSourceFactory(http)
                 .createMediaSource(MediaItem.fromUri(url))
             replacePlayer(source, generation)
@@ -110,6 +110,11 @@ class SyncPlayer(private val context: Context) {
             }
             override fun onPlayWhenReadyChanged(p: Boolean, reason: Int) {
                 updateSnap(generation) { it.copy(playWhenReady = p) }
+            }
+            // 出错时 ExoPlayer 自己回到 IDLE，快照会照实报 idle；这里只留一条日志，
+            // 被 NetGuard 拦下的内网地址也是从这里看出来的
+            override fun onPlayerError(error: PlaybackException) {
+                Log.w(TAG, "播放出错：${error.errorCodeName}", error)
             }
         })
         exo.setMediaSource(source)
@@ -204,4 +209,8 @@ class SyncPlayer(private val context: Context) {
         val playWhenReady: Boolean,
         val state: Int,
     )
+
+    companion object {
+        private const val TAG = "NoxReel"
+    }
 }

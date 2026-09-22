@@ -29,33 +29,49 @@ const PROVIDERS = [
   { url: 'https://ipinfo.io/json', pick: (j) => j.country },
 ];
 
-function fetchJson(url, timeoutMs = 4000) {
+const MAX_BODY_BYTES = 64 * 1024;
+
+/**
+ * setTimeout 只管「多久没动静」：对面每三秒回一个字节，64KB 的上限要拖好几天才碰得到，
+ * 启动时的地区提示也就一直出不来。所以再加一道从发起算起的硬上限，响应体按字节数截。
+ */
+function fetchJson(url, timeoutMs = 4000, { get = https.get } = {}) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers: { 'User-Agent': 'NoxReel/0.4.2' } }, (res) => {
+    let deadline = null;
+    const done = (fn, value) => {
+      clearTimeout(deadline);
+      fn(value);
+    };
+    const req = get(url, { headers: { 'User-Agent': 'NoxReel/0.4.2' } }, (res) => {
       if (res.statusCode !== 200) {
         res.resume();
-        return reject(new Error(`HTTP ${res.statusCode}`));
+        return done(reject, new Error(`HTTP ${res.statusCode}`));
       }
-      let body = '';
-      res.setEncoding('utf8');
+      const chunks = [];
+      let size = 0;
       res.on('data', (d) => {
-        body += d;
-        if (body.length > 64 * 1024) req.destroy(new Error('响应过大'));
+        size += d.length;
+        if (size > MAX_BODY_BYTES) return req.destroy(new Error('响应过大'));
+        chunks.push(d);
       });
       res.on('end', () => {
         try {
-          resolve(JSON.parse(body));
+          done(resolve, JSON.parse(Buffer.concat(chunks).toString('utf8')));
         } catch (e) {
-          reject(e);
+          done(reject, e);
         }
       });
+      res.on('error', (e) => done(reject, e));
     });
+    deadline = setTimeout(() => req.destroy(new Error('超时')), timeoutMs * 2);
     req.setTimeout(timeoutMs, () => req.destroy(new Error('超时')));
-    req.on('error', reject);
+    req.on('error', (e) => done(reject, e));
   });
 }
 
 let cached = null;
+// 同时来的几次检测共用一趟（页面连着点「重新检测」不该每次往三个服务各打一枪）
+let checking = null;
 
 /**
  * @returns {Promise<{country:string|null, determined:boolean, inScope:boolean, notice:string|null}>}
@@ -63,7 +79,14 @@ let cached = null;
  */
 async function check({ force = false } = {}) {
   if (cached && !force) return cached;
+  if (checking) return checking;
+  checking = probe().finally(() => {
+    checking = null;
+  });
+  return checking;
+}
 
+async function probe() {
   if (process.env.SYNCWATCH_SKIP_GEO === '1') {
     cached = { country: null, determined: false, inScope: true, notice: null };
     return cached;
@@ -96,4 +119,4 @@ async function check({ force = false } = {}) {
   return cached;
 }
 
-module.exports = { check, OUT_OF_SCOPE };
+module.exports = { check, fetchJson, OUT_OF_SCOPE, MAX_BODY_BYTES };

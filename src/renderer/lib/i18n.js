@@ -585,7 +585,8 @@ const EN = new Map(Object.entries({
   '桥接程序未构建': 'Bridge not built',
   '只支持 Windows': 'Windows only',
   '这一部还没收完': 'This video is not fully received yet',
-  '这个链接要带请求头': 'This link needs request headers',
+  '在线链接只用 mpv 播放': 'Online links play in mpv only',
+  '在线链接只能用 mpv 播放': 'Online links can only be played in mpv',
   '不可用': 'Unavailable',
   '桥接程序未构建（npm run build:bridge）': 'The bridge program is not built (npm run build:bridge)',
   '切换失败，已回到 mpv': 'Switching failed, back on mpv',
@@ -722,12 +723,50 @@ const EN = new Map(Object.entries({
   '还有人要来？这个邀请码接着发就行，不用重新生成。': 'More people coming? Just send the same invite code again; no need to make a new one.',
   '等待开播': 'Waiting to start',
   '下载 NoxReel': 'Download NoxReel',
+  // 0.7.5：加入流程的收尾、房间里收到新邀请、设置里的人数上限
+  '要离开当前房间吗？': 'Leave the current room?',
+  '收到了一条新的邀请。加入它要先离开当前房间，你这边的播放和传输都会停下。':
+    'You received a new invite. Joining it means leaving the current room first, and your playback and transfers here will stop.',
+  '离开并加入': 'Leave and join',
+  '要放弃正在准备的放映吗？': 'Abandon the watch party you are preparing?',
+  '收到了一条新的邀请。加入它要先停下正在准备的这部片。':
+    'You received a new invite. Joining it means stopping the video you are preparing.',
+  '放弃并加入': 'Abandon and join',
+  '你已经在这个房间里了。': 'You are already in this room.',
+  '同时连着的人太多了，多出来的连接请求已忽略': 'Too many simultaneous connections; the extra connection requests were ignored',
+  '操作太频繁了，稍后再试': 'Too many changes at once; try again in a moment',
+  '房主那边一直没能和你直连，你已被移出房间。可以请房主改发一对一邀请，或者双方在设置里配置 TURN 后再试。':
+    'The host could never connect to you directly, so you were removed from the room. Ask the host for a one-to-one invite, or both set up TURN in Settings and try again.',
+  '房间里正有好几个人在连接，稍后再点一次链接试试。': 'Several people are connecting to the room right now. Open the link again in a moment.',
+  '只影响以后新开的房间；这个房间的人数上限请在邀请区调整。':
+    'Only affects rooms you open later; change this room’s limit in the invite area.',
   简体中文: 'Simplified Chinese',
   繁体中文: 'Traditional Chinese',
   中文: 'Chinese',
   英文: 'English',
   日文: 'Japanese',
   韩文: 'Korean',
+  '写入接收缓存失败，磁盘可能已满': 'Could not write to the receive cache; the disk may be full',
+  '无效的媒体清单': 'Invalid media manifest',
+  '消息必须是 JSON 对象': 'Messages must be JSON objects',
+  '加入房间太频繁，请稍后再试': 'Joining rooms too often. Please try again later',
+  '创建房间太频繁，请稍后再试': 'Creating rooms too often. Please try again later',
+  '服务器的房间数已满，请稍后再试': 'The server has reached its room limit. Please try again later',
+  'name 必须是字符串': 'name must be a string',
+  'maxMembers 必须是数字': 'maxMembers must be a number',
+  'signal 需要字符串 to 和对象 payload': 'signal needs a string "to" and an object "payload"',
+  '消息发得太快，连接已断开': 'Messages were sent too fast, so the connection was closed',
+  '服务器处理这条消息时出错': 'The server failed to process this message',
+  '本机网络过滤代理启动失败，为防访问内网已拒绝打开在线链接': 'The local network filter proxy failed to start, so online links are blocked to protect your local network',
+  '正在解析的链接太多，稍后再试': 'Too many links are being resolved. Try again later',
+  '缓存目录未经用户选择，已拒绝': 'Rejected a cache folder that was not chosen by the user',
+  '本机过滤代理没有启动，已拒绝打开第三方页面': 'The local filter proxy is not running, so third-party pages are blocked',
+  '测速节点的响应过大': 'The speed test server response was too large',
+  '房主这边正在连接的人太多，暂时进不来，请稍后再试': 'Too many people are connecting to the host right now. Please try again later',
+  '你已经被移出这个房间，本场放映不能再加入': 'You were removed from this room and cannot rejoin this screening',
+  '你被移出了房间：一直没能和房主建立直连': 'You were removed from the room: a direct connection to the host never came up',
+  '房主这边还有人在连接，请稍后再试': 'Others are still connecting to the host. Please try again later',
+  '只有房主能移出成员': 'Only the host can remove members',
 }));
 
 const trimEnd = (text) => String(text).replace(/[.。]+$/, '');
@@ -788,6 +827,13 @@ const INVALID_LABELS = {
 };
 
 const EN_PATTERNS = [
+  // 0.7.5 加固
+  [/^(.+) 被停止供片后仍在持续发送数据，已断开连接$/, '$1 kept sending data after being cut off as a source and was disconnected'],
+  [/^(.+) 送来的分片多次校验失败，已停止向他要片$/, 'Chunks from $1 failed verification repeatedly; no longer requesting chunks from them'],
+  [/^写入接收缓存失败：(.*)$/, (_all, detail) => `Could not write to the receive cache: ${translate(detail, 'en')}`],
+  [/^信令消息太大（上限 (\d+) 字节）$/, 'Signaling message too large (limit $1 bytes)'],
+  [/^(.+) 超过 (\d+) 秒没有结束，已停止$/, '$1 did not finish within $2 seconds and was stopped'],
+  [/^(.+) 的输出超过 (\d+) MB，已停止$/, 'The output of $1 exceeded $2 MB, so it was stopped'],
   // 播放列表表格、就绪、行内加片（0.7）
   [/^传输中 (\d+)%$/, 'Transferring $1%'],
   [/^传输已暂停 (\d+)%$/, 'Transfer paused $1%'],
@@ -964,7 +1010,7 @@ const EN_PATTERNS = [
   [/^已指定 (.+) 的路径$/, 'Path set for $1'],
   // 下拉框里那一项：「PotPlayer（未找到）」。原因是枚举出来的那几个，不会误伤别的括号文案。
   [
-    /^(.+)（(未找到|桥接程序未构建|只支持 Windows|这一部还没收完|这个链接要带请求头|不可用)）$/,
+    /^(.+)（(未找到|桥接程序未构建|只支持 Windows|这一部还没收完|在线链接只用 mpv 播放|不可用)）$/,
     (_all, name, reason) => `${name} (${translate(reason, 'en')})`,
   ],
   [/^当前 (\d+) \/ (\d+) 人（包含房主）$/, '$1 / $2 people, including the host'],

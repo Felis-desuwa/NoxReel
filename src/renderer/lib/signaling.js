@@ -18,6 +18,18 @@ const SW2_PREFIX = 'SW2-';
 const NR2_PREFIX = 'NR2-';
 const CODE_PREFIX = 'NR3-';
 const MAX_CODE_LENGTH = 256 * 1024;
+// 粘贴框、深链接交进来的整段文本的上限。码本身最长 MAX_CODE_LENGTH，前后再带点聊天里的话；
+// 超过这个量的输入不可能是正常的邀请，直接拒掉，不去跑下面那一串正则。
+const MAX_INPUT_LENGTH = 1024 * 1024;
+// 解压后的上限。正常的码解开是几 KB 的 JSON（SDP 占大头）；而 gzip 的压缩比能到一千倍，
+// 256KB 的码能解出两百多 MB —— 不设上限，一条恶意邀请粘进来就能把界面卡死、内存撑爆。
+const MAX_DECODED_BYTES = 1024 * 1024;
+
+function tooLong() {
+  const err = new Error('邀请码异常过长');
+  err.code = 'TOO_LONG';
+  return err;
+}
 
 async function gzip(str) {
   const cs = new CompressionStream('gzip');
@@ -25,10 +37,28 @@ async function gzip(str) {
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
+/** 边解边数，超过 MAX_DECODED_BYTES 立刻停下，不把整块解压结果先堆进内存。 */
 async function gunzip(bytes) {
-  const ds = new DecompressionStream('gzip');
-  const stream = new Blob([bytes]).stream().pipeThrough(ds);
-  return new TextDecoder().decode(await new Response(stream).arrayBuffer());
+  const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')).getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_DECODED_BYTES) {
+      reader.cancel().catch(() => {});
+      throw tooLong();
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return new TextDecoder().decode(out);
 }
 
 // 零宽字符和软连字符都不算 \s，剥空白剥不掉它们，会一路混进 base64 正文直到 atob 才炸。
@@ -219,8 +249,27 @@ const BODY_CHARS = '[A-Za-z0-9._%-]';
 const LINK_RE = new RegExp(`noxreel://([jaJA])/(${BODY_CHARS}+)`, 'i');
 // https 形式不绑死域名：将来跳转页换了地址，旧版本发出去的链接照样能贴进来。
 // 只认 https://…#j/… 或 #a/… 这一种形状，正文后面的 '/' 结束符不在字母表里，自然截断。
-const WEB_LINK_RE = new RegExp(`https?://[^\\s#<>"'\`]+#([jaJA])/(${BODY_CHARS}+)`, 'i');
+const WEB_HASH_RE = new RegExp(`#([jaJA])/(${BODY_CHARS}+)`, 'g');
+// 网址里不会出现、用来给「http(s):// 到 # 之间那一段」划界的字符（空白在这之前已经剥光了）
+const URL_STOP = '#<>"\'`';
 const BARE_RE = new RegExp(`(?:NR3|NR2|SW2|SW1)-${BODY_CHARS}+`);
+
+/**
+ * 找 https://…#j/正文 这种链接，等价于 /https?:\/\/[^\s#<>"'`]+#([jaJA])\/(正文+)/i。
+ *
+ * 原来就是写成这条正则的。可输入里的空白已经全部剥掉，一长串「http://http://…」里每个
+ * http:// 都会一路扫到末尾找 #、再逐字回溯 —— 平方级，几百 KB 的输入能把界面卡上好几秒。
+ * 这里反过来：先找 #j/、#a/，再往回看它前面那一段（到上一个划界字符为止）里有没有
+ * http(s)://，每个字符只看一遍。
+ */
+function findWebLink(text) {
+  for (const hit of text.matchAll(WEB_HASH_RE)) {
+    let start = hit.index;
+    while (start > 0 && !URL_STOP.includes(text[start - 1])) start--;
+    if (/https?:\/\/./i.test(text.slice(start, hit.index))) return hit;
+  }
+  return null;
+}
 
 /**
  * 从一段文本里把邀请码找出来。
@@ -235,7 +284,9 @@ const BARE_RE = new RegExp(`(?:NR3|NR2|SW2|SW1)-${BODY_CHARS}+`);
  * 靠这一步救回来），最后才在剩下的文本里找码。
  */
 export function unwrapInviteInput(input) {
-  const cleaned = String(input || '')
+  const raw = String(input || '');
+  if (raw.length > MAX_INPUT_LENGTH) throw tooLong();
+  const cleaned = raw
     .replace(INVISIBLE_RE, '')
     // 邮件/聊天软件的引用前缀。'>' 不在码的字母表里，留着会把折行的码从中间截断。
     .replace(/^[ \t]*>+[ \t]?/gm, '');
@@ -246,7 +297,7 @@ export function unwrapInviteInput(input) {
   const text = cleaned.replace(/\s+/g, '');
   const segments = cleaned.split(/\s+/).filter(Boolean);
 
-  const link = LINK_RE.exec(text) || WEB_LINK_RE.exec(text);
+  const link = LINK_RE.exec(text) || findWebLink(text);
   if (link) {
     let body = link[2];
     if (body.includes('%')) {
@@ -308,14 +359,16 @@ export async function decodeCode(code) {
   let json;
   try {
     json = await unpack(prefix, body);
-  } catch {
+  } catch (first) {
+    if (first?.code === 'TOO_LONG') throw first;
     // '.' 既是字母表成员，也可能是句尾的那个句号 —— 提取的时候分不清。
     // 头一次解不开就把尾部的点削掉再试一次，别为了一个标点让人重新要一份码。
     const stripped = body.replace(/\.+$/, '');
     try {
       if (!stripped || stripped === body) throw new Error('nothing to strip');
       json = await unpack(prefix, stripped);
-    } catch {
+    } catch (second) {
+      if (second?.code === 'TOO_LONG') throw second;
       throw new Error(
         '邀请码损坏或不完整 —— 可能是复制时漏了一截，也可能是被聊天软件的格式化改掉了字符；把码放进反引号里再发一次通常能解决'
       );
@@ -346,6 +399,10 @@ export class WsSignaling extends Emitter {
     this._retry = 0;
     this._joinedOnce = false; // 曾经真的进过房吗。只有进过才值得自动重连
     this._closedByUs = false;
+    // 房主续期凭据。服务器只在房主自己的 joined 里发它，重连时带上才能拿回房主身份 ——
+    // 不然 HOST_ID_RESERVED 会把掉线重连的房主本人也挡在门外，之后再也收不到 peer-join。
+    // 只放在这个实例里：不交给调用方、不进邀请码、不广播。
+    this._hostToken = null;
   }
 
   connect() {
@@ -368,6 +425,7 @@ export class WsSignaling extends Emitter {
           peerId: this.peerId,
           name: this.name,
           maxMembers: this.maxMembers,
+          ...(this._hostToken ? { hostToken: this._hostToken } : {}),
         });
       };
 
@@ -378,15 +436,20 @@ export class WsSignaling extends Emitter {
         } catch {
           return;
         }
+        // 服务器是用户自己填的地址：null、数组、数字都可能收到，读 msg.t 之前先挡掉
+        if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
 
         if (msg.t === 'joined') {
           this._retry = 0; // 真正进房了，退避才该归零
           this._joinedOnce = true;
+          // 每次进房都以服务器这次的答复为准：房间被重建、自己不再是房主时它就没有这一项
+          const { hostToken, ...joined } = msg;
+          this._hostToken = typeof hostToken === 'string' && hostToken ? hostToken : null;
           if (!settled) {
             settled = true;
-            resolve(msg);
+            resolve(joined);
           }
-          this.emit('joined', msg);
+          this.emit('joined', joined);
           return;
         }
         if (msg.t === 'error') {

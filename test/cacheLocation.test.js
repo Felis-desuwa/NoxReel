@@ -200,6 +200,11 @@ test('标成垃圾的目录下次启动无条件回收，不看 PID 也不看主
   const trash = path.join(dir, 'trash-abcdef123456');
   await fsp.mkdir(trash);
   await fsp.writeFile(path.join(trash, 'x'), 'y');
+  // cleanupRun 改名时 run.json 跟着过去，这就是「标好的垃圾」的凭据。标记里是别的机器、活着的 PID
+  await fsp.writeFile(
+    path.join(trash, 'run.json'),
+    JSON.stringify({ app: 'noxreel', host: '别的机器', pid: 1, startedAt: 1 })
+  );
   assert.ok(TRASH_DIR_RE.test('trash-abcdef123456'));
 
   const manager = new CacheManager({
@@ -302,9 +307,10 @@ test('清理绝不碰同目录下用户自己的文件', async (t) => {
   assert.equal(fs.existsSync(myFile), true);
 
   // 占用统计同样只数自己的，不把用户的片子算进「缓存占用」吓唬人
+  // 老版本没有 run.json 的 run 目录：片子在 createOwnedDir 建的子目录里
   const orphan = path.join(dir, 'run-777-old-abcdef');
-  await fsp.mkdir(orphan);
-  await fsp.writeFile(path.join(orphan, 'x.bin'), 'z'.repeat(2048));
+  await fsp.mkdir(path.join(orphan, 'media-0-0123456789'), { recursive: true });
+  await fsp.writeFile(path.join(orphan, 'media-0-0123456789', 'x.bin'), 'z'.repeat(2048));
   const u = await manager.usage();
   assert.equal(u.staleRuns, 1, '只有那个 run- 目录算数，用户的目录不算');
 });

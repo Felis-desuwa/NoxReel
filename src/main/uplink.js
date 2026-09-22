@@ -22,6 +22,12 @@ const CACHE_MS = 10 * 60 * 1000;
 const STEPS = [256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 12 * 1024 * 1024];
 const MIN_SAMPLE_MS = 1200;
 const REQUEST_TIMEOUT_MS = 8000;
+// 上面那个只是「多久没动静」的空闲超时：对面每隔几秒回一个字节就能一直拖下去，
+// 而 estimate() 的并发合并意味着一次拖住，之后所有测速请求都跟着挂住。所以每个请求再加一道
+// 从发起算起的硬上限。按 STEPS 的放大规则，正常线路上单次上传不会超过五六秒。
+const REQUEST_DEADLINE_MS = 30_000;
+// 测速节点回的响应体只有几十字节，用不着读完一个无底洞
+const MAX_RESPONSE_BYTES = 64 * 1024;
 const TOTAL_BUDGET_MS = 12_000;
 // 太短的样本里连接开销占大头，只在没有更好的样本时才用。
 const TRUSTED_SAMPLE_MS = 400;
@@ -48,10 +54,15 @@ function pickThroughput(samples) {
   return (largest.bytes * 1000) / largest.ms;
 }
 
-function uploadOnce(agent, bytes) {
+function uploadOnce(agent, bytes, { request = https.request, deadlineMs = REQUEST_DEADLINE_MS } = {}) {
   return new Promise((resolve, reject) => {
     const body = crypto.randomBytes(bytes);
-    const req = https.request(
+    let deadline = null;
+    const done = (fn, value) => {
+      clearTimeout(deadline);
+      fn(value);
+    };
+    const req = request(
       {
         protocol: ENDPOINT.protocol,
         hostname: ENDPOINT.hostname,
@@ -63,15 +74,22 @@ function uploadOnce(agent, bytes) {
       },
       (res) => {
         const ms = Date.now() - started;
-        res.resume(); // 响应体不需要，但要读完，连接才能复用
-        res.on('end', () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) resolve({ bytes: body.length, ms });
-          else reject(new Error(`测速节点返回 HTTP ${res.statusCode}`));
+        let received = 0;
+        // 响应体不需要，但要读完，连接才能复用。读多少有上限
+        res.on('data', (chunk) => {
+          received += chunk.length;
+          if (received > MAX_RESPONSE_BYTES) req.destroy(new Error('测速节点的响应过大'));
         });
+        res.on('end', () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) done(resolve, { bytes: body.length, ms });
+          else done(reject, new Error(`测速节点返回 HTTP ${res.statusCode}`));
+        });
+        res.on('error', (error) => done(reject, error));
       }
     );
+    deadline = setTimeout(() => req.destroy(new Error('测速请求超时')), deadlineMs);
     req.on('timeout', () => req.destroy(new Error('测速请求超时')));
-    req.on('error', reject);
+    req.on('error', (error) => done(reject, error));
     const started = Date.now();
     req.end(body);
   });
@@ -123,4 +141,4 @@ async function estimate({ force = false } = {}) {
   return running;
 }
 
-module.exports = { estimate, pickThroughput, ENDPOINT: ENDPOINT.href };
+module.exports = { estimate, pickThroughput, uploadOnce, ENDPOINT: ENDPOINT.href, MAX_RESPONSE_BYTES };
