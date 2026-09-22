@@ -64,7 +64,7 @@ class FakeWindow extends EventEmitter {
     this.webContents = new EventEmitter();
     this.webContents.mainFrame = { url: MAIN_PAGE_URL };
     this.webContents.send = () => {};
-    this.webContents.session = { setPermissionRequestHandler() {} };
+    this.webContents.session = { setPermissionRequestHandler() {}, setPermissionCheckHandler() {} };
     this.webContents.setWindowOpenHandler = () => {};
     this.webContents.isLoadingMainFrame = () => false;
     windows.push(this);

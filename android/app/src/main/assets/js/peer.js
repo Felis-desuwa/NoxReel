@@ -49,14 +49,18 @@ const MAX_RTT_MS = 30_000;
  *  - trickle=true：候选地址边收集边发，连得快，需要信令服务器持续在线。
  *  - trickle=false：等候集齐所有候选再产出一份完整 SDP，慢几秒，但换来
  *    「一段文本复制粘贴就能连上」—— 这就是极简模式（零服务器）的实现基础。
+ *
+ * iceTransportPolicy：'all'（默认）或 'relay'。'relay' 是「隐藏我的 IP」：浏览器只收集中继候选，
+ * SDP 和 trickle 出去的候选里都不会有本机地址。别的值一律当 'all'。
  */
 export class Peer extends Emitter {
-  constructor({ peerId, name, initiator, iceServers, trickle = true, allowIdentityRename = false }) {
+  constructor({ peerId, name, initiator, iceServers, iceTransportPolicy = 'all', trickle = true, allowIdentityRename = false }) {
     super();
     this.peerId = peerId;
     this.name = name || peerId;
     this.initiator = initiator;
     this.trickle = trickle;
+    this.iceTransportPolicy = iceTransportPolicy === 'relay' ? 'relay' : 'all';
     // 信令层已经确认身份后必须钉死 peerId。只有极简模式在尚未知晓应答方身份、
     // 且明确使用占位 ID 时，调用方才可以单独放开一次改名。
     this.allowIdentityRename = allowIdentityRename === true;
@@ -99,6 +103,7 @@ export class Peer extends Emitter {
 
     this.pc = new RTCPeerConnection({
       iceServers,
+      iceTransportPolicy: this.iceTransportPolicy,
       iceCandidatePoolSize: 4,
       bundlePolicy: 'max-bundle',
     });

@@ -408,6 +408,55 @@ const EN = new Map(Object.entries({
     'A public address was found, but there is no relay fallback. Connections fail when both sides are behind strict NAT (symmetric NAT, CGNAT, some phone hotspots); configuring a TURN relay solves that.',
   '公网地址和中继候选都齐了。': 'Both a public address and a relay candidate are available.',
 
+  // —— IP 隐私：隐藏我的 IP、Cloudflare TURN（0.7.6） ——
+  'TURN 中继': 'TURN relay',
+  'TURN 来源': 'TURN source',
+  '自己填': 'Enter my own',
+  'Cloudflare 自动生成': 'Generate with Cloudflare',
+  '验证并保存': 'Verify and save',
+  '清除': 'Clear',
+  '在 Cloudflare 后台 Realtime → TURN Server 新建一个 Key，把 Turn Token ID 和 API Token 填进来，点「验证并保存」。':
+    'In the Cloudflare dashboard, create a key under Realtime → TURN Server, paste its Turn Token ID and API Token here, and click “Verify and save”.',
+  'API Token 加密保存在本机，只有 NoxReel 的主进程拿它向 Cloudflare 换 24 小时有效的临时账号，界面上不会再显示。':
+    'The API Token is stored encrypted on this computer. Only NoxReel’s main process uses it, to get 24-hour temporary credentials from Cloudflare; it is never shown in the interface again.',
+  'Cloudflare TURN 月用量上限': 'Cloudflare TURN monthly limit',
+  '每月最多用': 'Use at most',
+  'GB（本机统计）': 'GB per month (counted on this computer)',
+  '到上限就不再用 Cloudflare TURN（为免扣费），下个月 1 日（UTC）自动恢复；已经连着的不会被断开。':
+    'At the limit, Cloudflare TURN stops being used (to avoid charges) and comes back automatically on the 1st of next month (UTC); existing connections are not cut off.',
+  '这是本机统计，和 Cloudflare 账单可能有出入；建议另外在 Cloudflare 后台 Manage Account → Billing → Billable Usage 建一个 Budget alert 做兜底。':
+    'This is counted on this computer and may differ from your Cloudflare bill; as a safety net, also create a Budget alert in the Cloudflare dashboard under Manage Account → Billing → Billable Usage.',
+  '隐藏我的 IP（只经 TURN 中继连接）': 'Hide my IP (connect only through a TURN relay)',
+  '打开后，房间里的人只能看到 TURN 服务器的地址，看不到你的 IP。':
+    'When on, people in the room only see the TURN server’s address, not your IP.',
+  '需要先配好 TURN（自己填，或用 Cloudflare 自动生成）；TURN 用不了时会连不上，不会退回直连。只影响之后新建的连接。':
+    'Set up TURN first (your own server, or generated with Cloudflare). If TURN is unavailable you will not connect—there is no fallback to a direct connection. Only affects connections made from now on.',
+  'Turn Token ID 和 API Token 都要填。': 'Enter both the Turn Token ID and the API Token.',
+  '正在向 Cloudflare 验证…': 'Verifying with Cloudflare…',
+  '已保存': 'Saved',
+  '已清除': 'Cleared',
+  'Cloudflare 凭据还没保存：先点「验证并保存」，或者把这两个框清空。':
+    'The Cloudflare credentials are not saved yet: click “Verify and save” first, or clear both fields.',
+  'Cloudflare TURN 每月上限要填 1 到 1000 之间的整数（GB）。':
+    'The Cloudflare TURN monthly limit must be a whole number from 1 to 1000 (GB).',
+  '已打开「隐藏我的 IP」，但还没有可用的 TURN 中继：请在设置里配好 TURN，或者先关掉这个开关。':
+    '“Hide my IP” is on, but no TURN relay is available yet: set up TURN in Settings, or turn this option off.',
+  '还不能连接': 'Cannot connect yet',
+  '未授权：Cloudflare 不认这组 Turn Token ID 和 API Token': 'Unauthorized: Cloudflare rejected this Turn Token ID and API Token',
+  '网络不通：连不上 Cloudflare': 'Network problem: cannot reach Cloudflare',
+  'Cloudflare 的回应看不懂': 'Cloudflare sent a response that could not be understood',
+  '还没保存 Cloudflare 凭据': 'No Cloudflare credentials saved yet',
+  '本机的加密服务不可用，不能安全地保存 API Token': 'This computer’s encryption service is unavailable, so the API Token cannot be stored safely',
+  'Turn Token ID 或 API Token 的格式不对': 'The Turn Token ID or API Token is not in the right format',
+  '出错了': 'Something went wrong',
+  'Cloudflare TURN：还没配置': 'Cloudflare TURN: not set up',
+  'Cloudflare TURN：已配置': 'Cloudflare TURN: set up',
+  '本月用量已超过上限的 80%，快到上限了。': 'This month’s usage is past 80% of the limit and close to it.',
+  '已打开「隐藏我的 IP」，只能经 TURN 中继连接，但一条中继候选都没拿到 —— TURN 地址、用户名密码大概率有一项不对，或者账号已经过期。请检查设置里的 TURN，或者先关掉「隐藏我的 IP」。':
+    '“Hide my IP” is on, so only TURN relay connections are allowed, but no relay candidate arrived—the TURN address, username, or password is most likely wrong, or the credentials have expired. Check TURN in Settings, or turn “Hide my IP” off.',
+  '只经 TURN 中继连接：已经拿到中继候选，房间里的人只能看到 TURN 服务器的地址。':
+    'Relay-only connection: a relay candidate is available, so people in the room only see the TURN server’s address.',
+
   // —— 无损精简：选音轨与 PCM 转 FLAC ——
   '其余音轨会被丢掉。这一步不可逆，选错了得重新准备一次文件。':
     'Every other audio track is dropped. This cannot be undone—picking the wrong one means preparing the file again.',
@@ -824,6 +873,12 @@ const INVALID_LABELS = {
   起播位置: 'start position',
   轨道下标: 'track index',
   隔离浏览器请求: 'isolated browser request',
+  'Cloudflare 凭据': 'Cloudflare credentials',
+  'Turn Token ID': 'Turn Token ID',
+  'API Token': 'API Token',
+  'TURN 参数': 'TURN parameters',
+  'TURN 用量': 'TURN usage',
+  'TURN 用量上限': 'TURN usage limit',
 };
 
 const EN_PATTERNS = [
@@ -1087,6 +1142,33 @@ const EN_PATTERNS = [
   [/^TURN 中继 (.+) 报错（(.+)）。$/, 'The TURN relay $1 reported an error ($2).'],
   [/^STUN 服务器 (.+) 没能应答 —— 换一台，或检查防火墙有没有放行 UDP。$/, 'The STUN server $1 did not answer — try another one, or check whether the firewall allows UDP.'],
   [/^诊断：(.+)$/, (_all, detail) => `Diagnosis: ${translate(detail, 'en')}`],
+  // IP 隐私：隐藏我的 IP、Cloudflare TURN（0.7.6）
+  [
+    /^本月 Cloudflare TURN 用量已到你设的上限（(.+) GB），为免扣费已停用；下个月 1 日自动恢复，或者在设置里调高上限(。「隐藏我的 IP」开着，没有中继就不连接。)?$/,
+    (_all, gb, relayOnly) =>
+      `This month’s Cloudflare TURN usage has reached your limit (${gb} GB) and was turned off to avoid charges; it comes back on the 1st of next month, or raise the limit in Settings${
+        relayOnly ? '. “Hide my IP” is on, so without a relay no connection is made.' : ''
+      }`,
+  ],
+  [/^Cloudflare TURN：已配置，账号有效至 (\d{1,2}:\d{2})$/, 'Cloudflare TURN: set up, credentials valid until $1'],
+  [/^Cloudflare TURN：(.+)$/, (_all, detail) => `Cloudflare TURN: ${translate(detail, 'en')}`],
+  [/^Cloudflare TURN 账号没拿到：(.+)$/, (_all, detail) => `Could not get Cloudflare TURN credentials: ${translate(detail, 'en')}`],
+  [
+    /^Cloudflare TURN 账号没拿到（(.+)），这次先不走中继、只尝试直连$/,
+    (_all, detail) => `Could not get Cloudflare TURN credentials (${translate(detail, 'en')}); trying a direct connection only this time`,
+  ],
+  [
+    /^本月 Cloudflare TURN 用量已超过你设的上限的 80%（([\d.]+) \/ (\d+) GB）$/,
+    'This month’s Cloudflare TURN usage is past 80% of your limit ($1 / $2 GB)',
+  ],
+  [/^本月已用 ([\d.]+) GB \/ (\d+) GB$/, 'Used this month: $1 GB / $2 GB'],
+  [/^没保存：(.+)$/, (_all, detail) => `Not saved: ${translate(detail, 'en')}`],
+  [/^没清掉：(.+)$/, 'Could not clear: $1'],
+  [/^Cloudflare TURN 月上限没改成：(.+)$/, (_all, detail) => `The Cloudflare TURN monthly limit was not changed: ${translate(detail, 'en')}`],
+  [
+    /^这些 TURN 地址用的是 53 端口，浏览器会拦下这个端口：(.+)。换一个端口，常见的是 3478 或 443$/,
+    'These TURN addresses use port 53, which the browser blocks: $1. Use another port—3478 or 443 are common',
+  ],
   [/^运行环境检查失败：(.+)$/, 'Environment check failed: $1'],
   [/^缓存目录准备失败：(.+)$/, 'Could not prepare the cache directory: $1'],
   [/^播放器已关闭（code (.+)），可在房间里重新打开$/, 'Player closed (code $1). You can reopen it from the room.'],

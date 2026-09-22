@@ -31,6 +31,18 @@ contextBridge.exposeInMainWorld('sw', {
     estimateUplink: (opts) => ipcRenderer.invoke('net:estimateUplink', opts),
   },
 
+  // Cloudflare TURN。API Token 只进不出：cfSave 把它交给主进程加密保存，之后没有任何方法能把它读回来。
+  // 页面拿到的只有临时 TURN 账号（cfCredentials）和状态（cfStatus，不含 Token 也不含 Turn Token ID）。
+  turn: {
+    cfSave: (keyId, apiToken) => ipcRenderer.invoke('turn:cfSave', { keyId, apiToken }),
+    cfClear: () => ipcRenderer.invoke('turn:cfClear'),
+    cfStatus: () => ipcRenderer.invoke('turn:cfStatus'),
+    cfCredentials: (opts) => ipcRenderer.invoke('turn:cfCredentials', opts),
+    // 经 Cloudflare 中继的字节数增量；主进程按 UTC 自然月累加，返回本月用量
+    cfReportUsage: (bytes) => ipcRenderer.invoke('turn:cfReportUsage', bytes),
+    cfSetLimit: (limitGB) => ipcRenderer.invoke('turn:cfSetLimit', limitGB),
+  },
+
   cache: {
     usage: () => ipcRenderer.invoke('cache:usage'),
     purge: () => ipcRenderer.invoke('cache:purge'),

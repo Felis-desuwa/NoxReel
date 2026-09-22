@@ -12,6 +12,10 @@
  *  3. 候选诊断 —— 连不上的时候能说清是「没拿到公网地址」还是「拿到了但打不通」，
  *     这两种情况用户要做的事完全不同。
  *
+ * 另有一条隐私开关「只走中继」（隐藏我的 IP）：打开后只收集中继候选、不带 STUN，
+ * 房间里的人只能看到 TURN 服务器的地址。没有可用中继时 peerIceConfig() 返回 null，
+ * 调用方必须就此停下 —— 悄悄退回直连就等于把 IP 交出去了。
+ *
  * 全是纯函数，桌面端与 Android 端共用同一份逻辑。
  */
 
@@ -29,12 +33,45 @@ export const FALLBACK_STUN = Object.freeze([
   'stun:stun.cloudflare.com:3478',
 ]);
 
-/** 把设置里的一行拆成若干个 URL。允许用逗号、空格或换行分隔。 */
+/** 把设置里的一行拆成若干个 URL。允许用逗号、空格或换行分隔；已经是数组的逐条取。 */
 export function splitUrls(raw) {
-  return String(raw || '')
+  return (Array.isArray(raw) ? raw.map((u) => String(u || '')).join(' ') : String(raw || ''))
     .split(/[\s,]+/)
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+/**
+ * Chromium 拦下的 TURN 端口。53 是 DNS 端口，浏览器不许往那里连 ——
+ * 配上它不报错，只是候选收集要干等到超时；一对一邀请和房间链接都要等收集完，
+ * 整条邀请就跟着卡住。Cloudflare 生成的地址里恰好带着 53 端口的那几条。
+ */
+export const BLOCKED_TURN_PORTS = Object.freeze([53]);
+
+/** turn: / turns: 地址的端口；没写端口给默认值（3478 / 5349），认不出返回 null。 */
+export function turnUrlPort(url) {
+  const m = /^(turns?):([^?]*)/i.exec(String(url || '').trim());
+  if (!m) return null;
+  const hostPort = m[2];
+  let portText = '';
+  if (hostPort.startsWith('[')) {
+    const close = hostPort.indexOf(']');
+    if (close === -1) return null;
+    const rest = hostPort.slice(close + 1);
+    if (rest.startsWith(':')) portText = rest.slice(1);
+    else if (rest) return null;
+  } else {
+    const at = hostPort.lastIndexOf(':');
+    if (at !== -1) portText = hostPort.slice(at + 1);
+  }
+  if (!portText) return m[1].toLowerCase() === 'turns' ? 5349 : 3478;
+  if (!/^[0-9]{1,5}$/.test(portText)) return null;
+  return Number(portText);
+}
+
+/** 这条 TURN 地址的端口会被浏览器拦下吗。 */
+export function isBlockedTurnUrl(url) {
+  return BLOCKED_TURN_PORTS.includes(turnUrlPort(url));
 }
 
 /**
@@ -45,17 +82,20 @@ export function splitUrls(raw) {
  * 勾得好好的，实际上一条中继都没有，而且到连不上那一刻也不会有人告诉他为什么。
  *
  * 漏前缀是最常见的写法错误，所以这里直接补上而不是报错 —— 用户想表达的意思很清楚。
- * 真正认不出的才报出来。
+ * 真正认不出的才报出来。端口是 53 的也单独报出来：浏览器会拦下它（见 BLOCKED_TURN_PORTS），
+ * expandTurnUrls 会把它丢掉，不说的话又是一条「勾着却不生效」的中继。
  *
- * @returns {{urls: string[], fixed: string[], invalid: string[]}}
+ * @returns {{urls: string[], fixed: string[], invalid: string[], blocked: string[]}}
  */
 export function normalizeTurnInput(raw) {
   const urls = [];
   const fixed = [];
   const invalid = [];
+  const blocked = [];
   for (const url of splitUrls(raw)) {
     if (/^turns?:/i.test(url)) {
-      urls.push(url);
+      if (isBlockedTurnUrl(url)) blocked.push(url);
+      else urls.push(url);
       continue;
     }
     // stun: 写进 TURN 框是另一回事 —— 它不是中继，补个前缀也变不成中继
@@ -65,13 +105,17 @@ export function normalizeTurnInput(raw) {
     }
     if (/^[\w.\-[\]:]+(:\d+)?(\?.*)?$/.test(url)) {
       const next = `turn:${url}`;
+      if (isBlockedTurnUrl(next)) {
+        blocked.push(url);
+        continue;
+      }
       urls.push(next);
       fixed.push(next);
       continue;
     }
     invalid.push(url);
   }
-  return { urls, fixed, invalid };
+  return { urls, fixed, invalid, blocked };
 }
 
 /**
@@ -80,6 +124,7 @@ export function normalizeTurnInput(raw) {
  * 酒店、公司和一部分校园网会封掉 UDP，只留 TCP/443 出去。这种网络下
  * 只声明 UDP 的 TURN 等于没配 —— 而用户以为自己已经有兜底了。
  * 自己写死了 ?transport= 的地址原样保留，那是明确的意图。
+ * 端口 53 的丢掉：浏览器会拦下它，留着只会让候选收集干等到超时。
  */
 export function expandTurnUrls(raw) {
   const out = [];
@@ -88,6 +133,7 @@ export function expandTurnUrls(raw) {
   };
   for (const url of splitUrls(raw)) {
     if (!/^turns?:/i.test(url)) continue;
+    if (isBlockedTurnUrl(url)) continue;
     if (/[?&]transport=/i.test(url)) {
       push(url);
       continue;
@@ -104,33 +150,75 @@ export function expandTurnUrls(raw) {
 }
 
 /**
- * 组装 RTCConfiguration 的 iceServers。
+ * 这套设置下能交给浏览器的那条 TURN 中继，没有就返回 null。
  *
- * STUN 一栏填了多条就完全按用户写的来（他在自己管这个列表）；
- * 只填一条才补兜底服务器 —— 默认值也算「只填一条」。
+ *  - 来源是 Cloudflare（turnSource === 'cloudflare'）：只认没过期的临时账号 cfTurn
+ *    （{urls, username, credential, expiresAt}，主进程生成）。手动那套字段 —— 包括
+ *    「启用 TURN 中继」那个勾 —— 这时一概不看。
+ *  - 来源是自己填：勾着、地址认得出、用户名密码都在才算。缺用户名或密码的中继不交出去：
+ *    Chromium 会因为它把整个连接对象拒掉（见 turnMissingCredentials）。
+ *
+ * 两种来源都会去掉端口 53 的地址（见 BLOCKED_TURN_PORTS）。
  */
-export function buildIceServers({
-  stun,
+export function relayServer({
+  turnSource = 'manual',
   turnEnabled = false,
   turnUrl = '',
   turnUser = '',
   turnPass = '',
+  cfTurn = null,
+  now = Date.now(),
 } = {}) {
-  const configured = splitUrls(stun);
-  const urls = configured.length ? [...configured] : [DEFAULT_STUN];
-  if (urls.length === 1) {
-    for (const fallback of FALLBACK_STUN) {
-      if (!urls.includes(fallback)) urls.push(fallback);
-    }
+  if (turnSource === 'cloudflare') {
+    if (!cfTurn || typeof cfTurn !== 'object' || !(Number(cfTurn.expiresAt) > now)) return null;
+    const urls = expandTurnUrls(Array.isArray(cfTurn.urls) ? cfTurn.urls : []);
+    const username = typeof cfTurn.username === 'string' ? cfTurn.username : '';
+    const credential = typeof cfTurn.credential === 'string' ? cfTurn.credential : '';
+    if (!urls.length || !username || !credential) return null;
+    return { urls, username, credential };
   }
+  if (!turnEnabled || turnMissingCredentials({ turnEnabled, turnUrl, turnUser, turnPass })) return null;
+  const urls = expandTurnUrls(turnUrl);
+  return urls.length ? { urls, username: turnUser || '', credential: turnPass || '' } : null;
+}
 
-  const list = [{ urls }];
-  // 缺用户名或密码的中继不交出去：Chromium 会因为它把整个连接对象拒掉（见 turnMissingCredentials）
-  if (turnEnabled && !turnMissingCredentials({ turnEnabled, turnUrl, turnUser, turnPass })) {
-    const relays = expandTurnUrls(turnUrl);
-    if (relays.length) list.push({ urls: relays, username: turnUser || '', credential: turnPass || '' });
+/**
+ * 组装 RTCConfiguration 的 iceServers。
+ *
+ * STUN 一栏填了多条就完全按用户写的来（他在自己管这个列表）；
+ * 只填一条才补兜底服务器 —— 默认值也算「只填一条」。
+ * 只走中继（relayOnly）时一条 STUN 都不带：用不上它，还白白多几次对外请求。
+ */
+export function buildIceServers({ stun, relayOnly = false, ...turn } = {}) {
+  const list = [];
+  if (!relayOnly) {
+    const configured = splitUrls(stun);
+    const urls = configured.length ? [...configured] : [DEFAULT_STUN];
+    if (urls.length === 1) {
+      for (const fallback of FALLBACK_STUN) {
+        if (!urls.includes(fallback)) urls.push(fallback);
+      }
+    }
+    list.push({ urls });
   }
+  const relay = relayServer(turn);
+  if (relay) list.push(relay);
   return list;
+}
+
+/**
+ * 建一条连接用的 { iceServers, iceTransportPolicy }。
+ *
+ * 只走中继（relayOnly）：iceTransportPolicy 为 'relay'，浏览器只收集中继候选，SDP 里没有
+ * host 和 srflx —— 房间里的人只能看到 TURN 服务器的地址。这时没有可用的中继就返回 null，
+ * **调用方必须就此停下，不许建连接**：退回直连就等于把 IP 交出去了。
+ */
+export function peerIceConfig(opts = {}) {
+  if (opts.relayOnly) {
+    const relay = relayServer(opts);
+    return relay ? { iceServers: [relay], iceTransportPolicy: 'relay' } : null;
+  }
+  return { iceServers: buildIceServers(opts), iceTransportPolicy: 'all' };
 }
 
 /**
@@ -140,9 +228,10 @@ export function buildIceServers({
  * 直接抛「ICE server parsing failed: TURN server with empty username or password」——
  * 不是这一条中继用不了，是整个连接对象都建不起来：生成邀请、加入房间全部失败。
  * 所以这种中继干脆不交给浏览器，只走直连，由界面另外提醒去补全。
+ * 来源是 Cloudflare 时手动那套字段不生效，缺不缺都无所谓，不算。
  */
-export function turnMissingCredentials({ turnEnabled = false, turnUrl = '', turnUser = '', turnPass = '' } = {}) {
-  if (!turnEnabled || !expandTurnUrls(turnUrl).length) return false;
+export function turnMissingCredentials({ turnSource = 'manual', turnEnabled = false, turnUrl = '', turnUser = '', turnPass = '' } = {}) {
+  if (turnSource === 'cloudflare' || !turnEnabled || !expandTurnUrls(turnUrl).length) return false;
   return !String(turnUser || '').trim() || !String(turnPass || '').trim();
 }
 
@@ -341,10 +430,23 @@ export function detectSymmetricNat(candidates) {
 
 /**
  * 把候选统计翻译成一句用户能照着做的话。
+ *
+ * 只走中继（relayOnly）时本来就只收集中继候选，没有 host、没有 srflx 是正常的。这时一条中继都没有，
+ * 多半是 TURN 地址、账号不对或者已经过期 —— 照常规那几句去说「防火墙」「STUN 不通」，都是往错的方向指。
+ *
  * @param {ReturnType<typeof summarizeCandidates>} stats
- * @param {{turnConfigured?: boolean, symmetric?: ReturnType<typeof detectSymmetricNat>}} ctx
+ * @param {{turnConfigured?: boolean, symmetric?: ReturnType<typeof detectSymmetricNat>, relayOnly?: boolean}} ctx
  */
-export function diagnoseCandidates(stats, { turnConfigured = false, symmetric = null } = {}) {
+export function diagnoseCandidates(stats, { turnConfigured = false, symmetric = null, relayOnly = false } = {}) {
+  if (relayOnly) {
+    if (!stats || !stats.relay) {
+      return {
+        level: 'bad',
+        text: '已打开「隐藏我的 IP」，只能经 TURN 中继连接，但一条中继候选都没拿到 —— TURN 地址、用户名密码大概率有一项不对，或者账号已经过期。请检查设置里的 TURN，或者先关掉「隐藏我的 IP」。',
+      };
+    }
+    return { level: 'ok', text: '只经 TURN 中继连接：已经拿到中继候选，房间里的人只能看到 TURN 服务器的地址。' };
+  }
   if (!stats || !stats.total) {
     return {
       level: 'bad',
@@ -393,10 +495,10 @@ export function diagnoseCandidates(stats, { turnConfigured = false, symmetric = 
  * 做成纯函数是为了能按行为测这个顺序 —— 在编排层里靠 grep 源码验不出
  * 「这个循环到底有没有在迭代」。
  */
-export function adviseConnection({ stats, candidates = [], candidateErrors = [], turnConfigured = false } = {}) {
+export function adviseConnection({ stats, candidates = [], candidateErrors = [], turnConfigured = false, relayOnly = false } = {}) {
   for (const error of candidateErrors) {
     const told = describeCandidateError(error);
     if (told) return told;
   }
-  return diagnoseCandidates(stats, { turnConfigured, symmetric: detectSymmetricNat(candidates) });
+  return diagnoseCandidates(stats, { turnConfigured, symmetric: detectSymmetricNat(candidates), relayOnly });
 }

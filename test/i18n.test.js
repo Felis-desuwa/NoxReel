@@ -918,3 +918,86 @@ test('安卓端：弹幕聊天与只读列表的新文案都有英文', async ()
   assert.ok(literals.size > 15, `只找到 ${literals.size} 条中文字面量，正则可能失效了`);
   for (const zh of literals) assert.notEqual(translate(zh, 'en'), zh, `index.html 漏翻：${zh}`);
 });
+
+/**
+ * IP 隐私（0.7.6）：「隐藏我的 IP」和 Cloudflare TURN 的新文案。
+ * 带数字、时间和嵌套原因的句子全靠模式翻译 —— 每一种动态句式都实际跑一遍，
+ * 设置页和报错里写死的中文字面量一条条过一遍，一条都不能漏。
+ */
+test('IP 隐私（隐藏我的 IP、Cloudflare TURN）的新文案都有英文', async () => {
+  const { translate } = await import('../src/renderer/lib/i18n.js');
+  const app = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'app.js'), 'utf8').replace(/\r\n/g, '\n');
+  const fnSource = (name) => {
+    const m = new RegExp(`^(?:async )?function ${name}\\(`, 'm').exec(app);
+    assert.ok(m, `app.js 里没找到 ${name}`);
+    return app.slice(m.index, app.indexOf('\n}\n', m.index) + 2);
+  };
+  const errorTable = app.slice(app.indexOf('const CF_ERROR_TEXT = {'), app.indexOf('\n};\n', app.indexOf('const CF_ERROR_TEXT = {')));
+  const sources = [
+    fnSource('turnSettingsFields'),
+    fnSource('saveCfTurnCredentials'),
+    fnSource('clearCfTurnCredentials'),
+    fnSource('renderCfTurnStatus'),
+    fnSource('cfErrorText'),
+    fnSource('cfTurnStatusText'),
+    errorTable,
+    /^const RELAY_ONLY_NO_TURN = .*$/m.exec(app)[0],
+  ].join('\n');
+  const literals = new Set();
+  for (const m of sources.matchAll(/'([^'\n]*[一-鿿][^'\n]*)'/g)) literals.add(m[1]);
+  assert.ok(literals.size > 25, `只找到 ${literals.size} 条中文字面量，正则可能失效了`);
+  for (const zh of literals) assert.notEqual(translate(zh, 'en'), zh, `漏翻：${zh}`);
+
+  // 保存设置时的几条报错
+  assert.equal(
+    translate('这些 TURN 地址用的是 53 端口，浏览器会拦下这个端口：turn:a.example:53。换一个端口，常见的是 3478 或 443', 'en'),
+    'These TURN addresses use port 53, which the browser blocks: turn:a.example:53. Use another port—3478 or 443 are common'
+  );
+  assert.equal(translate('Cloudflare TURN 每月上限要填 1 到 1000 之间的整数（GB）。', 'en'), 'The Cloudflare TURN monthly limit must be a whole number from 1 to 1000 (GB).');
+  assert.match(translate('Cloudflare 凭据还没保存：先点「验证并保存」，或者把这两个框清空。', 'en'), /^The Cloudflare credentials are not saved yet/);
+
+  // 到上限：单独一句、带「隐藏我的 IP」的后半句、放在状态行里
+  const quota = '本月 Cloudflare TURN 用量已到你设的上限（900 GB），为免扣费已停用；下个月 1 日自动恢复，或者在设置里调高上限';
+  assert.equal(
+    translate(quota, 'en'),
+    'This month’s Cloudflare TURN usage has reached your limit (900 GB) and was turned off to avoid charges; it comes back on the 1st of next month, or raise the limit in Settings'
+  );
+  assert.match(translate(`${quota}。「隐藏我的 IP」开着，没有中继就不连接。`, 'en'), /raise the limit in Settings\. “Hide my IP” is on, so without a relay no connection is made\.$/);
+  assert.match(translate(`Cloudflare TURN：${quota}`, 'en'), /^Cloudflare TURN: This month’s Cloudflare TURN usage has reached your limit \(900 GB\)/);
+
+  // 状态行、用量、80% 提醒
+  assert.equal(translate('Cloudflare TURN：已配置，账号有效至 14:05', 'en'), 'Cloudflare TURN: set up, credentials valid until 14:05');
+  assert.equal(translate('Cloudflare TURN：还没配置', 'en'), 'Cloudflare TURN: not set up');
+  assert.equal(
+    translate('Cloudflare TURN：未授权：Cloudflare 不认这组 Turn Token ID 和 API Token', 'en'),
+    'Cloudflare TURN: Unauthorized: Cloudflare rejected this Turn Token ID and API Token'
+  );
+  assert.equal(translate('本月已用 123.5 GB / 900 GB', 'en'), 'Used this month: 123.5 GB / 900 GB');
+  assert.equal(
+    translate('本月 Cloudflare TURN 用量已超过你设的上限的 80%（720.3 / 900 GB）', 'en'),
+    'This month’s Cloudflare TURN usage is past 80% of your limit (720.3 / 900 GB)'
+  );
+
+  // 日志：取账号失败的两种说法，原因嵌在里面
+  assert.equal(
+    translate('Cloudflare TURN 账号没拿到（网络不通：连不上 Cloudflare），这次先不走中继、只尝试直连', 'en'),
+    'Could not get Cloudflare TURN credentials (Network problem: cannot reach Cloudflare); trying a direct connection only this time'
+  );
+  assert.equal(translate('Cloudflare TURN 账号没拿到：还没保存 Cloudflare 凭据', 'en'), 'Could not get Cloudflare TURN credentials: No Cloudflare credentials saved yet');
+  assert.equal(translate('没保存：Turn Token ID 或 API Token 的格式不对', 'en'), 'Not saved: The Turn Token ID or API Token is not in the right format');
+  assert.equal(translate('Cloudflare TURN 月上限没改成：无效的 TURN 用量上限', 'en'), 'The Cloudflare TURN monthly limit was not changed: Invalid TURN usage limit');
+
+  // 主进程参数校验的字段名
+  assert.equal(translate('无效的 API Token', 'en'), 'Invalid API Token');
+  assert.equal(translate('无效的 Cloudflare 凭据', 'en'), 'Invalid Cloudflare credentials');
+
+  // 只走中继时的连接诊断（ice.js）：单独一句，也嵌在「诊断：」和「直连失败了」里
+  const { diagnoseCandidates, summarizeCandidates } = await import('../src/renderer/lib/ice.js');
+  const none = diagnoseCandidates(summarizeCandidates(''), { relayOnly: true }).text;
+  const ok = diagnoseCandidates(summarizeCandidates('a=candidate:1 1 udp 100 198.51.100.7 5000 typ relay raddr 0.0.0.0 rport 0'), { relayOnly: true }).text;
+  assert.match(translate(none, 'en'), /^“Hide my IP” is on, so only TURN relay connections are allowed, but no relay candidate arrived/);
+  assert.match(translate(ok, 'en'), /^Relay-only connection: a relay candidate is available/);
+  assert.match(translate(`诊断：${none}`, 'en'), /^Diagnosis: “Hide my IP” is on/);
+  assert.match(translate(`和 Alice 的直连失败了。${none}`, 'en'), /“Hide my IP” is on/);
+  assert.equal(translate('还不能连接', 'zh-CN'), '还不能连接');
+});

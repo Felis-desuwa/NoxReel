@@ -43,9 +43,11 @@ import {
   detectSymmetricNat,
   normalizeTurnInput,
   parseSdpCandidates,
+  peerIceConfig,
   summarizeCandidates,
   turnMissingCredentials,
 } from './lib/ice.js';
+import { RelayUsageMeter, cloudflareRelayPairs, onlyCloudflareRelays } from './lib/turnUsage.js';
 import {
   bitrateOf,
   bufferLead,
@@ -230,7 +232,18 @@ const S = {
     turnUser: localStorage.getItem('sw.turnUser') || '',
     turnPass: localStorage.getItem('sw.turnPass') || '',
     turnEnabled: localStorage.getItem('sw.turnEnabled') !== '0',
+    // TURN 从哪来：'manual' 自己填（上面那几项），'cloudflare' 用自己的 Cloudflare 账号自动生成
+    turnSource: localStorage.getItem('sw.turnSource') === 'cloudflare' ? 'cloudflare' : 'manual',
+    // 隐藏我的 IP：只经 TURN 中继连接。默认关
+    relayOnly: localStorage.getItem('sw.relayOnly') === '1',
   },
+  // Cloudflare 的临时 TURN 账号 { urls, username, credential, expiresAt }，主进程生成，这里只缓存。
+  // API Token 永远不到渲染进程来。
+  cfTurn: null,
+  // 主进程报来的 Cloudflare TURN 状态 { configured, expiresAt, lastError }（设置页显示用）
+  cfTurnState: null,
+  // 本月本机统计的用量 { month, usedBytes, limitGB, exceeded, nearLimit }
+  cfTurnUsage: null,
 };
 
 // 只收当前这一代播放器的事件，见 lib/playerGate.js
@@ -317,9 +330,18 @@ function log(text, kind = '') {
  *  - TURN 地址自动展开成 UDP + TCP 两条。酒店和公司网络常常只放行 TCP，
  *    那里只声明 UDP 的中继等于没配。
  *
- * TURN 依旧需要用户自己填服务器 —— 中继要花真金白银的带宽，我们不代运营。
+ * TURN 依旧需要用户自己提供 —— 自己填服务器，或者用自己的 Cloudflare 账号自动生成临时账号。
+ * 中继要花真金白银的带宽，我们不代运营。
+ *
+ * 「隐藏我的 IP」（S.settings.relayOnly）打开时只经 TURN 中继连接、不带 STUN。
+ * 这时没有可用中继就不建连接（relayOnlyBlocked / peerIce），绝不悄悄退回直连。
  */
 let turnWarned = false;
+
+/** 组 ICE 配置要的全部输入：设置、Cloudflare 的临时账号（本月用量到上限时当它不存在）、此刻的时间。 */
+function iceInputs() {
+  return { ...S.settings, cfTurn: S.cfTurnUsage?.exceeded ? null : S.cfTurn, now: Date.now() };
+}
 
 function iceServers() {
   // 以前存下的设置可能就是「开了中继、没填密码」：这种中继 buildIceServers 不会交出去，
@@ -328,12 +350,283 @@ function iceServers() {
     turnWarned = true;
     log('TURN 中继开着但没填用户名或密码，这次先不走中继、只尝试直连。到设置里补全，或者把中继关掉。', 'warn');
   }
-  return buildIceServers(S.settings);
+  return buildIceServers(iceInputs());
+}
+
+const RELAY_ONLY_NO_TURN = '已打开「隐藏我的 IP」，但还没有可用的 TURN 中继：请在设置里配好 TURN，或者先关掉这个开关。';
+
+/** Cloudflare TURN 本月用量到了上限时的说法。 */
+function cfQuotaText(limitGB = S.cfTurnUsage?.limitGB) {
+  return `本月 Cloudflare TURN 用量已到你设的上限（${limitGB || '?'} GB），为免扣费已停用；下个月 1 日自动恢复，或者在设置里调高上限`;
+}
+
+/**
+ * 「隐藏我的 IP」开着、却没有可用的 TURN 中继时，拦下连接的原因；不拦返回空串。
+ * 这时绝不能悄悄退回直连 —— 那就等于把 IP 交出去了。
+ */
+function relayOnlyBlocked() {
+  if (!S.settings.relayOnly || peerIceConfig(iceInputs())) return '';
+  if (S.settings.turnSource === 'cloudflare' && S.cfTurnUsage?.exceeded) {
+    return `${cfQuotaText()}。「隐藏我的 IP」开着，没有中继就不连接。`;
+  }
+  return RELAY_ONLY_NO_TURN;
+}
+
+/**
+ * 建 Peer 用的 { iceServers, iceTransportPolicy }。app.js 里所有 new Peer 都从这里拿。
+ * 「隐藏我的 IP」开着时策略是 'relay'（只收集中继候选）；没有可用中继就抛错，不建连接。
+ */
+function peerIce() {
+  if (!S.settings.relayOnly) return { iceServers: iceServers(), iceTransportPolicy: 'all' };
+  const config = peerIceConfig(iceInputs());
+  if (!config) throw new Error(relayOnlyBlocked() || RELAY_ONLY_NO_TURN);
+  return config;
+}
+
+/** 信令事件里建连接用：被「隐藏我的 IP」拦下时记一条日志、返回 null，调用方不建连接。 */
+function signalPeerIce() {
+  try {
+    return peerIce();
+  } catch (error) {
+    sigLog('relay-only', error.message || String(error), 'bad');
+    return null;
+  }
+}
+
+/* ---------------------------- Cloudflare TURN ---------------------------- */
+
+// 临时账号离过期不到两小时就换一组新的（主进程那边的缓存本来就提前一小时算过期）
+const CF_REFRESH_BEFORE_MS = 2 * 60 * 60 * 1000;
+// 取账号失败后这么久之内不再去取：网络不通时别让每建一条连接都干等十秒
+const CF_RETRY_MS = 30_000;
+const CF_MIN_TIMER_MS = 60_000;
+let cfTurnFetch = null;
+let cfTurnRetryAt = 0;
+let cfTurnTimer = null;
+let cfQuotaLogged = false;
+
+/** 主进程报错里的代码（CF_NETWORK 这类）。参数校验的「无效的 xxx」也归成格式不对。 */
+function cfErrorCode(error) {
+  const text = String(error?.message || error || '');
+  const m = /\[(CF_[A-Z_]+)\]/.exec(text);
+  if (m) return m[1];
+  return /无效的/.test(text) ? 'CF_INVALID_INPUT' : '';
+}
+
+const CF_ERROR_TEXT = {
+  CF_UNAUTHORIZED: '未授权：Cloudflare 不认这组 Turn Token ID 和 API Token',
+  CF_NETWORK: '网络不通：连不上 Cloudflare',
+  CF_BAD_RESPONSE: 'Cloudflare 的回应看不懂',
+  CF_NOT_CONFIGURED: '还没保存 Cloudflare 凭据',
+  CF_NO_ENCRYPTION: '本机的加密服务不可用，不能安全地保存 API Token',
+  CF_INVALID_INPUT: 'Turn Token ID 或 API Token 的格式不对',
+};
+
+function cfErrorText(code) {
+  if (code === 'CF_QUOTA') return cfQuotaText();
+  return CF_ERROR_TEXT[code] || '出错了';
+}
+
+/** 来源是 Cloudflare、手上的临时账号没有或离过期不到两小时：建连接之前得先去取一组。 */
+function turnFetchNeeded() {
+  if (S.settings.turnSource !== 'cloudflare') return false;
+  if (S.cfTurn && S.cfTurn.expiresAt - Date.now() > CF_REFRESH_BEFORE_MS) return false;
+  return Boolean(cfTurnFetch) || Date.now() >= cfTurnRetryAt;
+}
+
+/** 本月用量到了上限：手上的临时账号作废，新建的连接不再带 Cloudflare TURN。只在日志里说一次。 */
+function markCfQuota(limitGB) {
+  S.cfTurn = null;
+  clearTimeout(cfTurnTimer);
+  cfTurnTimer = null;
+  S.cfTurnUsage = { ...(S.cfTurnUsage || {}), exceeded: true, ...(limitGB ? { limitGB } : {}) };
+  if (!cfQuotaLogged && S.settings.turnSource === 'cloudflare') {
+    cfQuotaLogged = true;
+    log(cfQuotaText(), 'bad');
+  }
+}
+
+/**
+ * 把 Cloudflare 的临时 TURN 账号备好。来源不是 Cloudflare、或者手上的还新鲜时什么都不做。
+ * 每次开房、邀请、加入真正建连接之前都要先过这一步（见各处的 turnFetchNeeded 判断）。
+ *
+ * 取不到也不抛错：没开「隐藏我的 IP」就记一条日志、照常直连（TURN 本来就是兜底）；
+ * 开了的话，紧接着的 relayOnlyBlocked() 会把连接拦下。同时只发一个请求。
+ */
+async function ensureTurnReady() {
+  if (!turnFetchNeeded()) return;
+  if (!cfTurnFetch) {
+    cfTurnFetch = (async () => {
+      try {
+        const creds = await window.sw.turn.cfCredentials({ minValidMs: CF_REFRESH_BEFORE_MS });
+        S.cfTurn = {
+          urls: [...creds.urls],
+          username: creds.username,
+          credential: creds.credential,
+          expiresAt: creds.expiresAt,
+        };
+        cfTurnRetryAt = 0;
+        cfQuotaLogged = false;
+        // 主进程肯发账号，说明这个月没到上限（跨了月、或者上限调高了）
+        if (S.cfTurnUsage?.exceeded) S.cfTurnUsage = { ...S.cfTurnUsage, exceeded: false };
+        S.cfTurnState = { ...(S.cfTurnState || {}), configured: true, expiresAt: creds.expiresAt, lastError: null };
+        scheduleCfTurnRefresh();
+      } catch (error) {
+        cfTurnRetryAt = Date.now() + CF_RETRY_MS;
+        const code = cfErrorCode(error) || 'CF_NETWORK';
+        S.cfTurnState = { ...(S.cfTurnState || {}), lastError: code };
+        if (code === 'CF_QUOTA') {
+          markCfQuota(Number(/（(\d+) GB）/.exec(String(error?.message || ''))?.[1]) || 0);
+        } else if (S.settings.relayOnly) {
+          log(`Cloudflare TURN 账号没拿到：${cfErrorText(code)}`, 'bad');
+        } else {
+          log(`Cloudflare TURN 账号没拿到（${cfErrorText(code)}），这次先不走中继、只尝试直连`, 'warn');
+        }
+      } finally {
+        cfTurnFetch = null;
+        renderCfTurnStatus();
+      }
+    })();
+  }
+  await cfTurnFetch;
+}
+
+/** 离过期不到两小时时自己换一组，不等下一次建连接。 */
+function scheduleCfTurnRefresh() {
+  clearTimeout(cfTurnTimer);
+  cfTurnTimer = null;
+  if (S.settings.turnSource !== 'cloudflare' || !S.cfTurn || !(S.cfTurn.expiresAt > Date.now())) return;
+  const wait = Math.max(CF_MIN_TIMER_MS, S.cfTurn.expiresAt - CF_REFRESH_BEFORE_MS - Date.now());
+  cfTurnTimer = setTimeout(async () => {
+    cfTurnTimer = null;
+    await ensureTurnReady().catch(() => {});
+    scheduleCfTurnRefresh();
+  }, wait);
+}
+
+/** 用量（主进程报来的）：第一次过 80% 在日志里提醒一次；到上限就停用 Cloudflare TURN。 */
+function applyCfUsage(usage) {
+  if (!usage || typeof usage !== 'object') return;
+  const wasExceeded = Boolean(S.cfTurnUsage?.exceeded);
+  S.cfTurnUsage = usage;
+  if (usage.crossedWarn) {
+    log(`本月 Cloudflare TURN 用量已超过你设的上限的 80%（${fmtGB(usage.usedBytes)} / ${usage.limitGB} GB）`, 'warn');
+  }
+  if (usage.exceeded && !wasExceeded) markCfQuota(usage.limitGB);
+  if (!usage.exceeded && wasExceeded) cfQuotaLogged = false;
+  renderCfTurnStatus();
+}
+
+function applyCfTurnState(state) {
+  if (!state || typeof state !== 'object') return;
+  S.cfTurnState = { configured: Boolean(state.configured), expiresAt: state.expiresAt || null, lastError: state.lastError || null };
+  if (state.usage) applyCfUsage(state.usage);
+  renderCfTurnStatus();
+}
+
+async function refreshCfTurnState() {
+  try {
+    applyCfTurnState(await window.sw.turn.cfStatus());
+  } catch (error) {
+    console.warn('[turn] 取 Cloudflare TURN 状态失败', error);
+  }
+}
+
+/** 字节 → GB（十进制，和 Cloudflare 的计费单位一致）。 */
+function fmtGB(bytes) {
+  const gb = (Number(bytes) || 0) / 1e9;
+  return gb.toFixed(gb < 10 ? 2 : 1);
+}
+
+function fmtClock(ms) {
+  return new Date(ms).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' });
+}
+
+function cfTurnStatusText() {
+  const state = S.cfTurnState;
+  if (!state) return '';
+  if (!state.configured) return 'Cloudflare TURN：还没配置';
+  if (S.cfTurnUsage?.exceeded) return `Cloudflare TURN：${cfQuotaText()}`;
+  if (state.lastError) return `Cloudflare TURN：${cfErrorText(state.lastError)}`;
+  const expiresAt = S.cfTurn?.expiresAt || state.expiresAt;
+  if (expiresAt > Date.now()) return `Cloudflare TURN：已配置，账号有效至 ${fmtClock(expiresAt)}`;
+  return 'Cloudflare TURN：已配置';
+}
+
+function cfUsageText() {
+  const usage = S.cfTurnUsage;
+  if (!usage) return '';
+  return `本月已用 ${fmtGB(usage.usedBytes)} GB / ${usage.limitGB} GB`;
+}
+
+/** 设置页开着时，把 Cloudflare TURN 的状态和用量刷到那几行上。 */
+function renderCfTurnStatus() {
+  const status = $('set-cf-status');
+  if (status) status.textContent = cfTurnStatusText();
+  const usage = $('set-cf-usage');
+  if (usage) usage.textContent = cfUsageText();
+  const warn = $('set-cf-warn');
+  if (warn) {
+    const near = Boolean(S.cfTurnUsage?.nearLimit && !S.cfTurnUsage?.exceeded);
+    warn.textContent = near ? t('本月用量已超过上限的 80%，快到上限了。') : '';
+    warn.classList.toggle('hidden', !near);
+  }
+}
+
+/* ------------------------- Cloudflare TURN 用量计量 ------------------------- */
+
+// 每条连接每 10 秒读一次 getStats()。连接关掉之前最后不到 10 秒的流量读不到（关了的连接不给统计），
+// 本机统计因此会略少算一点 —— 默认上限 900 GB 留出的余量就是给这类出入的。
+const TURN_METER_MS = 10_000;
+// 一次最多报这么多（和主进程的校验上限一致），攒多了分几次报
+const TURN_REPORT_MAX = 64 * 1e9;
+const turnMeter = new RelayUsageMeter();
+let turnMeterBusy = false;
+let turnUsagePending = 0;
+
+/**
+ * 数一遍各条连接经 Cloudflare 中继的字节（增量），汇报给主进程按月累加。
+ * 汇报失败的先攒着，下一轮一起报。
+ */
+async function meterTurnUsage() {
+  if (turnMeterBusy) return;
+  turnMeterBusy = true;
+  try {
+    for (const peer of [...(S.swarm?.peers?.values() || [])]) {
+      const pc = peer?.pc;
+      if (!pc || peer.closed || typeof pc.getStats !== 'function') continue;
+      let report;
+      try {
+        report = await pc.getStats();
+      } catch {
+        continue;
+      }
+      let assumeCloudflare = false;
+      try {
+        assumeCloudflare = onlyCloudflareRelays(pc.getConfiguration?.()?.iceServers);
+      } catch {}
+      turnUsagePending += turnMeter.take(pc, cloudflareRelayPairs(report, { assumeCloudflare }));
+    }
+    if (turnUsagePending > 0) {
+      const bytes = Math.min(turnUsagePending, TURN_REPORT_MAX);
+      const usage = await window.sw.turn.cfReportUsage(bytes);
+      turnUsagePending -= bytes;
+      applyCfUsage(usage);
+    }
+  } catch (error) {
+    console.warn('[turn] Cloudflare TURN 用量汇报失败，下一轮再报', error);
+  } finally {
+    turnMeterBusy = false;
+  }
 }
 
 /** 本机这次收集到的候选够不够用，连不上时用来给一句能照着做的话。 */
 function connectionAdvice(peer) {
-  const turnConfigured = Boolean(S.settings.turnEnabled && S.settings.turnUrl);
+  // Cloudflare 来源看这条连接建的时候带没带上中继；自己填的照旧看设置（勾了、填了地址就算）
+  const turnConfigured =
+    S.settings.turnSource === 'cloudflare'
+      ? Boolean(peer?._expectRelay)
+      : Boolean(S.settings.turnEnabled && S.settings.turnUrl);
   let stats = peer?.localCandidateStats || summarizeCandidates(peer?.pc?.localDescription?.sdp || '');
 
   // 信令模式（trickle）下候选是单独发出去的，本地描述里一条都没有 ——
@@ -355,6 +648,8 @@ function connectionAdvice(peer) {
     candidates,
     candidateErrors: peer?.candidateErrors || [],
     turnConfigured,
+    // 只走中继的连接本来就没有 host / srflx：一条中继都没有时要说 TURN 的问题，不是防火墙
+    relayOnly: peer?.iceTransportPolicy === 'relay',
   });
 }
 
@@ -385,6 +680,8 @@ function collectDiagnostics() {
     `Defender=${env.defender ? '有' : '无'} 运行中=${env.defenderRunning === null ? '未知' : env.defenderRunning ? '是' : '否'}`,
     `连接方式=${connectionModeLabel()} 安全模式=${S.roomSecurityMode || S.settings.securityMode}`,
     `TURN=${S.settings.turnEnabled ? (S.settings.turnUrl ? '已配置' : '勾了但地址为空') : '未启用'}`,
+    // 只记来源和状态，凭据一个字都不进诊断信息
+    `TURN来源=${S.settings.turnSource === 'cloudflare' ? `Cloudflare（${S.cfTurn && S.cfTurn.expiresAt > Date.now() ? '有临时账号' : '没有临时账号'}${S.cfTurnUsage?.exceeded ? '，本月已到上限' : ''}）` : '自己填'} 隐藏IP=${S.settings.relayOnly ? '开' : '关'}`,
     `候选类型=${[...new Set(candidates.map((c) => c.type))].join(',') || '无'}`,
     `对称NAT判定=${symmetric ? symmetric.kind : '未检出'}`,
     `成员=${peers.length ? peers.join(' | ') : '无'}`,
@@ -441,6 +738,10 @@ async function boot() {
   updateDepsPill();
   // 播放器清单要查注册表，慢一点无所谓：不拦启动，回来了再把下拉框重画一次
   refreshPlayerList();
+  // Cloudflare TURN：状态和本月用量（设置页要显示），来源选的是它就顺手把临时账号备好。都不拦启动
+  refreshCfTurnState();
+  ensureTurnReady().catch(() => {});
+  setInterval(() => meterTurnUsage(), TURN_METER_MS);
   show('view-home');
 }
 
@@ -2636,6 +2937,15 @@ async function joinViaManual(payload) {
   ]);
   $('prep-bar').style.width = '40%';
 
+  // Cloudflare 的临时 TURN 账号可能要现取；取的这会儿可能已经换了一次尝试
+  if (turnFetchNeeded()) {
+    await ensureTurnReady();
+    if (!attemptLive(gen)) return;
+  }
+  // 「隐藏我的 IP」开着却没有可用中继：不建连接，更不能悄悄退回直连
+  const turnBlocked = relayOnlyBlocked();
+  if (turnBlocked) return prepStop('还不能连接', turnBlocked);
+
   initSwarmAndSync();
 
   // 重试时同一个房主 id 会再来一次，先把上一条死连接摘掉，别让它占着成员表。
@@ -2645,7 +2955,7 @@ async function joinViaManual(payload) {
     peerId: payload.from,
     name: peerName(payload.name, '发起者'),
     initiator: false,
-    iceServers: iceServers(),
+    ...peerIce(),
     trickle: false, // 手动模式必须等候选集齐，SDP 得是自包含的
   });
   wirePeer(peer);
@@ -2795,6 +3105,14 @@ async function joinViaServer(payload) {
   $('prep-bar').style.width = '35%';
   replace('prep-actions', cancelJoinButton());
 
+  // 进了房间别人就会来连我：TURN 得在连信令之前备好，「隐藏我的 IP」没有中继就不进
+  if (turnFetchNeeded()) {
+    await ensureTurnReady();
+    if (!attemptLive(gen)) return;
+  }
+  const turnBlocked = relayOnlyBlocked();
+  if (turnBlocked) return prepStop('还不能连接', turnBlocked);
+
   initSwarmAndSync();
 
   try {
@@ -2864,6 +3182,14 @@ async function joinViaRelay(payload) {
   ]);
   $('prep-bar').style.width = '35%';
   replace('prep-actions', cancelJoinButton());
+
+  // 房主放行之后马上就要打洞：TURN 得先备好，「隐藏我的 IP」没有中继就不进
+  if (turnFetchNeeded()) {
+    await ensureTurnReady();
+    if (!attemptLive(gen)) return;
+  }
+  const turnBlocked = relayOnlyBlocked();
+  if (turnBlocked) return prepStop('还不能连接', turnBlocked);
 
   initSwarmAndSync();
 
@@ -3108,8 +3434,11 @@ async function connectSignaling(url, roomId, relay = null) {
     if (directLinkUp(existing)) return;
     if (!admitPeer(peerId, existing)) return;
     sigLog('join', `${name} 加入了房间`, 'good');
+    // 「隐藏我的 IP」开着却没有可用中继：不和他建连接（日志里说一声）
+    const ice = signalPeerIce();
+    if (!ice) return;
     // 中继信令不 trickle（候选打包进 SDP）；信令服务器照旧边收集边发
-    const peer = new Peer({ peerId, name, initiator: true, iceServers: iceServers(), trickle: sig.trickle !== false });
+    const peer = new Peer({ peerId, name, initiator: true, ...ice, trickle: sig.trickle !== false });
     wirePeer(peer, sig);
     S.swarm.addPeer(peer);
     const offer = await peer.createOffer();
@@ -3129,8 +3458,10 @@ async function connectSignaling(url, roomId, relay = null) {
       // setRemoteDescription，ICE 会在一条已经废掉的 pc 上重来一遍，双方都以为在协商，
       // 实际再也连不上 —— 表现就是信令一抖，传输永久停在原地。
       if (!admitPeer(from, peer)) return;
+      const ice = signalPeerIce();
+      if (!ice) return;
       if (peer) S.swarm.removePeer(from);
-      peer = new Peer({ peerId: from, name: peerName(name, from), initiator: false, iceServers: iceServers(), trickle: sig.trickle !== false });
+      peer = new Peer({ peerId: from, name: peerName(name, from), initiator: false, ...ice, trickle: sig.trickle !== false });
       wirePeer(peer, sig);
       S.swarm.addPeer(peer);
       const answer = await peer.acceptOffer(payload.sdp);
@@ -3313,12 +3644,14 @@ async function reconnectPeer(peerId, name, sig) {
   if (RENEGOTIATING.has(peerId)) return RENEGOTIATING.get(peerId);
 
   const run = (async () => {
+    // 先拿 ICE 参数：「隐藏我的 IP」没有可用中继时在这里就抛出去（调用方记日志），旧连接也不拆
+    const ice = peerIce();
     if (S.swarm.peers.has(peerId)) S.swarm.removePeer(peerId);
     const peer = new Peer({
       peerId,
       name: name || peerId,
       initiator: true,
-      iceServers: iceServers(),
+      ...ice,
       trickle: sig.trickle !== false,
     });
     wirePeer(peer, sig);
@@ -5749,6 +6082,20 @@ function applyRoomCapacity() {
 }
 
 /**
+ * 「隐藏我的 IP」开着却没有可用中继：这次邀请不发，原因画在邀请卡上（也记进日志）。
+ * 拦下了返回 true。
+ */
+function inviteBlocked(out) {
+  const blocked = relayOnlyBlocked();
+  if (!blocked) return false;
+  const line = make('p', { text: blocked });
+  line.style.color = 'var(--danger)';
+  replace(out, line);
+  log(blocked, 'bad');
+  return true;
+}
+
+/**
  * 房间链接（默认的邀请方式）：一条链接谁点都能进，直到坐满。经公共 Nostr 中继交换握手，
  * 不需要自建服务器；视频照旧点对点直传。连不上任何中继时退回一对一邀请，这场照样能开。
  */
@@ -5757,6 +6104,13 @@ async function inviteViaRelay() {
   if (!out) return;
   const gen = ++inviteGen;
   replace(out, make('p', { text: '正在连接公共中继…' }));
+  // 有人点了链接就要打洞：TURN 先备好。取账号那会儿房主可能已经改点了别的邀请方式
+  if (turnFetchNeeded()) {
+    await ensureTurnReady();
+    if (gen !== inviteGen) return;
+  }
+  // 被「隐藏我的 IP」拦下就停在这里，也不退回一对一邀请 —— 那一样是建连接
+  if (inviteBlocked(out)) return;
   try {
     if (!S.signaling || S.signalTransport !== 'relay') {
       // 从信令服务器切过来：老的那条先关掉（已经建好的直连不受影响）
@@ -5843,6 +6197,11 @@ async function inviteViaServer() {
   const out = $('inv-out');
   const gen = ++inviteGen;
   replace(out, make('p', { text: '正在连接信令服务器…' }));
+  if (turnFetchNeeded()) {
+    await ensureTurnReady();
+    if (gen !== inviteGen) return;
+  }
+  if (inviteBlocked(out)) return;
 
   try {
     // 手上那条若是房间链接（公共中继）的，先关掉：S.roomId 只有信令服务器才有，
@@ -5931,6 +6290,16 @@ async function inviteViaManual(notice = '') {
   const out = $('inv-out');
   const gen = ++inviteGen;
   replace(out, make('p', { text: '正在收集网络候选地址（几秒钟）…' }));
+  if (turnFetchNeeded()) {
+    await ensureTurnReady();
+    if (gen !== inviteGen) return;
+  }
+  if (inviteBlocked(out)) {
+    // 手上那条旧链接也作废：对方这时再发回应答，建起来的就是一条直连
+    S.pendingManualPeer?.close?.();
+    S.pendingManualPeer = null;
+    return;
+  }
   try {
     await createManualInvite(out, notice, gen);
   } catch (error) {
@@ -5955,7 +6324,7 @@ async function createManualInvite(out, notice, gen = inviteGen) {
     peerId: `pending-${crypto.randomUUID().replaceAll('-', '').slice(0, 6)}`,
     name: '待加入',
     initiator: true,
-    iceServers: iceServers(),
+    ...peerIce(),
     trickle: false,
   });
   S.pendingManualPeer = peer;
@@ -7417,6 +7786,180 @@ function cacheField() {
   );
 }
 
+/**
+ * 设置里 TURN 那一段：来源（自己填 / Cloudflare 自动生成）、两种来源各自的字段、「隐藏我的 IP」。
+ *
+ * Cloudflare 的 API Token 只进不出：输入框从不预填，「验证并保存」成功后当场清空，
+ * 之后界面上只显示状态（已配置、临时账号有效到几点、出了什么错）和本月用量。
+ */
+function turnSettingsFields() {
+  const cf = S.settings.turnSource === 'cloudflare';
+  const turnPassword = make('input', {
+    id: 'set-turn-pass',
+    attrs: { type: 'text', placeholder: '密码' },
+    props: { value: S.settings.turnPass },
+  });
+  turnPassword.style.marginTop = '6px';
+
+  const manualGroup = make('div', { id: 'set-turn-manual', className: cf ? 'hidden' : '' }, [
+    make('div', { className: 'field' }, [
+      make('label', { className: 'check' }, [
+        make('input', {
+          id: 'set-turn-on',
+          attrs: { type: 'checkbox' },
+          props: { checked: S.settings.turnEnabled },
+        }),
+        '启用 TURN 中继兜底',
+      ]),
+    ]),
+    field(
+      'TURN 地址',
+      make('input', {
+        id: 'set-turn-url',
+        attrs: { type: 'text', placeholder: 'turn:example.com:3478' },
+        props: { value: S.settings.turnUrl },
+      }),
+      hint('会自动同时尝试 UDP 和 TCP —— 酒店、公司和校园网经常只放行 TCP。')
+    ),
+    field(
+      'TURN 用户名 / 密码',
+      make('input', {
+        id: 'set-turn-user',
+        attrs: { type: 'text', placeholder: '用户名' },
+        props: { value: S.settings.turnUser },
+      }),
+      turnPassword
+    ),
+  ]);
+
+  const cfResult = make('p', { id: 'set-cf-result', className: 'fine' });
+  const cfSave = make('button', { id: 'set-cf-save', className: 'ghost', text: '验证并保存' });
+  cfSave.onclick = () => saveCfTurnCredentials(cfSave, cfResult);
+  const cfClear = make('button', { id: 'set-cf-clear', className: 'ghost', text: '清除' });
+  cfClear.onclick = () => clearCfTurnCredentials(cfResult);
+  const cfWarn = make('p', { id: 'set-cf-warn', className: 'fine hidden' });
+  cfWarn.style.color = 'var(--warn)';
+  const cfGroup = make('div', { id: 'set-turn-cf', className: cf ? '' : 'hidden' }, [
+    field(
+      'Turn Token ID',
+      make('input', { id: 'set-cf-key', attrs: { type: 'text', autocomplete: 'off', spellcheck: 'false' } })
+    ),
+    field(
+      'API Token',
+      // 只进不出：从不预填，保存成功就清空
+      make('input', { id: 'set-cf-token', attrs: { type: 'password', autocomplete: 'new-password', spellcheck: 'false' } }),
+      hint(
+        '在 Cloudflare 后台 Realtime → TURN Server 新建一个 Key，把 Turn Token ID 和 API Token 填进来，点「验证并保存」。',
+        'API Token 加密保存在本机，只有 NoxReel 的主进程拿它向 Cloudflare 换 24 小时有效的临时账号，界面上不会再显示。'
+      )
+    ),
+    make('div', { className: 'cmd-row' }, [cfSave, cfClear]),
+    cfResult,
+    make('p', { id: 'set-cf-status', className: 'fine', text: cfTurnStatusText() }),
+    field(
+      'Cloudflare TURN 月用量上限',
+      make('label', { className: 'check' }, [
+        '每月最多用',
+        make('input', {
+          id: 'set-cf-limit',
+          attrs: { type: 'number', min: 1, max: 1000, step: 1 },
+          props: { value: String(S.cfTurnUsage?.limitGB || 900) },
+          style: { width: '6em' },
+        }),
+        'GB（本机统计）',
+      ]),
+      make('p', { id: 'set-cf-usage', className: 'fine', text: cfUsageText() }),
+      cfWarn,
+      hint(
+        '到上限就不再用 Cloudflare TURN（为免扣费），下个月 1 日（UTC）自动恢复；已经连着的不会被断开。',
+        '这是本机统计，和 Cloudflare 账单可能有出入；建议另外在 Cloudflare 后台 Manage Account → Billing → Billable Usage 建一个 Budget alert 做兜底。'
+      )
+    ),
+  ]);
+
+  const pickSource = () => {
+    const useCf = $('set-turn-source-cf').checked;
+    manualGroup.classList.toggle('hidden', useCf);
+    cfGroup.classList.toggle('hidden', !useCf);
+  };
+  const sourceRadio = (value, checked) => ({
+    attrs: { type: 'radio', name: 'set-turn-source', value },
+    props: { checked, onchange: pickSource },
+  });
+
+  return [
+    field(
+      'TURN 中继',
+      hint(
+        '双方都在严格 NAT（CGNAT、卫星网络）后面时，打洞会失败，这时数据要经过中继转发。',
+        '中继会看到加密后的流量并产生带宽成本，所以需要你自己提供服务器 —— 我们不代运营。'
+      ),
+      make('p', { className: 'fine sub-title', text: 'TURN 来源' }),
+      make('label', { className: 'check' }, [
+        make('input', { id: 'set-turn-source-manual', ...sourceRadio('manual', !cf) }),
+        '自己填',
+      ]),
+      make('label', { className: 'check' }, [
+        make('input', { id: 'set-turn-source-cf', ...sourceRadio('cloudflare', cf) }),
+        'Cloudflare 自动生成',
+      ])
+    ),
+    manualGroup,
+    cfGroup,
+    make('div', { className: 'field' }, [
+      make('label', { className: 'check' }, [
+        make('input', { id: 'set-relay-only', attrs: { type: 'checkbox' }, props: { checked: S.settings.relayOnly } }),
+        '隐藏我的 IP（只经 TURN 中继连接）',
+      ]),
+      hint(
+        '打开后，房间里的人只能看到 TURN 服务器的地址，看不到你的 IP。',
+        '需要先配好 TURN（自己填，或用 Cloudflare 自动生成）；TURN 用不了时会连不上，不会退回直连。只影响之后新建的连接。'
+      ),
+    ]),
+  ];
+}
+
+/** 「验证并保存」：Token 交给主进程验证、加密保存；成功后输入框清空，只显示「已保存」。 */
+async function saveCfTurnCredentials(button, result) {
+  const keyInput = $('set-cf-key');
+  const tokenInput = $('set-cf-token');
+  const keyId = keyInput.value.trim();
+  const apiToken = tokenInput.value.trim();
+  if (!keyId || !apiToken) {
+    result.textContent = t('Turn Token ID 和 API Token 都要填。');
+    return;
+  }
+  button.disabled = true;
+  result.textContent = t('正在向 Cloudflare 验证…');
+  try {
+    const state = await window.sw.turn.cfSave(keyId, apiToken);
+    keyInput.value = '';
+    tokenInput.value = '';
+    // 换了凭据：手上那组临时账号作废，下次连接前现取（主进程验证时已经顺手缓存了一组）
+    S.cfTurn = null;
+    cfTurnRetryAt = 0;
+    applyCfTurnState(state);
+    result.textContent = t('已保存');
+    if (S.settings.turnSource === 'cloudflare') ensureTurnReady().catch(() => {});
+  } catch (error) {
+    result.textContent = t(`没保存：${cfErrorText(cfErrorCode(error))}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function clearCfTurnCredentials(result) {
+  try {
+    const state = await window.sw.turn.cfClear();
+    S.cfTurn = null;
+    scheduleCfTurnRefresh();
+    applyCfTurnState(state);
+    result.textContent = t('已清除');
+  } catch (error) {
+    result.textContent = t(`没清掉：${error.message || error}`);
+  }
+}
+
 $('btn-settings').onclick = () => {
   openModal({
     title: '设置',
@@ -7424,12 +7967,8 @@ $('btn-settings').onclick = () => {
       const modeLocked = roomEntered || !!S.swarm;
       const languageLocked = roomEntered || S.role !== null;
       const nameLocked = roomEntered || !!S.swarm;
-      const turnPassword = make('input', {
-        id: 'set-turn-pass',
-        attrs: { type: 'text', placeholder: '密码' },
-        props: { value: S.settings.turnPass },
-      });
-      turnPassword.style.marginTop = '6px';
+      // 设置页开着时顺手把 Cloudflare TURN 的状态和本月用量刷一遍
+      refreshCfTurnState();
       return [
         field(
           '界面语言',
@@ -7561,38 +8100,7 @@ $('btn-settings').onclick = () => {
             '留一条地址时会自动再挂两台备用服务器兜底；想自己管这个列表就用逗号或空格分隔多写几条，那样只用你写的。'
           )
         ),
-        make('div', { className: 'field' }, [
-          make('label', { className: 'check' }, [
-            make('input', {
-              id: 'set-turn-on',
-              attrs: { type: 'checkbox' },
-              props: { checked: S.settings.turnEnabled },
-            }),
-            '启用 TURN 中继兜底',
-          ]),
-          hint(
-            '双方都在严格 NAT（CGNAT、卫星网络）后面时，打洞会失败，这时数据要经过中继转发。',
-            '中继会看到加密后的流量并产生带宽成本，所以需要你自己提供服务器 —— 我们不代运营。'
-          ),
-        ]),
-        field(
-          'TURN 地址',
-          make('input', {
-            id: 'set-turn-url',
-            attrs: { type: 'text', placeholder: 'turn:example.com:3478' },
-            props: { value: S.settings.turnUrl },
-          }),
-          hint('会自动同时尝试 UDP 和 TCP —— 酒店、公司和校园网经常只放行 TCP。')
-        ),
-        field(
-          'TURN 用户名 / 密码',
-          make('input', {
-            id: 'set-turn-user',
-            attrs: { type: 'text', placeholder: '用户名' },
-            props: { value: S.settings.turnUser },
-          }),
-          turnPassword
-        ),
+        ...turnSettingsFields(),
         make('div', { id: 'set-turn-err', className: 'field-error hidden' }),
         cacheField(),
         field(
@@ -7613,19 +8121,41 @@ $('btn-settings').onclick = () => {
       const turnRaw = $('set-turn-url').value.trim();
       const turnCheck = normalizeTurnInput(turnRaw);
       const errorBox = $('set-turn-err');
-      if (turnCheck.invalid.length) {
-        errorBox.textContent = t(`这些 TURN 地址认不出来：${turnCheck.invalid.join('、')}。地址要形如 turn:example.com:3478`);
+      const turnSource = $('set-turn-source-cf').checked ? 'cloudflare' : 'manual';
+      // 手动那套字段只在来源是「自己填」时才生效，也只在那时才查
+      if (turnSource === 'manual') {
+        if (turnCheck.invalid.length) {
+          errorBox.textContent = t(`这些 TURN 地址认不出来：${turnCheck.invalid.join('、')}。地址要形如 turn:example.com:3478`);
+          errorBox.classList.remove('hidden');
+          return false;
+        }
+        // 53 端口会被浏览器拦下，留着它只会让候选收集干等到超时
+        if (turnCheck.blocked.length) {
+          errorBox.textContent = t(`这些 TURN 地址用的是 53 端口，浏览器会拦下这个端口：${turnCheck.blocked.join('、')}。换一个端口，常见的是 3478 或 443`);
+          errorBox.classList.remove('hidden');
+          return false;
+        }
+        if ($('set-turn-on').checked && !turnRaw) {
+          errorBox.textContent = t('勾了启用 TURN 中继，但地址是空的 —— 这样等于没配。填一个地址，或者把勾去掉。');
+          errorBox.classList.remove('hidden');
+          return false;
+        }
+        // 缺用户名或密码的中继，浏览器会连整个连接对象一起拒掉（邀请、加入全都失败），得当场拦下
+        if ($('set-turn-on').checked && (!$('set-turn-user').value.trim() || !$('set-turn-pass').value.trim())) {
+          errorBox.textContent = t('TURN 中继要填用户名和密码（中继服务器靠它们认人）。没有的话把「启用 TURN 中继」的勾去掉。');
+          errorBox.classList.remove('hidden');
+          return false;
+        }
+      }
+      // Cloudflare 凭据只能经「验证并保存」按钮进主进程；填了没保存就点确定，得说一声，别让人以为存上了
+      if ($('set-cf-key').value.trim() || $('set-cf-token').value.trim()) {
+        errorBox.textContent = t('Cloudflare 凭据还没保存：先点「验证并保存」，或者把这两个框清空。');
         errorBox.classList.remove('hidden');
         return false;
       }
-      if ($('set-turn-on').checked && !turnRaw) {
-        errorBox.textContent = t('勾了启用 TURN 中继，但地址是空的 —— 这样等于没配。填一个地址，或者把勾去掉。');
-        errorBox.classList.remove('hidden');
-        return false;
-      }
-      // 缺用户名或密码的中继，浏览器会连整个连接对象一起拒掉（邀请、加入全都失败），得当场拦下
-      if ($('set-turn-on').checked && (!$('set-turn-user').value.trim() || !$('set-turn-pass').value.trim())) {
-        errorBox.textContent = t('TURN 中继要填用户名和密码（中继服务器靠它们认人）。没有的话把「启用 TURN 中继」的勾去掉。');
+      const cfLimit = Number($('set-cf-limit').value);
+      if (!Number.isInteger(cfLimit) || cfLimit < 1 || cfLimit > 1000) {
+        errorBox.textContent = t('Cloudflare TURN 每月上限要填 1 到 1000 之间的整数（GB）。');
         errorBox.classList.remove('hidden');
         return false;
       }
@@ -7675,6 +8205,23 @@ $('btn-settings').onclick = () => {
       localStorage.setItem('sw.turnUrl', S.settings.turnUrl);
       localStorage.setItem('sw.turnUser', S.settings.turnUser);
       localStorage.setItem('sw.turnPass', S.settings.turnPass);
+      // TURN 来源和「隐藏我的 IP」。Cloudflare 的 API Token 不在这里 —— 它只存在主进程里
+      const sourceChanged = turnSource !== S.settings.turnSource;
+      S.settings.turnSource = turnSource;
+      S.settings.relayOnly = $('set-relay-only').checked;
+      localStorage.setItem('sw.turnSource', S.settings.turnSource);
+      localStorage.setItem('sw.relayOnly', S.settings.relayOnly ? '1' : '0');
+      if (sourceChanged) {
+        scheduleCfTurnRefresh();
+        cfTurnRetryAt = 0;
+        ensureTurnReady().catch(() => {});
+      }
+      if (cfLimit !== S.cfTurnUsage?.limitGB) {
+        window.sw.turn
+          .cfSetLimit(cfLimit)
+          .then(applyCfUsage)
+          .catch((error) => log(`Cloudflare TURN 月上限没改成：${error.message || error}`, 'bad'));
+      }
       // 切到安全模式时依赖胶囊要重算 —— Defender 没在跑这件事只在安全模式下算缺件。
       updateDepsPill();
       if (languageChanged) setTimeout(() => location.reload(), 0);

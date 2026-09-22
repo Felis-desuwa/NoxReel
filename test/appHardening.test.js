@@ -39,8 +39,21 @@ function appConst(name) {
   return Function(`return (${m[1]});`)();
 }
 
+/**
+ * 建连接之前那道 TURN 关口（0.7.6 IP 隐私）的默认替身：来源是「自己填」、没开「隐藏我的 IP」——
+ * 不用现取 Cloudflare 账号，也不拦。这几个函数本身的行为在 ipPrivacy.test.js 里测。
+ */
+const TURN_GATE_OPEN = {
+  turnFetchNeeded: () => false,
+  ensureTurnReady: async () => {},
+  relayOnlyBlocked: () => '',
+  inviteBlocked: () => false,
+  peerIce: () => ({ iceServers: [], iceTransportPolicy: 'all' }),
+  signalPeerIce: () => ({ iceServers: [], iceTransportPolicy: 'all' }),
+};
+
 function sandbox({ fns = [], decls = [], globals = {} }) {
-  const ctx = { console, inviteGen: 0, ...globals };
+  const ctx = { console, inviteGen: 0, ...TURN_GATE_OPEN, ...globals };
   vm.createContext(ctx);
   vm.runInContext([...decls.map(declSource), ...fns.map(fnSource)].join('\n\n'), ctx, { filename: 'app.js（节选）' });
   return ctx;
@@ -1019,6 +1032,11 @@ test('首页角落显示版本号，取自主进程的 env 状态', async () => 
         show: () => {},
         log: () => {},
         submitPlaylistOp: () => {},
+        // Cloudflare TURN 的启动三件事（状态、备账号、用量计量），这里不关心
+        refreshCfTurnState: () => {},
+        meterTurnUsage: () => {},
+        setInterval: () => 0,
+        TURN_METER_MS: 10_000,
       },
     });
     await ctx.boot();

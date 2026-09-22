@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links — now with a playlist for the whole evening, danmaku comments over the picture, and your own preferred player.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.5-7C5CFF?style=for-the-badge" alt="Version 0.7.5">
+    <img src="https://img.shields.io/badge/version-0.7.6-7C5CFF?style=for-the-badge" alt="Version 0.7.6">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -64,6 +64,9 @@
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
 
 > [!NOTE]
+> `v0.7.6` strengthens **IP privacy**. One-to-one invite and answer codes no longer contain your LAN address or your device's IPv6 address (they become random `xxx.local` names, and friends on the same network still connect). Settings gain **“Hide my IP (connect only through a TURN relay)”**: with it on, people in the room only see the TURN server's address, and if no relay is available the connection is refused rather than silently falling back to a direct one. The TURN source can be **generated automatically from Cloudflare**: create a TURN key in the Cloudflare dashboard and enter it once; NoxReel fetches short-lived credentials by itself (the API token is stored encrypted on this PC and can never be read back by the UI) and stops using Cloudflare when your **monthly usage cap** is reached (900 GB by default; the free tier is 1,000 GB) so you are not billed. **The P2P protocol is unchanged, so 0.7.6 works with other 0.7.x builds**.
+
+> [!NOTE]
 > `v0.7.5` is a broad security-hardening and anti-DoS release. A malicious member can no longer stall the whole room with bad chunks, by accepting requests and never sending, or by flooding messages; someone holding a room link can no longer fill every seat with fake identities (a seat that has not linked up with the host directly within 60 seconds is reclaimed); every network connection for an online link is checked at connect time, so redirects and segment playlists cannot be used to reach devices on your local network; and the self-hosted signaling server no longer crashes on a single malformed message and now enforces limits on connections, message rate, and join frequency (set `TRUST_PROXY=1` behind a reverse proxy). It also fixes leftover state after a failed join, duplicate connections from clicking a link twice, an invite being overwritten when you switch invite type right after entering a room, and a long first write for large files on NTFS; the home screen now shows the version. Behavior change: **online links play in mpv only** (external players cannot go through the filtering proxy). **The P2P protocol is unchanged, so 0.7.5 works with other 0.7.x builds**.
 
 > [!NOTE]
@@ -85,8 +88,8 @@
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.5.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.5.exe) |
+| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.6.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.6.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.6.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.6.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -148,6 +151,10 @@ Playlist: when one ends, the next starts once everyone is ready
 
 - Local video chunks travel over encrypted WebRTC connections between members.
 - With room links, connection details (SDP) are encrypted with the room key and exchanged through public Nostr relays; relays see who connects (IP addresses), not content. The invite redirect page is a static page, and the invite sits after the `#`, so it is never sent to GitHub.
+- **Your LAN address stays out of invites:** the desktop app denies the page's camera / microphone permission checks, so Chromium replaces local addresses with random `xxxx.local` names; one-to-one invite codes and connection details no longer show your LAN IP or public IPv6.
+- **Hide my IP** (Settings → TURN section, off by default): connects only through a TURN relay, without STUN, so people in the room only see the TURN server's address. Set up TURN first; if TURN is unavailable the connection fails with an explanation — it **never quietly falls back to a direct connection**.
+- **Cloudflare TURN, generated automatically:** without a TURN server of your own you can use your own Cloudflare account — in the Cloudflare dashboard create a key under Realtime → TURN Server, enter its Turn Token ID and API Token under "Generate with Cloudflare" in Settings, and click "Verify and save". The API Token is stored encrypted on your computer and used only by the main process, which fetches 24-hour temporary credentials before connecting.
+- **Cloudflare TURN monthly limit:** "Use at most N GB per month (counted on this computer)" in Settings defaults to 900 GB (the free tier is 1,000 GB, leaving 100 GB of headroom). Once reached, Cloudflare TURN is not used for the rest of the month and comes back on the 1st of next month (UTC); existing connections are not cut off. This is counted locally and may differ from your Cloudflare bill, so also create a Budget alert in the Cloudflare dashboard under Manage Account → Billing → Billable Usage as a safety net.
 - Discord status is off by default; when enabled it only talks to the local Discord app over its local pipe, and the title is hidden by default.
 - Chat and danmaku use the same encrypted P2P connections, never touch a server, and are never written to disk; the host keeps only the last 50 messages in memory to replay them to newcomers.
 - Every member loads video links directly from the original website; the NoxReel signaling server does not relay them. Short-lived Android playback URLs travel only through an authenticated room connection and exclude Cookie and Authorization headers.
@@ -189,7 +196,7 @@ The transfer layer is keyed by slot: a room can hold several videos at once, eac
 
 - **No interoperability with 0.6.x:** protocol v2 has no backward-compatible path, so a mixed room disconnects during the handshake and asks for an upgrade.
 - Public-internet NAT traversal depends on both networks and cannot be guaranteed.
-- Users must provide their own TURN relay and credentials.
+- Users must provide their own TURN relay: their own server and credentials, or their own Cloudflare account (Settings can generate temporary credentials from it).
 - There is no file size cap: the manifest and chunk bitfield are split automatically to stay under the DataChannel per-message limit. The largest current end-to-end real-media test is 1.75 GB.
 - The playlist holds at most 100 items, and the played section keeps at most 30.
 - PotPlayer and MPC-BE only take over fully received files and are Windows-only; danmaku is invisible under exclusive fullscreen, and MPC-BE additionally cannot open links that need request headers.

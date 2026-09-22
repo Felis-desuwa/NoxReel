@@ -19,8 +19,19 @@ function fnSource(name) {
   return APP.slice(m.index, end + 2);
 }
 
+// 建连接之前那道 TURN 关口（0.7.6）的默认替身：不用现取 Cloudflare 账号、没开「隐藏我的 IP」。
+// 关口本身的行为见 ipPrivacy.test.js。
+const TURN_GATE_OPEN = {
+  turnFetchNeeded: () => false,
+  ensureTurnReady: async () => {},
+  relayOnlyBlocked: () => '',
+  inviteBlocked: () => false,
+  peerIce: () => ({ iceServers: [], iceTransportPolicy: 'all' }),
+  signalPeerIce: () => ({ iceServers: [], iceTransportPolicy: 'all' }),
+};
+
 function sandbox(names, globals) {
-  const ctx = { console, Promise, inviteGen: 0, ...globals };
+  const ctx = { console, Promise, inviteGen: 0, ...TURN_GATE_OPEN, ...globals };
   vm.createContext(ctx);
   vm.runInContext(names.map(fnSource).join('\n\n'), ctx);
   return ctx;

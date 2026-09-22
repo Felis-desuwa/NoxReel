@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析；一整晚的片单、飘过画面的弹幕和你自己惯用的播放器都在里面。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.5-7C5CFF?style=for-the-badge" alt="Version 0.7.5">
+    <img src="https://img.shields.io/badge/version-0.7.6-7C5CFF?style=for-the-badge" alt="Version 0.7.6">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -64,6 +64,9 @@
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
 
 > [!NOTE]
+> `v0.7.6` 加强了 **IP 隐私**。一对一邀请码和应答码里不再出现你的局域网地址和本机 IPv6（换成随机的 `xxx.local`，同一网络里的朋友照样能连）。设置里新增 **「隐藏我的 IP（只经 TURN 中继连接）」**：打开后房间里的人只能看到 TURN 服务器的地址；没有可用中继时直接拦下、绝不悄悄退回直连。TURN 来源可以选 **Cloudflare 自动生成**：在 Cloudflare 后台建一个 TURN Key 填一次就行，软件自动换临时账号（API Token 加密存在本机、界面上读不回来），并按你设的**每月用量上限**（默认 900GB，免费额度 1000GB）到量自动停用，免得扣费。**P2P 协议没变，和 0.7.x 互通**。
+
+> [!NOTE]
 > `v0.7.5` 是一次全面的安全加固和防 DoS 更新。房间里的恶意成员不能再用坏分片、收了请求不发片、刷消息把全房拖停；拿到房间链接的人不能再用一堆假身份占满名额（放行后 60 秒内没和房主直连上的名额会被收回）；在线链接的每一次网络连接都会在连接那一刻检查目标地址，跳转和分片列表都没法被用来访问你局域网里的设备；自建信令服务器补上了一条消息就能打崩的漏洞，并加了连接数、消息速率、加入频率等上限（放在反向代理后面记得设 `TRUST_PROXY=1`）。另外修了加入失败后状态残留、重复点链接叠出两套连接、刚进房就改邀请方式被盖掉、NTFS 上大文件首次写入卡顿等问题；大厅会显示版本号。行为变化：**在线链接只用 mpv 播放**（外部播放器没法走过滤代理）。**P2P 协议没变，和 0.7.x 互通**。
 
 > [!NOTE]
@@ -85,8 +88,8 @@
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.5.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.5.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.5.exe) |
+| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.6.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.6.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.6.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.6.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -148,6 +151,10 @@
 
 - 本地视频分片通过加密的 WebRTC 连接在成员之间传输。
 - 房间链接模式下，连接信息（SDP）用房间密钥加密后经公共 Nostr 中继交换；中继能看到连接者的 IP，看不到内容。邀请跳转页是一张静态页，邀请内容只在 `#` 后面，不会发给 GitHub。
+- **本机内网地址不进邀请**：桌面端拒绝页面的摄像头 / 麦克风等权限检查，Chromium 因此把本机地址换成随机的 `xxxx.local` 名字，一对一邀请码和连接信息里看不到你的局域网 IP 和公网 IPv6。
+- **隐藏我的 IP**（设置 → TURN 那一段，默认关）：打开后只经 TURN 中继连接、不带 STUN，房间里的人只能看到 TURN 服务器的地址。需要先配好 TURN；TURN 用不了时会直接连不上并说明原因，**不会悄悄退回直连**。
+- **Cloudflare TURN 自动生成**：没有自己的 TURN 服务器时，可以用自己的 Cloudflare 账号——在 Cloudflare 后台 Realtime → TURN Server 新建一个 Key，把 Turn Token ID 和 API Token 填进设置里的「Cloudflare 自动生成」，点「验证并保存」。API Token 加密保存在本机、只有主进程使用，连接前自动换一组 24 小时有效的临时账号。
+- **Cloudflare TURN 月用量上限**：设置里「每月最多用 N GB（本机统计）」默认 900 GB（免费额度 1000 GB，留 100 GB 余量），到上限后本月不再使用 Cloudflare TURN、下个月 1 日（UTC）自动恢复，已经连着的连接不会被断开。这是本机统计，和 Cloudflare 账单可能有出入；建议另外在 Cloudflare 后台 Manage Account → Billing → Billable Usage 建一个 Budget alert 做兜底。
 - Discord 状态显示默认关闭；打开后只经本机 Discord 客户端的本地管道发送，片名默认不显示。
 - 聊天与弹幕也只走同一批加密的 P2P 连接，不经过任何服务器，不落盘；房主只在内存里保留最近 50 条用于补发历史。
 - 视频链接由每位成员直接从原始网站读取，不经过 NoxReel 信令服务器；Android 所需的短时效播放地址仅通过已认证的房间连接发送，并剔除 Cookie 与 Authorization。
@@ -189,7 +196,7 @@
 
 - **与 0.6.x 不互通**：协议 v2 没有做向下兼容，混用会在握手阶段断开并提示升级。
 - 真实公网 NAT 穿透效果取决于双方网络，无法保证所有网络组合都能直连。
-- TURN 中继需要使用者自行提供服务器与凭据。
+- TURN 中继需要使用者自行提供：自己的服务器与凭据，或者自己的 Cloudflare 账号（设置里可自动生成临时账号）。
 - 文件大小不设上限，清单和分片位图都会按 DataChannel 单条消息上限自动分段；目前真实媒体端到端测试规模为 1.75 GB。
 - 播放列表最多 100 项，已播放区最多保留 30 条。
 - PotPlayer 和 MPC-BE 只接手已经收完的文件，且只在 Windows 上可用；独占全屏下看不到弹幕，MPC-BE 还打不开需要请求头的链接。

@@ -7,6 +7,8 @@ const dns = require('dns/promises');
 const { CHUNK_SIZE } = require('./fileStore');
 const { validateManifestName } = require('./mediaGuard');
 const { isPublicIp } = require('./ipGuard');
+// Cloudflare TURN 凭据的格式由 cloudflareTurn 定义（它保存前还要再查一遍），这里只负责把关
+const { isValidKeyId, isValidApiToken } = require('./cloudflareTurn');
 // 弹幕的各种上限由覆盖层那一侧定义（它还要按同一个数截断播放器里发回来的文本），
 // 这里只负责把关。两边各写一份就迟早会对不上。
 const {
@@ -249,6 +251,20 @@ function externalUrl(value) {
   return httpUrl(value, '外部链接');
 }
 
+/**
+ * Cloudflare TURN 的 Turn Token ID 和 API Token。报错只说是哪个字段，
+ * 绝不把值本身拼进去 —— 报错会原样回到渲染进程，还可能进日志和诊断信息。
+ */
+function cfKeyId(value) {
+  if (!isValidKeyId(value)) fail('Turn Token ID');
+  return value;
+}
+
+function cfApiToken(value) {
+  if (!isValidApiToken(value)) fail('API Token');
+  return value;
+}
+
 function mediaHeaders(value) {
   if (value === undefined || value === null) return {};
   const source = plainObject(value, '媒体请求头');
@@ -266,6 +282,8 @@ module.exports = {
   MAX_DURATION_SEC,
   absolutePath,
   binary,
+  cfApiToken,
+  cfKeyId,
   danmakuFrame,
   externalUrl,
   finiteNumber,

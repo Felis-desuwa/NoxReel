@@ -13,7 +13,7 @@
  * 2MB 的 Buffer 走 IPC 是结构化克隆，开销可接受，换来的是不用引 node-webrtc。
  */
 
-const { app, BrowserWindow, ipcMain, dialog, shell, clipboard, screen, globalShortcut } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, clipboard, screen, globalShortcut, safeStorage } = require('electron');
 const fsp = require('fs/promises');
 const path = require('path');
 const { pathToFileURL } = require('url');
@@ -45,6 +45,8 @@ const { validateSourceName, SOURCE_EXTENSIONS, SUBTITLE_EXTENSIONS } = require('
 const subtitles = require('./subtitles');
 const { DiscordPresence, sanitizeActivity } = require('./discordPresence');
 const { sharedProxy, closeSharedProxy } = require('./publicProxy');
+const { lockDownPermissions } = require('./permissions');
+const { CloudflareTurn } = require('./cloudflareTurn');
 
 let win = null;
 // 同一时刻只有一个播放器；换播放器或重开时旧的先彻底退掉，迟到的事件按代丢弃
@@ -91,6 +93,9 @@ let cacheFallback = null; // 配置的目录用不了时记下原因，转给界
 // 而「哪个 exe 可以被启动」是一道授权，不能交给页面保管。
 let playerChoice = settings.resolvePlayer(mainConfig);
 let playerPaths = settings.playerPaths(mainConfig);
+// Cloudflare TURN 的凭据和本机月用量。API Token 只在主进程里：加密落盘，从不回传给渲染进程。
+// 构造时不碰磁盘也不碰 safeStorage（它要等 app ready），第一次用到时才读。
+const cfTurn = new CloudflareTurn({ userDataDir: USER_DATA_DIR, safeStorage });
 let cache = new CacheManager({ rootDir: cacheChoice.root, extraRoots: cacheKnownRoots });
 const remuxOutputs = new Map();
 // 转封装／精简正在跑的条数。产物要等任务结束才登记进 remuxOutputs，中间这段时间那张表是空的 ——
@@ -283,7 +288,9 @@ function createWindow() {
     reclaimAfterRendererGone();
   });
   win.webContents.on('render-process-gone', () => reclaimAfterRendererGone());
-  win.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+  // 权限请求和检查一律拒绝。检查那一道是为了让 Chromium 把 SDP 里的 host 候选换成 mDNS 名字
+  // （<uuid>.local），不然邀请码里明文带着本机局域网 IP 和公网 IPv6 —— media 绝不能放行，见 permissions.js
+  lockDownPermissions(win.webContents.session);
 
   // 主窗口是这个软件唯一的界面，它一关就该退出。
   // 这一句不能省，也不能指望 window-all-closed 兜底：覆盖窗（弹幕层）只 hide 不 destroy，
@@ -805,6 +812,39 @@ secureHandle('discord:clear', async () => {
 });
 
 secureHandle('discord:status', async () => discordPresence.status);
+
+/* ------------------------------ Cloudflare TURN ------------------------------ */
+
+// 一次汇报的增量上限：渲染进程每 10 秒报一次，10 Gbps 跑满也到不了这个数
+const MAX_TURN_USAGE_REPORT = 64 * 1e9;
+// 渲染进程只在离过期不到两小时时要一组新的；给大了等于允许它每次都绕过缓存去刷 Cloudflare
+const MAX_TURN_MIN_VALID_MS = 3 * 60 * 60 * 1000;
+
+// API Token 只进不出：这几个处理器没有一个把它交回去，报错里也不带它（见 cloudflareTurn.js）
+secureHandle('turn:cfSave', async (payload) => {
+  const { keyId, apiToken } = validate.plainObject(payload, 'Cloudflare 凭据');
+  return cfTurn.save({ keyId: validate.cfKeyId(keyId), apiToken: validate.cfApiToken(apiToken) });
+});
+
+secureHandle('turn:cfClear', async () => cfTurn.clear());
+
+secureHandle('turn:cfStatus', async () => cfTurn.status());
+
+secureHandle('turn:cfCredentials', async (opts) => {
+  const value = opts === undefined || opts === null ? {} : validate.plainObject(opts, 'TURN 参数');
+  const minValidMs =
+    value.minValidMs === undefined ? 0 : validate.integer(value.minValidMs, 'TURN 参数', { min: 0, max: MAX_TURN_MIN_VALID_MS });
+  return cfTurn.credentials({ minValidMs });
+});
+
+// 经 Cloudflare 中继的字节数（增量），按 UTC 自然月累加、落盘；返回本月用量
+secureHandle('turn:cfReportUsage', async (bytes) =>
+  cfTurn.addUsage(validate.integer(bytes, 'TURN 用量', { min: 0, max: MAX_TURN_USAGE_REPORT }))
+);
+
+secureHandle('turn:cfSetLimit', async (limitGB) =>
+  cfTurn.setLimit(validate.integer(limitGB, 'TURN 用量上限', { min: 1, max: 1000 }))
+);
 
 // 片子旁边的外挂字幕。片子本身必须已经批准过；找到的字幕顺手批准，
 // 之后 media:convert 才肯读它们 —— 渲染进程自己拼一个路径塞进来是不行的。

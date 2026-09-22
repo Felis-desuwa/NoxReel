@@ -57,7 +57,7 @@ const webContents = {
     list.push(fn);
     webEvents.set(name, list);
   },
-  session: { setPermissionRequestHandler() {} },
+  session: { setPermissionRequestHandler() {}, setPermissionCheckHandler() {} },
   setWindowOpenHandler() {},
 };
 

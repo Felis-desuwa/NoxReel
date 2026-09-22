@@ -40,6 +40,10 @@ function room({ peerThrows = true, previous = null } = {}) {
     replace: (target, ...nodes) => shown.push(nodes.flat().map((n) => n?.text).join('')),
     connectedPeerCount: () => 0,
     iceServers: () => [],
+    // 0.7.6 起建连接前要过 TURN 关口、ICE 参数统一从 peerIce() 拿；这里关口全开，失败来自 Peer 构造本身
+    turnFetchNeeded: () => false,
+    inviteBlocked: () => false,
+    peerIce: () => ({ iceServers: [], iceTransportPolicy: 'all' }),
     log: (text, level) => logs.push([text, level]),
     inviteGen: 0,
   });

@@ -113,6 +113,7 @@ textarea,
 input[type="text"],
 input[type="url"],
 input[type="number"],
+input[type="password"],
 select {
   width: 100%;
   background: var(--bg);
@@ -1793,6 +1794,15 @@ select:disabled {
   margin-bottom: 4px;
   font-size: 13px;
   color: var(--text);
+}
+/* 设置页一段里的小标题（如「TURN 来源」），和上面的说明拉开一点 */
+.field .sub-title {
+  margin-top: 10px;
+  margin-bottom: 4px;
+}
+/* Cloudflare 状态行和底下「月用量上限」那一栏之间留出距离 */
+#set-cf-status {
+  margin-bottom: 12px;
 }
 /* 房间链接底下那行：说明文字 + 「换一条链接」，按钮不再单独占一整行 */
 .relay-extra {
