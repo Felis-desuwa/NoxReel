@@ -393,7 +393,8 @@ test.after(() => {
 
 /** 最小的 RTCPeerConnection 替身：Peer 构造时只往上面挂回调、关的时候调 close。 */
 class FakePC {
-  constructor() {
+  constructor(config = {}) {
+    this.config = config;
     FakePC.instances.push(this);
     this.iceConnectionState = 'new';
     this.connectionState = 'new';
@@ -511,10 +512,10 @@ async function inviteFrom(h, hostId) {
 
 let caseNo = 0;
 
-async function loadPhone(t, { native = fakeNative(), session = new Map() } = {}) {
+async function loadPhone(t, { native = fakeNative(), session = new Map(), storage = {} } = {}) {
   const h = await installHooks();
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1_700_000_000_000 });
-  const store = new Map([['sw.securityMode', 'trusted']]);
+  const store = new Map([['sw.securityMode', 'trusted'], ...Object.entries(storage)]);
   globalThis.localStorage = {
     getItem: (k) => (store.has(k) ? store.get(k) : null),
     setItem: (k, v) => store.set(k, String(v)),
@@ -813,4 +814,453 @@ test('确认框放在播放层外面：大厅里也弹得出来', () => {
   assert.equal(opens, closes, '#invite-ask 落在了 #stage 里面');
   assert.match(indexHtml, /#invite-ask \{ position:fixed;/);
   for (const id of ['invite-stay', 'invite-leave']) assert.match(indexHtml, new RegExp(`id="${id}"`));
+});
+
+/* ================= 和电脑端补齐：房间链接、TURN、隐藏我的 IP、连接上限 ================= */
+
+/** 按 Nostr 中继协议（REQ / EVENT / CLOSE）工作的内存中继，和 relaySignaling.test.js 那份同一套。计时器走 mock。 */
+class FakeRelayNet {
+  constructor() {
+    this.relays = new Map();
+    this.sockets = new Set();
+  }
+  relay(url) {
+    if (!this.relays.has(url)) this.relays.set(url, { subs: new Set() });
+    return this.relays.get(url);
+  }
+  WebSocket() {
+    const net = this;
+    return class FakeRelayWS {
+      constructor(url) {
+        this.url = url;
+        this.readyState = 0;
+        net.sockets.add(this);
+        setTimeout(() => {
+          this.readyState = 1;
+          this.onopen?.();
+        }, 5);
+      }
+      send(text) {
+        if (this.readyState !== 1) return;
+        const msg = JSON.parse(text);
+        const relay = net.relay(this.url);
+        if (msg[0] === 'REQ') relay.subs.add({ ws: this, id: msg[1], filter: msg[2] });
+        else if (msg[0] === 'CLOSE') {
+          for (const s of relay.subs) if (s.ws === this && s.id === msg[1]) relay.subs.delete(s);
+        } else if (msg[0] === 'EVENT') {
+          const ev = msg[1];
+          for (const s of relay.subs) {
+            if (!s.filter.kinds.includes(ev.kind)) continue;
+            if (!ev.tags.some((tag) => tag[0] === 'x' && s.filter['#x'].includes(tag[1]))) continue;
+            setTimeout(() => s.ws.readyState === 1 && s.ws.onmessage?.({ data: JSON.stringify(['EVENT', s.id, ev]) }), 2);
+          }
+        }
+      }
+      close() {
+        if (this.readyState === 3) return;
+        this.readyState = 3;
+        for (const r of net.relays.values()) for (const s of r.subs) if (s.ws === this) r.subs.delete(s);
+        setTimeout(() => this.onclose?.(), 1);
+      }
+    };
+  }
+}
+
+const RELAYS = ['wss://relay-a.example', 'wss://relay-b.example'];
+
+/** 推着假时钟走（中继的连接、hello 重发、等放行的超时都是计时器），每一步让 Promise 链跑完。 */
+async function pump(t, ms, step = 25) {
+  for (let done = 0; done < ms; done += step) {
+    t.mock.timers.tick(step);
+    await flush(20);
+  }
+}
+
+async function pumpUntil(t, cond, what, maxMs = 20_000) {
+  for (let waited = 0; waited < maxMs; waited += 25) {
+    if (cond()) return;
+    t.mock.timers.tick(25);
+    // 签名、加解密有一部分是真的异步（WebCrypto），多让几轮事件循环，别让假时钟跑在它前头
+    await flush(20);
+  }
+  assert.fail(`等不到：${what}`);
+}
+
+/** 推着假时钟等一个 Promise 落定（里面既有假计时器，也有真的 WebCrypto）。 */
+async function pumpPromise(t, promise, what, maxMs = 20_000) {
+  let done = false;
+  let value;
+  let error;
+  promise.then(
+    (v) => {
+      done = true;
+      value = v;
+    },
+    (e) => {
+      done = true;
+      error = e;
+    }
+  );
+  await pumpUntil(t, () => done, what, maxMs);
+  if (error) throw error;
+  return value;
+}
+
+/** 电脑端的房主（和手机上是同一份 relaySignaling.js），连在假中继上。返回房主和它的房间链接。 */
+async function relayHost(t, phone, net, { securityMode = 'trusted' } = {}) {
+  const { RelaySignaling, newRoomSecret } = await import(assetUrl('relaySignaling.js'));
+  const { PROTOCOL_VERSION } = await import(assetUrl('protocol.js'));
+  const secret = newRoomSecret();
+  const host = new RelaySignaling({
+    secret,
+    isHost: true,
+    hostId: 'HOSTRLY1',
+    peerId: 'HOSTRLY1',
+    name: '房主',
+    relays: RELAYS,
+    maxMembers: 8,
+    occupied: () => 1,
+    protocolVersion: PROTOCOL_VERSION,
+    WebSocketImpl: net.WebSocket(),
+  });
+  t.after(() => host.close());
+  const events = { join: [], signal: [] };
+  host.on('peer-join', (e) => events.join.push(e));
+  host.on('signal', (e) => events.signal.push(e));
+  await pumpPromise(t, host.connect(), '房主连上假中继');
+  const code = await phone.h.signaling.encodeCode({
+    k: 'relay',
+    key: secret,
+    hk: host.publicKey,
+    from: 'HOSTRLY1',
+    maxMembers: 8,
+    securityMode,
+    relays: RELAYS,
+  });
+  return { host, events, link: phone.h.signaling.shareLink(code, 'join') };
+}
+
+function useRelayNet(net) {
+  Object.defineProperty(globalThis, 'WebSocket', { value: net.WebSocket(), configurable: true, writable: true });
+}
+
+test('房间链接：手机点开电脑房主的链接，等放行后进房；房主发来的 offer 不 trickle，手机回 answer', { timeout: 60_000 }, async (t) => {
+  const phone = await loadPhone(t);
+  const net = new FakeRelayNet();
+  useRelayNet(net);
+  const { host, events, link } = await relayHost(t, phone, net);
+
+  phone.open(link);
+  await pumpUntil(t, () => phone.logged('房主已放行，正在和房间里的人打洞') === 1, '房主放行');
+  assert.equal(events.join.length, 1, '房主那边看到手机进房');
+  assert.equal(phone.logged('这是房间链接，目前只有电脑端'), 0, '不能再说手机不支持');
+
+  // 老成员（房主）向新人发 offer
+  const phoneId = events.join[0].peerId;
+  host.signal(phoneId, { kind: 'offer', sdp: 'v=0 offer-from-host' });
+  await pumpUntil(t, () => phone.offers().length === 1, '手机收到 offer');
+  const { peer } = phone.offers()[0];
+  assert.equal(peer.peerId, 'HOSTRLY1');
+  assert.equal(peer.trickle, false, '中继路径不 trickle：候选打包进 SDP');
+  phone.offers()[0].resolve('v=0 answer-from-phone');
+  await pumpUntil(t, () => events.signal.some((s) => s.payload?.kind === 'answer'), '房主收到 answer');
+  assert.equal(events.signal.find((s) => s.payload?.kind === 'answer').from, phoneId, '署名是手机');
+
+  // 已经在房间里了：再点一条邀请要先问
+  phone.open(link);
+  await flush();
+  assert.ok(phone.$('invite-ask').classList.contains('on'));
+});
+
+test('房间链接：房主不在线就说清楚、收掉中继连接，之后还能再点', { timeout: 60_000 }, async (t) => {
+  const phone = await loadPhone(t);
+  const net = new FakeRelayNet();
+  useRelayNet(net);
+  const { host, link } = await relayHost(t, phone, net);
+  host.close(); // 房主走了
+  await pump(t, 50);
+
+  phone.open(link);
+  await pumpUntil(t, () => phone.logged('加入房间失败：找不到房主') === 1, '等放行超时', 40_000);
+  await pump(t, 50);
+  const phoneSockets = [...net.sockets].filter((ws) => ws.readyState !== 3);
+  assert.equal(phoneSockets.length, 0, '放弃之后中继连接要关掉');
+
+  phone.open(link);
+  await pump(t, 100);
+  assert.equal(phone.logged('上一条邀请还在处理'), 0, '闸门放开了');
+});
+
+test('房间链接：模式不一致、链接不完整都不连中继', { timeout: 60_000 }, async (t) => {
+  const phone = await loadPhone(t);
+  const net = new FakeRelayNet();
+  useRelayNet(net);
+  const { link } = await relayHost(t, phone, net, { securityMode: 'safe' });
+  const before = net.sockets.size;
+  phone.open(link);
+  await pump(t, 100);
+  assert.equal(phone.logged('房间使用安全模式，本机设置是可信房间'), 1);
+
+  const broken = await phone.h.signaling.encodeCode({ k: 'relay', key: 'x', hk: 'nothex', from: 'HOSTRLY1', securityMode: 'trusted' });
+  phone.open(phone.h.signaling.shareLink(broken, 'join'));
+  await pump(t, 100);
+  assert.equal(phone.logged('这个房间链接不完整'), 1);
+  assert.equal(net.sockets.size, before, '一条中继连接都不该开');
+});
+
+test('隐藏我的 IP 开着却没有中继：房间链接、一对一邀请、信令服务器都不建连接，也不退回直连', { timeout: 60_000 }, async (t) => {
+  const phone = await loadPhone(t, { storage: { 'sw.relayOnly': '1' } });
+  const net = new FakeRelayNet();
+  useRelayNet(net);
+  const { link } = await relayHost(t, phone, net);
+  const sockets = net.sockets.size;
+  phone.open(link);
+  await pump(t, 100);
+  assert.equal(net.sockets.size, sockets, '房间链接没开任何中继连接');
+
+  phone.open(await inviteFrom(phone.h, 'HOSTAAAA'));
+  await pump(t, 100);
+  assert.equal(phone.offers().length, 0, '一对一邀请没生成应答');
+
+  Object.defineProperty(globalThis, 'WebSocket', { value: CountingWebSocket, configurable: true, writable: true });
+  const ws = CountingWebSocket.instances.length;
+  phone.$('url').value = 'ws://127.0.0.1:9';
+  phone.$('room').value = 'room';
+  phone.$('join').click();
+  await flush();
+  assert.equal(CountingWebSocket.instances.length, ws, '信令服务器也没连');
+  assert.ok(phone.logged('已打开「隐藏我的 IP」，但还没有可用的 TURN 中继') >= 3, '三处都说清楚了');
+});
+
+test('隐藏我的 IP + 自己填的 TURN：一对一应答只走中继、不带 STUN；没拿到中继候选当场说', { timeout: 60_000 }, async (t) => {
+  const phone = await loadPhone(t, {
+    storage: {
+      'sw.relayOnly': '1',
+      'sw.turnEnabled': '1',
+      'sw.turnUrl': 'turn:turn.example.org:3478',
+      'sw.turnUser': 'u',
+      'sw.turnPass': 'p',
+    },
+  });
+  phone.open(await inviteFrom(phone.h, 'HOSTAAAA'));
+  await until(() => phone.offers().length === 1, '生成应答');
+  const { peer } = phone.offers()[0];
+  assert.equal(peer.iceTransportPolicy, 'relay');
+  const servers = peer.pc.config.iceServers;
+  assert.ok(servers.length === 1 && servers[0].urls.every((u) => /^turn:/.test(u)), JSON.stringify(servers));
+  assert.equal(peer.pc.config.iceTransportPolicy, 'relay');
+  phone.offers()[0].resolve('v=0 answer-without-candidates');
+  await until(() => !!phone.$('answer-out').value, '应答生成');
+  assert.equal(phone.logged('一条中继候选都没拿到'), 1, '只走中继却一条中继候选都没有：当场说');
+});
+
+test('没开隐藏我的 IP：自己填的 TURN 照样带上，STUN 也在', { timeout: 60_000 }, async (t) => {
+  const phone = await loadPhone(t, {
+    storage: { 'sw.turnEnabled': '1', 'sw.turnUrl': 'turn:turn.example.org:3478', 'sw.turnUser': 'u', 'sw.turnPass': 'p' },
+  });
+  phone.open(await inviteFrom(phone.h, 'HOSTAAAA'));
+  await until(() => phone.offers().length === 1, '生成应答');
+  const { peer } = phone.offers()[0];
+  assert.equal(peer.iceTransportPolicy, 'all');
+  const urls = peer.pc.config.iceServers.flatMap((s) => s.urls);
+  assert.ok(urls.some((u) => u.startsWith('stun:')), 'STUN 在');
+  assert.ok(urls.includes('turn:turn.example.org:3478?transport=udp') && urls.includes('turn:turn.example.org:3478?transport=tcp'), JSON.stringify(urls));
+});
+
+test('连接设置：写错了当场说；保存后用的是和电脑端同一组键', { timeout: 60_000 }, async (t) => {
+  const phone = await loadPhone(t);
+  const save = async () => {
+    phone.$('net-save').click();
+    await flush();
+    return phone.$('net-err').textContent;
+  };
+  phone.$('turn-source-manual').checked = true;
+  phone.$('turn-on').checked = true;
+  phone.$('turn-url').value = 'https://turn.example.org';
+  assert.match(await save(), /这些 TURN 地址认不出来/);
+  phone.$('turn-url').value = 'turn:turn.example.org:53';
+  assert.match(await save(), /53 端口/);
+  phone.$('turn-url').value = 'turn.example.org:3478';
+  phone.$('turn-user').value = 'u';
+  phone.$('turn-pass').value = '';
+  assert.match(await save(), /要填用户名和密码/);
+  phone.$('turn-pass').value = 'p';
+  phone.$('cf-key').value = 'abcdef1234';
+  assert.match(await save(), /Cloudflare 凭据还没保存/);
+  phone.$('cf-key').value = '';
+  phone.$('relay-only').checked = true;
+  assert.equal(await save(), '');
+  const get = (k) => globalThis.localStorage.getItem(k);
+  assert.equal(get('sw.turnSource'), 'manual');
+  assert.equal(get('sw.turnEnabled'), '1');
+  assert.equal(get('sw.turnUrl'), 'turn:turn.example.org:3478', '漏了 turn: 前缀的直接补上');
+  assert.equal(get('sw.turnUser'), 'u');
+  assert.equal(get('sw.turnPass'), 'p');
+  assert.equal(get('sw.relayOnly'), '1');
+  assert.equal(phone.logged('连接设置已保存'), 1);
+});
+
+test('信令那头刷人：同时挂着的连接有上限，同一个人刷 offer 被限速', { timeout: 60_000 }, async (t) => {
+  const phone = await loadPhone(t);
+  const { Peer } = await import(assetUrl('peer.js'));
+  const realCreateOffer = Peer.prototype.createOffer;
+  Peer.prototype.createOffer = () => new Promise(() => {});
+  t.after(() => {
+    Peer.prototype.createOffer = realCreateOffer;
+  });
+  phone.$('url').value = 'ws://127.0.0.1:9';
+  phone.$('room').value = 'room';
+  phone.$('join').click();
+  const ws = CountingWebSocket.instances.at(-1);
+  ws.onopen();
+  ws.onmessage({ data: JSON.stringify({ t: 'joined', peers: [] }) });
+  await until(() => phone.logged('已进入房间') === 1, '进房');
+  const swarm = phone.swarm();
+
+  for (let i = 0; i < 40; i++) ws.onmessage({ data: JSON.stringify({ t: 'peer-join', peerId: `FLOOD${String(i).padStart(3, '0')}`, name: 'x' }) });
+  await flush();
+  assert.equal(swarm.peers.size, 24, '同时挂着的连接不能超过 24 条');
+  assert.equal(phone.logged('同时连着的人太多了'), 1, '只说一次');
+
+  for (const p of [...swarm.peers.keys()]) swarm.removePeer(p);
+  const pcs = FakePC.instances.length;
+  for (let i = 0; i < 10; i++) {
+    ws.onmessage({ data: JSON.stringify({ t: 'signal', from: 'SPAMMER1', name: 'x', payload: { kind: 'offer', sdp: 'v=0' } }) });
+  }
+  await flush();
+  assert.equal(FakePC.instances.length - pcs, 4, '同一个人一下子最多重建 4 次');
+  ws.onmessage({ data: JSON.stringify({ t: 'signal', from: 'SPAMMER1', name: 'x', payload: 'not-an-object' }) });
+  await flush();
+});
+
+test('信令说「你被移出房间」（房间链接的房主一直没和你直连上）：还没进房就停在大厅说清楚', { timeout: 60_000 }, async (t) => {
+  const phone = await loadPhone(t);
+  phone.$('url').value = 'ws://127.0.0.1:9';
+  phone.$('room').value = 'room';
+  phone.$('join').click();
+  const ws = CountingWebSocket.instances.at(-1);
+  ws.onopen();
+  ws.onmessage({ data: JSON.stringify({ t: 'joined', peers: [] }) });
+  await until(() => phone.logged('已进入房间') === 1, '进房');
+  ws.onmessage({ data: JSON.stringify({ t: 'error', code: 'REMOVED', message: 'removed' }) });
+  await flush();
+  assert.equal(phone.logged('房主那边一直没能和你直连，你已被移出房间'), 1);
+  assert.equal(ws.closed, true, '信令收掉');
+  assert.equal(phone.reloads.length, 0, '还没进房不用整页重载');
+});
+
+test('被移出前已经在房间里：整页重载回大厅，原因留到大厅再说一遍（只说一次）', { timeout: 60_000 }, async (t) => {
+  const session = new Map([['sw.lobbyNotice', '房主那边一直没能和你直连，你已被移出房间。']]);
+  const phone = await loadPhone(t, { session });
+  assert.equal(phone.logged('你已被移出房间'), 1);
+  assert.equal(session.has('sw.lobbyNotice'), false, '说完就删');
+  const src = fs.readFileSync(path.join(root, 'android', 'app', 'src', 'main', 'assets', 'js', 'app-android.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function removedFromRoom()'), src.indexOf('\n}\n', src.indexOf('function removedFromRoom()')));
+  assert.match(fn, /sessionStorage\.setItem\(LOBBY_NOTICE_KEY, text\)/);
+  assert.match(fn, /window\.sw\.leaveRoom\(\);\s*location\.reload\(\);/);
+});
+
+/* ------------------------- Cloudflare TURN（页面这一侧） ------------------------- */
+
+/**
+ * 假原生层的 Cloudflare 调用：按动作交给 handlers，结果在下一个微任务里经 __noxreelNativeReply 送回，
+ * 和真机上「后台线程做完再切回主线程」一样是异步的。
+ */
+function cfNative(handlers) {
+  const calls = [];
+  return fakeNative({
+    cfCalls: calls,
+    cfCall(id, action, args) {
+      calls.push({ action, args: JSON.parse(args) });
+      queueMicrotask(() => {
+        let reply;
+        try {
+          reply = { ok: true, value: (handlers[action] || (() => ({})))(JSON.parse(args)) };
+        } catch (e) {
+          reply = { ok: false, error: e.message };
+        }
+        globalThis.window.__noxreelNativeReply(id, JSON.stringify(reply));
+      });
+    },
+  });
+}
+
+const CF_URLS = ['turn:turn.cloudflare.com:3478?transport=udp', 'turn:turn.cloudflare.com:443?transport=tcp'];
+const cfUsage = (over = {}) => ({ month: '2026-09', usedBytes: 0, limitGB: 900, limitBytes: 900e9, exceeded: false, nearLimit: false, ...over });
+
+test('Cloudflare 来源 + 隐藏我的 IP：生成应答前先取临时账号，连接只走 Cloudflare 中继', { timeout: 60_000 }, async (t) => {
+  const native = cfNative({
+    status: () => ({ configured: true, expiresAt: null, lastError: null, usage: cfUsage() }),
+    credentials: () => ({ urls: CF_URLS, username: 'cf-user', credential: 'cf-pass', expiresAt: Date.now() + 23 * 3600e3 }),
+  });
+  const phone = await loadPhone(t, { native, storage: { 'sw.turnSource': 'cloudflare', 'sw.relayOnly': '1' } });
+  await flush();
+  assert.deepEqual(native.cfCalls.map((c) => c.action), ['status'], '打开就看一眼状态，Token 不回来');
+  phone.open(await inviteFrom(phone.h, 'HOSTAAAA'));
+  await until(() => phone.offers().length === 1, '生成应答');
+  assert.deepEqual(native.cfCalls.at(-1), { action: 'credentials', args: { minValidMs: 2 * 3600e3 } });
+  const { peer } = phone.offers()[0];
+  assert.equal(peer.iceTransportPolicy, 'relay');
+  assert.deepEqual(peer.pc.config.iceServers, [{ urls: CF_URLS, username: 'cf-user', credential: 'cf-pass' }]);
+
+  // 手上的还新鲜：下一次建连接不再去取
+  const before = native.cfCalls.length;
+  phone.offers()[0].resolve('v=0 answer');
+  await until(() => !!phone.$('answer-out').value, '应答生成');
+  assert.equal(native.cfCalls.length, before);
+});
+
+test('本月 Cloudflare 用量到上限：取账号被拒（CF_QUOTA），隐藏我的 IP 开着就不连，说清楚是用量到了', { timeout: 60_000 }, async (t) => {
+  const native = cfNative({
+    status: () => ({ configured: true, expiresAt: null, lastError: null, usage: cfUsage() }),
+    credentials: () => {
+      throw new Error('[CF_QUOTA] 本月用量已到上限（900 GB）');
+    },
+  });
+  const phone = await loadPhone(t, { native, storage: { 'sw.turnSource': 'cloudflare', 'sw.relayOnly': '1' } });
+  phone.open(await inviteFrom(phone.h, 'HOSTAAAA'));
+  await flush();
+  await flush();
+  assert.equal(phone.offers().length, 0, '没有中继就不生成应答');
+  assert.ok(phone.logged('本月 Cloudflare TURN 用量已到你设的上限（900 GB）') >= 1);
+  assert.equal(phone.logged('「隐藏我的 IP」开着，没有中继就不连接'), 1);
+});
+
+test('连接设置里「验证并保存」：Token 交给原生层，成功后两个框清空；失败说人话；月上限另外保存', { timeout: 60_000 }, async (t) => {
+  let fail = true;
+  const native = cfNative({
+    status: () => ({ configured: false, expiresAt: null, lastError: null, usage: cfUsage() }),
+    save: () => {
+      if (fail) throw new Error('[CF_UNAUTHORIZED] HTTP 401');
+      return { configured: true, expiresAt: Date.now() + 23 * 3600e3, lastError: null, usage: cfUsage() };
+    },
+    setLimit: ({ limitGB }) => cfUsage({ limitGB, limitBytes: limitGB * 1e9 }),
+  });
+  const phone = await loadPhone(t, { native });
+  phone.$('cf-key').value = 'abcdef1234';
+  phone.$('cf-token').value = 't'.repeat(40);
+  phone.$('cf-save').click();
+  await flush();
+  assert.equal(native.cfCalls.at(-1).action, 'save');
+  assert.deepEqual(native.cfCalls.at(-1).args, { keyId: 'abcdef1234', apiToken: 't'.repeat(40) });
+  assert.equal(phone.$('cf-result').textContent, '没保存：未授权：Cloudflare 不认这组 Turn Token ID 和 API Token');
+  assert.equal(phone.$('cf-token').value, 't'.repeat(40), '没保存成功就别清空，让人改');
+
+  fail = false;
+  phone.$('cf-save').click();
+  await flush();
+  assert.equal(phone.$('cf-result').textContent, '已保存');
+  assert.equal(phone.$('cf-key').value, '');
+  assert.equal(phone.$('cf-token').value, '', '只进不出：保存成功就清空');
+  assert.equal(phone.$('cf-status').textContent.startsWith('Cloudflare TURN：已配置'), true);
+
+  phone.$('cf-limit').value = '0';
+  phone.$('cf-limit-save').click();
+  await flush();
+  assert.match(phone.$('net-err').textContent, /1 到 1000 之间的整数/);
+  phone.$('cf-limit').value = '500';
+  phone.$('cf-limit-save').click();
+  await flush();
+  assert.deepEqual(native.cfCalls.at(-1), { action: 'setLimit', args: { limitGB: 500 } });
+  assert.equal(phone.$('cf-usage').textContent, '本月已用 0.00 GB / 500 GB');
 });

@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links — now with a playlist for the whole evening, danmaku comments over the picture, and your own preferred player.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.6-7C5CFF?style=for-the-badge" alt="Version 0.7.6">
+    <img src="https://img.shields.io/badge/version-0.7.7-7C5CFF?style=for-the-badge" alt="Version 0.7.7">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -56,12 +56,15 @@
 - **Modern player UI:** mpv uses NoxReel's dark borderless appearance, rounded Windows corners, a bottom control bar, and clearer seek feedback.
 - **Native EXE entry points:** double-click the branded `NoxReel.exe` from a source checkout instead of using a BAT file; `NoxReel-Signal.exe` starts the signaling service.
 - **Selectable install location:** both Windows installers use a guided setup and let you choose the destination folder before installation.
-- **Android viewer:** follows the playlist, sends and receives chat, and shows danmaku over the picture; it cannot edit the playlist.
+- **Android viewer:** joins through a room link or a one-to-one invite, follows the playlist, sends and receives chat, and shows danmaku over the picture. Once the host makes you a moderator you can edit the playlist (the host applies the changes). TURN relays, “Hide my IP”, and Cloudflare TURN credentials work the same as on desktop.
 - **Chinese and English UI:** switch between Simplified Chinese and English from Settings on both desktop and the Android viewer. Nicknames, video titles, and chat text are always shown verbatim and are never translated.
 - **Automatic cache cleanup:** received videos and remuxed copies stay in the system temporary directory and are deleted when switching media, leaving the room, or closing the app. Crash leftovers are reclaimed on the next launch.
 - **Two security modes:** Trusted room is the default and starts progressive playback after about 8 MB, with a full scan after receipt. Safe mode remains available and plays only after complete receipt and a Microsoft Defender scan.
 - **Version and mode handshake:** invite codes and the P2P data channel both verify the protocol version and the selected room mode. A mismatch disconnects before media manifests, room controls, or video data are exchanged.
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
+
+> [!NOTE]
+> `v0.7.7` makes syncing **online links** steadier and brings the **Android app** level with desktop. Each member picks how to follow an online link: **Full sync** (default; jumps back to the host's position when you drift more than 2 seconds, learning how long a jump takes on that site) or **Manual sync** (follows only the host's play, pause, and seeks; shows how many seconds you are off, and **Sync to host** or `Ctrl+Shift+S` in mpv lines you up in one go). When the host or a moderator is buffering a stream, the whole room waits instead of the room clock running ahead of them. **On Android** you can now join straight from a **room link**, set up **TURN, “Hide my IP”, and Cloudflare TURN credentials** (the API token is encrypted with the system keystore), and **edit the playlist** once the host makes you a moderator. Also fixed: the status bar claiming “receiving initial data” when the host's player was closed, and browsers asking to “open Electron” when running from source; the top-bar Invite button, which duplicated “Invite someone else”, is gone. **The P2P protocol is unchanged, so 0.7.7 works with other 0.7.x builds**.
 
 > [!NOTE]
 > `v0.7.6` strengthens **IP privacy**. One-to-one invite and answer codes no longer contain your LAN address or your device's IPv6 address (they become random `xxx.local` names, and friends on the same network still connect). Settings gain **“Hide my IP (connect only through a TURN relay)”**: with it on, people in the room only see the TURN server's address, and if no relay is available the connection is refused rather than silently falling back to a direct one. The TURN source can be **generated automatically from Cloudflare**: create a TURN key in the Cloudflare dashboard and enter it once; NoxReel fetches short-lived credentials by itself (the API token is stored encrypted on this PC and can never be read back by the UI) and stops using Cloudflare when your **monthly usage cap** is reached (900 GB by default; the free tier is 1,000 GB) so you are not billed. **The P2P protocol is unchanged, so 0.7.6 works with other 0.7.x builds**.
@@ -88,8 +91,8 @@
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.6.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.6.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.6.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.6.exe) |
+| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.7.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.7.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.7.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.7.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -119,6 +122,17 @@ Playlist: when one ends, the next starts once everyone is ready
             Synchronized room state + danmaku chat
 ```
 
+### Sync mode for video links
+
+With a video link, every member streams from the original site, so connection speeds differ and positions can drift apart. Each member picks a mode from “Sync” on the control bar; the choice is stored only on that PC:
+
+- **Full sync** (default): stay aligned with the host. NoxReel checks once a second and jumps back automatically when you are more than 2 seconds off (it remembers how long a jump takes on this site and aims a little ahead); if you are a moderator, everyone waits while you buffer. If several catch-up jumps still cannot keep up (your connection is slower than the video bitrate), you are told “Auto-sync could not keep up” with the gap in seconds and offered manual sync.
+- **Manual sync**: follow only the host's play, pause, and seek. Slow buffering will not yank you around and will not make the room wait for you. When you drift, the status strip and the player show “You are 12 seconds behind the host”; click “Sync to host” or press `Ctrl+Shift+S` in mpv to realign (if the jump lands short, it tries once more by itself).
+
+After the host or a moderator seeks, the stream needs a few seconds to buffer again; the room waits for the host (and for moderators on full sync) to start playing before everyone continues.
+
+The host is the reference and has no such option. On Android, tap “Full sync / Manual sync” in the top bar of the player to switch. Local videos travel as P2P chunks and keep the room-wide pause-for-buffering behavior regardless of this setting.
+
 ## Player support
 
 | Player | Where it comes from | Progressive playback | Danmaku | Send danmaku in the player |
@@ -142,7 +156,7 @@ Playlist: when one ends, the next starts once everyone is ready
 | One-to-one invite | Each side clicks one invite/answer link | No, and no third party at all | Inviting one person, or networks that block public relays |
 | Signaling room (optional) | Members open one reusable room invite | Lightweight signaling server | Running everything yourself |
 
-- **Room links** exchange connection details through public Nostr relays: content is encrypted with the room key in the link, every message is signed, only people the host lets in count as joined, and the host's identity is vouched for by the signing key in the link. Relays see who connects (IP addresses) and message sizes and timing, but not content or titles; video never passes through them. Eight relays are used at once, so a few going down does not matter. **Room links are desktop-only for now**; phone support comes in the next version (phones should use a one-to-one invite).
+- **Room links** exchange connection details through public Nostr relays: content is encrypted with the room key in the link, every message is signed, only people the host lets in count as joined, and the host's identity is vouched for by the signing key in the link. Relays see who connects (IP addresses) and message sizes and timing, but not content or titles; video never passes through them. Eight relays are used at once, so a few going down does not matter. Phones can join through room links too (as viewers only; they cannot host).
 - **One-to-one invites:** serverless WebRTC must exchange both an offer and an answer, so the member still sends one answer link back.
 - **The optional signaling server** exchanges SDP, ICE, and room state only and never reads video.
 - Strict NAT, CGNAT, or firewall environments may require a self-hosted TURN relay.
@@ -200,7 +214,7 @@ The transfer layer is keyed by slot: a room can hold several videos at once, eac
 - There is no file size cap: the manifest and chunk bitfield are split automatically to stay under the DataChannel per-message limit. The largest current end-to-end real-media test is 1.75 GB.
 - The playlist holds at most 100 items, and the played section keeps at most 30.
 - PotPlayer and MPC-BE only take over fully received files and are Windows-only; danmaku is invisible under exclusive fullscreen, and MPC-BE additionally cannot open links that need request headers.
-- Android remains a beta viewer: it follows the playlist, sends and receives chat, and shows danmaku, but **cannot edit the playlist**.
+- Android is still in beta and **only joins as a viewer**: it cannot host a room or seed, so local files cannot be shared from a phone.
 - Uplink bandwidth is estimated by uploading random data to a Cloudflare speed-test node. It cannot see losses on the P2P path itself (cross-region routes and TURN relays are slower), so the UI always labels it as an estimate.
 - Website support changes with yt-dlp and the source site. If a short-lived stream expires, the host must switch to that link again.
 - Safe mode requires a **running** Microsoft Defender to automatically play local video received from another member; playback is refused when the scan is unavailable or does not pass. On machines with third-party antivirus software installed, Defender is often taken over and disabled, so Safe mode cannot release any received file — the dependency status shows “Missing Defender” at startup when this happens. Trusted rooms start before the final scan, and an unavailable scanner only produces a warning rather than interrupting playback; use them only when every participant trusts the host and content source.

@@ -435,7 +435,8 @@ test('Lua 脚本注册 Ctrl+Shift+D，旧版 mpv 上静默不生效', () => {
   assert.ok(lua.includes("pcall(require, 'mp.input')"));
   const guardAt = lua.indexOf('if not ok or type(input)');
   assert.ok(guardAt > 0, '没有版本探测');
-  assert.ok(guardAt < lua.indexOf('mp.add_key_binding('), '探测必须在注册按键之前');
+  // 「同步到房主」那个键不需要 mp.input，特意注册在探测前面（见下一条测试）；弹幕键必须在探测之后
+  assert.ok(guardAt < lua.indexOf('mp.add_key_binding(key, MESSAGE_NAME'), '探测必须在注册弹幕按键之前');
   assert.match(lua.slice(guardAt, lua.indexOf('\n', lua.indexOf('end', guardAt))), /return/);
   // 字数上限和聊天那边同一个数
   assert.ok(lua.includes('MAX_TEXT = ' + MAX_DANMAKU_TEXT));

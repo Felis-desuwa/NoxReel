@@ -275,11 +275,12 @@ test('粘贴或点开房间链接会走 joinViaRelay；诊断里认得出这种�
   assert.equal(ctx.connectionModeLabel(), '极简（零服务器）');
 });
 
-test('安卓端拿到房间链接：说清楚手机端下个版本支持，不报「不是邀请码」', async () => {
+test('安卓端拿到房间链接：走 joinRelayNow 真的加入，不再劝人改用一对一邀请', async () => {
   const android = fs.readFileSync(path.join(__dirname, '../android/app/src/main/assets/js/app-android.js'), 'utf8');
-  assert.match(android, /if \(payload\.k === 'relay'\) \{\s*log\('这是房间链接，目前只有电脑端 NoxReel 能用/);
+  assert.match(android, /relay = payload\.k === 'relay';\s*if \(relay\) \{[^}]*joinRelayNow\(payload\)/);
+  assert.ok(!android.includes('目前只有电脑端'), '旧的「手机端下个版本支持」说法要删干净');
   const i18n = fs.readFileSync(path.join(__dirname, '../android/app/src/main/assets/js/i18n.js'), 'utf8');
-  assert.ok(i18n.includes("'这是房间链接，目前只有电脑端 NoxReel 能用，手机端下个版本支持。请让房主给你发一条「一对一邀请」。'"));
+  assert.ok(!i18n.includes('目前只有电脑端'));
 });
 
 test('新文案都有英文', async () => {

@@ -48,6 +48,17 @@ import { MSG } from './protocol.js';
  * 旧 seq 丢、新 seq 暂存，同一发送者编号不大于已采信的丢。换片（resetMedia）清空就绪表，
  * 编号不清。有人掉线时房主替他转发一条 release（ready:false）撤销，收端不看编号；
  * 新人入房时房主在 SYNC 之后补发其他人的就绪状态，每个人都再报一次自己的。
+ *
+ * ── 在线链接（streaming）──
+ * 每个人各自从原网站拉流，缓冲由 mpv 自己管：缺数据时它自己停下来等（paused-for-cache），
+ * 攒够再接着放。没有分片水位线可看，「卡没卡」只认这个信号。每个成员自己选跟随方式：
+ *  - 完全同步（full，默认）：控制者缓冲时全房一起等；每秒核对一次本机和房间时钟差多少，
+ *    超过 2 秒就自动跳过去（往前多跳一点提前量，从上一次落地差了多少学来）。两分钟里往前追了四次
+ *    还是落后算「同步失败」（网速跟不上），停手一分钟并把差多少秒报给上层。
+ *  - 手动同步（manual）：缓冲只卡自己、房间照走；只跟真正的跳转（位置和房间原先的进度对不上），
+ *    播放/暂停不动他的进度；差开了只报差多少秒，由用户点「同步到房主」（落地没对上会自动补跳一次）。
+ *    他是管理员时按暂停/播放报房间的位置而不是自己的，免得把全房拽到他落后的地方。
+ * 房主是参照，没有选择，按完全同步走。
  */
 
 const STALL_THRESHOLD_SECONDS = 5; // 身前不足 5 秒的连续数据 → 喊停
@@ -61,6 +72,29 @@ const DATA_END_REPLAY_BACK = 0.5;
 const SEEK_DETECT_JUMP = 1.5; // 时间线跳变超过这个数，判定是用户拖了进度条
 // 命令发出后，给播放器这么久把状态变化推回来，这段时间里的变化都算回声、不算用户操作。
 const APPLY_ECHO_MS = 250;
+// 自己发出的跳转，落点在这么多毫秒内推回来都认作回声。网络流跳转要重新连接，
+// 位置变化可能晚于上面那个窗口才到 —— 被当成用户拖进度条的话，控制者会把这个落点广播给全房。
+const SEEK_ECHO_MS = 3000;
+// 在线链接：和房间差超过 DRIFT_OUT 秒算「没对上」，回到 DRIFT_BACK 秒以内才算重新对上（滞回）。
+const DRIFT_OUT_SECONDS = 2;
+const DRIFT_BACK_SECONDS = 1;
+// 连着这么多次核对都超出才算数：刚跳转完、刚缓冲完的读数常常还没稳住。
+const DRIFT_CONFIRM_CHECKS = 2;
+// 完全同步：自动对齐一次之后至少隔这么久才会再对（跳过去要重新缓冲）。
+const DRIFT_CORRECT_COOLDOWN_MS = 5000;
+// 一段时间里往前追了这么多次还是落后，算同步失败（网速跟不上）：停手一阵子，把差多少秒报出去。
+// 只数往前追的：跳过头了再往回对一下（缓存里的数据跳过去几乎不花时间，提前量会偏大）不是网速的问题。
+const DRIFT_FAIL_WINDOW_MS = 120_000;
+const DRIFT_FAIL_COUNT = 4;
+const DRIFT_FAIL_BACKOFF_MS = 60_000;
+// 网络流跳过去要重新请求、重新缓冲，落地时房间已经往前走了一截（实测 archive.org 要 7 秒）。
+// 自动对齐时往前多跳一点，这个提前量从上一次落地差了多少学来，封顶这么多秒。
+// 跳过去这么久还没核对上的不拿来学（多半卡住了）。
+const DRIFT_LEAD_MAX_SECONDS = 10;
+const DRIFT_LEAD_PROBE_MS = 20_000;
+// 手动同步点了「同步到房主」之后这么久之内，落地还没对上就自动再补跳一次（用刚学到的提前量）——
+// 第一次跳还不知道这个网站跳转要花多久，一次点不到位。只补一次，之后还差就照常提示。
+const DRIFT_CHASE_MS = 30_000;
 const MAX_NAME = 40;
 const MAX_STASH = 64;
 // 别人的 Lamport 最多比基准（_anchor）领先这么多。合法指令一次只加 1，一场放映远到不了；
@@ -167,6 +201,14 @@ export class SyncEngine extends Emitter {
     this.duration = 0;
     this.bytesPerSecond = 0;
     this.started = false;
+    // 最近一次自己发给播放器的跳转 {position, at}，用来认出迟到的回声（见 SEEK_ECHO_MS）
+    this._lastSeekCmd = null;
+
+    // 在线链接（见类注释）：当前项是不是各自从原网站拉流，以及本机选的跟随方式
+    this.streaming = false;
+    this.followMode = 'full';
+    this._seekLead = 0;
+    this._resetDrift();
   }
 
   get applying() {
@@ -210,6 +252,10 @@ export class SyncEngine extends Emitter {
     this._dataEndReported = false;
     this._dataEndStall = false;
     this._replayAt = 0;
+    this._lastSeekCmd = null;
+    // 跳转提前量是按这一部的网站学的，换一部从头学。跟随方式不动，由上层按新的当前项重新设
+    this._seekLead = 0;
+    this._resetDrift();
     this.localStalled = false;
     this.stalledPeers.clear();
     // 就绪是针对某一部的，换片后谁都得重新报。编号不清：它按发送者全局单调。
@@ -311,7 +357,10 @@ export class SyncEngine extends Emitter {
   }
 
   get effectivePaused() {
-    return this.intendedPaused || this.anyoneStalled;
+    // 在线链接自己在等数据时不用再按暂停：mpv 本来就停着在等，而且按了暂停之后 core-idle 恒为真，
+    // 就分不清「还在起播」和「已经好了」—— 放开、再卡、再放开，全房跟着一走一停。
+    const ownStall = this.localStalled && !this.streaming;
+    return this.intendedPaused || ownStall || this.stalledPeers.size > 0;
   }
 
   /**
@@ -353,8 +402,16 @@ export class SyncEngine extends Emitter {
     const t = this.lastTick;
     if (!t) return null;
     const base = t.position || 0;
-    if (t.paused || t.eof) return base;
+    if (!this._advancing(t)) return base;
     return base + Math.max(0, this.now() - t.at) / 1000;
+  }
+
+  /**
+   * 这条 tick 时播放器是不是在往前走。暂停、放到头、缓冲（在线链接缺数据时 mpv 自己停下来等，
+   * pause 仍然是 no）、跳转后重新起播（core-idle）时位置都停着。
+   */
+  _advancing(t) {
+    return !t.paused && !t.eof && !t.idle && !t.pausedForCache;
   }
 
   /**
@@ -539,7 +596,8 @@ export class SyncEngine extends Emitter {
     this._dataEndStall = false;
     this._replayAt = 0;
 
-    this._evaluateStall(snap, { contiguousBytes, runBytes, complete });
+    if (this.streaming) this._evaluateStreamStall(snap);
+    else this._evaluateStall(snap, { contiguousBytes, runBytes, complete });
 
     // 放到头了。mpv 开着 keep-open，会自己停在最后一帧 —— 这不是用户按了暂停，
     // 不能广播出去把还差半秒的人也停住。只报一次，由上层决定要不要推进列表。
@@ -571,7 +629,7 @@ export class SyncEngine extends Emitter {
         }
         this.intendedPaused = snap.paused;
         // 游客的播放/暂停只作用于自己这一路，不广播、不动共识状态。
-        if (this.canIControl()) this._broadcastSync(snap.position);
+        if (this.canIControl()) this._broadcastSync(this._actionPosition(snap.position));
         this.emit('local-action', {
           kind: snap.paused ? 'pause' : 'play',
           position: snap.position,
@@ -588,8 +646,14 @@ export class SyncEngine extends Emitter {
         typeof snap.sampledAt === 'number' && typeof prev.sampledAt === 'number'
           ? (snap.sampledAt - prev.sampledAt) / 1000
           : (this.lastTick.at - prev.at) / 1000;
-      const expected = prev.paused ? prev.position : prev.position + elapsed;
-      if (Math.abs(snap.position - expected) > SEEK_DETECT_JUMP) {
+      // 上一条 tick 时位置停着（暂停、缓冲、跳转后重新起播）就不能按「在走」外推：
+      // 在线链接缓冲了十秒，缓冲完的第一条 tick 会比预期落后十秒，被当成用户往回拖了进度条 ——
+      // 控制者会把全房拽回他缓冲的地方，游客会被往前拽、缓冲的那段直接跳过去。
+      const expected = this._advancing(prev) ? prev.position + elapsed : prev.position;
+      const cmd = this._lastSeekCmd;
+      const echo =
+        !!cmd && this.now() - cmd.at < SEEK_ECHO_MS && Math.abs(snap.position - cmd.position) <= this.seekTolerance;
+      if (!echo && Math.abs(snap.position - expected) > SEEK_DETECT_JUMP) {
         if (this.canIControl()) {
           this._broadcastSync(snap.position);
           this.emit('local-action', { kind: 'seek', position: snap.position });
@@ -614,7 +678,8 @@ export class SyncEngine extends Emitter {
    * 本来就该由它来触发重新评估。
    */
   onBufferProgress({ contiguousBytes, runBytes, complete }) {
-    if (!this.started) return;
+    // 在线链接没有分片进度，卡没卡只看播放器报的缓冲（_evaluateStreamStall）
+    if (!this.started || this.streaming) return;
     // 播放器可能还没起来（正在等片头下够）。这段时间同样要参与 stall 计算，
     // 否则别人会以为我们准备好了，自己先播起来。此时我们的「播放位置」是房间位置，
     // 不是 0 —— 中途加入时这两者差着整整一部片，写 0 会让整条链都错。
@@ -661,6 +726,22 @@ export class SyncEngine extends Emitter {
     } else if (this.localStalled && margin > this.resumeThresholdBytes) {
       this._setLocalStall(false, marginSeconds ?? 0, snap.position);
     }
+  }
+
+  /**
+   * 在线链接的卡顿：缓冲交给 mpv 自己管（缺数据时它自己停下来等），这里只决定要不要让全房一起等。
+   * 完全同步的控制者缓冲时全房等他；游客和手动同步的人只卡自己，房间照走 ——
+   * 他们落下的那段，完全同步的游客由核对差值自动跳过去，手动同步的人自己决定。
+   */
+  _evaluateStreamStall(snap) {
+    if (!this.started) return;
+    // 「在等数据」不只是 paused-for-cache：跳转之后重新请求、重新起播那几秒（seeking，
+    // 或者没暂停却 core-idle，比如刚打开链接）位置同样不动。房主跳到 5:00，网络流要好几秒才起播，
+    // 这段不让房间等的话，房间时钟跑在房主前面，房主反倒要被自动对齐往前拽、跳过自己没看到的内容。
+    const waiting =
+      snap.pausedForCache === true || (!snap.eof && (snap.seeking === true || (snap.idle === true && !snap.paused)));
+    const holdRoom = !this._manual() && this.canIControl() && waiting;
+    if (holdRoom !== this.localStalled) this._setLocalStall(holdRoom, 0, snap.position || 0);
   }
 
   _playbackByte(snap) {
@@ -822,6 +903,8 @@ export class SyncEngine extends Emitter {
     if (author !== from.origin) {
       byName = author === this.peerId ? this.name : author === this.shared.by ? this.shared.byName : author;
     }
+    // 手动同步的人只跟真正的跳转，要拿「这条指令之前房间播到哪」来比，所以在改时钟之前取
+    const seekTo = this._followTarget(msg.position, this.sharedPositionNow());
     this.shared = {
       paused: msg.paused,
       position: msg.position,
@@ -835,7 +918,7 @@ export class SyncEngine extends Emitter {
       // 不去改它；和房间不一致时也不拽他的进度。
       const following = this.intendedPaused === msg.paused;
       if (!msg.paused) this.emit('playing', { seq: this.seq });
-      this._reconcile(following ? { seekTo: msg.position } : {});
+      this._reconcile(following && seekTo !== null ? { seekTo } : {});
       return true;
     }
     this.intendedPaused = msg.paused;
@@ -846,8 +929,31 @@ export class SyncEngine extends Emitter {
       position: msg.position,
     });
     if (!msg.paused) this.emit('playing', { seq: this.seq });
-    this._reconcile({ seekTo: msg.position });
+    this._reconcile(seekTo === null ? {} : { seekTo });
     return true;
+  }
+
+  /**
+   * 收到房间的同步指令时要把播放器拽到哪（null = 不动进度，只跟暂停/播放）。
+   * 手动同步的人和房间差着几秒是他自己留着的，别人按一下暂停不该顺手替他对齐；
+   * 真正的跳转（指令的位置和房间原先的进度对不上）照跟，否则房主跳到下一段他还留在原地。
+   */
+  _followTarget(position, roomBefore) {
+    if (!this._manual()) return position;
+    return Math.abs(position - roomBefore) > SEEK_DETECT_JUMP ? position : null;
+  }
+
+  /** 本机现在是不是「在线链接 + 手动同步」。房主是参照，没有手动同步这回事。 */
+  _manual() {
+    return this.streaming && this.followMode === 'manual' && this.myRole() !== 'host';
+  }
+
+  /**
+   * 控制者按暂停/播放时报给全房的位置。手动同步的人报房间的位置：他可能正落后十几秒，
+   * 报自己的会把全房拽回他那里。拖进度条是真的要跳，不走这里。
+   */
+  _actionPosition(position) {
+    return this._manual() ? this.sharedPositionNow() : position;
   }
 
   _onRemoteStall(msg, fromPeer) {
@@ -1140,6 +1246,7 @@ export class SyncEngine extends Emitter {
   }
 
   async emit_seek(position) {
+    this._lastSeekCmd = { position, at: this.now() };
     if (this.onSeek) await this.onSeek(position);
   }
 
@@ -1155,7 +1262,9 @@ export class SyncEngine extends Emitter {
     this.intendedPaused = paused;
     // 游客：只暂停/播放自己这一路，不广播、不动共识。
     // 播放器没开着（比如刚关掉）时按的是界面上的按钮，这时报 0 会把全房拉回片头 —— 用房间时钟。
-    if (this.canIControl()) this._broadcastSync(this.playerPositionNow() ?? this.sharedPositionNow());
+    if (this.canIControl()) {
+      this._broadcastSync(this._actionPosition(this.playerPositionNow() ?? this.sharedPositionNow()));
+    }
     this._reconcile();
   }
 
@@ -1167,6 +1276,153 @@ export class SyncEngine extends Emitter {
     }
     this._broadcastSync(position);
     this._reconcile({ seekTo: position });
+  }
+
+  /* ------------------------ 在线链接的跟随方式 ------------------------ */
+
+  /**
+   * 当前项是不是在线链接，以及本机选的跟随方式（'full' 完全同步 / 'manual' 手动同步）。
+   * 上层在换片之后、用户改了选择时调用。
+   */
+  setFollow({ streaming = this.streaming, mode = this.followMode } = {}) {
+    const nextStreaming = !!streaming;
+    const nextMode = mode === 'manual' ? 'manual' : 'full';
+    if (nextStreaming === this.streaming && nextMode === this.followMode) return;
+    this.streaming = nextStreaming;
+    this.followMode = nextMode;
+    this._resetDrift();
+    // 改成手动同步时自己正让全房等着：放开，手动同步的人缓冲只卡自己
+    if (this.streaming && this.lastTick) this._evaluateStreamStall(this.lastTick);
+    this.emit('drift', this.driftStatus());
+  }
+
+  /** 供 UI：{state: 'ok'|'out'|'failed', seconds（本机减房间，负数是落后）, mode, streaming} */
+  driftStatus() {
+    return {
+      state: this._drift.state,
+      seconds: this._drift.seconds,
+      mode: this.followMode,
+      streaming: this.streaming,
+    };
+  }
+
+  /**
+   * 核对本机和房间差多少秒。由上层每秒调一次 —— 播放器静止时不推 tick，光靠 tick 看不出差距在变大。
+   * 房间的进度就是房间时钟（房主和管理员的指令定下的，房主自己也跟着它走）。
+   */
+  checkDrift() {
+    if (!this.streaming || !this.started) return;
+    const t = this.lastTick;
+    // 正在跳转、缓冲、重新起播，或者放到头了：此刻的位置说明不了什么，维持上一次的判断
+    if (!t || t.seeking || t.pausedForCache || t.eof || (t.idle && !t.paused) || this.applying) return;
+    // 自己按了暂停、只停自己（游客）：这是有意和房间分开，不算没对上
+    if (this.intendedPaused !== this.shared.paused) {
+      this._driftOver = 0;
+      this._setDrift('ok', 0);
+      return;
+    }
+    const room = this.sharedPositionNow();
+    // 房间时钟到片尾就封顶了，再往后的差值没有意义
+    if (this.duration > 0 && room >= this.duration - DRIFT_OUT_SECONDS) return;
+    const drift = this.playerPositionNow() - room;
+    const now = this.now();
+
+    // 上一次自动对齐落地之后的第一次核对：还差多少就是这个网站跳转要花的时间，下次多跳这么多
+    const probe = this._leadProbe;
+    if (probe && now - probe.at >= 1000) {
+      this._leadProbe = null;
+      if (probe.running && this._clockRunning() && now - probe.at < DRIFT_LEAD_PROBE_MS) {
+        this._seekLead = Math.min(DRIFT_LEAD_MAX_SECONDS, Math.max(0, this._seekLead - drift));
+      }
+    }
+
+    const off = Math.abs(drift);
+    if (off <= DRIFT_BACK_SECONDS) {
+      this._driftOver = 0;
+      this._setDrift('ok', 0);
+      return;
+    }
+    if (off <= DRIFT_OUT_SECONDS) {
+      // 滞回区：维持原来的判断，只更新数字
+      this._driftOver = 0;
+      if (this._drift.state !== 'ok') this._setDrift(this._drift.state, drift);
+      return;
+    }
+    if (++this._driftOver < DRIFT_CONFIRM_CHECKS) return;
+    if (this._manual()) {
+      // 刚点过「同步到房主」、落地还没对上：用刚学到的提前量补跳一次，一次点到位
+      if (this._chase > 0 && now - this._correctAt < DRIFT_CHASE_MS) {
+        if (now - this._correctAt < DRIFT_CORRECT_COOLDOWN_MS) return;
+        this._chase--;
+        this._correctToRoom();
+        return;
+      }
+      this._chase = 0;
+      this._setDrift('out', drift);
+      return;
+    }
+
+    // 完全同步：自动跳到房间的位置。往前追了好几次还是落后，就停手一阵子，把差多少秒报出去
+    if (this._drift.state === 'failed') {
+      this._setDrift('failed', drift);
+      if (now - this._failedAt < DRIFT_FAIL_BACKOFF_MS) return;
+    }
+    if (now - this._correctAt < DRIFT_CORRECT_COOLDOWN_MS) return;
+    if (drift < 0) {
+      this._corrections = this._corrections.filter((at) => now - at < DRIFT_FAIL_WINDOW_MS);
+      if (this._corrections.length >= DRIFT_FAIL_COUNT) {
+        this._corrections = [];
+        this._failedAt = now;
+        this._setDrift('failed', drift);
+        return;
+      }
+      this._corrections.push(now);
+    }
+    this.emit('drift-correct', { seconds: drift });
+    this._correctToRoom();
+  }
+
+  /**
+   * 用户点了「同步到房主」（或在播放器里按了快捷键）：立刻跳到房间的位置，
+   * 自己单独按过的暂停也一并回到房间的状态。两种跟随方式都能用。
+   */
+  syncToRoom() {
+    if (!this.streaming || !this.started || !this.lastTick) return false;
+    this.intendedPaused = this.shared.paused;
+    this._corrections = [];
+    this._failedAt = 0;
+    this._setDrift('ok', 0);
+    this._correctToRoom();
+    this._chase = 1;
+    return true;
+  }
+
+  _correctToRoom() {
+    const running = this._clockRunning();
+    let target = this.sharedPositionNow() + (running ? this._seekLead : 0);
+    if (this.duration > 0) target = Math.min(target, this.duration);
+    this._correctAt = this.now();
+    this._driftOver = 0;
+    this._leadProbe = { at: this._correctAt, running };
+    this._reconcile({ seekTo: target, force: true });
+  }
+
+  _resetDrift() {
+    this._drift = { state: 'ok', seconds: 0 };
+    this._driftOver = 0;
+    this._corrections = [];
+    this._correctAt = 0;
+    this._failedAt = 0;
+    this._leadProbe = null;
+    this._chase = 0;
+  }
+
+  /** 差值按整秒报，没变就不发事件（每秒核对一次，别每次都让界面重画）。 */
+  _setDrift(state, seconds) {
+    const rounded = state === 'ok' ? 0 : Math.round(seconds);
+    if (state === this._drift.state && rounded === this._drift.seconds) return;
+    this._drift = { state, seconds: rounded };
+    this.emit('drift', this.driftStatus());
   }
 
   /**
@@ -1309,6 +1565,15 @@ export {
   RESUME_THRESHOLD_SECONDS,
   SEEK_TOLERANCE,
   APPLY_ECHO_MS,
+  SEEK_ECHO_MS,
+  DRIFT_OUT_SECONDS,
+  DRIFT_BACK_SECONDS,
+  DRIFT_CORRECT_COOLDOWN_MS,
+  DRIFT_FAIL_COUNT,
+  DRIFT_FAIL_WINDOW_MS,
+  DRIFT_FAIL_BACKOFF_MS,
+  DRIFT_LEAD_MAX_SECONDS,
+  DRIFT_CHASE_MS,
   MAX_NAME,
   LAMPORT_WINDOW,
   LAMPORT_LEAD,

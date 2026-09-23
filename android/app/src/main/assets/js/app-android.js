@@ -5,8 +5,8 @@
  * 只把「存储」和「播放器」换成原生实现（经 native-shim 的 window.sw / window.swPlayer）。
  * 信令握手规则与 PC 端 connectSignaling 保持一致，才能互相连上。
  *
- * 手机永远是加入者/观众：跟着房主的播放列表走当前那一部，要片、参与全员暂停联动，
- * 不做种、不当房主、不能编辑列表。
+ * 手机永远是加入者：跟着房主的播放列表走当前那一部，要片、参与全员暂停联动，不做种、不当房主。
+ * 房主给了管理员身份的话可以编辑列表（加在线链接、调序、移除、立即播放），操作发给房主执行。
  */
 
 import './native-shim.js';
@@ -14,9 +14,18 @@ import { Peer } from './peer.js';
 import { Swarm } from './swarm.js';
 import { SyncEngine } from './syncEngine.js';
 import { WsSignaling, encodeCode, decodeCode, inviteLink, randomPeerId } from './signaling.js';
-import { buildIceServers } from './ice.js';
+import { RelaySignaling } from './relaySignaling.js';
+import {
+  buildIceServers,
+  diagnoseCandidates,
+  normalizeTurnInput,
+  peerIceConfig,
+  summarizeCandidates,
+  turnMissingCredentials,
+} from './ice.js';
+import { RelayUsageMeter, cloudflareRelayPairs, onlyCloudflareRelays } from './turnUsage.js';
 import { MSG, PROTOCOL_VERSION } from './protocol.js';
-import { catalogOf, createPlaylist, currentItem, validateSnapshot } from './playlist.js';
+import { catalogOf, createPlaylist, currentItem, findItem, reorderIds, validateSnapshot } from './playlist.js';
 import { ChatGate, ChatSender, parseHistory, trustsRelay } from './chat.js';
 import { AREAS, DanmakuEngine, DEFAULT_SETTINGS as DANMAKU_BASE } from './danmaku.js';
 import { currentLocale, setLocale, SKIP_ATTR, startI18n, translate as t } from './i18n.js';
@@ -46,16 +55,33 @@ const PENDING_INVITE_KEY = 'sw.pendingInvite';
 const LOG_VIEW_LIMIT = 200;
 // 加入流程里单独一步（生成应答、连信令）最多等这么久，超时就当失败，放开「正在加入」的闸门
 const JOIN_STEP_TIMEOUT_MS = 30_000;
+// 房间链接要等房主放行（relaySignaling 自己最多等 30 秒，连中继还要几秒），闸门给宽一点
+const RELAY_JOIN_TIMEOUT_MS = 60_000;
+// 房主改列表的回音最多等这么久（和桌面端 PLAYLIST_OP_TIMEOUT_MS 一致）
+const PLAYLIST_OP_TIMEOUT_MS = 45_000;
 const normalizeSecurityMode = (mode) => (mode === 'trusted' ? 'trusted' : 'safe');
 const securityModeLabel = (mode) => (normalizeSecurityMode(mode) === 'trusted' ? '可信房间' : '安全模式');
 
 const S = {
   peerId: randomPeerId(),
   name: '',
-  hostId: null, // 房主 peerId：极简模式从邀请码得来；信令模式手里没码，靠首个 ROLE 认定
+  hostId: null, // 房主 peerId：极简模式和房间链接从链接里得来；信令模式手里没码，靠首个 ROLE 认定
   swarm: null,
   sync: null,
   signaling: null,
+  // 这一场的信令走什么：'relay'（房间链接，公共中继）/ 'ws'（自建信令服务器）/ null（一对一邀请）
+  signalTransport: null,
+  // 连接设置：TURN 中继、隐藏我的 IP。和桌面端同一组 localStorage 键（见 loadNetSettings）
+  net: loadNetSettings(),
+  // Cloudflare 的临时 TURN 账号 { urls, username, credential, expiresAt }，原生层生成，这里只缓存。
+  // API Token 永远不到页面里来。
+  cfTurn: null,
+  // 原生层报来的 Cloudflare TURN 状态 { configured, expiresAt, lastError }
+  cfTurnState: null,
+  // 本月本机统计的用量 { month, usedBytes, limitGB, exceeded, nearLimit }
+  cfTurnUsage: null,
+  // 发给房主、还在等回音的列表操作：reqId -> 回调
+  pendingOps: new Map(),
   // 房主的播放列表（最近一次收到的快照）和当前项
   playlist: createPlaylist(),
   current: null,
@@ -87,6 +113,8 @@ const S = {
   // 极简模式上一次还没连上的尝试：{cancel()}，新的一次开始前把它的定时器和监听收掉
   manualAttempt: null,
   securityMode: localStorage.getItem('sw.securityMode') === 'safe' ? 'safe' : 'trusted',
+  // 在线链接怎么跟房主：'full' 完全同步（默认），'manual' 手动同步。只存在这台手机上
+  linkSync: localStorage.getItem('sw.linkSync') === 'manual' ? 'manual' : 'full',
   // 站点授权对话框正在弹着（同一时间只弹一次）
   askingSite: false,
   // 聊天。gate 管收端（先去重再扣令牌、只认房主转发来的 origin），sender 管发端。
@@ -176,20 +204,342 @@ function fmtTime(sec) {
 }
 
 /* ------------------------------ ICE 配置 ------------------------------ */
-// 只配一台 STUN 时 buildIceServers 会自动补两台兜底 —— 手机换基站、切 Wi-Fi 的
-// 频率比桌面高得多，那一台一旦不通就拿不到公网地址，跨 NAT 直接连不上。
-// TURN 地址也会自动展开成 UDP + TCP 两条。
-function iceServers() {
-  const turn = ($('turn') && $('turn').value.trim()) || '';
-  // TURN 可选，格式 turn:host:port|user|pass（这里预留，界面暂未放出）
-  const [turnUrl, turnUser, turnPass] = turn ? turn.split('|') : [];
-  return buildIceServers({
-    turnEnabled: Boolean(turnUrl),
-    turnUrl: turnUrl || '',
-    turnUser: turnUser || '',
-    turnPass: turnPass || '',
-  });
+// 规则和桌面端一样（lib/ice.js）：只配一台 STUN 时自动补两台兜底 —— 手机换基站、切 Wi-Fi 的
+// 频率比桌面高得多，那一台一旦不通就拿不到公网地址；TURN 地址自动展开成 UDP + TCP 两条。
+//
+// TURN 需要用户自己提供：自己填服务器，或者用自己的 Cloudflare 账号自动生成临时账号。
+// 「隐藏我的 IP」（S.net.relayOnly）打开时只经 TURN 中继连接、不带 STUN；
+// 这时没有可用中继就不建连接（relayOnlyBlocked / peerIce），绝不悄悄退回直连。
+
+/** 连接设置。键和桌面端完全一样，同一台设备上换端也认得。坏值一律回落到默认，绝不抛。 */
+function loadNetSettings() {
+  const get = (key) => {
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  };
+  return {
+    turnSource: get('sw.turnSource') === 'cloudflare' ? 'cloudflare' : 'manual',
+    turnEnabled: get('sw.turnEnabled') !== '0',
+    turnUrl: get('sw.turnUrl') || '',
+    turnUser: get('sw.turnUser') || '',
+    turnPass: get('sw.turnPass') || '',
+    relayOnly: get('sw.relayOnly') === '1',
+  };
 }
+
+function saveNetSettings(next) {
+  S.net = { ...S.net, ...next };
+  try {
+    localStorage.setItem('sw.turnSource', S.net.turnSource);
+    localStorage.setItem('sw.turnEnabled', S.net.turnEnabled ? '1' : '0');
+    localStorage.setItem('sw.turnUrl', S.net.turnUrl);
+    localStorage.setItem('sw.turnUser', S.net.turnUser);
+    localStorage.setItem('sw.turnPass', S.net.turnPass);
+    localStorage.setItem('sw.relayOnly', S.net.relayOnly ? '1' : '0');
+  } catch {
+    /* 写不进去就只在这一场生效 */
+  }
+}
+
+let turnWarned = false;
+
+/** 组 ICE 配置要的全部输入：设置、Cloudflare 的临时账号（本月用量到上限时当它不存在）、此刻的时间。 */
+function iceInputs() {
+  return { ...S.net, cfTurn: S.cfTurnUsage?.exceeded ? null : S.cfTurn, now: Date.now() };
+}
+
+function iceServers() {
+  // 开了中继却没填密码：这种中继 buildIceServers 不会交出去，说一声，别让人以为中继在工作
+  if (!turnWarned && turnMissingCredentials(S.net)) {
+    turnWarned = true;
+    log('TURN 中继开着但没填用户名或密码，这次先不走中继、只尝试直连。到连接设置里补全，或者把中继关掉。', 'warn');
+  }
+  return buildIceServers(iceInputs());
+}
+
+const RELAY_ONLY_NO_TURN = '已打开「隐藏我的 IP」，但还没有可用的 TURN 中继：请在连接设置里配好 TURN，或者先关掉这个开关。';
+
+/** Cloudflare TURN 本月用量到了上限时的说法。 */
+function cfQuotaText(limitGB = S.cfTurnUsage?.limitGB) {
+  return `本月 Cloudflare TURN 用量已到你设的上限（${limitGB || '?'} GB），为免扣费已停用；下个月 1 日自动恢复，或者在连接设置里调高上限`;
+}
+
+/**
+ * 「隐藏我的 IP」开着、却没有可用的 TURN 中继时，拦下连接的原因；不拦返回空串。
+ * 这时绝不能悄悄退回直连 —— 那就等于把 IP 交出去了。
+ */
+function relayOnlyBlocked() {
+  if (!S.net.relayOnly || peerIceConfig(iceInputs())) return '';
+  if (S.net.turnSource === 'cloudflare' && S.cfTurnUsage?.exceeded) {
+    return `${cfQuotaText()}。「隐藏我的 IP」开着，没有中继就不连接。`;
+  }
+  return RELAY_ONLY_NO_TURN;
+}
+
+/**
+ * 建 Peer 用的 { iceServers, iceTransportPolicy }。这个文件里所有 new Peer 都从这里拿。
+ * 「隐藏我的 IP」开着时策略是 'relay'（只收集中继候选）；没有可用中继就抛错，不建连接。
+ */
+function peerIce() {
+  if (!S.net.relayOnly) return { iceServers: iceServers(), iceTransportPolicy: 'all' };
+  const config = peerIceConfig(iceInputs());
+  if (!config) throw new Error(relayOnlyBlocked() || RELAY_ONLY_NO_TURN);
+  return config;
+}
+
+/** 信令事件里建连接用：被「隐藏我的 IP」拦下时记一条日志、返回 null，调用方不建连接。 */
+function signalPeerIce() {
+  try {
+    return peerIce();
+  } catch (error) {
+    logThrottled(error.message || String(error), 'bad');
+    return null;
+  }
+}
+
+/** 这一侧是不是配了中继（诊断里「配了中继却没拿到中继候选」要用）。 */
+function turnConfigured() {
+  return S.net.turnSource === 'cloudflare'
+    ? Boolean(S.cfTurn && S.cfTurn.expiresAt > Date.now() && !S.cfTurnUsage?.exceeded)
+    : Boolean(S.net.turnEnabled && S.net.turnUrl);
+}
+
+/**
+ * 自己这边的 SDP 里候选够不够用（一对一邀请的应答是整份 SDP，看得到全部候选）。
+ * 只在有问题时说：只走中继却一条中继都没有、配了中继却没拿到中继候选、一个候选都没有。
+ */
+function adviseLocalCandidates(sdp) {
+  const stats = summarizeCandidates(sdp || '');
+  const configured = turnConfigured();
+  // 「拿到了公网地址，但没有中继兜底」是常态，不在每次加入时都念一遍
+  if (!S.net.relayOnly && stats.total && !(configured && !stats.relay)) return;
+  const diag = diagnoseCandidates(stats, { turnConfigured: configured, relayOnly: S.net.relayOnly });
+  if (diag && diag.level !== 'ok') log(diag.text, diag.level === 'bad' ? 'bad' : 'warn');
+}
+
+/* ---------------------------- Cloudflare TURN ---------------------------- */
+// 和桌面端同一套：API Token 只在原生层（安卓系统密钥库加密保存），页面只拿 24 小时的临时账号。
+// 离过期不到两小时就换一组；取失败后隔一会儿再试，别让每建一条连接都干等十秒。
+
+const CF_REFRESH_BEFORE_MS = 2 * 60 * 60 * 1000;
+const CF_RETRY_MS = 30_000;
+const CF_MIN_TIMER_MS = 60_000;
+let cfTurnFetch = null;
+let cfTurnRetryAt = 0;
+let cfTurnTimer = null;
+let cfQuotaLogged = false;
+
+/** 原生层报错里的代码（CF_NETWORK 这类）。 */
+function cfErrorCode(error) {
+  const m = /\[(CF_[A-Z_]+)\]/.exec(String(error?.message || error || ''));
+  return m ? m[1] : '';
+}
+
+const CF_ERROR_TEXT = {
+  CF_UNAUTHORIZED: '未授权：Cloudflare 不认这组 Turn Token ID 和 API Token',
+  CF_NETWORK: '网络不通：连不上 Cloudflare',
+  CF_BAD_RESPONSE: 'Cloudflare 的回应看不懂',
+  CF_NOT_CONFIGURED: '还没保存 Cloudflare 凭据',
+  CF_NO_ENCRYPTION: '本机的加密服务不可用，不能安全地保存 API Token',
+  CF_INVALID_INPUT: 'Turn Token ID 或 API Token 的格式不对',
+};
+
+function cfErrorText(code) {
+  if (code === 'CF_QUOTA') return cfQuotaText();
+  return CF_ERROR_TEXT[code] || '出错了';
+}
+
+/** 来源是 Cloudflare、手上的临时账号没有或离过期不到两小时：建连接之前得先去取一组。 */
+function turnFetchNeeded() {
+  if (S.net.turnSource !== 'cloudflare') return false;
+  if (S.cfTurn && S.cfTurn.expiresAt - Date.now() > CF_REFRESH_BEFORE_MS) return false;
+  return Boolean(cfTurnFetch) || Date.now() >= cfTurnRetryAt;
+}
+
+/** 本月用量到了上限：手上的临时账号作废，新建的连接不再带 Cloudflare TURN。只在日志里说一次。 */
+function markCfQuota(limitGB) {
+  S.cfTurn = null;
+  clearTimeout(cfTurnTimer);
+  cfTurnTimer = null;
+  S.cfTurnUsage = { ...(S.cfTurnUsage || {}), exceeded: true, ...(limitGB ? { limitGB } : {}) };
+  if (!cfQuotaLogged && S.net.turnSource === 'cloudflare') {
+    cfQuotaLogged = true;
+    log(cfQuotaText(), 'bad');
+  }
+}
+
+/**
+ * 把 Cloudflare 的临时 TURN 账号备好。来源不是 Cloudflare、或者手上的还新鲜时什么都不做。
+ * 取不到也不抛错：没开「隐藏我的 IP」就记一条日志、照常直连；开了的话，
+ * 紧接着的 relayOnlyBlocked() 会把连接拦下。同时只发一个请求。
+ */
+async function ensureTurnReady() {
+  if (!turnFetchNeeded()) return;
+  if (!cfTurnFetch) {
+    cfTurnFetch = (async () => {
+      try {
+        const creds = await window.sw.turn.cfCredentials({ minValidMs: CF_REFRESH_BEFORE_MS });
+        S.cfTurn = {
+          urls: [...creds.urls],
+          username: creds.username,
+          credential: creds.credential,
+          expiresAt: creds.expiresAt,
+        };
+        cfTurnRetryAt = 0;
+        cfQuotaLogged = false;
+        if (S.cfTurnUsage?.exceeded) S.cfTurnUsage = { ...S.cfTurnUsage, exceeded: false };
+        S.cfTurnState = { ...(S.cfTurnState || {}), configured: true, expiresAt: creds.expiresAt, lastError: null };
+        scheduleCfTurnRefresh();
+      } catch (error) {
+        cfTurnRetryAt = Date.now() + CF_RETRY_MS;
+        const code = cfErrorCode(error) || 'CF_NETWORK';
+        S.cfTurnState = { ...(S.cfTurnState || {}), lastError: code };
+        if (code === 'CF_QUOTA') {
+          markCfQuota(Number(/（(\d+) GB）/.exec(String(error?.message || ''))?.[1]) || 0);
+        } else if (S.net.relayOnly) {
+          log(`Cloudflare TURN 账号没拿到：${cfErrorText(code)}`, 'bad');
+        } else {
+          log(`Cloudflare TURN 账号没拿到（${cfErrorText(code)}），这次先不走中继、只尝试直连`, 'warn');
+        }
+      } finally {
+        cfTurnFetch = null;
+        renderCfTurnStatus();
+      }
+    })();
+  }
+  await cfTurnFetch;
+}
+
+/** 离过期不到两小时时自己换一组，不等下一次建连接。 */
+function scheduleCfTurnRefresh() {
+  clearTimeout(cfTurnTimer);
+  cfTurnTimer = null;
+  if (S.net.turnSource !== 'cloudflare' || !S.cfTurn || !(S.cfTurn.expiresAt > Date.now())) return;
+  const wait = Math.max(CF_MIN_TIMER_MS, S.cfTurn.expiresAt - CF_REFRESH_BEFORE_MS - Date.now());
+  cfTurnTimer = setTimeout(async () => {
+    cfTurnTimer = null;
+    await ensureTurnReady().catch(() => {});
+    scheduleCfTurnRefresh();
+  }, wait);
+}
+
+/** 用量（原生层报来的）：第一次过 80% 在日志里提醒一次；到上限就停用 Cloudflare TURN。 */
+function applyCfUsage(usage) {
+  if (!usage || typeof usage !== 'object') return;
+  const wasExceeded = Boolean(S.cfTurnUsage?.exceeded);
+  S.cfTurnUsage = usage;
+  if (usage.crossedWarn) {
+    log(`本月 Cloudflare TURN 用量已超过你设的上限的 80%（${fmtGB(usage.usedBytes)} / ${usage.limitGB} GB）`, 'warn');
+  }
+  if (usage.exceeded && !wasExceeded) markCfQuota(usage.limitGB);
+  if (!usage.exceeded && wasExceeded) cfQuotaLogged = false;
+  renderCfTurnStatus();
+}
+
+function applyCfTurnState(state) {
+  if (!state || typeof state !== 'object') return;
+  S.cfTurnState = { configured: Boolean(state.configured), expiresAt: state.expiresAt || null, lastError: state.lastError || null };
+  if (state.usage) applyCfUsage(state.usage);
+  renderCfTurnStatus();
+}
+
+async function refreshCfTurnState() {
+  try {
+    applyCfTurnState(await window.sw.turn.cfStatus());
+  } catch (error) {
+    console.warn('[turn] 取 Cloudflare TURN 状态失败', error);
+  }
+}
+
+/** 字节 → GB（十进制，和 Cloudflare 的计费单位一致）。 */
+function fmtGB(bytes) {
+  const gb = (Number(bytes) || 0) / 1e9;
+  return gb.toFixed(gb < 10 ? 2 : 1);
+}
+
+function fmtClock(ms) {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+function cfTurnStatusText() {
+  const state = S.cfTurnState;
+  if (!state) return '';
+  if (!state.configured) return 'Cloudflare TURN：还没配置';
+  if (S.cfTurnUsage?.exceeded) return `Cloudflare TURN：${cfQuotaText()}`;
+  if (state.lastError) return `Cloudflare TURN：${cfErrorText(state.lastError)}`;
+  const expiresAt = S.cfTurn?.expiresAt || state.expiresAt;
+  if (expiresAt > Date.now()) return `Cloudflare TURN：已配置，账号有效至 ${fmtClock(expiresAt)}`;
+  return 'Cloudflare TURN：已配置';
+}
+
+function cfUsageText() {
+  const usage = S.cfTurnUsage;
+  if (!usage) return '';
+  return `本月已用 ${fmtGB(usage.usedBytes)} GB / ${usage.limitGB} GB`;
+}
+
+/** 连接设置里 Cloudflare 那几行：状态、用量、快到上限的提醒。 */
+function renderCfTurnStatus() {
+  const status = $('cf-status');
+  if (status) status.textContent = cfTurnStatusText();
+  const usage = $('cf-usage');
+  if (usage) usage.textContent = cfUsageText();
+  const warn = $('cf-warn');
+  if (warn) {
+    const near = Boolean(S.cfTurnUsage?.nearLimit && !S.cfTurnUsage?.exceeded);
+    warn.textContent = near ? '本月用量已超过上限的 80%，快到上限了。' : '';
+    show(warn, near);
+  }
+  const limit = $('cf-limit');
+  if (limit && S.cfTurnUsage?.limitGB && document.activeElement !== limit) limit.value = String(S.cfTurnUsage.limitGB);
+}
+
+/* ------------------------- Cloudflare TURN 用量计量 ------------------------- */
+// 每条连接每 10 秒读一次 getStats()，本地候选是 Cloudflare 中继的候选对收发都算，
+// 按 RTCPeerConnection 记增量，交给原生层按 UTC 自然月累加。汇报失败的攒着下一轮一起报。
+const TURN_METER_MS = 10_000;
+const TURN_REPORT_MAX = 64 * 1e9;
+const turnMeter = new RelayUsageMeter();
+let turnMeterBusy = false;
+let turnUsagePending = 0;
+
+async function meterTurnUsage() {
+  if (turnMeterBusy || !window.sw.turn) return;
+  turnMeterBusy = true;
+  try {
+    for (const peer of [...(S.swarm?.peers?.values() || [])]) {
+      const pc = peer?.pc;
+      if (!pc || peer.closed || typeof pc.getStats !== 'function') continue;
+      let report;
+      try {
+        report = await pc.getStats();
+      } catch {
+        continue;
+      }
+      let assumeCloudflare = false;
+      try {
+        assumeCloudflare = onlyCloudflareRelays(pc.getConfiguration?.()?.iceServers);
+      } catch {}
+      turnUsagePending += turnMeter.take(pc, cloudflareRelayPairs(report, { assumeCloudflare }));
+    }
+    if (turnUsagePending > 0) {
+      const bytes = Math.min(turnUsagePending, TURN_REPORT_MAX);
+      const usage = await window.sw.turn.cfReportUsage(bytes);
+      turnUsagePending -= bytes;
+      applyCfUsage(usage);
+    }
+  } catch (error) {
+    console.warn('[turn] Cloudflare TURN 用量汇报失败，下一轮再报', error);
+  } finally {
+    turnMeterBusy = false;
+  }
+}
+
+setInterval(() => meterTurnUsage(), TURN_METER_MS);
 
 /* ------------------------- 群管理 + 同步引擎 ------------------------- */
 function initSwarmAndSync() {
@@ -226,6 +576,9 @@ function initSwarmAndSync() {
   });
   S.sync.on('stall-change', renderWaiting);
   S.sync.on('state', renderWaiting);
+  // 在线链接：和房主差了多少秒
+  S.sync.on('drift', renderDrift);
+  S.sync.on('drift-correct', ({ seconds }) => log(`和房主差了 ${Math.abs(seconds).toFixed(1)} 秒，自动对齐`));
   S.sync.on('duration', (d) => {
     if (S.session?.slot != null) S.swarm.setDuration(S.session.slot, d);
   });
@@ -277,9 +630,11 @@ function initSwarmAndSync() {
     log(`已断开身份校验失败的成员：${expected}`, 'bad');
   });
   // 播放列表、链接地址、聊天归这里管；SYNC / STALL 这些同步消息转给同步引擎。
-  // 这里没有 PLAYLIST_OP：房主是列表的唯一权威，手机端既不发也不认列表操作。
+  // 列表操作（PLAYLIST_OP）只由手机发给房主，房主是列表的唯一权威；这里只收房主的回音。
   S.swarm.on('ctrl', ({ msg, peer }) => {
     if (msg.t === MSG.PLAYLIST) onPlaylist(msg, peer);
+    else if (msg.t === MSG.PLAYLIST_ACK) onPlaylistAck(msg, peer);
+    else if (msg.t === MSG.PLAYLIST_OP) return; // 手机不是房主，别人发来的列表操作一律不认
     else if (msg.t === MSG.NOW_LINK) onNowLink(msg, peer);
     else if (msg.t === MSG.CHAT) onChatMessage(msg, peer);
     else if (msg.t === MSG.CHAT_HISTORY) onChatHistory(msg, peer);
@@ -302,12 +657,31 @@ function onPlaylist(msg, peer) {
   }
   const snap = validateSnapshot(msg.state);
   if (!snap || snap.rev <= S.playlist.rev) return;
+  if (!sameItemsKept(S.playlist, snap)) {
+    logThrottled('收到的播放列表把已有条目的内容换掉了，已忽略', 'warn');
+    return;
+  }
   S.playlist = snap;
   S.swarm.setCatalog(catalogOf(snap));
   if (snap.seq !== S.currentSeq) switchCurrent(currentItem(snap));
   else S.current = currentItem(snap);
   renderFilmInfo();
   renderPlaylistPanel();
+}
+
+/**
+ * 同一个 id 必须还是同一样东西（和桌面端同一条规则）。房主那边把某一项的网址、文件换掉而 id 不变的话，
+ * 列表里写着的还是原来那个，点「允许」批准的却是从没见过的网站。改了就整张拒收。
+ */
+function sameItemsKept(before, after) {
+  const was = new Map();
+  for (const it of [...before.queue, ...before.history]) was.set(it.id, it);
+  for (const it of [...after.queue, ...after.history]) {
+    const old = was.get(it.id);
+    if (!old) continue;
+    if (old.kind !== it.kind || old.url !== it.url || old.fileId !== it.fileId) return false;
+  }
+  return true;
 }
 
 function stopPlayback() {
@@ -352,6 +726,8 @@ function switchCurrent(item) {
   S.sync.forgetPlayerState();
   S.swarm.setPlaying(item?.kind === 'file' ? item.slot : null);
   S.sync.resetMedia({ isSeeder: item?.kind === 'link', seq, position: item?.resumeAt || 0 });
+  // 手机永远不是房主，跟随方式就是本机选的那个
+  S.sync.setFollow({ streaming: item?.kind === 'link', mode: S.linkSync });
   if (item) S.sync.setMediaInfo({ duration: item.durationSec || 0, size: item.kind === 'file' ? item.size : 0 });
   // eof 守卫要用它判断「手上有没有一路连到文件尾的数据」
   S.sync.sizeHint = item?.kind === 'file' ? item.size : 0;
@@ -707,6 +1083,8 @@ function startPlayerTicks() {
     S.sync.lastTick = {
       position: snap.position,
       paused: snap.paused,
+      // ExoPlayer 缺数据在等（在线链接的「卡没卡」只认这个，见 syncEngine 的 streaming）
+      pausedForCache: snap.buffering === true,
       streamPos: null,
       duration: snap.duration,
       at: performance.now(),
@@ -722,11 +1100,15 @@ function startPlayerTicks() {
       S.prog = S.swarm.progress(slot);
     }
 
-    S.sync._evaluateStall(S.sync.lastTick, {
-      contiguousBytes: S.prog.contiguousBytes,
-      runBytes: S.prog.runBytes,
-      complete: S.sourceType === 'link' || S.prog.complete,
-    });
+    // 在线链接没有分片水位：完全同步的管理员缓冲时让全房等，其余只卡自己（和桌面端同一套）
+    if (S.sync.streaming) S.sync._evaluateStreamStall(S.sync.lastTick);
+    else {
+      S.sync._evaluateStall(S.sync.lastTick, {
+        contiguousBytes: S.prog.contiguousBytes,
+        runBytes: S.prog.runBytes,
+        complete: S.sourceType === 'link' || S.prog.complete,
+      });
+    }
 
     // 新播放器的第一条 tick：把房间状态补放给它。播放器起来之前收到的 SYNC 只能记着
     // （没有 lastTick 时引擎不下发跳转），新建的 ExoPlayer 又固定停在 0:00、暂停；
@@ -744,16 +1126,91 @@ function startPlayerTicks() {
 }
 
 /* ------------------------------ 信令连接 ------------------------------ */
-// 规则与 PC 端一致：房间里的老成员向新来的发起 offer，避免双方同时发 offer 撞车。
-async function connectSignaling(url, roomId) {
-  const sig = new WsSignaling({ url, roomId, peerId: S.peerId, name: S.name });
+// 信令这一侧最多同时挂多少条连接（含还在握手的）。房间最多 16 人，留出重连交替的余量；
+// 再多只可能是信令那头（服务器、公共中继上拿到链接的人）在刷 peer-join / offer —— 每一条都是一个 RTCPeerConnection。
+const MAX_LIVE_PEERS = 24;
+// 同一个人的连接按令牌桶限速重建：攒满 REBUILD_BURST 次，之后每 REBUILD_REFILL_MS 回一次。
+// 正常的断线重连走退避（最快 1.5 秒一次、三次就停），碰不到这个限。
+const REBUILD_BURST = 4;
+const REBUILD_REFILL_MS = 5000;
+const rebuildBudget = new Map(); // peerId -> {tokens, at}
+
+function allowRebuild(peerId) {
+  const now = Date.now();
+  const b = rebuildBudget.get(peerId) || { tokens: REBUILD_BURST, at: now };
+  b.tokens = Math.min(REBUILD_BURST, b.tokens + (now - b.at) / REBUILD_REFILL_MS);
+  b.at = now;
+  rebuildBudget.delete(peerId);
+  rebuildBudget.set(peerId, b);
+  while (rebuildBudget.size > MAX_LIVE_PEERS * 4) rebuildBudget.delete(rebuildBudget.keys().next().value);
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+
+/** 信令要我为 peerId 新建（或重建）一条连接时先过这一关：同时挂着的连接有上限，同一个人的重建有速率上限。 */
+function admitPeer(peerId, existing) {
+  if (!existing && S.swarm.peers.size >= MAX_LIVE_PEERS) {
+    logThrottled('同时连着的人太多了，多出来的连接请求已忽略', 'warn');
+    return false;
+  }
+  return allowRebuild(peerId);
+}
+
+/** 和这个人的直连还通着：数据通道开着，ICE 也没掉线。这种不必因为信令那头的一次 peer-join 就拆了重建。 */
+function directLinkUp(peer) {
+  if (!peer || peer.closed || peer.ctrl?.readyState !== 'open') return false;
+  const ice = peer.pc?.iceConnectionState;
+  return ice !== 'disconnected' && ice !== 'failed' && ice !== 'closed';
+}
+
+/** 信令给的昵称：截短、去空白，没有就用 id 开头几位。 */
+function peerName(name, peerId) {
+  const clean = typeof name === 'string' ? name.trim().slice(0, 40) : '';
+  return clean || String(peerId || '').slice(0, 8);
+}
+
+/**
+ * 连信令。两种传输接口一样：WsSignaling（自建信令服务器）和 RelaySignaling（房间链接，经公共 Nostr 中继）。
+ * 传了 relay 就走中继。规则与电脑端一致：房间里的老成员向新来的发起 offer，避免双方同时发 offer 撞车；
+ * 建连时的 trickle 跟 sig.trickle 走（中继不 trickle，候选打包进 SDP）。
+ */
+async function connectSignaling(url, roomId, relay = null) {
+  const sig = relay
+    ? new RelaySignaling({
+        secret: relay.secret,
+        hostKey: relay.hostKey,
+        hostId: relay.hostId,
+        relays: relay.relays,
+        peerId: S.peerId,
+        name: S.name,
+        maxMembers: 0,
+        protocolVersion: PROTOCOL_VERSION,
+      })
+    : new WsSignaling({ url, roomId, peerId: S.peerId, name: S.name });
+  S.signalTransport = relay ? 'relay' : 'ws';
+  const previous = S.signaling;
   S.signaling = sig;
+  // 手上还有一条就先关掉：它的处理器都还挂着，留着它就是第二套连接在往同一个 swarm 里塞人
+  if (previous && previous !== sig) previous.close();
+  // 被顶替之后，这条连接上迟到的事件一律不认
+  const live = () => S.signaling === sig;
+  const trickle = sig.trickle !== false;
 
   sig.on('peer-join', async ({ peerId, name }) => {
+    if (!live() || !S.swarm) return;
     // 这次会话里因为版本不符断开过的人，不再和他建连
     if (S.swarm.versionRejected.has(peerId)) return;
-    log(`${name} 加入了房间`, 'good');
-    const peer = new Peer({ peerId, name, initiator: true, iceServers: iceServers(), trickle: true });
+    name = peerName(name, peerId);
+    const existing = S.swarm.peers.get(peerId);
+    // 对方的信令重连之后会被当新人再广播一次 peer-join，可直连不经过信令，多半还好好的：留着
+    if (directLinkUp(existing)) return;
+    if (!admitPeer(peerId, existing)) return;
+    logThrottled(`${name} 加入了房间`, 'good', 2000);
+    // 「隐藏我的 IP」开着却没有可用中继：不和他建连接（日志里说一声）
+    const ice = signalPeerIce();
+    if (!ice) return;
+    const peer = new Peer({ peerId, name, initiator: true, ...ice, trickle });
     wirePeer(peer, sig);
     S.swarm.addPeer(peer);
     const offer = await peer.createOffer();
@@ -761,6 +1218,7 @@ async function connectSignaling(url, roomId) {
   });
 
   sig.on('signal', async ({ from, name, payload }) => {
+    if (!live() || !S.swarm || !payload || typeof payload !== 'object') return;
     let peer = S.swarm.peers.get(from);
     if (S.swarm.versionRejected.has(from)) return;
     if (payload.kind === 'offer') {
@@ -769,8 +1227,11 @@ async function connectSignaling(url, roomId) {
       // 数据通道可能刚被对端 abort，close 事件还堵在事件队列里没轮到。拿它去
       // setRemoteDescription，ICE 会在一条已经废掉的 pc 上重来一遍，双方都以为在协商，
       // 实际再也连不上 —— 表现就是信令一抖，传输永久停在原地。
+      if (!admitPeer(from, peer)) return;
+      const ice = signalPeerIce();
+      if (!ice) return;
       if (peer) S.swarm.removePeer(from);
-      peer = new Peer({ peerId: from, name, initiator: false, iceServers: iceServers(), trickle: true });
+      peer = new Peer({ peerId: from, name: peerName(name, from), initiator: false, ...ice, trickle });
       wirePeer(peer, sig);
       S.swarm.addPeer(peer);
       const answer = await peer.acceptOffer(payload.sdp);
@@ -782,7 +1243,11 @@ async function connectSignaling(url, roomId) {
       // 由 initiator 重发 offer。手机端不认它的话，凡是「手机当 initiator」的
       // 那条链路断了就永远回不来 —— 桌面之间能自愈，一牵扯到手机就永久卡住。
       cancelRecovery(from);
-      await reconnectPeer(from, name, sig).catch((e) => log('重连 ' + (name || from) + ' 失败：' + e.message, 'bad'));
+      // 重协商同样是新建一条连接：陌生 id 发来的、刷屏发来的都得过同一关
+      if (!admitPeer(from, peer)) return;
+      await reconnectPeer(from, peerName(name, from), sig).catch((e) =>
+        log('重连 ' + peerName(name, from) + ' 失败：' + e.message, 'bad')
+      );
       return;
     }
 
@@ -798,18 +1263,66 @@ async function connectSignaling(url, roomId) {
   // 广播 peer-leave；这时候把健康的 P2P 拆掉，传输会白白中断到对方重连为止，
   // 而下一行的提示还写着「已建立的直连不受影响」。真正离开的人，数据通道自己会关。
   sig.on('peer-leave', ({ peerId }) => {
+    if (!live() || !S.swarm) return;
     cancelRecovery(peerId); // 人是真走了，不是链路断了
     const peer = S.swarm.peers.get(peerId);
     if (peer?.ctrl?.readyState === 'open') {
-      log(peer.name + ' 的信令连接断了，但直连还在，传输继续', 'warn');
+      logThrottled(peer.name + ' 的信令连接断了，但直连还在，传输继续', 'warn');
       return;
     }
+    if (peerId === (S.hostId || S.sync?.hostId)) logThrottled('房主离开了房间', 'warn');
     S.swarm.removePeer(peerId);
   });
-  sig.on('reconnecting', ({ in: ms }) => log(`信令断开，${Math.round(ms / 1000)} 秒后重连（已建立的直连不受影响）`, 'warn'));
-  sig.on('error', (e) => log('信令错误：' + e.message, 'bad'));
+  sig.on('reconnecting', ({ in: ms }) => {
+    if (live()) logThrottled(`信令断开，${Math.round(ms / 1000)} 秒后重连（已建立的直连不受影响）`, 'warn');
+  });
+  sig.on('error', (e) => {
+    if (!live()) return;
+    // 房间链接的房主一直没和我直连上，收回了名额
+    if (e?.code === 'REMOVED') return removedFromRoom();
+    logThrottled('信令错误：' + (e?.message || e), 'bad');
+  });
 
   return sig.connect();
+}
+
+/** 房间链接加入失败时，按原因说人话（和电脑端同一套说法）。 */
+function relayJoinError(e) {
+  if (e?.code === 'HOST_OFFLINE') return '找不到房主：他可能已经离开房间，或者换过房间链接。请让房主重新发一条。';
+  if (e?.code === 'RELAY_UNREACHABLE') {
+    return '连不上公共中继（所在网络可能拦了它们）。请让房主改发「一对一邀请」，那个不经过任何第三方。';
+  }
+  if (e?.code === 'REMOVED') {
+    return '房主那边一直没能和你直连，你已被移出房间。可以请房主改发一对一邀请，或者双方配置 TURN 后再试。';
+  }
+  if (e?.code === 'BUSY') return '房间里正有好几个人在连接，稍后再点一次链接试试。';
+  return e?.message || String(e);
+}
+
+const LOBBY_NOTICE_KEY = 'sw.lobbyNotice';
+
+/**
+ * 房间链接的房主把我移出了房间（一直没和我直连上，名额收回了）。
+ * 还没进房（正在打洞）就停在大厅把原因说清楚；已经在房间里的，干净地退回大厅 ——
+ * 和「离开并加入」一样整页重载（原生会话、缓存一并收掉），原因记下来，回到大厅再说一遍。
+ */
+function removedFromRoom() {
+  const text = relayJoinError({ code: 'REMOVED' });
+  if (!S.entered) {
+    S.signaling?.close();
+    S.signaling = null;
+    S.serverJoined = false;
+    log(text, 'bad');
+    return;
+  }
+  try {
+    sessionStorage.setItem(LOBBY_NOTICE_KEY, text);
+  } catch {}
+  try {
+    S.signaling?.close();
+  } catch {}
+  window.sw.leaveRoom();
+  location.reload();
 }
 
 /* --------------------------- 直连断线恢复 --------------------------- */
@@ -863,13 +1376,15 @@ async function reconnectPeer(peerId, name, sig) {
   if (RENEGOTIATING.has(peerId)) return RENEGOTIATING.get(peerId);
 
   const run = (async () => {
+    // 先拿 ICE 参数：「隐藏我的 IP」没有可用中继时在这里就抛出去（调用方记日志），旧连接也不拆
+    const ice = peerIce();
     if (S.swarm.peers.has(peerId)) S.swarm.removePeer(peerId);
     const peer = new Peer({
       peerId,
       name: name || peerId,
       initiator: true,
-      iceServers: iceServers(),
-      trickle: true,
+      ...ice,
+      trickle: sig.trickle !== false,
     });
     wirePeer(peer, sig);
     S.swarm.addPeer(peer);
@@ -964,7 +1479,10 @@ function openInvite(raw) {
   joinManual(text);
 }
 
-/** 按房主的邀请生成应答。同一时间只跑一个，进了房间就不再跑（见 openInvite）。 */
+/**
+ * 按房主的邀请加入：房间链接直接进房，一对一邀请生成应答。
+ * 同一时间只跑一个，进了房间就不再跑（见 openInvite）。
+ */
 async function joinManual(hostCode) {
   // 调用方已经挡过一遍，这里再守一道，别让任何入口绕过去
   if (S.joining) {
@@ -976,36 +1494,41 @@ async function joinManual(hostCode) {
     return;
   }
   S.joining = true;
+  let relay = false;
   try {
-    // 候选收集自己有 8 秒上限，这里再兜一层：哪一步卡死了，闸门也得放开，不然之后的邀请全被挡在外面
-    await withTimeout(joinManualNow(hostCode), JOIN_STEP_TIMEOUT_MS, '生成应答链接超时');
+    let payload;
+    try {
+      payload = await decodeCode(hostCode);
+    } catch (e) {
+      log('邀请码无效：' + e.message, 'bad');
+      return;
+    }
+    relay = payload.k === 'relay';
+    if (relay) {
+      // 要等房主放行（最长半分钟）再加连中继的时间，闸门给宽一点
+      await withTimeout(joinRelayNow(payload), RELAY_JOIN_TIMEOUT_MS, '等房主放行超时');
+    } else {
+      // 候选收集自己有 8 秒上限，这里再兜一层：哪一步卡死了，闸门也得放开，不然之后的邀请全被挡在外面
+      await withTimeout(joinManualNow(payload), JOIN_STEP_TIMEOUT_MS, '生成应答链接超时');
+    }
   } catch (e) {
-    log('生成应答链接失败：' + e.message, 'bad');
+    if (relay) {
+      // 等放行超时的话信令还挂着：收掉，别让它之后又把人塞进来
+      S.signaling?.close();
+      S.signaling = null;
+      S.serverJoined = false;
+    }
+    log((relay ? '加入房间失败：' : '生成应答链接失败：') + e.message, 'bad');
   } finally {
     S.joining = false;
   }
 }
 
-async function joinManualNow(hostCode) {
-  let payload;
-  try {
-    payload = await decodeCode(hostCode);
-  } catch (e) {
-    log('邀请码无效：' + e.message, 'bad');
-    return;
-  }
-  // 房间链接（经公共中继、谁点谁进）这一版只有电脑端能用：说清楚该怎么办，别只报「不是邀请码」
-  if (payload.k === 'relay') {
-    log('这是房间链接，目前只有电脑端 NoxReel 能用，手机端下个版本支持。请让房主给你发一条「一对一邀请」。', 'bad');
-    return;
-  }
-  if (payload.k !== 'offer' || !payload.sdp) {
-    log('这不是一个房主邀请码', 'bad');
-    return;
-  }
+/** 按安全模式和协议版本核对一条邀请，对不上就说清楚、返回 false。 */
+function inviteUsable(payload) {
   if (normalizeSecurityMode(payload.securityMode) !== S.securityMode) {
     log(`房间使用${securityModeLabel(payload.securityMode)}，本机设置是${securityModeLabel(S.securityMode)}。请切换为相同模式后重试。`, 'bad');
-    return;
+    return false;
   }
   if (payload.protocolVersion !== PROTOCOL_VERSION) {
     log(
@@ -1014,13 +1537,82 @@ async function joinManualNow(hostCode) {
         : '这个邀请来自更新版本的 NoxReel，请先升级手机上的 NoxReel。',
       'bad'
     );
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 「隐藏我的 IP」开着却没有可用中继：说清楚、返回 true，调用方不建连接 —— 更不能悄悄退回直连。
+ *
+ * 调用方在它前面先 `if (turnFetchNeeded()) await ensureTurnReady()`：只在真要现取 Cloudflare 账号时才 await，
+ * 其余路径的同步时序不变（和电脑端同一条规则）。
+ */
+function relayBlockedStop() {
+  const blocked = relayOnlyBlocked();
+  if (!blocked) return false;
+  log(blocked, 'bad');
+  return true;
+}
+
+/**
+ * 房间链接（经公共 Nostr 中继）加入。房主放行（签名的 welcome）才算进房，房主身份由链接里的签名公钥担保；
+ * 之后房间里的老成员向我发 offer，和信令服务器模式同一套建连。
+ */
+async function joinRelayNow(payload) {
+  if (!inviteUsable(payload)) return;
+  if (!payload.key || !/^[0-9a-f]{64}$/.test(String(payload.hk || '')) || !payload.from) {
+    log('这个房间链接不完整，请让房主重新复制一次。', 'bad');
     return;
   }
+  // 房主放行之后马上就要打洞：TURN 得先备好，「隐藏我的 IP」没有中继就不进
+  if (turnFetchNeeded()) await ensureTurnReady();
+  if (relayBlockedStop()) return;
+  // 上一次没连上的尝试（一对一的占位连接、上一条中继信令）先收干净
+  S.manualAttempt?.cancel();
+  S.manualAttempt = null;
+  if (S.swarm) for (const p of [...S.swarm.peers.values()]) if (!p.authenticated) S.swarm.removePeer(p.peerId);
+  S.hostId = payload.from; // 链接里带着房主身份（和它的签名公钥），认它做角色权威
+  if (S.sync) S.sync.hostId = payload.from;
+  initSwarmAndSync();
+  log('正在通过公共中继找房主，等房主放行…', 'warn');
+  try {
+    await connectSignaling(null, null, {
+      secret: payload.key,
+      hostKey: payload.hk,
+      hostId: payload.from,
+      relays: payload.relays,
+    });
+  } catch (e) {
+    S.signaling?.close();
+    S.signaling = null;
+    log('加入房间失败：' + relayJoinError(e), 'bad');
+    return;
+  }
+  S.serverJoined = true;
+  log('房主已放行，正在和房间里的人打洞…', 'good');
+}
+
+async function joinManualNow(payload) {
+  if (payload.k !== 'offer' || !payload.sdp) {
+    log('这不是一个房主邀请码', 'bad');
+    return;
+  }
+  if (!inviteUsable(payload)) return;
+  // 应答里要带上中继候选：TURN 得先备好，「隐藏我的 IP」没有中继就不生成应答
+  if (turnFetchNeeded()) await ensureTurnReady();
+  if (relayBlockedStop()) return;
   // 上一次还没连上的尝试作废：定时器、监听和那条等不到应答的连接都收掉。
   // 不收的话，换了房主之后旧房主要是又点开了旧应答，连上来的是一个「非房主」。
   // 能走到这里说明还没有任何人连上（roomBusy 挡着），摘掉的只可能是这种残骸。
   S.manualAttempt?.cancel();
   S.manualAttempt = null;
+  // 上一次用房间链接试过、没进成：那条中继信令也收掉
+  if (S.signaling) {
+    S.signaling.close();
+    S.signaling = null;
+    S.signalTransport = null;
+  }
   if (S.swarm) for (const p of [...S.swarm.peers.values()]) if (!p.authenticated) S.swarm.removePeer(p.peerId);
   S.hostId = payload.from; // 邀请码带着房主身份，认它做角色权威
   // 同步引擎可能是上一次尝试时建的：房主身份跟着换（这时还没人连上，换它不影响谁）
@@ -1031,7 +1623,7 @@ async function joinManualNow(hostCode) {
     peerId: payload.from,
     name: payload.name || '房主',
     initiator: false,
-    iceServers: iceServers(),
+    ...peerIce(),
     trickle: false, // 手动模式等候选集齐，SDP 自包含
   });
   wirePeer(peer, null);
@@ -1082,6 +1674,8 @@ async function joinManualNow(hostCode) {
   });
   // 这一轮超时被放弃、后面又开了新的一轮：迟到的旧应答别把新的那条盖掉
   if (S.manualAttempt !== attempt) return;
+  // 应答是整份 SDP：只走中继却一条中继候选都没有、配了中继却没拿到，这时就说，别等连不上才猜
+  adviseLocalCandidates(answer);
 
   $('answer-out').value = inviteLink(code, 'answer');
   show($('answer-wrap'), true);
@@ -1126,44 +1720,277 @@ function renderRole() {
   }
   const hint = $('role-hint');
   if (hint) {
-    // 房主给了控制权也改不了列表：列表的唯一权威是房主那台机器，手机端连编辑入口都没有
     hint.textContent = canControl
-      ? `身份：${ROLE_LABEL[S.sync.myRole()]} · 可以控制播放，但手机端不能编辑列表`
+      ? `身份：${ROLE_LABEL[S.sync.myRole()]} · 可以控制播放、编辑列表`
       : '身份：游客 · 播放/暂停仅对自己生效，不能拖动进度';
   }
+  // 升降管理员会改变能不能编辑列表
+  renderPlaylistPanel();
 }
 
-/* ------------------------- 播放列表面板（只读） ------------------------- */
+/* ---------------------------- 播放列表面板 ---------------------------- */
 
 const itemName = (item) => (item ? (item.kind === 'link' ? item.title || item.url : item.name) || '' : '');
 
 const PLAYLIST_TAG = { now: '正在播放', next: '待播', done: '已播放' };
 
 /**
- * 只读的播放列表：队列第一项就是当前项，后面是待播，已播放区排在最后。
- * 这里没有拖动、删除、加片的任何入口 —— 手机端不编辑列表，也就不会发 PLAYLIST_OP。
+ * 手机上能不能改列表：房主给了管理员身份才行。手机永远不是房主，改列表是把操作发给房主，
+ * 由房主那台机器执行、再把新列表广播出来（房主是列表的唯一权威）。
+ */
+function canEditPlaylist() {
+  return Boolean(S.sync?.canIControl()) && S.sync.myRole() !== 'host';
+}
+
+// 点开了操作按钮的那一行（一次只展开一行，手机屏幕放不下每行一排按钮）
+let playlistExpanded = '';
+
+/**
+ * 播放列表：队列第一项就是当前项，后面是待播，已播放区排在最后。
+ * 管理员点一行展开操作按钮（和电脑端行菜单同一套：立即播放、跳过、上移、下移、移除、再放一次）；
+ * 顶上可以加在线链接、开关自动连播。游客只能看。
  */
 function renderPlaylistPanel() {
   const body = $('playlist-body');
   if (!body) return;
+  const canEdit = canEditPlaylist();
+  show($('playlist-edit'), canEdit);
+  $('playlist-note').textContent = canEdit
+    ? '你是管理员：点一行可以调整；改动由房主那边执行'
+    : '只有房主和管理员能改列表';
+  const auto = $('pl-autoplay');
+  if (auto) auto.checked = S.playlist.autoplay !== false;
   const queue = S.playlist.queue || [];
   const history = S.playlist.history || [];
   if (!queue.length && !history.length) {
-    body.replaceChildren(el('p', { className: 'panel-empty', text: '列表还是空的，等房主加片。' }));
+    body.replaceChildren(
+      el('p', { className: 'panel-empty', text: canEdit ? '列表还是空的，在上面加一个在线链接。' : '列表还是空的，等房主加片。' })
+    );
     return;
   }
-  const rows = queue.map((item, i) => playlistRow(item, i === 0 ? 'now' : 'next'));
-  for (const item of history) rows.push(playlistRow(item, 'done'));
+  const rows = queue.map((item, i) => playlistRow(item, i === 0 ? 'now' : 'next', canEdit ? queueActions(i, queue.length) : []));
+  for (const item of history) rows.push(playlistRow(item, 'done', canEdit ? HISTORY_ACTIONS : []));
   body.replaceChildren(...rows);
 }
 
-function playlistRow(item, kind) {
+/** 队列里第 index 项能做的事（和电脑端 queueMenu 一致）。 */
+function queueActions(index, length) {
+  const out = [index > 0 ? ['play-now', '立即播放'] : ['skip', '跳过这一部']];
+  if (index > 0) out.push(['move-up', '上移']);
+  if (index < length - 1) out.push(['move-down', '下移']);
+  out.push(['remove', '移除']);
+  return out;
+}
+
+const HISTORY_ACTIONS = [
+  ['requeue', '再放一次'],
+  ['play-now', '立即播放'],
+  ['remove', '从已播放中移除'],
+];
+
+function playlistRow(item, kind, actions) {
   const name = itemName(item);
-  return el('div', { className: `pl-row ${kind}` }, [
+  const line = el('div', { className: 'pl-line' }, [
     el('span', { className: 'pl-tag', text: PLAYLIST_TAG[kind] }),
     // 片名是别人起的：raw，既不翻译也不拼 innerHTML
     el('span', { className: 'pl-name', raw: true, text: name, title: name }),
   ]);
+  const row = el('div', { className: `pl-row ${kind}${actions.length ? ' editable' : ''}` }, [line]);
+  if (!actions.length) return row;
+  line.addEventListener('click', () => {
+    playlistExpanded = playlistExpanded === item.id ? '' : item.id;
+    renderPlaylistPanel();
+  });
+  if (playlistExpanded === item.id) {
+    row.appendChild(
+      el(
+        'div',
+        { className: 'pl-actions' },
+        actions.map(([key, label]) => {
+          const button = el('button', { className: key === 'remove' ? 'danger' : '', text: label });
+          button.addEventListener('click', () => onPlaylistAction(key, item.id));
+          return button;
+        })
+      )
+    );
+  }
+  return row;
+}
+
+/** 列表操作发给房主，等他的回音。和电脑端管理员同一条路（PLAYLIST_OP → PLAYLIST_ACK）。 */
+function submitPlaylistOp(op) {
+  if (!canEditPlaylist()) return Promise.resolve({ ok: false, reason: '你没有编辑播放列表的权限' });
+  const hostId = S.hostId || S.sync?.hostId;
+  const host = hostId ? S.swarm?.peers.get(hostId) : null;
+  if (!host?.authenticated) return Promise.resolve({ ok: false, reason: '和房主的连接断了' });
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  const reqId = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      S.pendingOps.delete(reqId);
+      resolve({ ok: false, reason: '房主没有回应' });
+    }, PLAYLIST_OP_TIMEOUT_MS);
+    S.pendingOps.set(reqId, (result) => {
+      clearTimeout(timer);
+      S.pendingOps.delete(reqId);
+      resolve(result);
+    });
+    if (!host.send({ t: MSG.PLAYLIST_OP, reqId, op })) {
+      S.pendingOps.get(reqId)?.({ ok: false, reason: '和房主的连接断了' });
+    }
+  });
+}
+
+/** 房主对列表操作的回音。只认房主那条连接。 */
+function onPlaylistAck(msg, peer) {
+  if (!fromHost(peer) || typeof msg.reqId !== 'string') return;
+  S.pendingOps.get(msg.reqId)?.({
+    ok: msg.ok === true,
+    reason: typeof msg.reason === 'string' ? msg.reason.slice(0, 200) : '',
+    id: typeof msg.id === 'string' ? msg.id.slice(0, 32) : '',
+  });
+}
+
+async function runPlaylistOp(op) {
+  const res = await submitPlaylistOp(op);
+  if (!res.ok && res.reason !== 'needs-confirm') log(`列表没改成：${res.reason || '未知原因'}`, 'warn');
+  return res;
+}
+
+async function onPlaylistAction(key, id) {
+  if (!canEditPlaylist()) return;
+  const found = findItem(S.playlist, id);
+  if (!found) return;
+  const { item, index, where } = found;
+  const { queue } = S.playlist;
+  playlistExpanded = '';
+  renderPlaylistPanel();
+  switch (key) {
+    // 点「立即播放」是明说要换，不再二次确认（和电脑端行菜单一样）
+    case 'play-now':
+      await runPlaylistOp({ type: 'playNow', id });
+      return;
+    case 'skip':
+      // 按钮点下去之前当前项可能已经换了，别跳错
+      if (where === 'queue' && index === 0) await runPlaylistOp({ type: 'ended', seq: S.playlist.seq });
+      return;
+    case 'move-up':
+      if (where === 'queue' && index > 0) await movePlaylistItem(id, queue[index - 1].id);
+      return;
+    case 'move-down':
+      if (where === 'queue' && index < queue.length - 1) await movePlaylistItem(id, queue[index + 2]?.id ?? null);
+      return;
+    case 'remove':
+      if (where === 'queue' && index === 0 && S.playlist.started) {
+        const ok = await confirmAsk('移除正在播放的这一部？', item, '会直接换到下一部。', '移除');
+        if (!ok) return;
+      }
+      await runPlaylistOp({ type: 'remove', id });
+      return;
+    case 'requeue':
+      await runPlaylistOp({ type: 'requeue', id });
+      return;
+    default:
+  }
+}
+
+/**
+ * 调顺序。开播之后换掉当前项必须先确认（和电脑端拖动排序同一条规则）：
+ * 确认后走「立即播放」，原来那部退到第二位、记下播到哪，回头从那儿接着放。
+ */
+async function movePlaylistItem(id, beforeId) {
+  const ids = reorderIds(
+    S.playlist.queue.map((it) => it.id),
+    id,
+    beforeId
+  );
+  if (!ids) return;
+  const cur = currentItem(S.playlist);
+  if (S.playlist.started && ids[0] !== cur.id) {
+    await switchByMove(ids, cur);
+    return;
+  }
+  const res = await runPlaylistOp({ type: 'move', id, beforeId });
+  // 房主那边已经开播了，我这份列表刚跟上：按最新的顺序重算一遍再问
+  if (res.reason !== 'needs-confirm') return;
+  const fresh = reorderIds(
+    S.playlist.queue.map((it) => it.id),
+    id,
+    beforeId
+  );
+  if (fresh) await switchByMove(fresh, currentItem(S.playlist));
+}
+
+async function switchByMove(ids, cur) {
+  const target = S.playlist.queue.find((it) => it.id === ids[0]);
+  if (!target || !cur || target.id === cur.id) return;
+  const at = S.sync?.sharedPositionNow() || 0;
+  const ok = await confirmAsk(
+    '切换正在播放的片子？',
+    target,
+    at >= 1 ? `正在放的这部排到下一位，回头从 ${fmtTime(at)} 接着放。` : '正在放的这部排到下一位。',
+    '切换'
+  );
+  if (!ok) return;
+  const res = await runPlaylistOp({ type: 'playNow', id: target.id });
+  if (!res.ok) return;
+  // 是把正在放的那部往下挪：切过去之后再把它挪到要去的位置
+  const pos = ids.indexOf(cur.id);
+  if (pos > 1) {
+    const beforeId = ids.slice(pos + 1).find((x) => S.playlist.queue.some((it) => it.id === x)) ?? null;
+    await runPlaylistOp({ type: 'move', id: cur.id, beforeId });
+  }
+}
+
+/** 加一个在线链接。手机解析不了网页，只交地址；轮到它时由房主那边解析，每个人在自己那边允许一次这个网站。 */
+async function addLinkFromPhone() {
+  const input = $('pl-link');
+  const raw = input.value.trim();
+  if (!raw) return;
+  let url = '';
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') url = parsed.href;
+  } catch {}
+  if (!url || url.length > 2048) {
+    log('只能加 http:// 或 https:// 开头的视频链接', 'warn');
+    return;
+  }
+  const button = $('pl-add');
+  button.disabled = true;
+  try {
+    const res = await runPlaylistOp({ type: 'add', item: { kind: 'link', url, title: '', durationSec: 0 } });
+    if (res.ok) {
+      input.value = '';
+      log('链接已加进列表', 'good');
+    }
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/**
+ * 页面里的确认框（不用 window.confirm：WebView 的原生弹窗会把整个 JS 线程堵住）。
+ * 片名只走 textContent、打 raw；其余整句过 t()。
+ */
+let confirmDone = null;
+
+function confirmAsk(title, item, note, okText) {
+  confirmDone?.(false);
+  return new Promise((resolve) => {
+    $('confirm-title').textContent = t(title);
+    const name = $('confirm-name');
+    name.textContent = itemName(item);
+    $('confirm-note').textContent = t(note);
+    $('confirm-ok').textContent = t(okText);
+    $('confirm-ask').classList.add('on');
+    confirmDone = (ok) => {
+      confirmDone = null;
+      $('confirm-ask').classList.remove('on');
+      resolve(ok);
+    };
+  });
 }
 
 /* ------------------------------ 抽屉 ------------------------------ */
@@ -1632,6 +2459,55 @@ function renderWaiting() {
   $('pp').textContent = st.paused ? '▶' : '⏸';
 }
 
+/* ------------------------ 在线链接的跟随方式 ------------------------ */
+
+/** 「你比房主慢 12 秒」。seconds 是本机减房间，负数是落后。 */
+function driftText(seconds) {
+  const n = Math.abs(Math.round(seconds));
+  return `你比房主${seconds < 0 ? '慢' : '快'} ${n} 秒`;
+}
+
+// 上一次画出来的样子。每秒都会调到这里，没变就不碰 DOM —— 否则自动翻译每秒都要把中文再换一遍
+let driftKey = null;
+
+/** 顶栏的同步方式按钮（只在在线链接出现），和差开时那一条「你比房主慢 12 秒 · 同步到房主」。 */
+function renderDrift() {
+  const link = S.sourceType === 'link';
+  const d = S.sync?.driftStatus();
+  const shown = link && !!S.playerTimer && !!d && d.streaming && d.state !== 'ok';
+  const key = `${link}|${S.linkSync}|${shown ? `${d.state}|${d.seconds}` : ''}`;
+  if (key === driftKey) return;
+  driftKey = key;
+  show($('btn-follow'), link);
+  $('btn-follow').textContent = S.linkSync === 'manual' ? '手动同步' : '完全同步';
+  show($('drift'), shown);
+  if (!shown) return;
+  $('drift-kind').textContent = d.state === 'failed' ? '自动同步没跟上' : '手动同步';
+  $('drift-text').textContent = driftText(d.seconds);
+}
+
+$('btn-follow').addEventListener('click', () => {
+  S.linkSync = S.linkSync === 'manual' ? 'full' : 'manual';
+  localStorage.setItem('sw.linkSync', S.linkSync);
+  S.sync?.setFollow({ mode: S.linkSync });
+  log(
+    S.linkSync === 'manual'
+      ? '改成手动同步：缓冲慢了不再把你拽走，和房主差开时提示差多少秒'
+      : '改成完全同步：一直跟房主对齐，差开了自动跳过去'
+  );
+  renderDrift();
+});
+
+$('drift-sync').addEventListener('click', () => {
+  if (S.sourceType === 'link' && S.sync?.syncToRoom()) log('已同步到房主的进度', 'good');
+});
+
+// 每秒核对一次和房主差多少（播放器静止时位置不变，差距在变大只能靠这个看出来），顺手刷新那一条
+setInterval(() => {
+  if (S.sync && S.sourceType === 'link' && S.playerTimer) S.sync.checkDrift();
+  renderDrift();
+}, 1000);
+
 /* ------------------------------ 事件绑定 ------------------------------ */
 $('pp').addEventListener('click', () => {
   if (!S.sync) return;
@@ -1655,6 +2531,12 @@ $('join').addEventListener('click', async () => {
   if (S.joining) { log('正在加入房间，请稍候', 'warn'); return; }
   if (roomConnected()) { log('你已经在房间里了。要加入新的房间，请先离开当前房间。', 'warn'); return; }
   S.joining = true;
+  // 进了房间别人就会来连我：TURN 得在连信令之前备好，「隐藏我的 IP」没有中继就不进
+  if (turnFetchNeeded()) await ensureTurnReady().catch(() => {});
+  if (relayBlockedStop()) {
+    S.joining = false;
+    return;
+  }
   initSwarmAndSync();
   log(`正在连接 ${url} …`);
   try {
@@ -1713,6 +2595,159 @@ function submitChat() {
 
 $('site-allow').addEventListener('click', () => siteAskDone?.(true));
 $('site-deny').addEventListener('click', () => siteAskDone?.(false));
+
+// 列表编辑（管理员）
+$('pl-add').addEventListener('click', () => addLinkFromPhone());
+$('pl-link').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' || e.isComposing) return;
+  e.preventDefault?.();
+  addLinkFromPhone();
+});
+$('pl-autoplay').addEventListener('change', () => {
+  runPlaylistOp({ type: 'setAutoplay', on: !!$('pl-autoplay').checked }).then(renderPlaylistPanel);
+});
+$('confirm-ok').addEventListener('click', () => confirmDone?.(true));
+$('confirm-cancel').addEventListener('click', () => confirmDone?.(false));
+
+/* ------------------------------ 连接设置 ------------------------------ */
+
+/** 把 S.net 落到大厅那几个控件上。Cloudflare 的 API Token 输入框从不预填。 */
+function renderNetSettings() {
+  const cf = S.net.turnSource === 'cloudflare';
+  $('turn-source-manual').checked = !cf;
+  $('turn-source-cf').checked = cf;
+  show($('turn-manual'), !cf);
+  show($('turn-cf'), cf);
+  $('turn-on').checked = S.net.turnEnabled;
+  $('turn-url').value = S.net.turnUrl;
+  $('turn-user').value = S.net.turnUser;
+  $('turn-pass').value = S.net.turnPass;
+  $('relay-only').checked = S.net.relayOnly;
+  renderCfTurnStatus();
+}
+
+function netError(text) {
+  const box = $('net-err');
+  box.textContent = text ? t(text) : '';
+  show(box, !!text);
+}
+
+/** 「保存连接设置」：和电脑端设置页同一套校验，写错了当场说，别让人以为中继在工作。 */
+function saveNetFromForm() {
+  const turnSource = $('turn-source-cf').checked ? 'cloudflare' : 'manual';
+  const turnRaw = $('turn-url').value.trim();
+  const turnCheck = normalizeTurnInput(turnRaw);
+  const turnEnabled = !!$('turn-on').checked;
+  const turnUser = $('turn-user').value.trim();
+  const turnPass = $('turn-pass').value.trim();
+  // 手动那套字段只在来源是「自己填」时才生效，也只在那时才查
+  if (turnSource === 'manual') {
+    if (turnCheck.invalid.length) {
+      return netError(`这些 TURN 地址认不出来：${turnCheck.invalid.join('、')}。地址要形如 turn:example.com:3478`);
+    }
+    // 53 端口会被浏览器内核拦下，留着它只会让候选收集干等到超时
+    if (turnCheck.blocked.length) {
+      return netError(`这些 TURN 地址用的是 53 端口，浏览器会拦下这个端口：${turnCheck.blocked.join('、')}。换一个端口，常见的是 3478 或 443`);
+    }
+    if (turnEnabled && !turnRaw) {
+      return netError('勾了启用 TURN 中继，但地址是空的 —— 这样等于没配。填一个地址，或者把勾去掉。');
+    }
+    if (turnEnabled && (!turnUser || !turnPass)) {
+      return netError('TURN 中继要填用户名和密码（中继服务器靠它们认人）。没有的话把「启用 TURN 中继」的勾去掉。');
+    }
+  }
+  // Cloudflare 凭据只能经「验证并保存」进原生层；填了没保存就点这里，得说一声
+  if ($('cf-key').value.trim() || $('cf-token').value.trim()) {
+    return netError('Cloudflare 凭据还没保存：先点「验证并保存」，或者把这两个框清空。');
+  }
+  netError('');
+  // 漏了 turn: 前缀是最常见的写法错误，意思很清楚，直接补上
+  const turnUrl = turnCheck.fixed.length ? turnCheck.urls.join(' ') : turnRaw;
+  const sourceChanged = turnSource !== S.net.turnSource;
+  saveNetSettings({ turnSource, turnEnabled, turnUrl, turnUser, turnPass, relayOnly: !!$('relay-only').checked });
+  turnWarned = false;
+  renderNetSettings();
+  if (sourceChanged) {
+    S.cfTurn = null;
+    cfTurnRetryAt = 0;
+    if (turnSource === 'cloudflare') refreshCfTurnState();
+  }
+  log('连接设置已保存（只影响之后新建的连接）', 'good');
+}
+
+/** 「验证并保存」：Token 交给原生层验证、加密保存；成功后输入框清空，只显示「已保存」。 */
+async function saveCfTurnCredentials() {
+  const keyInput = $('cf-key');
+  const tokenInput = $('cf-token');
+  const result = $('cf-result');
+  const keyId = keyInput.value.trim();
+  const apiToken = tokenInput.value.trim();
+  if (!keyId || !apiToken) {
+    result.textContent = t('Turn Token ID 和 API Token 都要填。');
+    return;
+  }
+  const button = $('cf-save');
+  button.disabled = true;
+  result.textContent = t('正在向 Cloudflare 验证…');
+  try {
+    const state = await window.sw.turn.cfSave(keyId, apiToken);
+    keyInput.value = '';
+    tokenInput.value = '';
+    // 换了凭据：手上那组临时账号作废，下次连接前现取
+    S.cfTurn = null;
+    cfTurnRetryAt = 0;
+    applyCfTurnState(state);
+    result.textContent = t('已保存');
+    if (S.net.turnSource === 'cloudflare') ensureTurnReady().catch(() => {});
+  } catch (error) {
+    result.textContent = t(`没保存：${cfErrorText(cfErrorCode(error))}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function clearCfTurnCredentials() {
+  const result = $('cf-result');
+  try {
+    applyCfTurnState(await window.sw.turn.cfClear());
+    S.cfTurn = null;
+    clearTimeout(cfTurnTimer);
+    cfTurnTimer = null;
+    result.textContent = t('已清除');
+  } catch (error) {
+    result.textContent = t(`没清除：${cfErrorText(cfErrorCode(error))}`);
+  }
+}
+
+async function saveCfLimit() {
+  const limit = Number($('cf-limit').value);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+    netError('Cloudflare TURN 每月上限要填 1 到 1000 之间的整数（GB）。');
+    return;
+  }
+  netError('');
+  try {
+    applyCfUsage(await window.sw.turn.cfSetLimit(limit));
+    log(`Cloudflare TURN 每月上限已设为 ${limit} GB`, 'good');
+  } catch (error) {
+    netError(`没保存上限：${cfErrorText(cfErrorCode(error))}`);
+  }
+}
+
+for (const id of ['turn-source-manual', 'turn-source-cf']) {
+  $(id).addEventListener('change', () => {
+    const cf = $('turn-source-cf').checked;
+    show($('turn-manual'), !cf);
+    show($('turn-cf'), cf);
+    if (cf) refreshCfTurnState();
+  });
+}
+$('net-save').addEventListener('click', saveNetFromForm);
+$('cf-save').addEventListener('click', () => saveCfTurnCredentials());
+$('cf-clear').addEventListener('click', () => clearCfTurnCredentials());
+$('cf-limit-save').addEventListener('click', () => saveCfLimit());
+renderNetSettings();
+if (S.net.turnSource === 'cloudflare') refreshCfTurnState();
 
 // 弹幕层：装在 #stage 上，随播放器这一代启停
 S.danmaku = createDanmakuLayer({
@@ -1796,6 +2831,13 @@ $('invite-leave').addEventListener('click', () => {
 
 // 原生收到 noxreel:// 深链接后调这里（MainActivity.deliverInviteLink）
 window.noxreelOpenInvite = (link) => openInvite(link);
+
+// 被房间链接的房主移出、整页重载之前记下的原因：回到大厅再说一遍，只说一次
+try {
+  const notice = sessionStorage.getItem(LOBBY_NOTICE_KEY);
+  sessionStorage.removeItem(LOBBY_NOTICE_KEY);
+  if (notice) log(notice, 'bad');
+} catch {}
 
 // 「离开并加入」整页重载前留下的那条邀请：重载完接着处理，只处理这一次
 let resumedInvite = '';

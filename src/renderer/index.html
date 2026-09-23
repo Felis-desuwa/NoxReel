@@ -29,10 +29,6 @@
         <div class="topbar-right">
           <span class="pill" id="pill-geo"></span>
           <span class="pill" id="pill-deps"></span>
-          <button class="ghost top-btn hidden" id="btn-invite-top">
-            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M19 8v6M22 11h-6"></path></svg>
-            <span>邀请</span>
-          </button>
           <button class="ghost" id="btn-settings">设置</button>
           <button class="ghost top-btn leave hidden" id="btn-leave">
             <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><path d="M16 17l5-5-5-5"></path><path d="M21 12H9"></path></svg>
@@ -135,8 +131,11 @@
                     <div class="ready-text" id="ready-text"></div>
                   </div>
                   <div class="role-hint hidden" id="role-hint"></div>
+                  <!-- 在线链接：本机和房主没对上时差多少秒 -->
+                  <div class="drift-row hidden" id="drift-row"></div>
                 </div>
                 <div class="status-actions">
+                  <button class="ghost tiny hidden" id="btn-sync-now">同步到房主</button>
                   <button class="ghost tiny hidden" id="btn-force-start">仍然开始</button>
                   <button class="ghost tiny hidden" id="btn-reopen">重新打开播放器</button>
                   <button class="ghost tiny hidden" id="btn-rescan">重新扫描</button>
@@ -166,6 +165,18 @@
                 <button class="play-btn" id="btn-playpause" data-state="play" disabled>播放</button>
                 <div class="time" id="time-display">0:00 / 0:00</div>
                 <div class="controls-spacer"></div>
+                <!-- 在线链接：每个成员自己选怎么跟房主（房主是参照，看不到这一项） -->
+                <span
+                  class="sync-mode-box hidden"
+                  id="sync-mode-box"
+                  title="完全同步：一直跟房主对齐，差开了自动跳过去；你是管理员时，你缓冲全房会等你。手动同步：只跟房主的播放、暂停和跳转，缓冲慢了不会被拽走，差开了提示差多少秒，由你点「同步到房主」或在播放器里按 Ctrl+Shift+S。"
+                >
+                  <span class="ctl-label">同步</span>
+                  <select class="player-pick" id="sync-mode" aria-label="同步方式">
+                    <option value="full">完全同步</option>
+                    <option value="manual">手动同步</option>
+                  </select>
+                </span>
                 <span class="ctl-label">播放器</span>
                 <div class="controls-slot" id="player-slot"></div>
                 <button class="ghost tiny hidden" id="btn-switch-player"></button>

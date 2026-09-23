@@ -121,6 +121,11 @@ class PlayerManager extends EventEmitter {
       'chat-input',
       fromCurrent((payload) => this.send('player:chat-input', { ...payload, gen, kind }))
     );
+    // 在播放器窗口里按快捷键要求「同步到房主」。同样只认当前这一代。
+    adapter.on(
+      'sync-request',
+      fromCurrent(() => this.send('player:sync-request', { gen, kind }))
+    );
     // 下面两条只给主进程自己（覆盖窗）用，不转发给渲染进程。
     adapter.on('window', fromCurrent((state) => this.emit('window', { ...state, gen, kind })));
     adapter.on('banner', fromCurrent(({ text }) => this.emit('banner', { text, gen, kind })));

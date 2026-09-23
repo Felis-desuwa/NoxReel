@@ -50,9 +50,9 @@ test('页签和面板一一对应；邀请不再单独一页，住在成员页�
   // 成员面板里依次是：成员表、「邀请下一位」、邀请卡片（里面装着 renderInvite 画的 invite-body）
   assert.match(html, /id="panel-peers"[\s\S]*?id="peer-list"[\s\S]*?id="invite-next"[\s\S]*?id="invite-card"[\s\S]*?id="invite-body"/);
   assert.match(html, /id="panel-log"[\s\S]*?id="event-log"/);
-  // 顶栏：邀请（只给房主）和离开房间，进房前都藏着
+  // 顶栏：离开房间进房前藏着；邀请只走成员页（顶栏那个和「邀请下一位」重复，去掉了）
   const topbar = html.slice(html.indexOf('<header id="topbar"'), html.indexOf('</header>'));
-  assert.match(topbar, /class="ghost top-btn hidden" id="btn-invite-top"/);
+  assert.doesNotMatch(topbar, /btn-invite-top|邀请/);
   assert.match(topbar, /class="ghost top-btn leave hidden" id="btn-leave"/);
   assert.match(topbar, /class="pill room-pill hidden" id="pill-room"/);
   // 老的「增加 / 切换视频」块已经换成列表上的加片按钮
@@ -84,10 +84,10 @@ test('房间固定高度、各块自己滚动；控制条用弹性占位而不�
   assert.match(css, /\.dm-panel \{[^}]*top: calc\(100% \+ 6px\);/);
 });
 
-test('进房后顶栏亮出邀请（只给房主）和离开；有人进来只点角标，不抢页签', () => {
+test('进房后顶栏亮出离开；有人进来只点角标，不抢页签', () => {
   const app = read('src/renderer/app.js');
   const enter = app.slice(app.indexOf('async function enterRoom()'), app.indexOf('function selectRoomTab('));
-  assert.match(enter, /\$\('btn-invite-top'\)\.classList\.toggle\('hidden', S\.role !== 'host'\)/);
+  assert.doesNotMatch(app, /btn-invite-top/, '顶栏的「邀请」已经去掉，别留下找不到元素的引用');
   assert.match(enter, /\$\('btn-leave'\)\.classList\.remove\('hidden'\)/);
   assert.match(enter, /renderInviteArea\(\);/);
   assert.match(enter, /startRateTicker\(\);/);
@@ -99,7 +99,6 @@ test('进房后顶栏亮出邀请（只给房主）和离开；有人进来只�
   assert.match(peers, /notePeersChanged\(\)/);
   // 页签的点击是用户操作
   assert.match(app, /selectRoomTab\(tab\.dataset\.tab, \{ byUser: true \}\)/);
-  assert.match(app, /\$\('btn-invite-top'\)\.onclick = openInvite;/);
   assert.match(app, /\$\('btn-invite-next'\)\.onclick = openInvite;/);
 });
 

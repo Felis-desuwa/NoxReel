@@ -196,6 +196,9 @@ class SyncPlayer(private val context: Context) {
             .put("position", s.posMs / 1000.0)
             .put("duration", s.durMs / 1000.0)
             .put("paused", !advancing)
+            // 缺数据在等（跳转后、网速跟不上时）。让没让它播都算：同步引擎让全房等的时候会把它暂停，
+            // 暂停期间 ExoPlayer 照样在缓冲，攒够了变成 READY 才算缓冲完
+            .put("buffering", s.state == Player.STATE_BUFFERING)
             .put("idle", s.state == Player.STATE_IDLE)
             .put("eof", s.state == Player.STATE_ENDED)
             .toString()

@@ -42,7 +42,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var web: WebView
     private lateinit var player: SyncPlayer
     private lateinit var store: Store
+    private lateinit var bridge: NativeBridge
     private val main = Handler(Looper.getMainLooper())
+    // WebView 已经被摘下销毁（渲染进程没了）：后台线程迟到的回复别再往它身上送
+    private var webGone = false
 
     // 深链接收件箱：只留最新一条。页面没加载完之前先存着，加载完再送。
     private var pendingInviteLink: String? = null
@@ -65,7 +68,17 @@ class MainActivity : AppCompatActivity() {
         store.cleanupStale()
         player = SyncPlayer(applicationContext)
         player.attachView(playerView)
-        val bridge = NativeBridge(store, player)
+        // Cloudflare TURN 的结果从后台线程回来：切回主线程，按请求 id 交给页面（见 native-shim 的 nativeCall）。
+        // 两个参数都经 JSONObject.quote 变成 JS 字符串字面量，不拼接任何未转义的内容。
+        bridge = NativeBridge(store, player, CloudflareTurn(applicationContext.filesDir)) { id, json ->
+            main.post {
+                if (webGone || !::web.isInitialized) return@post
+                web.evaluateJavascript(
+                    "window.__noxreelNativeReply?.(${JSONObject.quote(id)}, ${JSONObject.quote(json)})",
+                    null
+                )
+            }
+        }
         // 只有全新启动才看启动它的那条链接。重建（渲染进程崩溃后、从最近任务恢复）时
         // Intent 还是上一次那条：再处理一遍就是把旧邀请重放一次，要是正是它把页面撑崩的，
         // 还会崩了又重建、重建又崩。
@@ -117,6 +130,7 @@ class MainActivity : AppCompatActivity() {
             override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
                 Log.e(TAG, "WebView 渲染进程退出（崩溃：${detail.didCrash()}），重建界面")
                 pageReady = false
+                webGone = true
                 (view.parent as? ViewGroup)?.removeView(view)
                 view.destroy()
                 recreate()
@@ -173,6 +187,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
+        webGone = true
+        if (::bridge.isInitialized) bridge.shutdown()
         player.release()
         // 关掉所有会话，接收缓存跟着删。原来只 release 播放器，
         // 缓存留在 filesDir 里既看不到也删不掉，只能去系统设置清数据。

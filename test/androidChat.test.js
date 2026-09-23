@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * 安卓观众端的播放列表面板（只读）、聊天和弹幕（app-android.js + index.html）。
+ * 安卓观众端的播放列表面板（游客只读、管理员可编辑）、聊天和弹幕（app-android.js + index.html）。
  *
  * 和 androidFollow.test.js 同一套路子：不起 WebView、不起 ExoPlayer，用假 DOM、
  * 假 Native（native-shim 原样加载，只把 Kotlin 桥换成内存里的假实现）和假房主连接，
@@ -109,7 +109,9 @@ function fakeNative() {
       calls.push(['release']);
       player = null;
     },
-    log() {},
+    log(msg) {
+      calls.push(['log', String(msg)]);
+    },
   };
   return native;
 }
@@ -384,6 +386,7 @@ async function bootPhone(t, { securityMode = 'trusted', role = 'guest', name = '
       }
     },
     nativeCalls: (kind) => globalThis.Native.calls.filter((c) => c[0] === kind),
+    nativeLogs: () => globalThis.Native.calls.filter((c) => c[0] === 'log').map((c) => c[1]),
   };
   return phone;
 }
@@ -398,9 +401,12 @@ async function startLink(phone, { seq = 1, rev = 1, url = 'https://video.example
   await flush();
 }
 
-/* ======================== 一、播放列表面板只读 ======================== */
+/* ======================== 一、播放列表面板 ======================== */
 
-test('安卓端：播放列表面板只读，没有任何编辑入口', async (t) => {
+/** 一行里片名那一格（行 → 第一行文字 → 片名）。 */
+const nameCellOf = (phone, index) => phone.$('playlist-body').children[index].children[0].children[1];
+
+test('安卓端：游客的播放列表只读，没有编辑入口', async (t) => {
   const phone = await bootPhone(t);
   const a = makeManifest('A');
   const b = makeManifest('B');
@@ -420,52 +426,188 @@ test('安卓端：播放列表面板只读，没有任何编辑入口', async (t
     ['pl-row now', 'pl-row next', 'pl-row done']
   );
   // 片名是用户输入：必须打跳过标记，不能被自动翻译改写
-  const nameCell = phone.$('playlist-body').children[0].children[1];
+  const nameCell = nameCellOf(phone, 0);
   assert.equal(nameCell.getAttribute('data-i18n-skip'), '');
   assert.equal(nameCell.getAttribute('title'), 'A.mp4');
+  assert.equal(phone.$('playlist-edit').style.display, 'none', '游客看不到加链接、自动连播');
+  assert.equal(phone.$('playlist-note').textContent, '只有房主和管理员能改列表');
 
-  // 手机收到列表操作也不会应用：这条路根本不存在
-  phone.send({ t: 'playlist-op', op: { type: 'remove', id: rows[1] }, rev: 2 });
+  // 点一行也不会展开操作按钮
+  phone.$('playlist-body').children[1].children[0].click();
+  await flush();
+  assert.equal(phone.$('playlist-body').children[1].children.length, 1, '游客的行不能展开');
+
+  // 手机收到列表操作也不会应用：手机不是房主，别人发来的列表操作一律不认
+  phone.send({ t: 'playlist-op', reqId: 'x1', op: { type: 'remove', id: rows[1] } });
   await flush();
   assert.deepEqual(
     phone.playlistRows().map((r) => r.text),
     ['正在播放A.mp4', '待播B.mp4', '已播放C.mp4'],
     '列表操作不该改变手机上的列表'
   );
-  assert.equal(phone.host.sent.filter((m) => String(m.t).startsWith('playlist')).length, 0, '手机不发任何列表消息');
+  assert.equal(phone.host.sent.filter((m) => String(m.t).startsWith('playlist')).length, 0, '游客不发任何列表消息');
 });
 
-test('安卓端：app-android.js 里没有列表编辑那一套，界面上也只有一个关闭按钮', async () => {
+test('安卓端：手机从不自己执行列表操作（只发给房主），不拼 innerHTML、不用 window.confirm', async () => {
   const src = fs.readFileSync(path.join(JS, 'app-android.js'), 'utf8');
-  // 注释里提到这些词是说明「故意没有」，扫描只看代码
   const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-  for (const forbidden of ['PLAYLIST_OP', 'playlist-op', 'applyOp', 'reorderIds', 'markStarted', 'PLAYLIST_ACK']) {
+  // 执行列表操作、标记开播是房主的事：手机端连这几个函数都不该引进来
+  for (const forbidden of ['applyOp', 'markStarted', 'markSources', 'commitPlaylist']) {
     assert.ok(!code.includes(forbidden), `手机端不该出现 ${forbidden}`);
   }
   // 聊天正文、昵称、片名都是别人给的字符串：只能走 textContent
   assert.ok(!code.includes('innerHTML'), '不许拼 innerHTML');
-  // 站点授权改用页面里的对话框，不再用会堵住整个 JS 线程的原生弹窗
-  assert.ok(!code.includes('confirm('), '不该再用 window.confirm');
+  // 站点授权、换片确认都用页面里的对话框，不用会堵住整个 JS 线程的原生弹窗
+  assert.ok(!/(^|[^\w.])confirm\(/m.test(code) && !code.includes('window.confirm'), '不该用 window.confirm');
   assert.ok(code.includes('askSite'), '要有按站点授权的对话框');
 
   const html = fs.readFileSync(path.join(ASSETS, 'index.html'), 'utf8');
   const sheet = html.slice(html.indexOf('<div id="playlist-sheet"'), html.indexOf('<div id="chat-sheet"'));
   assert.ok(sheet.length > 100, '找不到播放列表面板');
-  assert.match(sheet, /手机端暂不支持编辑列表/);
-  const buttons = sheet.match(/<button[^>]*>/g) || [];
-  assert.equal(buttons.length, 1, '只读面板里只能有关闭按钮');
-  assert.match(buttons[0], /id="playlist-close"/);
-  assert.equal((sheet.match(/<input|<textarea|<select/g) || []).length, 0, '只读面板里不能有输入控件');
+  // 编辑入口默认藏着，按身份才露出来
+  assert.match(sheet, /<div id="playlist-edit" style="display:none">/);
   // 弹幕层必须不吃触摸，否则整块画面都点不动
   assert.match(html, /#danmaku \{[^}]*pointer-events:none/);
 });
 
-test('安卓端：本机被设成管理员时，说清楚能控制播放但不能编辑列表', async (t) => {
+test('安卓端：本机被设成管理员时，说清楚能控制播放、编辑列表，编辑入口露出来', async (t) => {
   const phone = await bootPhone(t, { role: 'admin' });
   phone.send(playlistMsg({ rev: 1, seq: 1, queue: [linkItem('https://video.example.org/x.m3u8')] }));
   await flush();
-  assert.equal(phone.$('role-hint').textContent, '身份：管理员 · 可以控制播放，但手机端不能编辑列表');
+  assert.equal(phone.$('role-hint').textContent, '身份：管理员 · 可以控制播放、编辑列表');
   assert.equal(phone.$('seek').disabled, false);
+  assert.equal(phone.$('playlist-edit').style.display, '');
+});
+
+/** 房主回音：把手机发来的某条列表操作答复成 ok / 失败。 */
+function ackLast(phone, { ok = true, reason = '' } = {}) {
+  const op = phone.host.sent.filter((m) => m.t === 'playlist-op').at(-1);
+  assert.ok(op, '手机没发列表操作');
+  phone.send({ t: 'playlist-ack', reqId: op.reqId, ok, reason, id: '' });
+  return op;
+}
+
+test('安卓端：管理员点一行展开操作，上移、下移、移除、立即播放、跳过都发给房主执行', async (t) => {
+  const phone = await bootPhone(t, { role: 'admin' });
+  const a = linkItem('https://video.example.org/a.m3u8');
+  const b = linkItem('https://video.example.org/b.m3u8');
+  const c = linkItem('https://video.example.org/c.m3u8');
+  phone.send(playlistMsg({ rev: 1, seq: 1, queue: [a, b, c] }));
+  await flush();
+
+  // 点一行展开（已经展开的不再点：再点一下是收起）
+  const openRow = async (index) => {
+    const row = phone.$('playlist-body').children[index];
+    if (row.children.length === 1) {
+      row.children[0].click();
+      await flush();
+    }
+    return phone.$('playlist-body').children[index].children[1].children;
+  };
+  const labels = (buttons) => buttons.map((btn) => btn.textContent);
+
+  assert.deepEqual(labels(await openRow(0)), ['跳过这一部', '下移', '移除'], '当前项');
+  assert.deepEqual(labels(await openRow(1)), ['立即播放', '上移', '下移', '移除'], '中间一项');
+  assert.deepEqual(labels(await openRow(2)), ['立即播放', '上移', '移除'], '最后一项');
+
+  // 最后一项上移：挪到 b 前面
+  (await openRow(2))[1].click();
+  await flush();
+  let op = ackLast(phone);
+  assert.deepEqual(op.op, { type: 'move', id: c.id, beforeId: b.id });
+  assert.match(op.reqId, /^[0-9a-f]{16}$/);
+
+  (await openRow(1))[0].click(); // 立即播放 b
+  await flush();
+  op = ackLast(phone);
+  assert.deepEqual(op.op, { type: 'playNow', id: b.id });
+
+  (await openRow(0))[0].click(); // 跳过当前这一部
+  await flush();
+  op = ackLast(phone);
+  assert.deepEqual(op.op, { type: 'ended', seq: 1 });
+
+  // 房主拒绝了：说清楚为什么
+  (await openRow(1)).at(-1).click(); // 移除 b
+  await flush();
+  op = ackLast(phone, { ok: false, reason: '列表里没有这一项' });
+  assert.deepEqual(op.op, { type: 'remove', id: b.id });
+  await flush();
+  assert.ok(phone.nativeLogs().some((l) => l.includes('列表没改成：列表里没有这一项')));
+
+  // 别人冒充房主发回音：不认
+  const before = phone.host.sent.length;
+  (await openRow(2)).at(-1).click();
+  await flush();
+  const pending = phone.host.sent.slice(before).find((m) => m.t === 'playlist-op');
+  const stranger = fakePeer('STRANGER', '路人');
+  phone.swarm.addPeer(stranger);
+  phone.sendFrom(stranger, { t: 'playlist-ack', reqId: pending.reqId, ok: false, reason: '冒充的' });
+  await flush();
+  assert.ok(!phone.nativeLogs().some((l) => l.includes('冒充的')), '非房主的回音不认');
+});
+
+test('安卓端：已开播时把别的片挪到第一位要先确认，确认后走「立即播放」', async (t) => {
+  const phone = await bootPhone(t, { role: 'admin' });
+  const a = linkItem('https://video.example.org/a.m3u8');
+  const b = linkItem('https://video.example.org/b.m3u8');
+  phone.send(playlistMsg({ rev: 1, seq: 1, queue: [a, b], started: true }));
+  await flush();
+  phone.$('playlist-body').children[1].children[0].click();
+  await flush();
+  phone.$('playlist-body').children[1].children[1].children[1].click(); // 上移 b
+  await flush();
+  assert.ok(phone.$('confirm-ask').classList.contains('on'), '要先问');
+  assert.equal(phone.$('confirm-name').textContent, b.title || b.url);
+  phone.$('confirm-cancel').click();
+  await flush();
+  assert.equal(phone.host.sent.filter((m) => m.t === 'playlist-op').length, 0, '取消就什么都不发');
+
+  phone.$('playlist-body').children[1].children[0].click();
+  await flush();
+  phone.$('playlist-body').children[1].children[1].children[1].click();
+  await flush();
+  phone.$('confirm-ok').click();
+  await flush();
+  const op = ackLast(phone);
+  assert.deepEqual(op.op, { type: 'playNow', id: b.id });
+});
+
+test('安卓端：管理员加在线链接（只交地址，由房主那边解析）；不是 http/https 的不发', async (t) => {
+  const phone = await bootPhone(t, { role: 'admin' });
+  phone.send(playlistMsg({ rev: 1, seq: 1, queue: [] }));
+  await flush();
+  phone.$('pl-link').value = 'ftp://192.168.1.2/x.mkv';
+  phone.$('pl-add').click();
+  await flush();
+  assert.equal(phone.host.sent.filter((m) => m.t === 'playlist-op').length, 0);
+  assert.ok(phone.nativeLogs().some((l) => l.includes('只能加 http:// 或 https:// 开头的视频链接')));
+
+  phone.$('pl-link').value = '  https://Video.Example.org/watch?v=1  ';
+  phone.$('pl-add').click();
+  await flush();
+  const op = ackLast(phone);
+  assert.deepEqual(op.op, {
+    type: 'add',
+    item: { kind: 'link', url: 'https://video.example.org/watch?v=1', title: '', durationSec: 0 },
+  });
+  await flush();
+  assert.equal(phone.$('pl-link').value, '', '加成了就清空');
+
+  phone.$('pl-autoplay').checked = false;
+  phone.$('pl-autoplay').dispatch('change');
+  await flush();
+  assert.deepEqual(ackLast(phone).op, { type: 'setAutoplay', on: false });
+});
+
+test('安卓端：游客绕过界面直接调也发不出列表操作', async (t) => {
+  const phone = await bootPhone(t, { role: 'guest' });
+  phone.send(playlistMsg({ rev: 1, seq: 1, queue: [linkItem('https://video.example.org/a.m3u8')] }));
+  await flush();
+  phone.$('pl-link').value = 'https://video.example.org/b';
+  phone.$('pl-add').click();
+  await flush();
+  assert.equal(phone.host.sent.filter((m) => m.t === 'playlist-op').length, 0);
 });
 
 test('安卓端：游客还是老样子——只影响自己、不能拖进度', async (t) => {
@@ -900,7 +1042,7 @@ test('安卓端：界面文案跟着语言走，聊天正文和昵称原样保�
   await flush();
   const rows = phone.playlistRows();
   assert.equal(rows[0].text, 'Now playing可信房间');
-  assert.equal(phone.$('playlist-body').children[0].children[1].getAttribute('data-i18n-skip'), '');
+  assert.equal(nameCellOf(phone, 0).getAttribute('data-i18n-skip'), '');
 });
 
 /* ======================== 八、链接项：按站点授权 ======================== */

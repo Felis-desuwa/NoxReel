@@ -6,6 +6,8 @@ import org.json.JSONObject
 import java.net.InetAddress
 import java.net.URI
 import java.net.URL
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 /**
  * JS ↔ 原生 的唯一通道，对应 PC 端 preload.js 暴露的 window.sw。
@@ -16,11 +18,52 @@ import java.net.URL
  *
  * 注意：这些方法运行在 WebView 的 JavaBridge 线程，不是主线程。
  * 碰播放器（ExoPlayer 只能主线程）的调用由 [SyncPlayer] 内部 post 到主线程。
+ *
+ * 唯一的例外是要走网络的 Cloudflare TURN（[cfCall]）：同步返回的话一次慢请求就把整页卡住，
+ * 所以它在单独的后台线程里做，做完经 [reply] 回调给页面（见 native-shim 的 nativeCall）。
  */
 class NativeBridge(
     private val store: Store,
     private val player: SyncPlayer,
+    private val cloudflare: CloudflareTurn,
+    private val reply: (id: String, json: String) -> Unit,
 ) {
+    // 单线程：Cloudflare 的调用一个接一个做，同时只有一个生成请求在路上
+    private val cfExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "noxreel-cloudflare").apply { isDaemon = true }
+    }
+
+    /* --------------------------- Cloudflare TURN --------------------------- */
+
+    /**
+     * 页面发起一次 Cloudflare TURN 调用：保存凭据、清除、状态、取临时账号、记用量、改上限。
+     * 立即返回，结果经 [reply] 送回：{ok:true, value} 或 {ok:false, error:"[CF_XXX] 说明"}。
+     *
+     * API Token 只进不出：save 把它交给 [CloudflareTurn] 加密保存，之后没有任何方法把它读回来；
+     * 参数和报错都不写日志。
+     */
+    @JavascriptInterface
+    fun cfCall(reqId: String, action: String, argsJson: String) {
+        if (!CF_REQ_ID.matches(reqId) || action !in CF_ACTIONS || argsJson.length > MAX_CF_ARGS_CHARS) return
+        cfExecutor.execute {
+            val result = try {
+                val args = JSONObject(argsJson.ifBlank { "{}" })
+                JSONObject().put("ok", true).put("value", cloudflare.dispatch(action, args))
+            } catch (e: CfException) {
+                JSONObject().put("ok", false).put("error", e.message)
+            } catch (e: Exception) {
+                // 只记类型：说明文字里理论上不该有 Token，但这里不去赌
+                Log.e(TAG, "Cloudflare TURN 调用出错：${e.javaClass.simpleName}")
+                JSONObject().put("ok", false).put("error", "[CF_NETWORK] 原生层出错")
+            }
+            reply(reqId, result.toString())
+        }
+    }
+
+    /** Activity 销毁时收掉后台线程。 */
+    fun shutdown() {
+        cfExecutor.shutdownNow()
+    }
     /* ------------------------------ 存储 ------------------------------ */
 
     @JavascriptInterface
@@ -211,5 +254,9 @@ class NativeBridge(
         private const val MAX_LOG_CHARS = 4000
         private const val MAX_HEADERS_JSON_CHARS = 16 * 1024
         private val IPV4_LITERAL = Regex("""^\d{1,3}(\.\d{1,3}){3}$""")
+        private val CF_REQ_ID = Regex("^c[0-9]{1,15}$")
+        private val CF_ACTIONS = setOf("save", "clear", "status", "credentials", "addUsage", "setLimit")
+        // 参数里最长的是 API Token（512 字）加 Turn Token ID（128 字）
+        private const val MAX_CF_ARGS_CHARS = 4096
     }
 }

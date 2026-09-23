@@ -188,7 +188,7 @@ function stripRoom({ banner = [], ready = null, safety = 'clean' } = {}) {
     $('ready-row').classes.add('all');
     $('ready-row').classes.add('alone');
   }
-  const ctx = sandbox([fnSource('updateStripTone')], { $, S: { mediaSafety: { status: safety } } });
+  const ctx = sandbox([fnSource('updateStripTone'), fnSource('driftShown')], { $, S: { mediaSafety: { status: safety } } });
   ctx.updateStripTone();
   return $('status-strip').attrs['data-tone'];
 }

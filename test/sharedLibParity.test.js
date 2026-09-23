@@ -22,6 +22,10 @@ const SHARED = [
   'playlist.js',
   'chat.js',
   'danmaku.js',
+  // 房间链接（安卓也能用了）和 Cloudflare TURN 的用量计量
+  'relaySignaling.js',
+  'third_party/secp256k1.js',
+  'turnUsage.js',
 ];
 
 const root = path.join(__dirname, '..');

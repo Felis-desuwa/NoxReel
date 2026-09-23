@@ -236,6 +236,8 @@ const S = {
     turnSource: localStorage.getItem('sw.turnSource') === 'cloudflare' ? 'cloudflare' : 'manual',
     // 隐藏我的 IP：只经 TURN 中继连接。默认关
     relayOnly: localStorage.getItem('sw.relayOnly') === '1',
+    // 在线链接怎么跟房主：'full' 完全同步（默认），'manual' 手动同步。每个成员自己选，只存在本机
+    linkSync: localStorage.getItem('sw.linkSync') === 'manual' ? 'manual' : 'full',
   },
   // Cloudflare 的临时 TURN 账号 { urls, username, credential, expiresAt }，主进程生成，这里只缓存。
   // API Token 永远不到渲染进程来。
@@ -1996,6 +1998,7 @@ async function switchCurrent(item) {
     position: item?.resumeAt || 0,
     broadcast: isRoomHost(),
   });
+  S.sync.setFollow({ streaming: item?.kind === 'link', mode: linkFollowMode() });
   if (item) S.sync.setMediaInfo({ duration: item.durationSec || 0, size: item.kind === 'file' ? item.size : 0 });
   S.sync.sizeHint = item?.kind === 'file' ? item.size : 0;
   if (roomEntered) {
@@ -4188,6 +4191,12 @@ function initSwarmAndSync() {
 
   S.sync.on('state', renderStatus);
   S.sync.on('margin', renderStatus);
+  // 在线链接：本机和房主差了多少秒。横幅（「播放中，但你和房主没对上」）和差值那一行要一起换，
+  // 所以走整个 renderStatus（它会调 renderDrift），不能只画那一行
+  S.sync.on('drift', renderStatus);
+  S.sync.on('drift-correct', ({ seconds }) => {
+    log(`和${driftRefName()}差了 ${Math.abs(seconds).toFixed(1)} 秒，自动对齐`);
+  });
 
   // 角色变化：重画成员列表（含标签/切换按钮）、更新我自己的身份提示。
   S.sync.on('roles', () => {
@@ -4362,9 +4371,9 @@ async function enterRoom() {
   renderChat();
   ensureDanmakuControls();
   renderPlayerControls();
-  // 顶栏：邀请只给房主；离开房间和房间药丸进房后一直在。
-  // 邀请不再单独占一个页签：空房间时成员页就是邀请流程，有人进来后收成一行「邀请下一位」。
-  $('btn-invite-top').classList.toggle('hidden', S.role !== 'host');
+  // 顶栏：离开房间和房间药丸进房后一直在。
+  // 邀请只有成员页一个入口：空房间时成员页就是邀请流程，有人进来后收成一行「邀请下一位」。
+  // 顶栏原来还有一个「邀请」，和「邀请下一位」是同一个动作，重复了，去掉。
   $('btn-leave').classList.remove('hidden');
   $('pill-room').classList.remove('hidden');
   renderRoomPill();
@@ -5184,6 +5193,7 @@ function refreshMediaUi() {
   // 按钮只画一个文件夹图标，文字放到悬停提示里
   $('btn-reveal').title = t($('btn-reveal').textContent);
   $('buffer').classList.toggle('link-mode', S.sourceType === 'link');
+  renderSyncModeControl();
   syncPlaylistEditUi();
   // 换了一部：这一部收没收完、是不是链接，都可能让「能不能用外部播放器」翻面
   updatePlayerSwitchHint();
@@ -6551,11 +6561,13 @@ function renderProgress(p) {
     const snap = S.sync?.lastTick;
     const playRatio = snap && S.sync.duration ? Math.min(1, (snap.position || 0) / S.sync.duration) : 0;
     $('buf-head').style.left = `${(playRatio * 100).toFixed(2)}%`;
+    const manual = linkFollowMode() === 'manual';
     replace(
       'buffer-stats',
       stat('来源', '原始视频网站'),
-      stat('同步', '播放 / 暂停 / 跳转'),
-      stat('缓冲', '由各自的 mpv 管理')
+      stat('同步', isRoomHost() ? '大家以你的进度为准' : manual ? '手动同步，差开了只提示' : '完全同步，差开了自动对齐'),
+      // 完全同步的控制者缓冲时全房等他；游客和手动同步的人只卡自己
+      stat('缓冲', !manual && S.sync?.canIControl() ? '你缓冲时全员等你' : '各自的 mpv 管，只卡自己')
     );
     replace(
       'transfer-stats',
@@ -7374,8 +7386,13 @@ function renderStatus() {
     banner.className = 'status-banner waiting';
     banner.textContent = stallBannerText(st.waitingFor);
   } else if (!st.paused && !linkWaiting) {
-    banner.className = 'status-banner playing';
-    banner.textContent = guest ? '播放中（你在独立观看，操作不影响他人）' : '播放中，所有人同步';
+    // 在播但本机和房主没对上：用提醒的黄色，别亮「一切正常」的绿
+    banner.className = driftShown() ? 'status-banner waiting' : 'status-banner playing';
+    banner.textContent = driftShown()
+      ? `播放中，但你和${driftRefName()}没对上`
+      : guest
+      ? '播放中（你在独立观看，操作不影响他人）'
+      : '播放中，所有人同步';
   } else {
     banner.className = 'status-banner';
     banner.textContent = S.mpvRunning
@@ -7398,6 +7415,10 @@ function renderStatus() {
       ? '文件已完整接收，但本机扫描器不可用 —— 这份文件没有经过扫描'
       : S.mediaSafety.status === 'scan-timeout' || S.mediaSafety.status === 'scan-stopped'
       ? '文件已完整接收但没有扫完 —— 文件还在，可以重新扫描'
+      : // 这一部本机已经能播（房主手里就有、或者已经收够 / 扫过），只是播放器没开着（被关掉、没起来）。
+      // 不单列的话会落到下面「正在接收」那两句 —— 房主看到「正在接收片头」完全摸不着头脑
+      S.filePath && !S.switchingMedia && playbackAllowed()
+      ? '播放器没开着，点「重新打开播放器」接着看'
       : S.roomSecurityMode === 'trusted'
       ? '可信房间：正在接收片头，达到约 8 MB 后将边下边播…'
       : '正在完整接收并校验媒体，完成后会进行安全扫描…';
@@ -7422,6 +7443,8 @@ function renderStatus() {
   $('btn-playpause').setAttribute?.('data-state', st.intendedPaused ? 'play' : 'pause');
   $('time-display').textContent = `${fmtTime(st.position)} / ${fmtTime(st.duration)}`;
   renderNowKicker(st);
+  // 播放器开了、关了都会走到这里：差值那一行跟着显隐（它自己比对，没变就不动 DOM）
+  renderDrift();
   updateStripTone();
   // 每个播放器 tick 都会跑到这里：updatePresence 自己比对，没变就不发
   updatePresence();
@@ -7460,9 +7483,122 @@ function updateStripTone() {
   if (ready && !ready.classList.contains('hidden')) {
     tone = ready.classList.contains('alone') ? 'info' : ready.classList.contains('all') ? 'ok' : 'warn';
   }
+  // 在播，但本机和房主没对上：不能亮「一切正常」的绿
+  if (tone === 'ok' && driftShown()) tone = 'warn';
   if (S.mediaSafety?.status === 'blocked') tone = 'bad';
   strip.setAttribute('data-tone', tone);
 }
+
+/* ---------------------------- 在线链接的跟随方式 ---------------------------- */
+
+/** 本机实际用的跟随方式。房主是参照，没得选，按完全同步走；其他人按自己在本机选的。 */
+function linkFollowMode() {
+  return isRoomHost() ? 'full' : S.settings.linkSync;
+}
+
+/** 差值是跟谁比的。房主自己跟的是房间时钟（管理员的操作也会改它）。 */
+function driftRefName() {
+  return isRoomHost() ? '房间进度' : '房主';
+}
+
+/** 「你比房主慢 12 秒」。seconds 是本机减房间，负数是落后。 */
+function driftText(seconds) {
+  const n = Math.abs(Math.round(seconds));
+  return `你比${driftRefName()}${seconds < 0 ? '慢' : '快'} ${n} 秒`;
+}
+
+/** 这一刻要不要把「没对上」摆出来：在线链接、播放器开着、引擎报了没对上或同步失败。 */
+function driftShown() {
+  const d = S.sync?.driftStatus();
+  return !!d && d.streaming && d.state !== 'ok' && S.sourceType === 'link' && !!S.mpvRunning;
+}
+
+// 上一次画出来的样子（没变就不碰 DOM：renderStatus 每个 tick 都会调到这里）。null = 还没画过
+let driftKey = null;
+// 在 mpv 画面上提醒过的状态和时刻：刚差开时说一声，之后差值变了也最多每分钟再说一次
+let driftOsdState = 'ok';
+let driftOsdAt = 0;
+const DRIFT_OSD_REPEAT_MS = 60_000;
+
+/** 状态带里那一行「你比房主慢 12 秒」+「同步到房主」按钮，以及控制条上的同步方式。 */
+function renderDrift() {
+  renderSyncModeControl();
+  const row = $('drift-row');
+  const btn = $('btn-sync-now');
+  if (!row || !btn) return;
+  const shown = driftShown();
+  const d = S.sync?.driftStatus();
+  const key = shown ? `${d.state}|${d.seconds}|${isRoomHost()}` : '';
+  if (key === driftKey) return;
+  driftKey = key;
+  row.classList.toggle('hidden', !shown);
+  btn.classList.toggle('hidden', !shown);
+  updateStripTone();
+  if (!shown) {
+    driftOsdState = 'ok';
+    return;
+  }
+  const failed = d.state === 'failed';
+  replace(
+    row,
+    make('b', { text: failed ? '自动同步没跟上' : '手动同步' }),
+    make('span', { text: driftText(d.seconds) }),
+    ...(failed && !isRoomHost()
+      ? [make('span', { className: 'fine', text: '网速跟不上的话，可以把同步方式改成「手动同步」' })]
+      : [])
+  );
+  btn.textContent = isRoomHost() ? '同步到房间进度' : '同步到房主';
+  // mpv 是独立窗口，全屏看片时房间窗口整个看不见。OSD 不进 DOM，得自己过一遍 t()
+  const now = Date.now();
+  if (d.state !== driftOsdState || now - driftOsdAt >= DRIFT_OSD_REPEAT_MS) {
+    driftOsdState = d.state;
+    driftOsdAt = now;
+    window.sw.player.osd(`${t(driftText(d.seconds))} · ${t('按 Ctrl+Shift+S 同步')}`, 4000).catch(() => {});
+  }
+}
+
+/** 控制条上的「同步 [完全同步 / 手动同步]」：只在当前项是在线链接、而且自己不是房主时出现。 */
+function renderSyncModeControl() {
+  const box = $('sync-mode-box');
+  if (!box) return;
+  box.classList.toggle('hidden', !(roomEntered && S.sourceType === 'link' && !isRoomHost()));
+  const select = $('sync-mode');
+  if (select && select.value !== S.settings.linkSync) select.value = S.settings.linkSync;
+}
+
+function setLinkSyncMode(value) {
+  const mode = value === 'manual' ? 'manual' : 'full';
+  if (mode === S.settings.linkSync) return;
+  S.settings.linkSync = mode;
+  localStorage.setItem('sw.linkSync', mode);
+  S.sync?.setFollow({ mode: linkFollowMode() });
+  log(
+    mode === 'manual'
+      ? '改成手动同步：缓冲慢了不再把你拽走，和房主差开时提示差多少秒'
+      : '改成完全同步：一直跟房主对齐，差开了自动跳过去'
+  );
+  renderStatus();
+  renderProgress(S.swarm?.progress());
+}
+
+/** 「同步到房主」按钮和 mpv 里的 Ctrl+Shift+S。 */
+function syncToHost() {
+  if (!roomEntered || S.sourceType !== 'link' || !S.sync?.syncToRoom()) return;
+  const text = isRoomHost() ? '已同步到房间进度' : '已同步到房主的进度';
+  log(text, 'good');
+  window.sw.player.osd(t(text), 2000).catch(() => {});
+}
+
+$('sync-mode').onchange = () => setLinkSyncMode($('sync-mode').value);
+$('btn-sync-now').onclick = syncToHost;
+window.sw.player.onSyncRequest?.(() => syncToHost());
+
+// 在线链接：每秒核对一次和房主差多少。播放器静止时不推 tick，差距在变大只能靠这个看出来
+function driftTick() {
+  if (!S.sync || S.sourceType !== 'link' || !S.mpvRunning || S.switchingMedia) return;
+  S.sync.checkDrift();
+}
+setInterval(driftTick, 1000);
 
 /* ------------------------------ 播放器事件 ----------------------------- */
 
@@ -7689,7 +7825,6 @@ async function leaveRoom() {
 }
 
 $('btn-leave').onclick = leaveRoom;
-$('btn-invite-top').onclick = openInvite;
 $('btn-invite-next').onclick = openInvite;
 $('btn-invite-close').onclick = closeInvite;
 

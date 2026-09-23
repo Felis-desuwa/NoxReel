@@ -53,6 +53,11 @@
                  color:#fff; text-shadow:0 1px 2px #000c; will-change:transform; }
   #danmaku .dm.self { -webkit-text-stroke:1px var(--accent); }
   #topbar, #botbar { z-index:2; }
+  /* 在线链接和房主差开了：顶栏下面一条，带「同步到房主」按钮 */
+  #drift { position:absolute; top:64px; left:50%; transform:translateX(-50%); z-index:2; display:flex; flex-wrap:wrap;
+           align-items:center; justify-content:center; gap:4px 8px; background:#000b; border:1px solid var(--warn);
+           color:var(--warn); padding:8px 12px; border-radius:10px; font-size:13px; max-width:90%; }
+  #drift button { padding:4px 10px; font-size:12px; }
 
   /* -------- 顶部的三个开关 -------- */
   #topbtns { display:flex; gap:6px; align-items:center; }
@@ -119,6 +124,34 @@
   #invite-ask { position:fixed; inset:0; display:none; align-items:center; justify-content:center;
                 padding:24px; background:#000a; z-index:10; }
   #invite-ask.on { display:flex; }
+  #confirm-ask { position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+                 padding:24px; background:#000a; z-index:11; }
+  #confirm-ask.on { display:flex; }
+  #confirm-ask .box { max-width:420px; padding:18px; border-radius:14px; border:1px solid #332f47; background:var(--panel); }
+  #confirm-ask .row { display:flex; gap:10px; margin-top:16px; }
+  #confirm-ask .row button { flex:1; }
+
+  /* -------- 大厅：连接设置 -------- */
+  #net-settings { margin-top:18px; border-top:1px solid #26233a; padding-top:12px; }
+  #net-settings summary { cursor:pointer; color:var(--text); font-size:14px; padding:4px 0; }
+  label.check { display:flex; align-items:center; gap:8px; color:var(--text); font-size:14px; margin:10px 0 4px; }
+  label.check input { width:auto; flex:0 0 auto; }
+  .choice { display:flex; gap:18px; flex-wrap:wrap; }
+  #net-settings .row { flex-wrap:wrap; }
+  #net-settings .row button { flex:1; }
+
+  /* -------- 播放列表：管理员的编辑入口 -------- */
+  #playlist-edit { padding:8px 14px 0; }
+  .pl-add { display:flex; gap:8px; }
+  .pl-add input { flex:1; padding:8px 10px; }
+  .pl-add button { flex:0 0 auto; padding:8px 14px; }
+  .pl-auto { font-size:13px; }
+  .pl-row { flex-direction:column; align-items:stretch; }
+  .pl-row.editable .pl-line { cursor:pointer; }
+  .pl-line { display:flex; gap:8px; align-items:baseline; min-width:0; }
+  .pl-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .pl-actions button { padding:6px 10px; font-size:12px; }
+  .pl-actions button.danger { color:var(--bad); }
 </style>
 </head>
 <body>
@@ -145,7 +178,7 @@
     <div class="hint">房主和成员必须分别选择相同模式才能握手。Android 安全模式会等待完整接收与分片校验；可信房间在片头就绪后提前播放。</div>
 
     <div class="tabs">
-      <button id="tab-manual" class="on">零服务器链接</button>
+      <button id="tab-manual" class="on">邀请链接</button>
       <button id="tab-server">信令服务器</button>
     </div>
 
@@ -159,18 +192,71 @@
       <div class="hint">电脑端启动信令服务器后，把它所在电脑的局域网 IP 填这里（例如 <code>ws://192.168.1.20:8080</code>）。手机和电脑要在同一网络，或电脑有公网地址。</div>
     </div>
 
-    <!-- 极简粘贴模式 -->
+    <!-- 邀请链接：房间链接（经公共中继，点开就进）或一对一邀请（生成应答链接发回给房主） -->
     <div id="panel-manual" class="panel on">
       <label>打开或粘贴房主给你的 NoxReel 邀请链接</label>
-      <textarea id="host-code" rows="4" placeholder="noxreel://j/… 或 NR3-…"></textarea>
-      <button class="primary" id="gen-answer" style="margin-top:12px; width:100%">生成应答链接</button>
+      <textarea id="host-code" rows="4" placeholder="https://…#j/… 或 noxreel://j/…"></textarea>
+      <button class="primary" id="gen-answer" style="margin-top:12px; width:100%">加入</button>
       <div id="answer-wrap" style="display:none">
         <label>把应答链接发回给房主（对方点开后即可连接）</label>
         <textarea id="answer-out" rows="4" readonly></textarea>
         <button id="copy-answer" style="margin-top:8px; width:100%">复制应答链接</button>
       </div>
-      <div class="hint">默认不使用信令服务器。点开邀请链接后，应答链接会自动生成；把它发回房主即可。</div>
+      <div class="hint">房间链接点开就进，等房主放行即可。一对一邀请会生成一条应答链接，把它发回给房主，对方点开就连上。</div>
     </div>
+
+    <!-- 连接设置：TURN 中继、隐藏我的 IP。只影响之后新建的连接 -->
+    <details id="net-settings">
+      <summary>连接设置（TURN 中继、隐藏我的 IP）</summary>
+      <div class="hint">双方都在严格 NAT（CGNAT、部分手机热点）后面时，打洞会失败，这时数据要经过中继转发。中继会产生带宽成本，需要你自己提供：自己填服务器，或者用自己的 Cloudflare 账号自动生成。</div>
+
+      <label>TURN 来源</label>
+      <div class="choice">
+        <label class="check"><input type="radio" name="turn-source" id="turn-source-manual" value="manual" /> 自己填</label>
+        <label class="check"><input type="radio" name="turn-source" id="turn-source-cf" value="cloudflare" /> Cloudflare 自动生成</label>
+      </div>
+
+      <div id="turn-manual">
+        <label class="check"><input type="checkbox" id="turn-on" /> 启用 TURN 中继兜底</label>
+        <label>TURN 地址</label>
+        <input id="turn-url" placeholder="turn:example.com:3478" autocomplete="off" spellcheck="false" />
+        <div class="hint">会自动同时尝试 UDP 和 TCP —— 酒店、公司和校园网经常只放行 TCP。</div>
+        <label>TURN 用户名 / 密码</label>
+        <input id="turn-user" placeholder="用户名" autocomplete="off" spellcheck="false" />
+        <input id="turn-pass" placeholder="密码" autocomplete="off" spellcheck="false" style="margin-top:6px" />
+      </div>
+
+      <div id="turn-cf" style="display:none">
+        <label>Turn Token ID</label>
+        <input id="cf-key" autocomplete="off" spellcheck="false" />
+        <label>API Token</label>
+        <!-- 只进不出：从不预填，保存成功就清空 -->
+        <input id="cf-token" type="password" autocomplete="new-password" spellcheck="false" />
+        <div class="hint">在 Cloudflare 后台 Realtime → TURN Server 新建一个 Key，把 Turn Token ID 和 API Token 填进来，点「验证并保存」。API Token 用手机系统的密钥库加密保存，只有 NoxReel 的原生层拿它换 24 小时有效的临时账号，界面上不会再显示。</div>
+        <div class="row" style="margin-top:10px">
+          <button id="cf-save">验证并保存</button>
+          <button id="cf-clear">清除</button>
+        </div>
+        <div class="hint" id="cf-result"></div>
+        <div class="hint" id="cf-status"></div>
+        <label>Cloudflare TURN 月用量上限</label>
+        <div class="row">
+          <span class="hint" style="margin:0">每月最多用</span>
+          <input id="cf-limit" type="number" min="1" max="1000" step="1" value="900" style="width:6em" />
+          <span class="hint" style="margin:0">GB（本机统计）</span>
+          <button id="cf-limit-save">保存上限</button>
+        </div>
+        <div class="hint" id="cf-usage"></div>
+        <div class="hint" id="cf-warn" style="display:none; color:var(--warn)"></div>
+        <div class="hint">到上限就不再用 Cloudflare TURN（为免扣费），下个月 1 日（UTC）自动恢复；已经连着的不会被断开。这是本机统计，和 Cloudflare 账单可能有出入；建议另外在 Cloudflare 后台建一个 Budget alert 做兜底。</div>
+      </div>
+
+      <label class="check" style="margin-top:16px"><input type="checkbox" id="relay-only" /> 隐藏我的 IP（只经 TURN 中继连接）</label>
+      <div class="hint">打开后，房间里的人只能看到 TURN 服务器的地址，看不到你的 IP。需要先配好 TURN；TURN 用不了时会连不上，不会退回直连。</div>
+
+      <div class="hint" id="net-err" style="display:none; color:var(--bad)"></div>
+      <button class="primary" id="net-save" style="margin-top:12px; width:100%">保存连接设置</button>
+    </details>
 
     <div id="log"></div>
   </div>
@@ -188,6 +274,8 @@
       </div>
       <div id="peers"></div>
       <div id="topbtns">
+        <!-- 在线链接的同步方式，点一下在「完全同步 / 手动同步」之间切换，只存在这台手机上 -->
+        <button id="btn-follow" style="display:none" title="完全同步：一直跟房主对齐，差开了自动跳过去。手动同步：只跟房主的播放、暂停和跳转，差开了提示差多少秒，由你点「同步到房主」。">完全同步</button>
         <button id="btn-playlist">列表</button>
         <button id="btn-chat">聊天<span id="chat-unread"></span></button>
         <button id="btn-danmaku">弹幕</button>
@@ -195,6 +283,13 @@
     </div>
 
     <div id="waiting"></div>
+
+    <!-- 在线链接：和房主没对上时差多少秒，点一下对齐 -->
+    <div id="drift" style="display:none">
+      <b id="drift-kind"></b>
+      <span id="drift-text"></span>
+      <button id="drift-sync">同步到房主</button>
+    </div>
 
     <div id="botbar" class="bar">
       <div id="buf"><i></i></div>
@@ -211,7 +306,15 @@
         <span class="grow">播放列表</span>
         <button class="sheet-close" id="playlist-close" aria-label="关闭">✕</button>
       </div>
-      <div class="sheet-note">手机端暂不支持编辑列表</div>
+      <div class="sheet-note" id="playlist-note">只有房主和管理员能改列表</div>
+      <!-- 管理员才看得到：加在线链接、自动连播。改动发给房主执行 -->
+      <div id="playlist-edit" style="display:none">
+        <div class="pl-add">
+          <input id="pl-link" placeholder="粘贴视频页面或直链（http/https）" autocomplete="off" spellcheck="false" />
+          <button id="pl-add">加入</button>
+        </div>
+        <label class="check pl-auto"><input type="checkbox" id="pl-autoplay" /> 放完自动接下一部</label>
+      </div>
       <div class="sheet-body" id="playlist-body"></div>
     </div>
 
@@ -271,6 +374,19 @@
       <div class="row">
         <button id="invite-stay">留在当前房间</button>
         <button class="primary" id="invite-leave">离开并加入</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 改列表时的确认（换掉正在放的、移除正在放的）。不用 window.confirm：原生弹窗会堵住整个 JS 线程 -->
+  <div id="confirm-ask">
+    <div class="box">
+      <div id="confirm-title" style="font-weight:600"></div>
+      <div id="confirm-name" data-i18n-skip style="margin-top:8px; overflow-wrap:anywhere"></div>
+      <div id="confirm-note" class="hint"></div>
+      <div class="row">
+        <button id="confirm-cancel">取消</button>
+        <button class="primary" id="confirm-ok">确定</button>
       </div>
     </div>
   </div>

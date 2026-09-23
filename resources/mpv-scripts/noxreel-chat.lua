@@ -1,4 +1,4 @@
--- NoxReel：在 mpv 窗口里直接发弹幕。
+-- NoxReel：在 mpv 窗口里直接发弹幕，以及按快捷键同步到房主。
 --
 -- 按 Ctrl+Shift+D 调出输入框，回车发送。为什么不是 Ctrl+Enter：PotPlayer 和 MPC-BE
 -- 都占了 Ctrl+Enter，三个播放器统一成一个键，用户不用记三套。
@@ -24,6 +24,17 @@ local DEFAULT_PROMPT = '弹幕：'
 -- Shift 保留而字母被提成大写、Shift 被折进字母里只剩 Ctrl+D。三种都注册，
 -- 一次按键只会命中其中一条，不会发三遍。Ctrl+D 在 mpv 默认键位里是空的，不抢别人的。
 local BINDING_KEYS = { 'Ctrl+Shift+d', 'Ctrl+Shift+D', 'Ctrl+D' }
+
+-- 在线链接选了「手动同步」、和房主差开了的时候，按 Ctrl+Shift+S 同步到房主。
+-- 这个键不需要 mp.input，所以注册在版本检查前面，旧版 mpv 上也能用。
+-- 三种写法的道理同上；mpv 默认键位里只有 Ctrl+s（小写，窗口截图），大写这几种都是空的。
+local SYNC_MESSAGE_NAME = 'noxreel-sync'
+local SYNC_KEYS = { 'Ctrl+Shift+s', 'Ctrl+Shift+S', 'Ctrl+S' }
+for i, key in ipairs(SYNC_KEYS) do
+  mp.add_key_binding(key, SYNC_MESSAGE_NAME .. '-' .. i, function()
+    mp.commandv('script-message', SYNC_MESSAGE_NAME)
+  end)
+end
 
 local ok, input = pcall(require, 'mp.input')
 if not ok or type(input) ~= 'table' or type(input.get) ~= 'function' then

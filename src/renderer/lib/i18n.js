@@ -246,6 +246,29 @@ const EN = new Map(Object.entries({
   '播放 / 暂停 / 跳转': 'Play / Pause / Seek',
   '缓冲': 'Buffer',
   '由各自的 mpv 管理': 'Managed by each member’s mpv',
+  // 在线链接的跟随方式
+  '大家以你的进度为准': 'Everyone follows your position',
+  '手动同步，差开了只提示': 'Manual sync: you are only told when you drift',
+  '完全同步，差开了自动对齐': 'Full sync: drift is corrected automatically',
+  '你缓冲时全员等你': 'Everyone waits while you buffer',
+  '各自的 mpv 管，只卡自己': 'Handled by your own mpv; only you pause',
+  '完全同步': 'Full sync',
+  '手动同步': 'Manual sync',
+  '同步方式': 'Sync mode',
+  '完全同步：一直跟房主对齐，差开了自动跳过去；你是管理员时，你缓冲全房会等你。手动同步：只跟房主的播放、暂停和跳转，缓冲慢了不会被拽走，差开了提示差多少秒，由你点「同步到房主」或在播放器里按 Ctrl+Shift+S。':
+    'Full sync: stay aligned with the host and jump back automatically when you drift; if you are a moderator, everyone waits while you buffer. Manual sync: follow only the host’s play, pause, and seek; slow buffering will not yank you around, and when you drift you are told by how many seconds, then click “Sync to host” or press Ctrl+Shift+S in the player.',
+  '同步到房主': 'Sync to host',
+  '同步到房间进度': 'Sync to the room',
+  '自动同步没跟上': 'Auto-sync could not keep up',
+  '网速跟不上的话，可以把同步方式改成「手动同步」': 'If your connection cannot keep up, switch the sync mode to “Manual sync”',
+  '按 Ctrl+Shift+S 同步': 'Press Ctrl+Shift+S to sync',
+  '播放中，但你和房主没对上': 'Playing, but you are out of sync with the host',
+  '播放中，但你和房间进度没对上': 'Playing, but you are out of sync with the room',
+  '已同步到房主的进度': 'Synced to the host’s position',
+  '已同步到房间进度': 'Synced to the room’s position',
+  '改成手动同步：缓冲慢了不再把你拽走，和房主差开时提示差多少秒':
+    'Switched to manual sync: slow buffering no longer yanks you around, and you are told how far you drift from the host',
+  '改成完全同步：一直跟房主对齐，差开了自动跳过去': 'Switched to full sync: you stay aligned with the host and jump back automatically when you drift',
   '视频传输': 'Video transfer',
   '原网站 → 每位成员': 'Original site → each member',
   '房间消息': 'Room messages',
@@ -316,6 +339,7 @@ const EN = new Map(Object.entries({
     'TURN relay is enabled but the address is empty, which means there is no relay at all. Enter an address, or clear the checkbox.',
   '扫描没做完 · 文件仍在': 'Scan unfinished · File kept',
   '扫描已停止 · 文件仍在': 'Scan stopped · File kept',
+  '播放器没开着，点「重新打开播放器」接着看': 'The player is closed. Select “Reopen player” to keep watching',
   '可信房间：正在接收片头，达到约 8 MB 后将边下边播…': 'Trusted room: receiving initial data; progressive playback starts at about 8 MB…',
   '正在完整接收并校验媒体，完成后会进行安全扫描…': 'Receiving and verifying the full media file. A security scan will run when complete…',
   '房间安全模式': 'Room security mode',
@@ -882,6 +906,16 @@ const INVALID_LABELS = {
 };
 
 const EN_PATTERNS = [
+  // 在线链接的跟随方式：差多少秒
+  [
+    /^你比(房主|房间进度)(慢|快) (\d+) 秒$/,
+    (_all, ref, dir, n) =>
+      `You are ${n} ${n === '1' ? 'second' : 'seconds'} ${dir === '慢' ? 'behind' : 'ahead of'} ${ref === '房主' ? 'the host' : 'the room'}`,
+  ],
+  [
+    /^和(房主|房间进度)差了 ([\d.]+) 秒，自动对齐$/,
+    (_all, ref, n) => `${n} seconds off from ${ref === '房主' ? 'the host' : 'the room'}; realigned automatically`,
+  ],
   // 0.7.5 加固
   [/^(.+) 被停止供片后仍在持续发送数据，已断开连接$/, '$1 kept sending data after being cut off as a source and was disconnected'],
   [/^(.+) 送来的分片多次校验失败，已停止向他要片$/, 'Chunks from $1 failed verification repeatedly; no longer requesting chunks from them'],

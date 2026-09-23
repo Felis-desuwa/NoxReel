@@ -22,7 +22,24 @@ const { findYtDlp } = require('./linkMedia');
 
 // 我们关心的属性。stream-pos 是字节位置 —— 这个比 time-pos 更适合跟连续水位线比，
 // 因为不用靠码率去猜时间和字节的换算。
-const OBSERVED = ['time-pos', 'pause', 'duration', 'stream-pos', 'core-idle', 'eof-reached', 'seeking'];
+// paused-for-cache：在线链接缺数据时 mpv 自己停下来等（pause 仍是 no），同步引擎靠它区分
+// 「在缓冲」和「用户拖了进度条」，完全同步的控制者还据此让全房一起等。
+const OBSERVED = [
+  'time-pos',
+  'pause',
+  'duration',
+  'stream-pos',
+  'core-idle',
+  'eof-reached',
+  'seeking',
+  'paused-for-cache',
+];
+
+/**
+ * 在线链接缓冲时攒够这么多秒才接着放（mpv 默认 1 秒）。完全同步的控制者一缓冲全房就停，
+ * 只攒 1 秒的话网速略低于码率时几秒就停一次，全房跟着一走一停。
+ */
+const REMOTE_CACHE_PAUSE_WAIT = 5;
 
 // 覆盖层的虚拟画布。字号按它定，窗口化和全屏下横幅大小才一致。
 const OVERLAY_RES_X = 1280;
@@ -59,6 +76,8 @@ const MAX_OVERLAY_SIZE = 16_384;
 /** 播放器内发弹幕的 Lua 脚本文件名，以及它回传消息时用的 script-message 名字。 */
 const CHAT_SCRIPT_FILE = 'noxreel-chat.lua';
 const CHAT_MESSAGE_NAME = 'noxreel-chat';
+// 同一个脚本里「同步到房主」那个快捷键回传的消息名，不带参数
+const SYNC_MESSAGE_NAME = 'noxreel-sync';
 
 /** mpv JSON IPC 一行的上限。正常的回包和事件都是几百字节，1MB 已经宽松得离谱。 */
 const MAX_IPC_LINE = 1024 * 1024;
@@ -280,6 +299,7 @@ function buildLaunchArgs({
       : []),
     ...(!isRemote ? ['--load-scripts=no', '--ytdl=no'] : []),
     ...(isRemote ? ['--load-scripts=no', '--ytdl=yes', '--script-opt=ytdl_hook-try_ytdl_first=yes'] : []),
+    ...(isRemote ? [`--cache-pause-wait=${REMOTE_CACHE_PAUSE_WAIT}`] : []),
     ...(ytDlp ? [`--script-opt=ytdl_hook-ytdl_path=${ytDlp}`] : []),
     ...(isRemote
       ? Object.entries(headers).map(([name, value]) => `--http-header-fields-append=${name}: ${value}`)
@@ -522,6 +542,11 @@ class MpvController extends EventEmitter {
       if (text) this.emit('chat-input', { text });
     }
 
+    // 播放器里按快捷键要求「同步到房主」（在线链接的手动同步）。只是一声招呼，不带任何内容。
+    if (msg.event === 'client-message' && Array.isArray(msg.args) && msg.args[0] === SYNC_MESSAGE_NAME) {
+      this.emit('sync-request', {});
+    }
+
     if (msg.event) this.emit('mpv-event', msg);
   }
 
@@ -541,6 +566,7 @@ class MpvController extends EventEmitter {
       idle: this.props['core-idle'] === true,
       eof: this.props['eof-reached'] === true,
       seeking: this.props['seeking'] === true,
+      pausedForCache: this.props['paused-for-cache'] === true,
     };
   }
 
@@ -726,6 +752,8 @@ module.exports = {
   MAX_OVERLAY_SIZE,
   CHAT_SCRIPT_FILE,
   CHAT_MESSAGE_NAME,
+  SYNC_MESSAGE_NAME,
+  REMOTE_CACHE_PAUSE_WAIT,
   MAX_IPC_LINE,
   REMOTE_PROTOCOLS,
   networkArgs,

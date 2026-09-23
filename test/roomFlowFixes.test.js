@@ -263,6 +263,7 @@ async function makeRoom({ fns, stubs = {}, sync } = {}) {
     enterRoom: async () => {},
     releaseUnreferenced: noop,
     isRoomHost: () => true,
+    linkFollowMode: () => 'full',
     siteApproved: () => false,
     cancelPrepJob: noop,
     manifestCandidates: () => [],

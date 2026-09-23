@@ -259,6 +259,19 @@ test('paused 取「是否真的在推进」：缓冲中不算在播，免得被�
   assert.equal(idle.idle, true);
 });
 
+test('buffering 只看 STATE_BUFFERING，让没让它播都算（在线链接的「卡没卡」靠它）', () => {
+  const kt = kotlinPlayer();
+  assert.equal(kt.snapshot(Snap(2, 5000, 60000, true, PLAYER_STATE.STATE_BUFFERING)).buffering, true);
+  assert.equal(
+    kt.snapshot(Snap(2, 5000, 60000, false, PLAYER_STATE.STATE_BUFFERING)).buffering,
+    true,
+    '全房在等他时引擎会把他暂停，暂停着也要报还在缓冲，否则当场放开、一走一停'
+  );
+  for (const state of [PLAYER_STATE.STATE_READY, PLAYER_STATE.STATE_IDLE, PLAYER_STATE.STATE_ENDED]) {
+    assert.equal(kt.snapshot(Snap(2, 5000, 60000, true, state)).buffering, false);
+  }
+});
+
 test('resetSnap：新代号的初始快照是 0:00、暂停、idle', () => {
   const kt = kotlinPlayer();
   const s = kt.resetSnap(9);
@@ -273,6 +286,7 @@ test('resetSnap：新代号的初始快照是 0:00、暂停、idle', () => {
     position: 0,
     duration: 0,
     paused: true,
+    buffering: false,
     idle: true,
     eof: false,
   });
@@ -591,7 +605,12 @@ test('版本号在 0.7 线上（协议 v2，和 0.6.x 不互通）', () => {
 
 test('android/README.md 写清了手机端的新能力和那条硬限制', () => {
   const md = read('android/README.md');
-  assert.match(md, /不能编辑列表/, '没写「手机不能编辑播放列表」这条用户定下的边界');
+  assert.match(md, /管理员/, '没写「被设成管理员后才能编辑列表」');
+  assert.match(md, /发给房主执行/, '没写「列表操作交给房主执行，手机自己不改」');
+  assert.match(md, /永远不当房主/, '没写「手机不开房、不做种」这条硬限制');
+  assert.match(md, /房间链接/);
+  assert.match(md, /隐藏我的 IP/);
+  assert.match(md, /CloudflareTurn\.kt/);
   assert.match(md, /弹幕/);
   assert.match(md, /聊天/);
   assert.match(md, /usableSpace/, '没写 JS 侧空间预算要用的原生接口');

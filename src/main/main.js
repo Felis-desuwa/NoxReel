@@ -47,6 +47,7 @@ const { DiscordPresence, sanitizeActivity } = require('./discordPresence');
 const { sharedProxy, closeSharedProxy } = require('./publicProxy');
 const { lockDownPermissions } = require('./permissions');
 const { CloudflareTurn } = require('./cloudflareTurn');
+const { labelProtocolHandler } = require('./protocolName');
 
 let win = null;
 // 同一时刻只有一个播放器；换播放器或重开时旧的先彻底退掉，迟到的事件按代丢弃
@@ -513,11 +514,13 @@ async function ensureCacheReady() {
 app.whenReady().then(async () => {
   // 多开的测试实例不去改系统的 noxreel:// 协议关联
   if (!DEV_USER_DATA) {
-    if (process.defaultApp && process.argv[1]) {
-      app.setAsDefaultProtocolClient('noxreel', process.execPath, [path.resolve(process.argv[1])]);
-    } else {
-      app.setAsDefaultProtocolClient('noxreel');
-    }
+    const registered =
+      process.defaultApp && process.argv[1]
+        ? app.setAsDefaultProtocolClient('noxreel', process.execPath, [path.resolve(process.argv[1])])
+        : app.setAsDefaultProtocolClient('noxreel');
+    // 源码运行时登记的是 electron.exe，浏览器会问「要打开 Electron 吗？」—— 补上显示名。
+    // 不等它：写不上只是弹窗里的名字不对，不耽误开窗口
+    if (registered) labelProtocolHandler().catch(() => {});
   }
   await ensureCacheReady();
   await cleanupLegacySidecars(LEGACY_DOWNLOAD_DIR);

@@ -128,6 +128,8 @@ contextBridge.exposeInMainWorld('sw', {
     // 用户在播放器窗口里直接发的弹幕：{ text, gen, kind }。文本已按聊天上限截断，
     // 但清洗、限速、去重仍然要走 lib/chat.js —— 这里只是多了一个入口，不是一条特权通道。
     onChatInput: on('player:chat-input'),
+    // 用户在 mpv 窗口里按 Ctrl+Shift+S 要求「同步到房主」：{ gen, kind }，不带别的内容
+    onSyncRequest: on('player:sync-request'),
     // 播放器侧的提示：{ code }，目前有 exclusive-fullscreen（独占全屏看不到弹幕）、
     // hotkey-taken（快捷键被别的程序占了）、chat-unavailable（这会儿弹不出输入条）
     onNotice: on('player:notice'),

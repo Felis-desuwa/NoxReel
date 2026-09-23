@@ -333,6 +333,7 @@ async function lobby({ securityMode = 'trusted', capacity = '4' } = {}) {
       reconnectPeer: async () => {},
       renderPeersSoon: () => {},
       renderStatus: () => {},
+      renderDrift: () => {},
       queueLocalFiles: () => {},
       trackClosing: (p) => p,
       prepareLocalFile: async () => ({ manifest: { fileId: 'f1' }, state: { sessionId: 's1' }, filePath: 'D:/a.mkv' }),

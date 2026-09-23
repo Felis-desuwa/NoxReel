@@ -822,6 +822,8 @@ test('后台扫的片切成当前项后，扫描已用时间会自己走起来',
     S,
     $,
     updatePresence: () => {}, // Discord 状态显示：这里不关心
+    renderDrift: () => {}, // 在线链接和房主差多少秒：这里不关心
+    driftShown: () => false,
     t: (s) => s,
     fmtTime: () => '3:12',
     stallBannerText: () => '',
@@ -847,4 +849,86 @@ test('后台扫的片切成当前项后，扫描已用时间会自己走起来',
   S.mediaSafety.status = 'clean';
   ctx.renderStatus();
   assert.equal(timers.cleared, 1, '扫完之后计时器要关掉');
+});
+
+test('本机已经能播、只是播放器没开着：横幅说「播放器没开着」，房主不会看到「正在接收片头」', () => {
+  const { $ } = domStub();
+  const S = {
+    sync: {
+      status: () => ({ stalled: false, paused: true, position: 0, duration: 100, intendedPaused: true, waitingFor: [] }),
+      canIControl: () => true,
+    },
+    current: { kind: 'file', fileId: 'f1' },
+    sourceType: 'file',
+    filePath: 'D:\\片子\\房主的片.mp4',
+    isSeeder: true,
+    switchingMedia: false,
+    mpvRunning: false,
+    mediaSafety: { status: 'idle' },
+    roomSecurityMode: 'trusted',
+    skippedLinks: new Set(),
+    diskFull: new Set(),
+  };
+  const ctx = sandbox(
+    fns('renderStatus', 'renderNowKicker', 'updateStripTone', 'setScanTicker', 'scanProgressLabel', 'playbackAllowed'),
+    {
+      S,
+      $,
+      updatePresence: () => {},
+      renderDrift: () => {},
+      driftShown: () => false,
+      t: (s) => s,
+      fmtTime: () => '0:00',
+      stallBannerText: () => '',
+      canEditPlaylist: () => true,
+      linkWaitText: () => '',
+      linkResolveFailed: () => false,
+      linkAsking: () => false,
+      fallbackAsking: () => false,
+      currentUnavailable: () => false,
+      currentSession: () => ({}),
+      pushMpvBanner: () => {},
+      setInterval: () => 1,
+      clearInterval: () => {},
+      scanTicker: null,
+    }
+  );
+  const banner = () => $('status-banner').textContent;
+  const CLOSED = '播放器没开着，点「重新打开播放器」接着看';
+
+  // 房主（片源）：可信房间里也不该说「正在接收片头」
+  ctx.renderStatus();
+  assert.equal(banner(), CLOSED);
+  S.roomSecurityMode = 'safe';
+  ctx.renderStatus();
+  assert.equal(banner(), CLOSED, '安全模式的房主也不是在「完整接收并校验」');
+
+  // 观众：安全模式下收完且扫过了，关掉播放器之后同样是「没开着」
+  S.isSeeder = false;
+  S.mediaSafety.status = 'clean';
+  ctx.renderStatus();
+  assert.equal(banner(), CLOSED);
+
+  // 观众还没收够：照旧说在接收，不能给一个点了也放不了的提示
+  S.mediaSafety.status = 'receiving';
+  ctx.renderStatus();
+  assert.equal(banner(), '正在完整接收并校验媒体，完成后会进行安全扫描…');
+  S.roomSecurityMode = 'trusted';
+  ctx.renderStatus();
+  assert.equal(banner(), '可信房间：正在接收片头，达到约 8 MB 后将边下边播…');
+  // 收够片头了 —— 能播，播放器却没开着
+  S.mediaSafety.status = 'trusted-streaming';
+  ctx.renderStatus();
+  assert.equal(banner(), CLOSED);
+
+  // 换片途中文件路径还是上一部的，不作数
+  S.switchingMedia = true;
+  ctx.renderStatus();
+  assert.equal(banner(), '可信房间：正在接收片头，达到约 8 MB 后将边下边播…');
+  S.switchingMedia = false;
+
+  // 播放器开着就是「已暂停」
+  S.mpvRunning = true;
+  ctx.renderStatus();
+  assert.equal(banner(), '已暂停');
 });

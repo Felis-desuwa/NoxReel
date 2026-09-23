@@ -25,6 +25,8 @@ class MpvAdapter extends EventEmitter {
     // 用户在 mpv 窗口里按 Ctrl+Shift+D 发的弹幕。mpv 自己带输入框，所以这一路是原生的；
     // 外部播放器没有，P6 那两个适配器要靠覆盖窗弹输入条，事件名保持一样。
     this.ctl.on('chat-input', (payload) => this.emit('chat-input', payload));
+    // 在线链接手动同步时按 Ctrl+Shift+S「同步到房主」。在线链接只交给 mpv，外部播放器没有这一路。
+    this.ctl.on('sync-request', () => this.emit('sync-request', {}));
   }
 
   static find() {

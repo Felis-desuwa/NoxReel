@@ -108,6 +108,64 @@ window.sw.appVersion = () => {
   }
 };
 
+/*
+ * 要走网络的原生调用（Cloudflare TURN）不能同步返回 —— JS 桥是同步的，网络请求一卡就把整页卡住。
+ * 这里改成「请求 id + 回调」：页面调 Native.cfCall(id, 动作, 参数)，原生层在后台线程做完后
+ * 经 evaluateJavascript 调 window.__noxreelNativeReply(id, 结果 JSON)。
+ * 结果形如 {ok:true, value} 或 {ok:false, error:"[CF_XXX] 说明"}（和桌面端主进程报错同一个格式）。
+ */
+const NATIVE_CALL_TIMEOUT_MS = 30_000;
+const nativeCalls = new Map(); // id -> {resolve, reject, timer}
+let nativeCallSeq = 0;
+
+window.__noxreelNativeReply = (id, json) => {
+  const call = nativeCalls.get(id);
+  if (!call) return;
+  nativeCalls.delete(id);
+  clearTimeout(call.timer);
+  let result = null;
+  try {
+    result = JSON.parse(json);
+  } catch {
+    result = null;
+  }
+  if (result && result.ok === true) call.resolve(result.value);
+  else call.reject(new Error(result && typeof result.error === 'string' ? result.error : '[CF_BAD_RESPONSE] 原生层的回复看不懂'));
+};
+
+function nativeCall(action, args = {}) {
+  return new Promise((resolve, reject) => {
+    if (typeof Native === 'undefined' || typeof Native.cfCall !== 'function') {
+      reject(new Error('[CF_NOT_CONFIGURED] 这个版本的原生层不支持 Cloudflare TURN'));
+      return;
+    }
+    const id = `c${++nativeCallSeq}`;
+    const timer = setTimeout(() => {
+      nativeCalls.delete(id);
+      reject(new Error('[CF_NETWORK] 原生层没有回应'));
+    }, NATIVE_CALL_TIMEOUT_MS);
+    nativeCalls.set(id, { resolve, reject, timer });
+    try {
+      Native.cfCall(id, action, JSON.stringify(args));
+    } catch (e) {
+      nativeCalls.delete(id);
+      clearTimeout(timer);
+      reject(new Error('[CF_NETWORK] 调不到原生层'));
+    }
+  });
+}
+
+// Cloudflare TURN。签名和桌面端 preload 的 window.sw.turn 一致，页面代码两边一样写。
+// API Token 只进不出：cfSave 把它交给原生层，之后没有任何方法能把它读回来。
+window.sw.turn = {
+  cfSave: (keyId, apiToken) => nativeCall('save', { keyId, apiToken }),
+  cfClear: () => nativeCall('clear'),
+  cfStatus: () => nativeCall('status'),
+  cfCredentials: (opts = {}) => nativeCall('credentials', { minValidMs: Number(opts?.minValidMs) || 0 }),
+  cfReportUsage: (bytes) => nativeCall('addUsage', { bytes }),
+  cfSetLimit: (limitGB) => nativeCall('setLimit', { limitGB }),
+};
+
 // 把 console 也送一份到 logcat，方便 adb logcat 里看。
 // logcat 单条本来就只显示 4KB 左右：超长的先在这边截掉，别拖着几 MB 的字符串过桥。
 const MAX_NATIVE_LOG_CHARS = 4000;

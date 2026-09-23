@@ -202,7 +202,9 @@ test('两份 README 都讲全了 0.7 的关键说法', () => {
     ['独占全屏下看不到弹幕', /独占全屏/, /exclusive fullscreen/i],
     ['中途加入不拖停全房', /中途加入/, /mid-playback/i],
     ['安卓能聊天看弹幕', /Android/, /Android/],
-    ['安卓不能编辑列表', /不能编辑播放列表|不能编辑列表/, /cannot edit the playlist/i],
+    ['安卓当管理员能编辑列表', /管理员后能编辑列表/, /moderator you can edit the playlist/i],
+    ['安卓只当观众、不能开房', /只当观众/, /only joins as a viewer/i],
+    ['安卓能用房间链接加入', /手机端也能用房间链接加入/, /Phones can join through room links/],
     ['APK 在 Releases 的 Assets 里', /app-debug\.apk/, /app-debug\.apk/],
   ];
 
@@ -831,6 +833,75 @@ test('播放器内弹幕输入框的提示语按界面语言传给 mpv', async (
 });
 
 /**
+ * 安卓端补齐电脑端的那几块：房间链接、连接设置（TURN、隐藏我的 IP、Cloudflare）、管理员编辑列表。
+ * 大厅和列表面板里新加的中文逐条扫一遍（标签、按钮、提示、占位符），代码里拼出来的句子单独列。
+ */
+test('安卓端：房间链接、连接设置、Cloudflare、列表编辑的新文案都有英文', async () => {
+  const androidI18n = path.join(__dirname, '..', 'android', 'app', 'src', 'main', 'assets', 'js', 'i18n.js');
+  const { translate } = await import(pathToFileURL(androidI18n).href);
+  const html = fs.readFileSync(path.join(__dirname, '..', 'android', 'app', 'src', 'main', 'assets', 'index.html'), 'utf8');
+  const cjk = /[一-鿿]/;
+  const texts = new Set();
+  for (const [start, end] of [
+    ['<div id="panel-manual"', '<div id="log">'],
+    ['<div id="playlist-edit"', '<div class="sheet-body" id="playlist-body">'],
+    ['<div id="confirm-ask">', '<script'],
+  ]) {
+    const block = html.slice(html.indexOf(start), html.indexOf(end, html.indexOf(start)));
+    assert.ok(block.length > 20, `找不到 ${start}`);
+    const withoutComments = block.replace(/<!--[\s\S]*?-->/g, '');
+    for (const m of withoutComments.matchAll(/>([^<>]+)</g)) {
+      const text = m[1].trim();
+      if (cjk.test(text)) texts.add(text);
+    }
+    for (const m of withoutComments.matchAll(/(?:placeholder|title)="([^"]+)"/g)) if (cjk.test(m[1])) texts.add(m[1]);
+  }
+  texts.add('邀请链接');
+  assert.ok(texts.size > 25, `扫到的文案太少，扫描范围可能不对：${texts.size}`);
+  for (const zh of texts) {
+    const en = translate(zh, 'en');
+    assert.doesNotMatch(en, cjk, `安卓端漏翻：${zh}`);
+  }
+
+  // 代码里拼出来的句子
+  for (const [zh, en] of [
+    ['加入房间失败：等房主放行超时', 'Could not join the room: Timed out waiting for the host to let you in'],
+    [
+      '本月 Cloudflare TURN 用量已到你设的上限（900 GB），为免扣费已停用；下个月 1 日自动恢复，或者在连接设置里调高上限。「隐藏我的 IP」开着，没有中继就不连接。',
+      'This month’s Cloudflare TURN usage has reached your limit (900 GB) and was turned off to avoid charges; it comes back on the 1st of next month, or raise the limit in the connection settings. “Hide my IP” is on, so without a relay no connection is made.',
+    ],
+    ['Cloudflare TURN：已配置，账号有效至 09:30', 'Cloudflare TURN: set up, credentials valid until 09:30'],
+    ['Cloudflare TURN：网络不通：连不上 Cloudflare', 'Cloudflare TURN: Network problem: cannot reach Cloudflare'],
+    ['没保存：未授权：Cloudflare 不认这组 Turn Token ID 和 API Token', 'Not saved: Unauthorized: Cloudflare rejected this Turn Token ID and API Token'],
+    ['本月已用 12.50 GB / 900 GB', 'Used this month: 12.50 GB / 900 GB'],
+    ['Cloudflare TURN 每月上限已设为 500 GB', 'Cloudflare TURN monthly limit set to 500 GB'],
+    ['列表没改成：列表里没有这一项', 'The playlist was not changed: That item is not in the playlist'],
+    ['列表没改成：列表最多 100 项', 'The playlist was not changed: The playlist can hold at most 100 items'],
+    ['正在放的这部排到下一位，回头从 12:30 接着放。', 'The current video moves to the next position and resumes from 12:30 later.'],
+    ['这些 TURN 地址用的是 53 端口，浏览器会拦下这个端口：turn:a:53。换一个端口，常见的是 3478 或 443', 'These TURN addresses use port 53, which the browser blocks: turn:a:53. Use another port—3478 or 443 are common'],
+  ]) {
+    assert.equal(translate(zh, 'en'), en);
+  }
+  for (const zh of [
+    '正在通过公共中继找房主，等房主放行…',
+    '房主已放行，正在和房间里的人打洞…',
+    '这个房间链接不完整，请让房主重新复制一次。',
+    '找不到房主：他可能已经离开房间，或者换过房间链接。请让房主重新发一条。',
+    '房主那边一直没能和你直连，你已被移出房间。可以请房主改发一对一邀请，或者双方配置 TURN 后再试。',
+    '已打开「隐藏我的 IP」，但还没有可用的 TURN 中继：请在连接设置里配好 TURN，或者先关掉这个开关。',
+    'TURN 中继开着但没填用户名或密码，这次先不走中继、只尝试直连。到连接设置里补全，或者把中继关掉。',
+    '连接设置已保存（只影响之后新建的连接）',
+    '只能加 http:// 或 https:// 开头的视频链接',
+    '链接已加进列表',
+    '你是管理员：点一行可以调整；改动由房主那边执行',
+    '列表还是空的，在上面加一个在线链接。',
+    '本月用量已超过上限的 80%，快到上限了。',
+  ]) {
+    assert.doesNotMatch(translate(zh, 'en'), cjk, `安卓端漏翻：${zh}`);
+  }
+});
+
+/**
  * 安卓观众端的弹幕聊天与只读播放列表（0.7 P7）。
  * 桌面和安卓是两份独立的字典，桌面加了词条不代表手机上也有 ——
  * 手机端界面里写死的中文一条都不能漏翻，聊天正文和昵称则反过来一律不翻。
@@ -877,12 +948,12 @@ test('安卓端：弹幕聊天与只读列表的新文案都有英文', async ()
 
   // 身份提示：具体那两条要排在通配的「身份：X」前面，否则永远轮不到它们
   assert.equal(
-    translate('身份：管理员 · 可以控制播放，但手机端不能编辑列表', 'en'),
-    'Role: Moderator · You can control playback, but the playlist cannot be edited on phones'
+    translate('身份：管理员 · 可以控制播放、编辑列表', 'en'),
+    'Role: Moderator · You can control playback and edit the playlist'
   );
   assert.equal(
-    translate('身份：房主 · 可以控制播放，但手机端不能编辑列表', 'en'),
-    'Role: Host · You can control playback, but the playlist cannot be edited on phones'
+    translate('身份：房主 · 可以控制播放、编辑列表', 'en'),
+    'Role: Host · You can control playback and edit the playlist'
   );
   assert.equal(
     translate('身份：游客 · 播放/暂停仅对自己生效，不能拖动进度', 'en'),

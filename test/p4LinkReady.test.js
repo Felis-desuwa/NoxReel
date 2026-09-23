@@ -165,6 +165,10 @@ async function linkRoom({ peerId = 'victim-peer', inspect, isHost = false, pause
     S,
     URL,
     updatePresence: () => {}, // Discord 状态显示：这里不关心
+    // 在线链接和房主差多少秒：这里不关心（linkFollow.test.js 专门测）
+    renderDrift: () => {},
+    driftShown: () => false,
+    driftRefName: () => '房主',
     Date: FakeDate,
     LINK_INFO_TTL_MS,
     FALLBACK_CONFIRM_MS,

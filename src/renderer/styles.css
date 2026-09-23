@@ -653,6 +653,18 @@ select:disabled {
   min-width: 0;
   overflow-wrap: anywhere;
 }
+/* 在线链接：本机和房主差了多少秒。第一段是哪种情况，第二段是差多少，第三段（有的话）是建议 */
+.drift-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  font-size: 12px;
+  color: #e3b341;
+}
+.drift-row .fine {
+  color: var(--muted);
+}
 
 /* 进度条就是缓冲条：白点 = 播放位置，绿 = 从这里起不用等的一段，深蓝 = 已收到（分片图，空洞一眼可见） */
 .buffer-block {
@@ -1187,6 +1199,17 @@ select:disabled {
 }
 .player-pick-exe {
   flex-shrink: 0;
+}
+/* 在线链接的同步方式，和播放器下拉框同一个样子 */
+.sync-mode-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+/* 控制条挤的时候「同步」两个字会被压成竖排 */
+.sync-mode-box .ctl-label {
+  white-space: nowrap;
 }
 /* 「当前实际使用：mpv（原因：…）」。为空时整段不占位，免得控制条平白空一块 */
 .player-actual {
@@ -1907,7 +1930,7 @@ select:disabled {
   stroke-linecap: round;
   stroke-linejoin: round;
 }
-/* 顶栏：邀请（只给房主）和离开房间。离开是低频的危险操作，别再和片名挤在一起 */
+/* 顶栏：离开房间。离开是低频的危险操作，别再和片名挤在一起 */
 .top-btn {
   display: inline-flex;
   align-items: center;
