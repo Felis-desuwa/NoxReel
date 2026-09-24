@@ -24,7 +24,7 @@ import {
   turnMissingCredentials,
 } from './ice.js';
 import { RelayUsageMeter, cloudflareRelayPairs, onlyCloudflareRelays } from './turnUsage.js';
-import { MSG, PROTOCOL_VERSION } from './protocol.js';
+import { MSG, PROTOCOL_VERSION, normalizePlatform } from './protocol.js';
 import { catalogOf, createPlaylist, currentItem, findItem, reorderIds, validateSnapshot } from './playlist.js';
 import { ChatGate, ChatSender, parseHistory, trustsRelay } from './chat.js';
 import { AREAS, DanmakuEngine, DEFAULT_SETTINGS as DANMAKU_BASE } from './danmaku.js';
@@ -1709,6 +1709,45 @@ function renderFilmInfo() {
 
 const ROLE_LABEL = { host: '房主', admin: '管理员', guest: '游客' };
 
+/** 成员面板上的设备标记。系统名是专有名词，不翻译；老版本电脑端只报得出「电脑」。 */
+const PLATFORM_LABEL = { windows: 'Windows', mac: 'macOS', linux: 'Linux', android: 'Android', desktop: '电脑' };
+
+/** 连上了、握过手的人。和「N 人在线」数的是同一拨。 */
+function connectedPeers() {
+  return S.swarm
+    ? S.swarm.peerList().filter((p) => p.authenticated && (p.state === 'connected' || p.state === 'completed'))
+    : [];
+}
+
+/**
+ * 成员面板：自己 + 连上的每个人，各自用什么设备、什么角色。房主排最前。
+ * 昵称是别人起的（raw，不翻译）；设备是对端在握手里自己报的，只拿来显示。
+ */
+function renderMembers() {
+  const body = $('members-body');
+  if (!body) return;
+  const roleOf = (peerId) => {
+    const role = S.sync?.roleOf(peerId) || 'guest';
+    return ROLE_LABEL[role] ? role : 'guest';
+  };
+  const row = (name, platform, role, self) => {
+    const key = normalizePlatform(platform);
+    return el('div', { className: 'mb-row' }, [
+      el('span', { className: 'mb-name', raw: true, text: name }),
+      self ? el('span', { className: 'mb-role', text: '（你）' }) : null,
+      el('span', { className: `mb-os ${key}`, text: PLATFORM_LABEL[key] }),
+      el('span', { className: 'mb-role', text: ROLE_LABEL[role] }),
+    ]);
+  };
+  const others = connectedPeers()
+    .map((p) => ({ p, role: roleOf(p.peerId) }))
+    .sort((a, b) => (a.role === 'host' ? -1 : b.role === 'host' ? 1 : 0));
+  body.replaceChildren(
+    row(S.name || '', 'android', S.sync?.myRole() || 'guest', true),
+    ...others.map(({ p, role }) => row(p.name || '', p.platform, role, false))
+  );
+}
+
 /** 反映房主分给我的角色：游客禁用进度条、给出说明；管理员/房主放开控制。 */
 function renderRole() {
   if (!S.sync) return;
@@ -1724,8 +1763,9 @@ function renderRole() {
       ? `身份：${ROLE_LABEL[S.sync.myRole()]} · 可以控制播放、编辑列表`
       : '身份：游客 · 播放/暂停仅对自己生效，不能拖动进度';
   }
-  // 升降管理员会改变能不能编辑列表
+  // 升降管理员会改变能不能编辑列表，成员面板上的角色也跟着变
   renderPlaylistPanel();
+  renderMembers();
 }
 
 /* ---------------------------- 播放列表面板 ---------------------------- */
@@ -1999,6 +2039,7 @@ const SHEETS = [
   { sheet: 'playlist-sheet', button: 'btn-playlist' },
   { sheet: 'chat-sheet', button: 'btn-chat' },
   { sheet: 'danmaku-sheet', button: 'btn-danmaku' },
+  { sheet: 'members-sheet', button: 'peers' },
 ];
 let openSheet = '';
 
@@ -2416,10 +2457,9 @@ function renderStatus(p) {
 }
 
 function renderPeers() {
-  const n = S.swarm
-    ? S.swarm.peerList().filter((p) => p.authenticated && (p.state === 'connected' || p.state === 'completed')).length
-    : 0;
+  const n = connectedPeers().length;
   $('peers').textContent = n ? `${n} 人在线` : '等待连接…';
+  renderMembers();
 }
 
 let seeking = false;
@@ -2574,7 +2614,8 @@ $('copy-answer').addEventListener('click', () => {
 $('btn-playlist').addEventListener('click', () => toggleSheet('playlist-sheet'));
 $('btn-chat').addEventListener('click', () => toggleSheet('chat-sheet'));
 $('btn-danmaku').addEventListener('click', () => toggleSheet('danmaku-sheet'));
-for (const id of ['playlist-close', 'chat-close', 'danmaku-close']) $(id).addEventListener('click', () => setSheet(''));
+for (const id of ['playlist-close', 'chat-close', 'danmaku-close', 'members-close']) $(id).addEventListener('click', () => setSheet(''));
+$('peers').addEventListener('click', () => toggleSheet('members-sheet'));
 
 $('chat-send').addEventListener('click', submitChat);
 $('chat-input').addEventListener('keydown', (e) => {

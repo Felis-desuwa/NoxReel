@@ -35,7 +35,6 @@
   #stage .bar { position:absolute; left:0; right:0; padding:12px 16px; background:linear-gradient(#000a,#0000); pointer-events:auto; }
   #topbar { top:0; display:flex; align-items:center; gap:12px; }
   #film { font-weight:600; font-size:15px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  #peers { font-size:12px; color:var(--dim); }
   #status { font-size:12px; color:var(--dim); margin-top:2px; width:100%; }
   #botbar { bottom:0; background:linear-gradient(#0000,#000c); display:flex; flex-direction:column; gap:8px; padding-bottom:20px; }
   #buf { height:4px; border-radius:2px; background:#ffffff22; overflow:hidden; }
@@ -88,6 +87,15 @@
   .pl-row.now .pl-tag { color:var(--good); }
   .pl-row.done { opacity:.55; }
   .pl-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  /* -------- 成员：谁在房间里、用什么设备、什么角色 -------- */
+  #peers { font-size:12px; color:var(--dim); background:none; padding:6px 4px; }
+  #peers.on { color:var(--accent); }
+  .mb-row { display:flex; gap:8px; align-items:center; padding:8px 0; border-bottom:1px solid #26233a; }
+  .mb-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .mb-os { flex:0 0 auto; font-size:11px; padding:0 6px; border-radius:4px; background:#ffffff12; color:var(--dim); }
+  .mb-os.android { color:var(--good); }
+  .mb-role { flex:0 0 auto; font-size:11px; color:var(--dim); }
 
   /* -------- 聊天 -------- */
   #chat-body { display:flex; flex-direction:column; gap:6px; }
@@ -272,7 +280,8 @@
         <div id="status"></div>
         <div id="role-hint"></div>
       </div>
-      <div id="peers"></div>
+      <!-- 「N 人在线」，点开是成员面板 -->
+      <button id="peers"></button>
       <div id="topbtns">
         <!-- 在线链接的同步方式，点一下在「完全同步 / 手动同步」之间切换，只存在这台手机上 -->
         <button id="btn-follow" style="display:none" title="完全同步：一直跟房主对齐，差开了自动跳过去。手动同步：只跟房主的播放、暂停和跳转，差开了提示差多少秒，由你点「同步到房主」。">完全同步</button>
@@ -316,6 +325,15 @@
         <label class="check pl-auto"><input type="checkbox" id="pl-autoplay" /> 放完自动接下一部</label>
       </div>
       <div class="sheet-body" id="playlist-body"></div>
+    </div>
+
+    <!-- 成员：只列和这台手机连上的人（一对一邀请时只有房主），设备是各自在握手里报的 -->
+    <div id="members-sheet" class="sheet">
+      <div class="sheet-head">
+        <span class="grow">成员</span>
+        <button class="sheet-close" id="members-close" aria-label="关闭">✕</button>
+      </div>
+      <div class="sheet-body" id="members-body"></div>
     </div>
 
     <!-- 聊天：竖屏是底部面板，横屏是侧边抽屉（见 .sheet 的方向媒体查询） -->

@@ -69,7 +69,7 @@ export class Peer extends Emitter {
 
     this.ctrl = null;
     this.data = null;
-    this.platform = null; // HELLO 里对方报的平台：desktop / android
+    this.platform = null; // HELLO 里对方报的平台：windows / mac / linux / android，老电脑端是 desktop
     // 对方每个文件槽位上有哪些分片：slot -> { have: Uint8Array }
     this.remote = new Map();
     this.inflight = new Set(); // 我方已向该 peer 请求、还没收齐的分片，键是 "槽位:下标"

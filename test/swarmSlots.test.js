@@ -1257,7 +1257,7 @@ impl('HELLO：协议版本不符先于安全模式检查，断开并记下；缺
   }
 });
 
-impl('HELLO：版本对了才看安全模式；通过后记下平台（非 android 一律 desktop）并补发全部槽位位图', async (dir) => {
+impl('HELLO：版本对了才看安全模式；通过后记下平台（只认 windows / mac / linux / android，其余一律 desktop）并补发全部槽位位图', async (dir) => {
   const { Swarm } = await load(dir);
   instantStore();
   const swarm = new Swarm({ peerId: 'me-local', name: 'me' });
@@ -1278,7 +1278,12 @@ impl('HELLO：版本对了才看安全模式；通过后记下平台（非 andro
 
   for (const [id, platform, expected] of [
     ['peer-an', 'android', 'android'],
+    ['peer-wi', 'windows', 'windows'],
+    ['peer-mc', 'mac', 'mac'],
+    ['peer-lx', 'linux', 'linux'],
+    ['peer-dt', 'desktop', 'desktop'], // 0.7.7 之前的电脑端
     ['peer-io', 'ios', 'desktop'],
+    ['peer-ob', { toString: () => 'windows' }, 'desktop'], // 不是字符串的一律不认
     ['peer-np', undefined, 'desktop'],
     ['peer-AN', 'ANDROID', 'desktop'],
   ]) {

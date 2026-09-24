@@ -53,7 +53,8 @@ const TURN_GATE_OPEN = {
 };
 
 function sandbox({ fns = [], decls = [], globals = {} }) {
-  const ctx = { console, inviteGen: 0, ...TURN_GATE_OPEN, ...globals };
+  // myPlatform：HELLO 里报的本机系统（成员表上的设备标记），这些测试不关心
+  const ctx = { console, inviteGen: 0, myPlatform: () => 'windows', ...TURN_GATE_OPEN, ...globals };
   vm.createContext(ctx);
   vm.runInContext([...decls.map(declSource), ...fns.map(fnSource)].join('\n\n'), ctx, { filename: 'app.js（节选）' });
   return ctx;
@@ -1050,8 +1051,8 @@ test('首页角落显示版本号，取自主进程的 env 状态', async () => 
   const home = html.slice(html.indexOf('<section id="view-home"'), html.indexOf('<section id="view-prepare"'));
   assert.match(home, /<p class="home-version" id="home-version" data-i18n-skip><\/p>/);
   assert.match(read('src/renderer/styles.css'), /\.home-version \{/);
-  // 主进程那边确实报了 version
-  assert.match(read('src/main/main.js'), /version: app\.getVersion\(\)/);
+  // 主进程那边确实报了 version（带上构建号，见 appVersion.js）
+  assert.match(read('src/main/main.js'), /version: displayVersion\(app\.getVersion\(\), readBuildNumber\(\)\)/);
 });
 
 /* ------------------------------ 高频重画 ------------------------------ */

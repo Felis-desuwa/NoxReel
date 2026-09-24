@@ -286,7 +286,7 @@ const EN = new Map(Object.entries({
   '下行': 'Download',
   '房主': 'Host',
   '管理员': 'Moderator',
-  '（手机）': ' (phone)',
+  '电脑': 'Desktop',
   '游客': 'Guest',
   '设为游客': 'Make guest',
   '设为管理员': 'Make moderator',

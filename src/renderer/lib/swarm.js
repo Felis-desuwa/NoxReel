@@ -11,6 +11,7 @@ import {
   packBitfield,
   chunkLengthAt,
   isSlot,
+  normalizePlatform,
   BITFIELD_CHUNKS_PER_PART,
 } from './protocol.js';
 import { Scheduler } from './scheduler.js';
@@ -244,7 +245,7 @@ export class Swarm extends Emitter {
     this.peerId = peerId;
     this.name = name;
     this.securityMode = securityMode === 'trusted' ? 'trusted' : 'safe';
-    this.platform = platform === 'android' ? 'android' : 'desktop';
+    this.platform = normalizePlatform(platform);
     /** @type {Map<string, import('./peer.js').Peer>} */
     this.peers = new Map();
 
@@ -852,7 +853,7 @@ export class Swarm extends Emitter {
       return;
     }
 
-    peer.platform = msg.platform === 'android' ? 'android' : 'desktop';
+    peer.platform = normalizePlatform(msg.platform);
     peer.authenticated = true;
     this._sendIntro(peer);
     this.emit('peer-authenticated', peer);

@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links — now with a playlist for the whole evening, danmaku comments over the picture, and your own preferred player.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.7-7C5CFF?style=for-the-badge" alt="Version 0.7.7">
+    <img src="https://img.shields.io/badge/version-0.7.7.101-7C5CFF?style=for-the-badge" alt="Version 0.7.7.101">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -64,6 +64,9 @@
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
 
 > [!NOTE]
+> `v0.7.7.101` shows everyone in the room **which device each member joined from**. On desktop, every row of the member list — including yours — is tagged Windows, macOS, Linux, or Android; on Android, tap “N online” in the top bar to open the member panel with each person's device and role. Older desktop builds show up as “Desktop”. **The P2P protocol is unchanged, so 0.7.7.101 works with other 0.7.x builds**.
+
+> [!NOTE]
 > `v0.7.7` makes syncing **online links** steadier and brings the **Android app** level with desktop. Each member picks how to follow an online link: **Full sync** (default; jumps back to the host's position when you drift more than 2 seconds, learning how long a jump takes on that site) or **Manual sync** (follows only the host's play, pause, and seeks; shows how many seconds you are off, and **Sync to host** or `Ctrl+Shift+S` in mpv lines you up in one go). When the host or a moderator is buffering a stream, the whole room waits instead of the room clock running ahead of them. **On Android** you can now join straight from a **room link**, set up **TURN, “Hide my IP”, and Cloudflare TURN credentials** (the API token is encrypted with the system keystore), and **edit the playlist** once the host makes you a moderator. Also fixed: the status bar claiming “receiving initial data” when the host's player was closed, and browsers asking to “open Electron” when running from source; the top-bar Invite button, which duplicated “Invite someone else”, is gone. **The P2P protocol is unchanged, so 0.7.7 works with other 0.7.x builds**.
 
 > [!NOTE]
@@ -91,8 +94,8 @@
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.7.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.7.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.7.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.7.exe) |
+| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.7.101.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.7.101.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.7.101.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.7.101.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 

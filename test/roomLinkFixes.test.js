@@ -830,6 +830,7 @@ test('当前这部在补一段时，收到新片就重算传输目标（补完�
   };
   const ctx = sandbox(['initSwarmAndSync'], {
     S,
+    myPlatform: () => 'windows', // HELLO 里报的本机系统：这里不关心
     Swarm: class extends FakeEmitter {
       constructor() {
         super();

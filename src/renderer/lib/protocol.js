@@ -53,6 +53,22 @@ export const MSG = {
   PONG: 'pong',
 };
 
+/**
+ * HELLO 里报的平台（成员表上标「这人用什么设备」）。只认这几个值；0.7.7 之前的电脑端报的是
+ * 笼统的 'desktop'，没带、乱填的也一律当 'desktop'。老客户端只分 android / 非 android，
+ * 所以报得细一点不影响互通。对端自己报的，只拿来显示，不参与任何判断。
+ */
+export const PLATFORMS = ['windows', 'mac', 'linux', 'android'];
+
+export function normalizePlatform(value) {
+  return PLATFORMS.includes(value) ? value : 'desktop';
+}
+
+/** 电脑端按 Node 的 process.platform 定自己报什么。 */
+export function platformOfOs(os) {
+  return os === 'win32' ? 'windows' : os === 'darwin' ? 'mac' : os === 'linux' ? 'linux' : 'desktop';
+}
+
 /** 槽位是 32 位无符号整数。 */
 export function isSlot(value) {
   return Number.isSafeInteger(value) && value >= 0 && value <= MAX_SLOT;

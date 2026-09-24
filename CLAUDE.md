@@ -87,4 +87,5 @@ npm test           # Node 自动测试（传输、安全、缓存、邀请码、
 - **页面给的路径不能直接进白名单**：preload 不再暴露「按路径批准片源」，片源只能来自对话框或 `pathForFile(File)`（页面自己 `new File()` 拿到的是空串）；换缓存目录只认 `dialog:pickCacheDir` 登记过的目录。
 - **接收文件在 NTFS 上先标稀疏再 truncate**（`fileStore.markSparse`，调 `%SystemRoot%\System32\fsutil.exe sparse setflag`，非管理员进程也能用）：不标的话第一次写文件尾或中途位置，NTFS 要先把前面整段清零，50GB 的片要卡几十秒。标不上就退回整块预分配。稀疏之后不再预先占盘，所以 `ensureFreeSpace` 要扣掉本进程其他接收会话还没写入的部分，否则播放列表里每部单独都放得下、合起来却能把盘写满。**缓存清理不凭名字删**：只认本软件写的 run.json 标记或 `createOwnedDir` 的目录布局，用户把缓存目录选成 `D:\` 时同名文件夹不会被递归删掉。
 - **加入流程按「尝试」管理**（`app.js` 的 `beginAttempt` / `resetAttempt` / `attemptLive(gen)`）：没走进房间的尝试必须经 `resetAttempt` 拆干净（信令、Swarm、SyncEngine、一对一的占位 Peer、`S.hostId` 等），否则下一次开房或加入会沿用上一次的 hostId，自己开房变成游客、进别人的房永远不同步；异步步骤每次 await 之后都要查 `attemptLive(gen)`，过期的尝试不许改当前状态。信令事件只认当前 `S.signaling`；`peer-join` 时直连还健康就不重建；在房间里收到新邀请先问，绝不静默拆掉当前房间。
+- **成员的设备标记**（`protocol.js` 的 `normalizePlatform` / `platformOfOs`，桌面 `platformChip`，安卓 `renderMembers`）：HELLO 的 `platform` 只认 windows / mac / linux / android，其余（含 0.7.7 之前电脑端报的 `desktop`、乱填的）一律当 `desktop`、显示「电脑」。老客户端只分 android / 非 android，所以报细了不影响互通。这是对端自己报的，只拿来显示，别拿它做任何判断。
 - 注释和用户可见文案一律用简体中文，与现有代码保持一致。

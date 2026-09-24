@@ -333,7 +333,7 @@ async function bootPhone(t, { securityMode = 'trusted', role = 'guest', name = '
       swarm._onCtrl(peer, msg);
     },
     /** 新来一位并完成握手（走真的 HELLO，好让 peer-authenticated 事件真的发出来）。 */
-    join(peerId, peerName) {
+    join(peerId, peerName, platform = 'desktop') {
       const peer = fakePeer(peerId, peerName, { authenticated: false });
       swarm.addPeer(peer);
       swarm._onCtrl(peer, {
@@ -342,7 +342,7 @@ async function bootPhone(t, { securityMode = 'trusted', role = 'guest', name = '
         peerId,
         name: peerName,
         securityMode,
-        platform: 'desktop',
+        platform,
       });
       return peer;
     },
@@ -985,6 +985,45 @@ test('安卓端：三个抽屉一次只开一个，聊天没开着时按钮上�
   phone.$('chat-send').click();
   await flush();
   assert.equal(phone.$('chat-unread').textContent, '');
+});
+
+test('安卓端：点「N 人在线」打开成员面板，每个人标着用什么设备、什么角色', async (t) => {
+  const phone = await bootPhone(t, { name: '手机上的我' });
+  const on = (id) => phone.$(id).classList.contains('on');
+  // 一位 Windows 电脑端、一位老版本电脑端（只报 desktop）、一位乱报平台的
+  phone.join('peer-win', '阿花', 'windows');
+  phone.join('peer-old', '老版本', 'desktop');
+  phone.join('peer-bad', '<b>乱报</b>', 'ios<script>');
+  await flush();
+  assert.equal(phone.$('peers').textContent, '4 人在线');
+
+  phone.$('peers').click();
+  assert.ok(on('members-sheet') && on('peers'), '点「N 人在线」打开成员面板');
+  phone.$('btn-chat').click();
+  assert.ok(!on('members-sheet'), '和别的抽屉一样，一次只开一个');
+  phone.$('peers').click();
+
+  const rows = rowsOf(phone.$('members-body')).map((r) => r.text);
+  assert.deepEqual(rows, [
+    '手机上的我（你）Android游客',
+    '房主电脑房主', // 房主排最前；测试里的房主连接没走 HELLO，没报平台 → 笼统的「电脑」
+    '阿花Windows游客',
+    '老版本电脑游客',
+    '<b>乱报</b>电脑游客', // 不认识的平台不照抄；昵称原样当文字
+  ]);
+  const nameCell = phone.$('members-body').children[4].children[0];
+  assert.ok(nameCell.hasAttribute('data-i18n-skip'), '昵称不进翻译');
+
+  // 房主把阿花升成管理员：面板上的角色跟着变
+  phone.send({ t: 'role', hostId: phone.sync.hostId, roles: [[phone.peerId, 'guest'], ['peer-win', 'admin'], ['peer-old', 'guest'], ['peer-bad', 'guest']] });
+  await flush();
+  assert.ok(rowsOf(phone.$('members-body')).map((r) => r.text).includes('阿花Windows管理员'));
+
+  // 有人走了：面板跟着少一行
+  phone.swarm.removePeer('peer-old');
+  await flush();
+  assert.equal(rowsOf(phone.$('members-body')).length, 4);
+  assert.equal(phone.$('peers').textContent, '3 人在线');
 });
 
 test('安卓端：往上翻着看旧消息时，新消息不会把人拽回底下', async (t) => {

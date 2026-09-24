@@ -597,7 +597,8 @@ test('版本号在 0.7 线上（协议 v2，和 0.6.x 不互通）', () => {
   const name = /versionName\s+"([^"]+)"/.exec(gradle)[1];
   assert.ok(code >= 16, `versionCode 要大于 0.6.8 的 15，现在是 ${code}`);
   // 具体是 0.7 的第几版由 launcher.test 钉成和 package.json 一致，这里只管「协议 v2 这条线」
-  assert.match(name, /^0\.7\.\d+$/);
+  // 末尾可以再带一段构建号，比如 0.7.7.101
+  assert.match(name, /^0\.7\.\d+(\.\d+)?$/);
   assert.match(read('android/README.md'), /0\.7\.0/, 'README 还写着旧版本号');
 });
 

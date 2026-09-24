@@ -228,8 +228,10 @@ test('两份 README 都讲全了 0.7 的关键说法', () => {
  */
 test('两份 README 的版本号跟着 package.json 走', () => {
   const root = path.join(__dirname, '..');
-  const version = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version;
-  assert.match(version, /^\d+\.\d+\.\d+$/);
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  // 带上构建号，比如 0.7.7.101（安装包文件名也是这个）
+  const version = require('../src/main/appVersion').displayVersion(pkg.version, pkg.buildNumber);
+  assert.match(version, /^\d+\.\d+\.\d+(\.\d+)?$/);
   const escaped = version.replace(/\./g, '\\.');
 
   for (const name of ['README.md', 'README.en.md']) {
@@ -238,9 +240,9 @@ test('两份 README 的版本号跟着 package.json 走', () => {
     assert.match(text, new RegExp(`NoxReel-Setup-${escaped}\\.exe`), `${name} 的完整版下载链接不是 ${version}`);
     assert.match(text, new RegExp(`NoxReel-WebSetup-${escaped}\\.exe`), `${name} 的联网版下载链接不是 ${version}`);
     // 上一版的链接留在文里，就等于把旧安装包继续推给用户
-    const stale = text.match(/NoxReel-(?:Web)?Setup-(\d+\.\d+\.\d+)\.exe/g) || [];
+    const stale = text.match(/NoxReel-(?:Web)?Setup-(\d+\.\d+\.\d+(?:\.\d+)?)\.exe/g) || [];
     for (const hit of stale) {
-      assert.ok(hit.includes(version), `${name} 里还留着旧版下载链接：${hit}`);
+      assert.ok(hit.endsWith(`-${version}.exe`), `${name} 里还留着旧版下载链接：${hit}`);
     }
   }
 });

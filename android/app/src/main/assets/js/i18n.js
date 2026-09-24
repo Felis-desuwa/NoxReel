@@ -67,6 +67,10 @@ const EN = new Map(Object.entries({
   '房主': 'Host',
   '管理员': 'Moderator',
   '游客': 'Guest',
+  // 成员面板：系统名（Windows、Android …）是专有名词不翻译，老版本电脑端只报得出「电脑」
+  '成员': 'Members',
+  '（你）': ' (you)',
+  '电脑': 'Desktop',
   '邀请码异常过长': 'The invite code is unexpectedly long',
   '这不像是一个 NoxReel 邀请码': 'This does not look like a NoxReel invite code',
   '邀请码损坏或不完整 —— 可能是复制时漏了一截，也可能是被聊天软件的格式化改掉了字符；把码放进反引号里再发一次通常能解决':

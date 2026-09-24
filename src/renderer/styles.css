@@ -1569,6 +1569,20 @@ select:disabled {
   font-size: 12px;
   white-space: nowrap;
 }
+/* 成员用什么设备加入的：Windows / Android …，比角色徽章再淡一点，别抢昵称 */
+.peer-os {
+  flex: none;
+  font-size: 11px;
+  line-height: 16px;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.peer-os.android {
+  color: #7fd6a4;
+}
 .peer-name.stalled::after {
   content: " ⏳";
 }

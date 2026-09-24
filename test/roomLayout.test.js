@@ -168,28 +168,37 @@ test('片子信息里的房间模式也翻成英文，不在英文句子里夹�
 });
 
 /**
- * 手机加入的人要在成员列表上标出来：他跟得上列表、能聊天看弹幕，但编辑不了列表 ——
- * 房主知道这一点才不会干等他去调顺序。platform 从 HELLO 一路传到 swarm.peerList()，
+ * 成员表上每个人（包括自己）都标着用什么设备加入的：Windows / macOS / Linux / Android，
+ * 老版本电脑端只报得出笼统的「电脑」。platform 从 HELLO 一路传到 swarm.peerList()，
  * 这里钉的是「渲染层真的用了它」，以及标记是独立元素（昵称是用户输入，不能把标记拼进去）。
  */
-test('成员列表把手机加入的人标出来，标记不拼进昵称里', async () => {
+test('成员表每一行都标着设备，标记不拼进昵称里', async () => {
   const app = read('src/renderer/app.js');
-  const peers = app.slice(app.indexOf('function renderPeers('), app.indexOf("$('peer-list').addEventListener"));
-  assert.match(peers, /peer\.platform === 'android'/, '要按 platform 判断，不是猜昵称');
-  assert.match(peers, /className: 'peer-platform', text: '（手机）'/);
+  const peers = app.slice(app.indexOf('function selfPeerRow('), app.indexOf("$('peer-list').addEventListener"));
+  assert.match(peers, /platformChip\(S\.swarm\?\.platform \|\| myPlatform\(\)\)/, '自己那一行也要标');
+  assert.match(peers, /platformChip\(peer\.platform\)/, '要按 HELLO 报的 platform 标，不是猜昵称');
+  assert.doesNotMatch(peers, /（手机）/, '旧的「（手机）」标记换成了统一的设备标记');
   const nameLine = peers.split('\n').find((line) => line.includes('className: `peer-name'));
   assert.ok(nameLine, '找不到昵称那一行');
-  assert.doesNotMatch(nameLine, /手机/, '标记要单独一个元素，不能拼进 raw 的昵称里');
+  assert.doesNotMatch(nameLine, /platform/, '标记要单独一个元素，不能拼进 raw 的昵称里');
 
-  // 中英都要有；昵称本身照旧不翻译
+  // 设备标记：认识的平台用系统名，其余一律「电脑」；本机按主进程报的 process.platform 定
+  assert.match(app, /const PLATFORM_LABEL = \{ windows: 'Windows', mac: 'macOS', linux: 'Linux', android: 'Android', desktop: '电脑' \};/);
+  assert.match(app, /const key = normalizePlatform\(platform\);/);
+  assert.match(app, /const myPlatform = \(\) => platformOfOs\(S\.env\?\.platform\);/);
+  const init = app.slice(app.indexOf('function initSwarmAndSync('), app.indexOf('S.sync = new SyncEngine({'));
+  assert.match(init, /platform: myPlatform\(\),/, 'HELLO 里要把本机系统报出去');
+
+  // 中英都要有；系统名是专有名词不翻译
   const { translate } = await import('../src/renderer/lib/i18n.js');
-  assert.equal(translate('（手机）', 'en'), ' (phone)');
+  assert.equal(translate('电脑', 'en'), 'Desktop');
+  assert.equal(translate('Windows', 'en'), 'Windows');
 
-  // 数据这一路是真的：swarm 把 HELLO 带来的 platform 暴露给了渲染层
+  // 数据这一路是真的：swarm 把 HELLO 带来的 platform 过白名单后暴露给了渲染层
   const swarm = read('src/renderer/lib/swarm.js');
   assert.match(swarm, /platform: peer\.platform \|\| 'desktop'/);
-  assert.match(swarm, /peer\.platform = msg\.platform === 'android' \? 'android' : 'desktop'/);
+  assert.match(swarm, /peer\.platform = normalizePlatform\(msg\.platform\);/);
 
   // 样式存在，否则标记会和昵称一样粗
-  assert.match(read('src/renderer/styles.css'), /\.peer-platform \{/);
+  assert.match(read('src/renderer/styles.css'), /\.peer-os \{/);
 });

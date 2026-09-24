@@ -1,6 +1,7 @@
 {
   "name": "noxreel",
   "version": "0.7.7",
+  "buildNumber": "101",
   "description": "多人同步观影工具：P2P 安全接收、视频链接解析与房间同步",
   "main": "src/main/main.js",
   "scripts": {
@@ -33,6 +34,7 @@
     "compression": "maximum",
     "appId": "app.noxreel.desktop",
     "productName": "NoxReel",
+    "buildNumber": "101",
     "protocols": [
       {
         "name": "NoxReel Invite",
@@ -43,7 +45,7 @@
     ],
     "win": {
       "target": "nsis",
-      "artifactName": "NoxReel-Setup-${version}.${ext}",
+      "artifactName": "NoxReel-Setup-${buildVersion}.${ext}",
       "icon": "assets/branding/noxreel-icon.ico",
       "signAndEditExecutable": true
     },
@@ -57,8 +59,8 @@
       "shortcutName": "NoxReel"
     },
     "nsisWeb": {
-      "artifactName": "NoxReel-WebSetup-${version}.${ext}",
-      "appPackageUrl": "https://github.com/Felis-desuwa/NoxReel/releases/download/v${version}",
+      "artifactName": "NoxReel-WebSetup-${buildVersion}.${ext}",
+      "appPackageUrl": "https://github.com/Felis-desuwa/NoxReel/releases/download/v0.7.7.101",
       "oneClick": false,
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,

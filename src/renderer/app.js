@@ -1,7 +1,7 @@
 import { Peer } from './lib/peer.js';
 import { Swarm } from './lib/swarm.js';
 import { SyncEngine } from './lib/syncEngine.js';
-import { MSG, PROTOCOL_VERSION, randomId } from './lib/protocol.js';
+import { MSG, PROTOCOL_VERSION, normalizePlatform, platformOfOs, randomId } from './lib/protocol.js';
 import { encodeCode, decodeCode, shareLink, WsSignaling, randomRoomId, randomPeerId } from './lib/signaling.js';
 import { RelaySignaling, DEFAULT_RELAYS, newRoomSecret } from './lib/relaySignaling.js';
 import { currentLocale, setLocale, startI18n, translate as t } from './lib/i18n.js';
@@ -4051,6 +4051,8 @@ function initSwarmAndSync() {
     peerId: S.peerId,
     name: S.name,
     securityMode: S.roomSecurityMode || S.settings.securityMode,
+    // HELLO 里报给别人：成员表上显示你用什么设备（Windows / macOS / Linux）
+    platform: myPlatform(),
   });
   S.sync = new SyncEngine({
     peerId: S.peerId,
@@ -6778,6 +6780,18 @@ function drawChunkMap() {
 
 const ROLE_LABEL = { host: '房主', admin: '管理员', guest: '游客' };
 
+/** 成员表上的设备标记。系统名是专有名词，不翻译；老版本电脑端只报得出「电脑」。 */
+const PLATFORM_LABEL = { windows: 'Windows', mac: 'macOS', linux: 'Linux', android: 'Android', desktop: '电脑' };
+
+/** 本机在 HELLO 里报的平台。主进程的 env 还没到时只能笼统报「电脑」。 */
+const myPlatform = () => platformOfOs(S.env?.platform);
+
+/** 成员名后面那个设备标记。平台是对端自己报的，只拿来显示；标记单独一个元素，不拼进昵称。 */
+function platformChip(platform) {
+  const key = normalizePlatform(platform);
+  return make('span', { className: `peer-os ${key}`, text: PLATFORM_LABEL[key] });
+}
+
 /* ------------------------------ 卡顿预判 ------------------------------ */
 
 // 每个成员一个速度计，按「对方已有字节」随时间的增长算他从所有来源收片的总速度。
@@ -7119,6 +7133,7 @@ function selfPeerRow(waiting) {
     make('div', { className: 'peer-who', attrs: { role: 'cell' } }, [
       avatarOf(S.peerId, S.name),
       make('span', { raw: true, className: 'peer-name', text: S.name || '' }),
+      platformChip(S.swarm?.platform || myPlatform()),
       make('span', { className: 'peer-platform', text: '（你）' }),
     ]),
     make('div', { attrs: { role: 'cell' } }, [
@@ -7219,9 +7234,8 @@ function renderPeers(list) {
         make('div', { className: 'peer-who', attrs: { role: 'cell' } }, [
           avatarOf(peer.peerId, peer.name),
           make('span', { raw: true, className: `peer-name ${stalled ? 'stalled' : ''}`, text: peer.name }),
-          // 手机加入的人标一下：他跟得上列表、能聊天看弹幕，但编辑不了列表，
-          // 房主知道这一点才不会等他去调顺序。昵称是用户输入，标记单独一个元素，别拼进去。
-          ...(peer.platform === 'android' ? [make('span', { className: 'peer-platform', text: '（手机）' })] : []),
+          // 每个人用什么设备加入的（Windows / Android …）。昵称是用户输入，标记单独一个元素，别拼进去
+          platformChip(peer.platform),
         ]),
         make('div', { attrs: { role: 'cell' } }, [
           make('span', { className: `role-badge ${role}`, text: ROLE_LABEL[role] }),

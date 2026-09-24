@@ -48,6 +48,7 @@ const { sharedProxy, closeSharedProxy } = require('./publicProxy');
 const { lockDownPermissions } = require('./permissions');
 const { CloudflareTurn } = require('./cloudflareTurn');
 const { labelProtocolHandler } = require('./protocolName');
+const { displayVersion, readBuildNumber } = require('./appVersion');
 
 let win = null;
 // 同一时刻只有一个播放器；换播放器或重开时旧的先彻底退掉，迟到的事件按代丢弃
@@ -598,7 +599,8 @@ secureHandle('env:status', async () => {
     cacheSource: cacheChoice.source,
     cacheFallback,
     platform: process.platform,
-    version: app.getVersion(),
+    // 带上构建号：0.7.7.101（package.json 的 version 只能写三段，见 appVersion.js）
+    version: displayVersion(app.getVersion(), readBuildNumber()),
     defender: malwareScan.findDefender(),
     // 光有 MpCmdRun.exe 不代表它能扫 —— 被第三方杀软接管停用时文件照样在。
     // true/false/null（问不出来），安全模式靠它提前把话说清楚。

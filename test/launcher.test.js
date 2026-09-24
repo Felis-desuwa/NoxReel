@@ -27,11 +27,11 @@ test('源码目录只提供带图标的 EXE 启动入口，不再保留 BAT', ()
   }
 });
 
-test('启动器构建脚本嵌入 NoxReel 图标和 0.7.7 版本信息', () => {
+test('启动器构建脚本嵌入 NoxReel 图标和 0.7.7.101 版本信息', () => {
   const source = fs.readFileSync(path.join(root, 'src/launcher/NoxReelLauncher.cs'), 'utf8');
   const build = fs.readFileSync(path.join(root, 'scripts/build-launcher.ps1'), 'utf8');
-  assert.match(source, /AssemblyVersion\("0\.7\.7\.0"\)/);
-  assert.match(source, /AssemblyFileVersion\("0\.7\.7\.0"\)/);
+  assert.match(source, /AssemblyVersion\("0\.7\.7\.101"\)/);
+  assert.match(source, /AssemblyFileVersion\("0\.7\.7\.101"\)/);
   assert.match(source, /WindowsPowerShell/);
   assert.match(source, /--self-test/);
   assert.match(build, /noxreel-icon\.ico/);
@@ -45,14 +45,29 @@ test('启动器构建脚本嵌入 NoxReel 图标和 0.7.7 版本信息', () => {
  * 排查起来先得怀疑网络。所以这里把四处钉在一起。
  */
 test('package.json、启动器与安卓的版本号一致', () => {
-  const version = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version;
-  assert.match(version, /^\d+\.\d+\.\d+$/);
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  // version 只能是三段（electron-builder 按 semver 校验）；构建号另记在 buildNumber，拼成 0.7.7.101
+  assert.match(pkg.version, /^\d+\.\d+\.\d+$/, 'package.json 的 version 写成四段的话打包直接报 Invalid version');
+  const { displayVersion } = require('../src/main/appVersion');
+  const version = displayVersion(pkg.version, pkg.buildNumber);
+  // 顶层的给界面用，build 里的给 electron-builder 用（文件名、Windows 文件版本、联网安装器地址），必须一致
+  assert.equal(pkg.build.buildNumber, pkg.buildNumber, 'package.json 顶层和 build 里的 buildNumber 对不上');
+  assert.match(pkg.build.win.artifactName, /\$\{buildVersion\}/);
+  assert.match(pkg.build.nsisWeb.artifactName, /\$\{buildVersion\}/);
+  // appPackageUrl 只认 ${version}（三段，会指到上一个不带构建号的 Release），不认 ${buildVersion}
+  // （原样写进安装器，NSIS 当成错误停下）—— 所以写死，每次改版本号都要跟着改
+  assert.ok(
+    pkg.build.nsisWeb.appPackageUrl.endsWith(`/releases/download/v${version}`),
+    `联网安装器要去 v${version} 那个 Release 取包，现在是 ${pkg.build.nsisWeb.appPackageUrl}`
+  );
+  // 程序集版本本来就是四段，三段的补 .0
+  const assembly = version.split('.').length === 4 ? version : `${version}.0`;
 
   const source = fs.readFileSync(path.join(root, 'src/launcher/NoxReelLauncher.cs'), 'utf8');
   for (const attr of ['AssemblyVersion', 'AssemblyFileVersion']) {
     const hit = source.match(new RegExp(`${attr}\\("([^"]+)"\\)`));
     assert.ok(hit, `启动器源码里没有 ${attr}`);
-    assert.equal(hit[1], `${version}.0`, `启动器的 ${attr} 和 package.json 对不上`);
+    assert.equal(hit[1], assembly, `启动器的 ${attr} 和 package.json 对不上`);
   }
 
   const gradle = fs.readFileSync(path.join(root, 'android/app/build.gradle'), 'utf8');
