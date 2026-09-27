@@ -1274,6 +1274,12 @@ secureHandle('player:quit', async (gen) => {
   await players.quit(gen === undefined || gen === null ? undefined : validate.integer(gen, '播放器代号', { min: 1 }));
 });
 
+// 撒手：用户在外部播放器里自己开了别的片。不再给那个窗口发任何指令、横幅、OSD，
+// 覆盖窗和快捷键也松开（gone），但不关它 —— 见 PlayerManager.release。
+secureHandle('player:release', async (gen) => {
+  await players.release(gen === undefined || gen === null ? undefined : validate.integer(gen, '播放器代号', { min: 1 }));
+});
+
 secureHandle('player:list', async () => listPlayers());
 
 // 选哪个播放器。存进主进程侧的配置：下次开软件、下一部片都照这个来。

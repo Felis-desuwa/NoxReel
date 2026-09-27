@@ -230,6 +230,14 @@ const S = {
   playerKind: 'mpv',
   playerFallback: '',
   switchingPlayer: false,
+  // relaunchWithPlayer 正在「退旧的 → 起新的」：这段时间 S.mpvRunning 是 false，
+  // 别的起播请求（供片的 progress、扫描通过…）一律让位，否则会抢先拉起一个，把这次切换挤成「失败」。
+  // 期间换了片、拦下威胁、改做种都会再退一次播放器（retirePlayer），独占随之作废，轮到它们起播
+  relaunchingPlayer: false,
+  // 这一部（记的是 seq）不再自动拉起播放器：用户自己关掉了它、在外部播放器里换了别的片让我们撒了手、
+  // 或者这一部起播失败了。供片时每发出一片都会走一遍 maybeLaunchPlayer，不挡的话关一次弹一次。
+  // 用户点「重新打开」（起播成功）、换到下一部（seq 变了）、会话重新就绪时作废。
+  noAutoLaunchSeq: null,
   settings: {
     language: currentLocale(),
     securityMode: localStorage.getItem('sw.securityMode') === 'safe' ? 'safe' : 'trusted',
@@ -2182,6 +2190,8 @@ function skipCurrentLocally() {
 /** 当前项的会话就绪：同步引擎开工（哪怕播放器还没起，也要参与 stall 计算）。 */
 function onCurrentSessionReady(sess) {
   if (S.leaving) return; // 离开房间途中还有半截交接在跑，别再把同步和播放器拉起来
+  // 重新就绪（改做种、重新开出会话）：之前记下的「这一部别自动拉起」作废，按新会话重新判断
+  S.noAutoLaunchSeq = null;
   syncCurrentMirrors();
   S.sync.isSeeder = sess.isSeeder;
   renderFilmInfo();
@@ -2492,6 +2502,8 @@ function trackClosing(promise) {
  */
 function retirePlayer() {
   playerGate.retire();
+  // 换播放器途中又被别处退了一次（换片、拦下威胁、改做种）：那次切换的启动随之作废，独占让出来
+  S.relaunchingPlayer = false;
   const quitting = window.sw.player.quit().catch(() => {});
   // 上一次退出可能还没落地（主进程已经没有当前播放器，这一次 quit 会立刻返回）：连它一起等
   S.playerQuit = Promise.all([S.playerQuit, quitting]).then(() => {});
@@ -6008,6 +6020,9 @@ async function onLinkSessionReady() {
 /** 接收方：安全模式扫描后播放；可信房间达到片头水位即播放，完整后仍补做扫描。 */
 function maybeLaunchPlayer(p) {
   if (S.mpvRunning || S.isSeeder || !S.filePath || !p || p.slot !== S.swarm?.playingSlot) return;
+  // 用户在这一部上关掉了播放器（或起不来）：供片的 progress 不许再把它拉起来，等他点「重新打开」。
+  // 换播放器的途中也不抢：那一次启动归 relaunchWithPlayer。
+  if ((Number.isInteger(S.noAutoLaunchSeq) && S.noAutoLaunchSeq === S.currentSeq) || S.relaunchingPlayer) return;
   if (S.roomSecurityMode === 'trusted') {
     if (S.mediaSafety.status === 'trusted-streaming') return;
     const readyBytes = Math.min(HEAD_READY_BYTES, S.manifest?.size || HEAD_READY_BYTES);
@@ -6168,8 +6183,12 @@ async function applyScanResult(session, result, before) {
   if (outcome.status === 'clean') {
     // 缓存什么时候清按文件真正在哪儿说：退房从来不删 —— 临时缓存关软件时清，长期缓存文件夹里的从不自动删
     const kept = !!session.persistent;
+    // 用户在这一部上关掉过播放器（可信房间边下边播时）就不再替他拉起来；
+    // 正在换播放器时那一次启动归 relaunchWithPlayer，这里不抢
+    const dismissed = Number.isInteger(S.noAutoLaunchSeq) && S.noAutoLaunchSeq === S.currentSeq;
+    const open = !S.mpvRunning && !dismissed && !S.relaunchingPlayer;
     log(
-      S.mpvRunning
+      !open
         ? kept
           ? '完整文件安全扫描通过；这部片存在长期缓存文件夹里，可在设置里清理'
           : '完整文件安全扫描通过；缓存在关软件时清掉'
@@ -6178,7 +6197,7 @@ async function applyScanResult(session, result, before) {
         : '安全扫描通过，正在打开播放器；缓存在关软件时清掉',
       'good'
     );
-    if (!S.mpvRunning) await launchPlayer();
+    if (open) await launchPlayer();
     window.sw.player.osd(t(kept ? '安全扫描通过 · 已存进长期缓存文件夹' : '安全扫描通过 · 缓存关软件时清掉'), 2500);
     return;
   }
@@ -6276,16 +6295,22 @@ function playbackAllowed() {
 /**
  * 拉起播放器。
  *
- * @param {{startAt?: number|null}} [opts] startAt 给「即时换播放器」用：那一路要接着
+ * @param {{startAt?: number|null, relaunch?: boolean}} [opts] startAt 给「即时换播放器」用：那一路要接着
  *   旧播放器停下的地方放，而不是回到房间共识位置（两者可能差着一次刚做的跳转）。
+ *   relaunch 只有 relaunchWithPlayer 自己传：换播放器途中只放行它这一次启动，失败了也由它自己退回 mpv。
  * @returns {Promise<boolean|'superseded'>} true 表示这一代真的起来了；false 是真失败；
- *   `'superseded'` 是「这次启动已经作废」（换片、拦下威胁、列表推进、正在离开房间）——
- *   调用方绝不能把它当成失败去做补救，见 relaunchWithPlayer。
+ *   `'superseded'` 是「这次启动已经作废」（换片、拦下威胁、列表推进、正在离开房间、
+ *   正在换播放器）—— 调用方绝不能把它当成失败去做补救，见 relaunchWithPlayer。
  */
-async function launchPlayer({ startAt = null } = {}) {
+async function launchPlayer({ startAt = null, relaunch = false } = {}) {
   // 离开房间的收尾里还有好几段 await（关会话、删缓存），扫描通过、做种交接完成都可能在这期间
   // 回来把播放器拉起来 —— 页面一刷新它就成了没人管的窗口，还占着刚要删的缓存。
   if (S.leaving) return 'superseded';
+  // 换播放器途中（旧的已退、新的还没起来，S.mpvRunning 是 false）别人来起播：让位。
+  // 抢先起来的那个会占住 S.mpvRunning，relaunchWithPlayer 自己那次就被挤成 false，
+  // 被当成「新播放器起不来」—— 选择被改写成 mpv，日志报一次并没有发生的失败。
+  // 让位不丢东西：relaunchWithPlayer 自己会起一个，起不来也会把「重新打开」露出来。
+  if (!relaunch && S.relaunchingPlayer) return 'superseded';
   if (S.mpvRunning || !S.filePath) return false;
   if (!playbackAllowed()) {
     log(
@@ -6330,6 +6355,9 @@ async function launchPlayer({ startAt = null } = {}) {
     }
     S.playerKind = want.kind;
     S.playerFallback = want.reason;
+    // 这一部又有播放器了（多半是用户点了「重新打开」）：之前「别自动拉起」的记号作废。
+    // 必须排在下面补处理 early.exit 之前 —— 刚起来就退出的，还得重新记上
+    if (S.noAutoLaunchSeq === seq) S.noAutoLaunchSeq = null;
     S.sync?.setPlayerCaps?.(info?.caps || {});
     $('btn-playpause').disabled = false;
     $('btn-reopen')?.classList.add('hidden');
@@ -6347,11 +6375,42 @@ async function launchPlayer({ startAt = null } = {}) {
   } catch (e) {
     // 换片（或播放器被叫退）时旧的启动被打断是预期内的，不报错，也不算失败
     if (seq !== S.currentSeq || ticket !== playerGate.epoch) return 'superseded';
-    S.mpvRunning = false; // 占位撤回，否则再也不会重试
+    S.mpvRunning = false; // 占位撤回，否则连「重新打开」也起不来
     $('btn-reopen')?.classList.remove('hidden');
     reportLaunchFailure(e, want.kind, name);
+    // 外部播放器起不来：本次改用 mpv。换播放器那一路（relaunch）自己会退回 mpv，这里不抢着做
+    if (!relaunch && fallsBackToMpv(want.kind, e)) return launchMpvInstead(startAt);
+    // 起不来的这一部不再自动重试：供片的 progress 每来一条都会走 maybeLaunchPlayer，
+    // 不挡的话每发出一片就重拉一次、报一遍错（单实例的 PotPlayer 还会把片子一遍遍塞给用户开着的窗口）
+    S.noAutoLaunchSeq = seq;
     return false;
   }
+}
+
+/**
+ * 外部播放器起播失败时，本次要不要改用 mpv。PLAYER_GONE 除外：那多半是 PotPlayer 的单实例设置
+ * 把片子交给了用户已经开着的窗口 —— 他那边有画面，只是没接上同步，再拉一个 mpv 就是两个窗口一起出声。
+ * 这种只在提示里给下一步（见 reportLaunchFailure）。
+ */
+function fallsBackToMpv(kind, error) {
+  return kind !== 'mpv' && errCode(error) !== 'PLAYER_GONE';
+}
+
+/**
+ * 外部播放器第一次起播就起不来（不是运行中切换）：本次改用 mpv，选择也改回 mpv ——
+ * 和运行中切换失败、遥控断了那两路一样。不改的话扫描通过、下一部、「重新打开」都会照着选择
+ * 再去拉它，每次都要等它超时、再报一遍同样的错，人一直晾在没有画面的房间里。
+ *
+ * 调用方刚把 S.mpvRunning 撤回，这里同步地改选择、再起一次（中间没有 await），
+ * 别的起播请求插不进来；主进程那份配置的写入不用等。
+ */
+function launchMpvInstead(startAt) {
+  S.playerChoice = 'mpv';
+  Promise.resolve(window.sw.player.select('mpv'))
+    .then(applyPlayerList)
+    .catch(() => {});
+  log('已改用 mpv 播放，播放器选择也改回了 mpv', 'warn');
+  return launchPlayer({ startAt });
 }
 
 /* ------------------------------ 可切换播放器 ------------------------------ */
@@ -6406,6 +6465,13 @@ function reportLaunchFailure(error, kind, name) {
   if (code === 'PLAYER_ELEVATED') return log(`${name} 以管理员身份运行，NoxReel 遥控不了它`, 'bad');
   if (code === 'PLAYER_NO_HEADERS') return log(`${name} 打不开需要请求头的链接`, 'bad');
   if (code === 'PLAYER_DETACHED') return log(`${name} 脱离了遥控，请关掉它再重开`, 'bad');
+  // 这一种不自动退回 mpv（见 fallsBackToMpv），下一步得说给用户听
+  if (code === 'PLAYER_GONE' && kind !== 'mpv') {
+    return log(
+      `${name} 启动后立刻退出了，片子多半被它的单实例设置交给了已开着的窗口，那个窗口不跟房间同步。关掉它再点「重新打开播放器」，或在控制条里改用 mpv`,
+      'bad'
+    );
+  }
   log(`启动 ${name} 失败：${errText(error)}`, 'bad');
 }
 
@@ -6544,7 +6610,15 @@ async function switchPlayer(id) {
   renderPlayerControls();
   try {
     applyPlayerList(await window.sw.player.select(id));
-    if (S.mpvRunning) await relaunchWithPlayer();
+    if (S.mpvRunning) {
+      // 新的选择不改变这一部实际用哪个（在线链接、边下边播还没收完、选的那个没找到，
+      // 或者本来就因为这些原因在跑 mpv 又切回 mpv）：只记下选择，把「当前实际使用」那行的原因换成新的。
+      // 白白重开一次 mpv 会黑一下、弹幕清空、退出全屏；在线链接还要重新解析、重新缓冲，
+      // 控制者重开期间全房跟着等。启动还在途（代号没确认）时照旧重来：那一次用的是旧选择。
+      const next = desiredPlayerKind();
+      if (playerGate.gen !== null && next.kind === S.playerKind) S.playerFallback = next.reason;
+      else await relaunchWithPlayer();
+    }
   } catch (e) {
     S.playerChoice = previous;
     log(`切换播放器失败：${errText(e)}`, 'bad');
@@ -6569,23 +6643,36 @@ async function relaunchWithPlayer() {
   const shared = S.sync?.sharedPositionNow?.() || 0;
   const startAt = Math.abs(local - shared) < PLAYER_SWITCH_TOLERANCE ? local : shared;
   // 旧播放器必须真的退干净再拉新的：两个窗口同时开着，声音会叠在一起
-  await retirePlayer();
-  // 上一个播放器屏幕上的弹幕不该飞到新窗口里
-  S.danmaku?.clear();
-  const launched = await launchPlayer({ startAt });
-  if (launched === true) return true;
-  // 这次启动是被作废的（换片、拦下威胁、列表推进、正在离开房间），不是起不来：
-  // 后面那一套补救全是错的 —— 会把主进程里的播放器选择写成 mpv、报一句「切换失败」，
-  // 再拿上一部的位置去拉 mpv，正好盖掉刚换上的那一部。
-  if (launched === 'superseded') return false;
-  // 新播放器起不来：退回 mpv，别把人卡在一个没有画面的房间里
-  if (S.playerChoice !== 'mpv') {
-    await Promise.resolve(window.sw.player.select('mpv')).then(applyPlayerList).catch(() => {});
-    S.playerChoice = 'mpv';
-    log('切换失败，已回到 mpv', 'bad');
-    return (await launchPlayer({ startAt })) === true;
+  const quitting = retirePlayer();
+  // 从退旧的到起新的（含起不来时退回 mpv 那一次），起播归这里独占，别的起播请求让位（见 launchPlayer）。
+  // 必须排在 retirePlayer 之后：它会把这个标记清掉 —— 期间换了片、拦下威胁、改做种都会再退一次
+  // 播放器，这里那次启动随之作废，那时候就该轮到它们起播，否则新的一部永远没人拉起来
+  S.relaunchingPlayer = true;
+  try {
+    await quitting;
+    // 等旧的退出期间被别处又退了一次（换片、拦下威胁、改做种）：这次切换作废，起播轮到它们。
+    // 照旧往下起的话，撞上它们刚占住的 S.mpvRunning 会被当成「新播放器起不来」
+    if (!S.relaunchingPlayer) return false;
+    // 上一个播放器屏幕上的弹幕不该飞到新窗口里
+    S.danmaku?.clear();
+    const launched = await launchPlayer({ startAt, relaunch: true });
+    if (launched === true) return true;
+    // 这次启动是被作废的（换片、拦下威胁、列表推进、正在离开房间），不是起不来：
+    // 后面那一套补救全是错的 —— 会把主进程里的播放器选择写成 mpv、报一句「切换失败」，
+    // 再拿上一部的位置去拉 mpv，正好盖掉刚换上的那一部。
+    if (launched === 'superseded') return false;
+    // 新播放器起不来：退回 mpv，别把人卡在一个没有画面的房间里
+    if (S.playerChoice !== 'mpv') {
+      await Promise.resolve(window.sw.player.select('mpv')).then(applyPlayerList).catch(() => {});
+      S.playerChoice = 'mpv';
+      log('切换失败，已回到 mpv', 'bad');
+      if (!S.relaunchingPlayer) return false; // 同上：等的时候被换片之类作废了
+      return (await launchPlayer({ startAt, relaunch: true })) === true;
+    }
+    return false;
+  } finally {
+    S.relaunchingPlayer = false;
   }
-  return false;
 }
 
 /**
@@ -6618,7 +6705,7 @@ function handlePlayerError({ message = '', code = '', kind = '', gen } = {}) {
   // 所以只是撒手：不再跟着它同步，界面给一句话和「重新打开」的入口，要不要回来由他决定。
   if (code === 'PLAYER_FOREIGN_FILE' && external) {
     log(text, 'warn');
-    detachFromPlayer();
+    detachFromPlayer(Number.isInteger(gen) ? gen : playerGate.gen);
     return null;
   }
   const fatal = PLAYER_FATAL_CODES.has(code) && external;
@@ -6631,13 +6718,23 @@ function handlePlayerError({ message = '', code = '', kind = '', gen } = {}) {
  *
  * 用在「用户自己在播放器里打开了别的文件」这一种：再往同步引擎喂它的 tick，
  * 报的就是另一部片的位置。停掉本机这一路，界面上留「重新打开」让用户自己决定回不回来。
+ *
+ * 主进程那一侧必须一起撒手（player:release）：只在这边停的话，PlayerManager 仍把它当当前播放器，
+ * 同步引擎每次收敛发的播放/暂停、全员暂停横幅、缓冲 OSD 照样打到他自己开的那部片上，
+ * 覆盖窗和快捷键也还跟着它；之后「重新打开」、换片、退房还会给这个窗口发 WM_CLOSE。
+ * release 只放那一代（gen），不关窗口；已经显示在覆盖窗上的横幅随「播放器没了」一起清掉。
  */
-function detachFromPlayer() {
+function detachFromPlayer(gen = playerGate.gen) {
   playerGate.retire(); // 迟到的 tick / exit / error 一律作废，不必等进程退出
+  const releasing = Promise.resolve(window.sw.player.release(gen)).catch(() => {});
+  // 下一代要等桥上的登记撤干净（主进程那边也会等），关会话、删缓存照旧等它
+  S.playerQuit = Promise.all([S.playerQuit, releasing]).then(() => {});
   S.mpvRunning = false;
   lastMpvBanner = '';
   S.danmaku?.setActive(false);
   S.sync?.playerGone?.();
+  // 他在自己的窗口里看别的片：供片的 progress 不许再给这一部拉起一个新窗口，等他点「重新打开」
+  S.noAutoLaunchSeq = S.currentSeq;
   $('btn-reopen')?.classList.remove('hidden');
   refreshMediaUi();
 }
@@ -8550,6 +8647,9 @@ function handlePlayerExit({ code }) {
   S.sync?.playerGone?.();
   $('btn-playpause').disabled = true;
   if (!S.switchingMedia && S.filePath) {
+    // 用户自己关掉的（或崩了）：这一部不再自动拉起。安全模式下本机还在给别人供片的话，
+    // 每发出一片都会走一遍 maybeLaunchPlayer —— 不记下来就是关一次弹一次，和下面这句提示对不上
+    S.noAutoLaunchSeq = S.currentSeq;
     $('btn-reopen')?.classList.remove('hidden');
     log(`播放器已关闭（code ${code}），可在房间里重新打开`, 'warn');
   }

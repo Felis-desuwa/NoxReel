@@ -154,6 +154,29 @@ class PlayerManager extends EventEmitter {
   }
 
   /**
+   * 撒手：这一代不再归我们管，但不关它的窗口。
+   *
+   * 用在「用户在外部播放器里自己打开了别的片」：那个窗口从此是他的。只在渲染进程那边停止同步不够 ——
+   * current 还指着它的话，房间的播放/暂停、全员暂停横幅、缓冲 OSD 照样打到他的片上，
+   * 覆盖窗和 Ctrl+Shift+D 也还跟着它；之后重开、换片、退房走到 _stop() 还会给它发 WM_CLOSE。
+   * 所以这里把 current 置空、松开覆盖窗（gone）、摘掉监听器，再让适配器自己撤掉桥上的登记，
+   * 进程和窗口原样留着。收尾照样记进 stopping：桥的 untrack 不分窗口，
+   * 下一代得等它落地再 track，否则会把新窗口的跟踪一并撤掉。
+   * 适配器没有 release()（mpv 不会有「用户换片」这回事）就照常退掉，不留一个没人管的进程。
+   * 给了 gen 就只放那一代。
+   */
+  async release(gen) {
+    const current = this.current;
+    if (!current) return false;
+    if (gen !== undefined && gen !== null && current.gen !== gen) return false;
+    this.current = null;
+    current.stopped = true;
+    this.emit('gone', { gen: current.gen, kind: current.kind });
+    await this._retire(current.adapter, { keepWindow: typeof current.adapter.release === 'function' });
+    return true;
+  }
+
+  /**
    * 退掉当前这一代（如果有），再等所有正在退出的旧播放器都退干净 ——
    * 别人发起的退出也要等：调用方接下来要么拉起新的，要么删缓存，都得等旧进程放手。
    */
@@ -175,11 +198,12 @@ class PlayerManager extends EventEmitter {
    *
    * 两条路共用：主动退（_stop）和用户自己关掉播放器（exit 事件）。后者以前只把 current
    * 置空就完了 —— 适配器那一侧的收尾（摘桥监听、untrack、forget）一步都没做。
+   * keepWindow 是撒手那一路（release）：同样的收尾，只是不关窗口。
    */
-  _retire(adapter) {
+  _retire(adapter, { keepWindow = false } = {}) {
     adapter.removeAllListeners();
     const exited = Promise.resolve()
-      .then(() => adapter.quit())
+      .then(() => (keepWindow ? adapter.release() : adapter.quit()))
       .catch(() => {});
     this.stopping.add(exited);
     exited.then(() => this.stopping.delete(exited));

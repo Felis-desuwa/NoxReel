@@ -205,6 +205,118 @@ test('运行期的错误带着代号走 —— 渲染进程靠它决定要不要
   await mgr.quit();
 });
 
+/** 外部播放器那一类：用户在它里面换了片之后，可以撒手而不关它的窗口。 */
+class FakeExternal extends FakePlayer {
+  constructor(opts) {
+    super(opts);
+    this.releases = 0;
+    this.paused = [];
+    this.osds = [];
+    this.banners = [];
+  }
+  async release() {
+    this.releases++;
+  }
+  async setPause(paused) {
+    this.paused.push(paused);
+  }
+  osd(text) {
+    this.osds.push(text);
+  }
+  setBanner(text) {
+    this.banners.push(text);
+  }
+}
+
+function externalManager() {
+  const made = [];
+  const events = [];
+  const Tracked = class extends FakeExternal {
+    constructor(opts) {
+      super(opts);
+      made.push(this);
+    }
+  };
+  const mgr = new PlayerManager({ send: () => {}, adapters: { ext: Tracked, fake: FakePlayer } });
+  mgr.on('gone', (payload) => events.push(payload));
+  return { mgr, made, events };
+}
+
+test('撒手：current 置空、覆盖窗松开，之后的暂停、横幅、OSD 一条都不再发给他的窗口', async () => {
+  const { mgr, made, events } = externalManager();
+  const info = await mgr.launch('ext', {});
+  const adapter = made[0];
+  assert.equal(await mgr.release(info.gen), true);
+  assert.equal(adapter.releases, 1);
+  assert.equal(adapter.quits, 0, '撒手不是退出：用户正在看的那部片不能被关掉');
+  assert.equal(mgr.running, false);
+  assert.deepEqual(events.map((e) => e.gen), [info.gen], '覆盖窗和 Ctrl+Shift+D 要跟着松开');
+  assert.equal(adapter.listenerCount('tick') + adapter.listenerCount('error') + adapter.listenerCount('window'), 0);
+
+  // 同步引擎每次收敛都会发暂停；全员暂停横幅、缓冲 OSD 也照发 —— 都得落空
+  await assert.rejects(mgr.setPause(true), /播放器未启动/);
+  mgr.osd('等待 小明 缓冲…', 3000);
+  mgr.setBanner('全员暂停中');
+  assert.deepEqual(adapter.paused, []);
+  assert.deepEqual(adapter.osds, []);
+  assert.deepEqual(adapter.banners, []);
+
+  // 之后「重新打开」、换片、退房：开新窗口 / 退当前播放器，都不许去关他那个窗口
+  await mgr.quit();
+  await mgr.launch('ext', {});
+  await mgr.quit();
+  assert.equal(adapter.quits, 0, '撒手之后的 quit 还是关掉了他的窗口');
+  assert.equal(made[1].quits, 1, '新开的那一个照常归我们管');
+});
+
+test('撒手只放那一代：代号对不上（换过播放器了）什么都不动', async () => {
+  const { mgr, made } = externalManager();
+  const first = await mgr.launch('ext', {});
+  await mgr.launch('ext', {});
+  assert.equal(await mgr.release(first.gen), false);
+  assert.equal(mgr.running, true, '迟到的撒手把刚起来的新播放器放掉了');
+  assert.equal(made[1].releases, 0);
+  assert.equal(await mgr.release(), true, '不带代号就放当前这一代');
+  assert.equal(await mgr.release(), false, '没有播放器时是空操作');
+});
+
+test('撒手的收尾（撤掉桥上的跟踪）落地之前，下一代不许起来', async () => {
+  const { mgr, made } = externalManager();
+  await mgr.launch('ext', {});
+  let finish = null;
+  made[0].release = () =>
+    new Promise((resolve) => {
+      finish = resolve;
+    });
+  const releasing = mgr.release();
+  const next = mgr.launch('ext', {});
+  await new Promise((resolve) => setImmediate(resolve));
+  // 桥的 untrack 不分窗口：新窗口先 track、旧的后 untrack，就把新窗口的跟踪一并撤掉了
+  assert.equal(made.length, 1, '撒手还没收完尾就拉起了下一代');
+  finish();
+  await releasing;
+  await next;
+  assert.equal(made.length, 2);
+  await mgr.quit();
+});
+
+test('没有撒手这一说的播放器（mpv）照常退掉，不留没人管的进程', async () => {
+  const { mgr } = manager();
+  await mgr.launch('fake', {});
+  const adapter = FakePlayer.made[0];
+  assert.equal(await mgr.release(), true);
+  await mgr.quit();
+  assert.equal(adapter.quits, 1);
+});
+
+test('撒手接了线：player:release 带代号校验，preload 暴露了它，渲染进程撒手时调用', () => {
+  const main = read('src', 'main', 'main.js');
+  const preload = read('src', 'main', 'preload.js');
+  assert.match(main, /secureHandle\('player:release', async \(gen\) => \{\r?\n\s*await players\.release\(gen === undefined \|\| gen === null \? undefined : validate\.integer\(gen, '播放器代号', \{ min: 1 \}\)\);/);
+  assert.match(preload, /release: \(gen\) => ipcRenderer\.invoke\('player:release', gen\)/);
+  assert.match(fnSource('detachFromPlayer'), /window\.sw\.player\.release\(gen\)/);
+});
+
 test('画不了弹幕的播放器，这一帧落到覆盖窗；自带弹幕层的不落', async () => {
   const overlayFrames = [];
   const { mgr } = manager({ danmakuSink: (frame) => (overlayFrames.push(frame), true) });
@@ -383,6 +495,10 @@ const PLAYER_FNS = [
   'errCode',
   'errText',
   'reportLaunchFailure',
+  'fallsBackToMpv',
+  'launchMpvInstead',
+  'maybeLaunchPlayer',
+  'handlePlayerExit',
   'playerErrorText',
   'handlePlayerError',
   'detachFromPlayer',
@@ -428,6 +544,8 @@ function playerBox({ choice = 'mpv', list = null, complete = true, sourceType = 
     ],
     playerKind: 'mpv',
     playerFallback: '',
+    relaunchingPlayer: false,
+    noAutoLaunchSeq: null,
     danmaku: { setActive: () => calls.push('danmaku.setActive'), clear: () => calls.push('danmaku.clear') },
     sync: {
       sharedPositionNow: () => 600,
@@ -447,6 +565,7 @@ function playerBox({ choice = 'mpv', list = null, complete = true, sourceType = 
       return { gen: calls.length, caps: {} };
     },
     quit: async () => calls.push('quit'),
+    release: async (gen) => calls.push(['release', gen]),
     snapshot: async () => ({ running: true, paused: false, position: 601.2 }),
     osd: async (text) => calls.push(['osd', text]),
     select: async (id) => {
@@ -487,12 +606,20 @@ function playerBox({ choice = 'mpv', list = null, complete = true, sourceType = 
       begin() {
         return this.epoch;
       },
-      confirm: () => ({}),
+      // 和真的闸门一样：回包认下这一代，退播放器时作废（换播放器要靠它分清「已经起来了」和「还在起」）
+      confirm(gen) {
+        this.gen = Number.isInteger(gen) ? gen : null;
+        return {};
+      },
       acceptExit: () => false,
-      retire: () => calls.push('gate.retire'),
+      retire() {
+        this.gen = null;
+        this.epoch++;
+        calls.push('gate.retire');
+      },
     },
     handlePlayerTick: noop,
-    handlePlayerExit: noop,
+    renderStatus: noop,
     showDepsHelp: () => calls.push('showDepsHelp'),
     renderPlayerControls: () => calls.push('renderPlayerControls'),
     refreshMediaUi: () => calls.push('refreshMediaUi'),
@@ -910,4 +1037,362 @@ test('用户在播放器里打开了别的文件：撒手不再同步，但不�
   assert.equal(box.S.playerChoice, 'pot', '选择不动：用户回头还想用它');
   assert.match(box.logs[0][0], /打开了别的文件/);
   assert.equal(box.logs[0][1], 'warn', '这不是故障，是用户自己的操作');
+});
+
+/* ======================= 四、播放器生命周期（批次 7） ======================= */
+
+/**
+ * A5-1：撒手只在渲染进程生效的话，主进程的 current 还指着他的窗口 —— 房间的播放/暂停、
+ * 全员暂停横幅、缓冲 OSD 照样打过去，之后重开、换片、退房还会给它发 WM_CLOSE。
+ * 渲染进程这一侧要做的是：带着那一代的代号叫主进程撒手，而且之后不再自动给这一部开新窗口。
+ */
+test('撒手时叫主进程一起放掉那一代（带代号），关会话要等它；同一部不再自动拉起', async () => {
+  const box = playerBox({ choice: 'pot' });
+  box.S.roomSecurityMode = 'safe';
+  box.S.swarm = { playingSlot: 0 };
+  await box.ctx.launchPlayer();
+  const gen = box.ctx.playerGate.gen;
+  assert.ok(Number.isInteger(gen));
+  box.calls.length = 0;
+
+  await box.ctx.handlePlayerError({ message: '原始正文', code: 'PLAYER_FOREIGN_FILE', kind: 'pot', gen });
+  assert.deepEqual(box.calls.filter((c) => c[0] === 'release'), [['release', gen]], '主进程那一侧没撒手，指令还会打到他的片上');
+  assert.ok(!box.calls.includes('quit'), '撒手不是退出：他的窗口不能被关掉');
+  await box.S.playerQuit; // 关会话、删缓存前等的那一串里要有这一次撒手
+
+  // 本机在给别人供片：每发出一片来一条 progress。不能给这一部再拉一个新窗口
+  box.ctx.maybeLaunchPlayer({ slot: 0, complete: true });
+  await Promise.resolve();
+  assert.deepEqual(box.calls.filter((c) => c[0] === 'launch'), [], '撒手之后又自动开了一个新窗口');
+  assert.equal(box.$('btn-reopen').hidden, false, '要不要回来由他决定：「重新打开」得在');
+});
+
+/**
+ * A5-2：安全模式、网状拓扑、本机还在给别人供当前这部。swarm 每发完一片就 emit('progress')，
+ * maybeLaunchPlayer 的安全模式分支条件一直成立 —— 用户关一次，下一片发出去就又弹出来。
+ */
+test('安全模式下用户关掉播放器：供片的 progress 不再把它拉起来；「重新打开」、换片照常', async () => {
+  const box = playerBox({ choice: 'mpv' });
+  box.S.roomSecurityMode = 'safe';
+  box.S.swarm = { playingSlot: 0 };
+  const launches = () => box.calls.filter((c) => c[0] === 'launch').length;
+  const served = { slot: 0, complete: true, contiguousBytes: 1, runBytes: 1 };
+  await box.ctx.launchPlayer();
+  assert.equal(launches(), 1);
+
+  box.ctx.handlePlayerExit({ code: 0 });
+  assert.equal(box.S.mpvRunning, false);
+  for (let i = 0; i < 5; i++) box.ctx.maybeLaunchPlayer(served);
+  await Promise.resolve();
+  assert.equal(launches(), 1, '关一次弹一次：用户没法「留在房间里但先不看」');
+  assert.ok(box.logs.some(([text]) => /可在房间里重新打开/.test(text)));
+
+  // 用户自己点「重新打开」：照常起来，记号随之作废
+  assert.equal(await box.ctx.launchPlayer(), true);
+  assert.equal(launches(), 2);
+  assert.equal(box.S.noAutoLaunchSeq, null);
+
+  // 再关一次，照样挡住
+  box.ctx.handlePlayerExit({ code: 0 });
+  box.ctx.maybeLaunchPlayer(served);
+  await Promise.resolve();
+  assert.equal(launches(), 2);
+
+  // 换到下一部（seq 变了）：自动起播照旧
+  box.S.currentSeq = 4;
+  box.ctx.maybeLaunchPlayer(served);
+  await Promise.resolve();
+  assert.equal(launches(), 3, '下一部不该被上一部的「关掉了」挡住');
+});
+
+/** 扫描通过那一刻的起播：用户在这一部上关掉过播放器、或正在换播放器时都不抢。 */
+function scanBox({ dismissed = false, relaunching = false } = {}) {
+  const calls = [];
+  const logs = [];
+  const session = { fileId: 'f1', sessionId: 's1', slot: 0, manifest: { name: 'a.mkv' }, safety: { status: 'scanning' } };
+  const S = {
+    leaving: false,
+    sessions: new Map([['f1', session]]),
+    roomSecurityMode: 'trusted',
+    mpvRunning: false,
+    currentSeq: 5,
+    noAutoLaunchSeq: dismissed ? 5 : null,
+    relaunchingPlayer: relaunching,
+  };
+  const ctx = {
+    S,
+    t: (s) => s,
+    log: (text, kind) => logs.push([text, kind]),
+    decideScanOutcome: () => ({ destroy: false, status: 'clean' }),
+    blockScannedSession: async () => {},
+    maybeSaveDownload: () => {},
+    currentSession: () => session,
+    launchPlayer: async () => calls.push('launch'),
+    renderStatus: () => {},
+    window: { sw: { player: { osd: async () => {} } } },
+  };
+  vm.createContext(ctx);
+  vm.runInContext(fnSource('applyScanResult'), ctx, { filename: 'app.js（节选）' });
+  return { ctx, calls, logs, session };
+}
+
+test('可信房间边下边播时用户关掉了播放器：扫描通过不再替他拉起来，日志不说「正在打开播放器」', async () => {
+  const closed = scanBox({ dismissed: true });
+  await closed.ctx.applyScanResult(closed.session, { ok: true, status: 'clean' }, 'trusted-streaming');
+  assert.deepEqual(closed.calls, [], '用户关掉的那一部被扫描通过又弹了出来');
+  assert.equal(closed.logs[0][0], '完整文件安全扫描通过；缓存在关软件时清掉');
+
+  const switching = scanBox({ relaunching: true });
+  await switching.ctx.applyScanResult(switching.session, { ok: true, status: 'clean' }, 'trusted-streaming');
+  assert.deepEqual(switching.calls, [], '换播放器途中抢先起了一个');
+
+  // 反面：没关过、也没在换，扫描通过照常打开
+  const normal = scanBox();
+  await normal.ctx.applyScanResult(normal.session, { ok: true, status: 'clean' }, 'waiting-download');
+  assert.deepEqual(normal.calls, ['launch']);
+  assert.equal(normal.logs[0][0], '安全扫描通过，正在打开播放器；缓存在关软件时清掉');
+});
+
+test('换片途中旧播放器退出不算「用户关掉了这一部」', async () => {
+  const box = playerBox({ choice: 'mpv' });
+  box.S.roomSecurityMode = 'safe';
+  box.S.swarm = { playingSlot: 0 };
+  await box.ctx.launchPlayer();
+  box.S.switchingMedia = true;
+  box.ctx.handlePlayerExit({ code: 0 });
+  box.S.switchingMedia = false;
+  assert.equal(box.S.noAutoLaunchSeq, null);
+});
+
+test('起播失败的这一部不再被供片的 progress 反复重拉，「重新打开」仍可重试', async () => {
+  const box = playerBox({ choice: 'mpv', launchFails: () => true });
+  box.S.roomSecurityMode = 'safe';
+  box.S.swarm = { playingSlot: 0 };
+  box.ctx.maybeLaunchPlayer({ slot: 0, complete: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(box.calls.filter((c) => c[0] === 'launch').length, 1);
+  assert.equal(box.S.mpvRunning, false);
+  for (let i = 0; i < 5; i++) box.ctx.maybeLaunchPlayer({ slot: 0, complete: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(box.calls.filter((c) => c[0] === 'launch').length, 1, '每发出一片就重拉一次、报一遍错');
+  assert.equal(box.$('btn-reopen').hidden, false);
+  // 用户手动重试不受这道门影响
+  await box.ctx.launchPlayer();
+  assert.equal(box.calls.filter((c) => c[0] === 'launch').length, 2);
+});
+
+/**
+ * A5-3：选择变了，但这一部实际仍得用 mpv（在线链接、边下边播还没收完、选的那个没找到、
+ * 或者本来就因为这些在跑 mpv 又切回 mpv）。白白重开一次 mpv：窗口黑一下、弹幕清空、退出全屏，
+ * 在线链接还要重新解析、重新缓冲，控制者重开期间全房跟着等。
+ */
+test('换播放器但实际仍得用 mpv：不重启正在跑的 mpv，只把「当前实际使用」的原因换成新的', async () => {
+  const restarts = (box) =>
+    box.calls.filter((c) => c === 'gate.retire' || c === 'quit' || (Array.isArray(c) && c[0] === 'launch')).length;
+
+  // 情形 A：在线链接，选 PotPlayer
+  const link = playerBox({ choice: 'mpv', sourceType: 'link' });
+  await link.ctx.launchPlayer();
+  link.calls.length = 0;
+  await link.ctx.switchPlayer('pot');
+  assert.equal(restarts(link), 0, '在线链接只用 mpv，换了选择也还是这个 mpv');
+  assert.equal(link.S.playerChoice, 'pot', '选择照样记下');
+  assert.equal(link.S.playerKind, 'mpv');
+  assert.equal(link.ctx.playerActualText(), '当前实际使用：mpv（原因：在线链接只用 mpv 播放）');
+  // 情形 D：本来就因为回退原因在跑 mpv，又切回 mpv
+  await link.ctx.switchPlayer('mpv');
+  assert.equal(restarts(link), 0);
+  assert.equal(link.S.playerFallback, '', '原因也要跟着换，不然那行字还挂着旧原因');
+  assert.equal(link.ctx.playerActualText(), '');
+
+  // 情形 B：边下边播还没收完，在两个外部播放器之间来回切
+  const streaming = playerBox({ choice: 'mpv', complete: false });
+  await streaming.ctx.launchPlayer();
+  streaming.calls.length = 0;
+  await streaming.ctx.switchPlayer('mpc');
+  await streaming.ctx.switchPlayer('pot');
+  assert.equal(restarts(streaming), 0);
+  assert.equal(streaming.ctx.playerActualText(), '当前实际使用：mpv（原因：这一部还没收完）');
+
+  // 情形 C：选了下拉框里标着「（未找到）」的那一项
+  const missing = playerBox({
+    choice: 'mpv',
+    list: [
+      { id: 'mpv', name: 'mpv', available: true, reason: '' },
+      { id: 'pot', name: 'PotPlayer', available: false, reason: 'not-found' },
+    ],
+  });
+  await missing.ctx.launchPlayer();
+  missing.calls.length = 0;
+  await missing.ctx.switchPlayer('pot');
+  assert.equal(restarts(missing), 0);
+  assert.equal(missing.ctx.playerActualText(), '当前实际使用：mpv（原因：未找到）');
+});
+
+test('启动还在途（代号没确认）时换播放器照旧重来：那一次用的是旧选择', async () => {
+  const box = playerBox({ choice: 'mpv', sourceType: 'link' });
+  box.S.mpvRunning = true; // 占着位，回包还没到
+  await box.ctx.switchPlayer('pot');
+  assert.ok(box.calls.includes('gate.retire'));
+  assert.deepEqual(box.calls.filter((c) => c[0] === 'launch'), [['launch', 'mpv', 601]]);
+});
+
+/** 旧播放器的 quit 挂起，直到测试放行 —— 用来卡在「旧的已退、新的还没起」那段窗口里。 */
+function holdQuit(box) {
+  const pending = [];
+  box.ctx.window.sw.player.quit = () => {
+    box.calls.push('quit');
+    return new Promise((resolve) => pending.push(resolve));
+  };
+  return {
+    get waiting() {
+      return pending.length > 0;
+    },
+    release: () => pending.splice(0).forEach((resolve) => resolve()),
+  };
+}
+
+/**
+ * A5-4：安全模式 + 供片时换播放器。relaunchWithPlayer 等旧进程退出的那几秒里 S.mpvRunning 是 false，
+ * 这时来一条供片 progress，maybeLaunchPlayer 就抢先拉起一个；relaunchWithPlayer 自己那次撞上
+ * S.mpvRunning 返回 false，被当成「新播放器起不来」—— 选择被改写成 mpv，日志报一次并没有发生的失败。
+ */
+test('换播放器途中别处来的起播请求让位，这次切换不会被挤成「失败」', async () => {
+  const box = playerBox({ choice: 'mpv' });
+  box.S.roomSecurityMode = 'safe';
+  box.S.swarm = { playingSlot: 0 };
+  await box.ctx.launchPlayer();
+  box.calls.length = 0;
+  box.logs.length = 0;
+  const held = holdQuit(box);
+
+  const switching = box.ctx.switchPlayer('pot');
+  while (!held.waiting) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(box.S.mpvRunning, false, '旧的已经退了、新的还没起');
+  // 供片的 progress、扫描通过这类起播请求正好在这时到了
+  box.ctx.maybeLaunchPlayer({ slot: 0, complete: true });
+  assert.equal(await box.ctx.launchPlayer(), 'superseded', '让位要报「作废」，不能报成失败');
+  assert.deepEqual(box.calls.filter((c) => c[0] === 'launch'), [], '别处抢先起了一个');
+
+  held.release();
+  await switching;
+  assert.deepEqual(box.calls.filter((c) => c[0] === 'launch'), [['launch', 'pot', 601]]);
+  assert.equal(box.S.playerChoice, 'pot', '选择被悄悄改写成了 mpv');
+  assert.equal(box.S.playerKind, 'pot');
+  assert.deepEqual(box.calls.filter((c) => c[0] === 'select'), [['select', 'pot']]);
+  assert.ok(!box.logs.some(([text]) => text === '切换失败，已回到 mpv'), '报了一次并没有发生的失败');
+  assert.equal(box.S.relaunchingPlayer, false, '切换结束要把独占放掉');
+});
+
+test('换播放器途中换了片：独占让出来，新的一部照常起播，这次切换不报失败', async () => {
+  const box = playerBox({ choice: 'mpv' });
+  await box.ctx.launchPlayer();
+  box.calls.length = 0;
+  box.logs.length = 0;
+  const held = holdQuit(box);
+
+  const switching = box.ctx.switchPlayer('pot');
+  while (!held.waiting) await new Promise((resolve) => setImmediate(resolve));
+  // 换片：switchCurrent 先退播放器，再给新的一部起播
+  box.ctx.retirePlayer();
+  box.S.currentSeq = 4;
+  const next = box.ctx.launchPlayer();
+  held.release();
+  assert.equal(await next, true, '新的一部被换播放器的独占挡住了');
+  await switching;
+  assert.equal(box.calls.filter((c) => c[0] === 'launch').length, 1, '被作废的切换不该再起一个');
+  assert.ok(!box.logs.some(([text]) => text === '切换失败，已回到 mpv'));
+  assert.equal(box.S.playerChoice, 'pot');
+});
+
+/**
+ * A5-5：外部播放器第一次起播就起不来（不是运行中切换）。以前只报一句，下一部、扫描通过、
+ * 「重新打开」都照着选择再去拉它，每次都要等它超时，人一直晾在没有画面的房间里。
+ */
+test('外部播放器首次起播失败：本次改用 mpv，选择也改回 mpv，原因说出来', async () => {
+  for (const code of ['PLAYER_NO_WINDOW', 'PLAYER_ELEVATED', 'PLAYER_DETACHED', 'PLAYER_TIMEOUT']) {
+    const box = playerBox({ choice: 'pot' });
+    box.ctx.window.sw.player.launch = async (opts) => {
+      box.calls.push(['launch', opts.kind, Math.round(opts.startAt)]);
+      if (opts.kind === 'pot') throw new Error(`Error invoking remote method 'player:launch': Error: [${code}] 起不来`);
+      return { gen: box.calls.length, caps: {} };
+    };
+    assert.equal(await box.ctx.launchPlayer(), true, `${code}：本次没有退回 mpv`);
+    assert.deepEqual(
+      box.calls.filter((c) => c[0] === 'launch'),
+      [
+        ['launch', 'pot', 600],
+        ['launch', 'mpv', 600],
+      ],
+      code
+    );
+    assert.equal(box.S.playerKind, 'mpv');
+    assert.equal(box.S.playerChoice, 'mpv', `${code}：选择不改的话，下一部还会去拉那个起不来的播放器`);
+    assert.deepEqual(box.calls.filter((c) => c[0] === 'select'), [['select', 'mpv']]);
+    assert.ok(box.logs.some(([text]) => text === '已改用 mpv 播放，播放器选择也改回了 mpv'), code);
+    assert.equal(box.S.noAutoLaunchSeq, null, '最后起来了，就不算这一部起不来');
+  }
+});
+
+test('PotPlayer 单实例把片子交给了已开着的窗口（PLAYER_GONE）：不自动再拉 mpv，提示里给下一步', async () => {
+  const box = playerBox({ choice: 'pot' });
+  box.S.roomSecurityMode = 'safe';
+  box.S.swarm = { playingSlot: 0 };
+  box.ctx.window.sw.player.launch = async (opts) => {
+    box.calls.push(['launch', opts.kind, Math.round(opts.startAt)]);
+    throw new Error(
+      "Error invoking remote method 'player:launch': Error: [PLAYER_GONE] PotPlayer 启动后立刻退出了（可能是它的单实例设置把文件交给了别的窗口）"
+    );
+  };
+  assert.equal(await box.ctx.launchPlayer(), false);
+  assert.deepEqual(box.calls.filter((c) => c[0] === 'launch'), [['launch', 'pot', 600]], '他那边已经有画面了，再拉一个 mpv 就是两个窗口一起出声');
+  assert.equal(box.S.playerChoice, 'pot');
+  assert.match(box.logs.at(-1)[0], /^PotPlayer 启动后立刻退出了.*在控制条里改用 mpv$/);
+  // 供片的 progress 不许一遍遍重拉 —— 每一次都会把片子再塞给他那个窗口
+  box.ctx.maybeLaunchPlayer({ slot: 0, complete: true });
+  await Promise.resolve();
+  assert.equal(box.calls.filter((c) => c[0] === 'launch').length, 1);
+});
+
+test('mpv 自己起不来不会「退回 mpv」', async () => {
+  const box = playerBox({ choice: 'mpv', launchFails: () => true });
+  assert.equal(await box.ctx.launchPlayer(), false);
+  assert.equal(box.calls.filter((c) => c[0] === 'launch').length, 1);
+  assert.deepEqual(box.calls.filter((c) => c[0] === 'select'), []);
+});
+
+test('运行中切换失败仍由 relaunchWithPlayer 自己退回 mpv，不会退两遍', async () => {
+  const box = playerBox({ choice: 'mpv', launchFails: (opts) => opts.kind === 'pot' });
+  await box.ctx.launchPlayer();
+  box.calls.length = 0;
+  box.logs.length = 0;
+  await box.ctx.switchPlayer('pot');
+  assert.deepEqual(
+    box.calls.filter((c) => c[0] === 'launch'),
+    [
+      ['launch', 'pot', 601],
+      ['launch', 'mpv', 601],
+    ]
+  );
+  assert.deepEqual(box.calls.filter((c) => c[0] === 'select'), [['select', 'pot'], ['select', 'mpv']]);
+  assert.ok(!box.logs.some(([text]) => text === '已改用 mpv 播放，播放器选择也改回了 mpv'), '切换那一路有自己的说法');
+});
+
+test('批次 7 的新文案都有英文，播放器名字原样留着', async () => {
+  const { translate } = await import('../src/renderer/lib/i18n.js');
+  assert.equal(
+    translate('已改用 mpv 播放，播放器选择也改回了 mpv', 'en'),
+    'Playing in mpv instead; the player choice was switched back to mpv'
+  );
+  const gone = translate(
+    'PotPlayer 启动后立刻退出了，片子多半被它的单实例设置交给了已开着的窗口，那个窗口不跟房间同步。关掉它再点「重新打开播放器」，或在控制条里改用 mpv',
+    'en'
+  );
+  assert.match(gone, /^PotPlayer exited right after starting\./);
+  assert.match(gone, /“Reopen player”/);
+  assert.doesNotMatch(gone, /[一-鿿]/, '英文界面上还剩中文');
+  // 拼出来的那一句（reportLaunchFailure）和字典里的是同一句
+  const box = playerBox();
+  box.ctx.reportLaunchFailure(new Error('Error: [PLAYER_GONE] x'), 'pot', 'MPC-BE');
+  assert.doesNotMatch(translate(box.logs.at(-1)[0], 'en'), /[一-鿿]/);
 });

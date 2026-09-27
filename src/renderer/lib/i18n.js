@@ -751,6 +751,8 @@ const EN = new Map(Object.entries({
   '不可用': 'Unavailable',
   '桥接程序未构建（npm run build:bridge）': 'The bridge program is not built (npm run build:bridge)',
   '切换失败，已回到 mpv': 'Switching failed, back on mpv',
+  // 外部播放器第一次起播就起不来：本次改用 mpv
+  '已改用 mpv 播放，播放器选择也改回了 mpv': 'Playing in mpv instead; the player choice was switched back to mpv',
   '独占全屏下看不到弹幕，切成无边框全屏就能看到':
     'Danmaku cannot be shown over exclusive fullscreen. Switch the player to borderless fullscreen to see it.',
   'Ctrl+Shift+D 被别的程序占用了，在播放器里发不了弹幕':
@@ -1192,6 +1194,10 @@ const EN_PATTERNS = [
   [/^(.+) 打不开需要请求头的链接$/, '$1 cannot open a link that needs request headers'],
   [/^(.+) 脱离了遥控，请关掉它再重开$/, '$1 is no longer under remote control — close it and open it again'],
   [/^(.+) 脱离了遥控$/, '$1 is no longer under remote control'],
+  [
+    /^(.+) 启动后立刻退出了，片子多半被它的单实例设置交给了已开着的窗口，那个窗口不跟房间同步。关掉它再点「重新打开播放器」，或在控制条里改用 mpv$/,
+    '$1 exited right after starting. Its single-instance setting probably handed the video to a window that was already open, and that window does not follow the room. Close it and select “Reopen player”, or switch to mpv in the control bar.',
+  ],
   [/^(.+) 不再应答遥控$/, '$1 stopped answering remote control'],
   [/^有人在 (.+) 里打开了别的文件$/, 'Someone opened a different file in $1'],
   // 运行期出错后自动退回 mpv：前半段自己还要再翻一道

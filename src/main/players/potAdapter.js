@@ -319,6 +319,8 @@ class PotAdapter extends EventEmitter {
       this._onPollFailure(error);
       return;
     }
+    // 撒手或退出途中才回来的这一轮不算数：撒手之后他那部片的状态变化不许再引出任何指令（比如换片时的暂停）
+    if (this._closing) return;
     if (!Array.isArray(results) || results.length < 3) {
       this._onPollFailure(playerError('PotPlayer 返回了看不懂的结果', 'PLAYER_PROTOCOL'));
       return;
@@ -657,6 +659,24 @@ class PotAdapter extends EventEmitter {
     this._stopLoop();
     this._failWaiters(error);
     this.emit('error', error);
+  }
+
+  /**
+   * 撒手：用户在 PotPlayer 里自己开了别的片，这个窗口从此归他（见 PlayerManager.release）。
+   * 和 quit() 一样停轮询、摘桥上的监听、撤掉窗口跟踪和 pid 授权，
+   * 只是不发 WM_CLOSE、不等进程退出、不强杀 —— 他正在看的那部片不能被我们关掉。
+   */
+  async release() {
+    this._closing = true;
+    this._stopLoop();
+    this._failWaiters(playerError('PotPlayer 已交还给用户，不再遥控', 'PLAYER_CLOSING'));
+    if (!this.bridge) return true;
+    this.bridge.off('copydata', this._onCopyData);
+    this.bridge.off('win', this._onWinEvent);
+    this.bridge.off('restart', this._onBridgeRestart);
+    await this.bridge.call('untrack', {}, { timeoutMs: 1500 }).catch(() => {});
+    if (this.pid) await this.bridge.call('forget', { pid: this.pid }, { timeoutMs: 1500 }).catch(() => {});
+    return true;
   }
 
   /** 进程真正退出才返回：删缓存之前必须等它放开文件句柄。 */

@@ -149,6 +149,8 @@ contextBridge.exposeInMainWorld('sw', {
     setDanmakuFrame: (frame) => ipcRenderer.invoke('player:setDanmakuFrame', frame),
     snapshot: () => ipcRenderer.invoke('player:snapshot'),
     quit: (gen) => ipcRenderer.invoke('player:quit', gen),
+    // 撒手：用户在外部播放器里开了别的片，那一代不再遥控，但不关它的窗口
+    release: (gen) => ipcRenderer.invoke('player:release', gen),
     onTick: on('player:tick'),
     onExit: on('player:exit'),
     onError: on('player:error'),

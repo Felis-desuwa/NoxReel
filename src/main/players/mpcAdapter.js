@@ -549,6 +549,24 @@ class MpcAdapter extends EventEmitter {
     this.emit('error', error);
   }
 
+  /**
+   * 撒手：用户在 MPC-BE 里自己开了别的片，这个窗口从此归他（见 PlayerManager.release）。
+   * 收尾和 quit() 一样，只是不发 WM_CLOSE、不等进程退出、不强杀。pid 授权撤掉之后，
+   * 它照旧按 /slave 发给桥的通知会被桥直接丢掉。
+   */
+  async release() {
+    this._closing = true;
+    this._stopLoop();
+    this._failWaiters(playerError('MPC-BE 已交还给用户，不再遥控', 'PLAYER_CLOSING'));
+    if (!this.bridge) return true;
+    this.bridge.off('copydata', this._onCopyData);
+    this.bridge.off('win', this._onWinEvent);
+    this.bridge.off('restart', this._onBridgeRestart);
+    await this.bridge.call('untrack', {}, { timeoutMs: 1500 }).catch(() => {});
+    if (this.pid) await this.bridge.call('forget', { pid: this.pid }, { timeoutMs: 1500 }).catch(() => {});
+    return true;
+  }
+
   async quit() {
     this._closing = true;
     this._stopLoop();

@@ -758,6 +758,32 @@ test('PotPlayer 退出：先发 WM_CLOSE，进程真没了才算退干净', asyn
   assert.ok(bridge.calls.some((c) => c.cmd === 'forget'), '退出后要撤掉 PID 授权');
 });
 
+/**
+ * 撒手（用户在 PotPlayer 里自己开了别的片之后）：窗口从此归他。收尾和 quit() 一样 ——
+ * 停轮询、摘桥上的监听、撤掉窗口跟踪和 pid 授权 —— 只是不关窗口、不等进程、不强杀。
+ */
+test('PotPlayer 撒手：撤掉跟踪和授权，但不发 WM_CLOSE、不杀进程，之后一条指令都不再发', async () => {
+  const { adapter, bridge, proc } = await launchPot();
+  const exits = [];
+  adapter.on('exit', (e) => exits.push(e));
+  bridge.calls.length = 0;
+  assert.equal(await adapter.release(), true);
+  assert.deepEqual(
+    bridge.calls.map((c) => c.cmd),
+    ['untrack', 'forget'],
+    '撒手只撤登记，不许碰他的窗口'
+  );
+  assert.equal(proc.killed, 0);
+  assert.equal(bridge.listenerCount('copydata') + bridge.listenerCount('win') + bridge.listenerCount('restart'), 0, '共用桥上的监听没摘');
+  // 轮询停了：他那部片的位置、文件名不再有人问
+  bridge.calls.length = 0;
+  await sleep(40);
+  assert.deepEqual(bridge.calls, []);
+  // 他之后自己关掉 PotPlayer，也不关我们的事了
+  proc.exit(0);
+  assert.deepEqual(exits, []);
+});
+
 test('PotPlayer 不肯退出时超时强杀，不会永远挂着', async () => {
   const { adapter, bridge, proc } = await launchPot();
   bridge.onClose = null; // 装死：WM_CLOSE 收下了，窗口和进程都不动
@@ -1023,6 +1049,22 @@ test('MPC-BE 退出：等进程真正退出', async () => {
   assert.equal(await adapter.quit(), true);
   assert.equal(proc.killed, 0);
   assert.ok(bridge.calls.some((c) => c.cmd === 'close'));
+});
+
+test('MPC-BE 撒手：撤掉跟踪和授权，但不关窗口，之后不再轮询', async () => {
+  const { adapter, bridge, proc } = await launchMpc();
+  const exits = [];
+  adapter.on('exit', (e) => exits.push(e));
+  bridge.calls.length = 0;
+  assert.equal(await adapter.release(), true);
+  assert.deepEqual(bridge.calls.map((c) => c.cmd), ['untrack', 'forget']);
+  assert.equal(proc.killed, 0);
+  assert.equal(bridge.listenerCount('copydata') + bridge.listenerCount('win') + bridge.listenerCount('restart'), 0);
+  bridge.calls.length = 0;
+  await sleep(60);
+  assert.deepEqual(bridge.calls, [], '撒手之后还在问他那部片的位置');
+  proc.exit(0);
+  assert.deepEqual(exits, []);
 });
 
 test('两个外部播放器都不接手正在增长的文件', () => {
