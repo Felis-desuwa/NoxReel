@@ -134,16 +134,20 @@ function setCapped(map, key, value, max) {
 }
 
 export class SyncEngine extends Emitter {
-  constructor({ peerId, name, isSeeder, hostId }) {
+  constructor({ peerId, name, isSeeder, hostId, playAfterComplete = false }) {
     super();
     this.peerId = peerId;
     this.name = name;
     this.isSeeder = isSeeder;
+    // 本机要把片子收完（安全模式还要扫描通过）才打开播放器。没收完时他根本不在看，
+    // 缓冲不足轮不到让房间等他：不因为自己缓冲不足喊停（别人报的卡顿照样听）。
+    // 开播前等不等他由上层的就绪门槛管。
+    this.playAfterComplete = !!playAfterComplete;
 
-    // 权限。hostId 是「谁是房主」的锚点：房主自己传自身 peerId；加入者从邀请码拿到房主的
-    // peerId。都不知道时（安卓信令模式直接填房间号进来，手里没邀请码）传 null —— 此时
-    // 自己算游客（默认最保守），等第一条 ROLE 认定并钉死房主身份。**不要**默认成 peerId，
-    // 否则不知情的加入者会把自己错当成房主，短暂拿到控场权。
+    // 权限。hostId 是「谁是房主」的锚点：房主自己传自身 peerId；加入者从邀请码 / 房间链接拿到
+    // 房主的 peerId，安卓直接填信令服务器地址和房间号进来的，拿服务器 joined 里的 hostId。
+    // 都不知道时传 null —— 此时自己算游客（默认最保守），等第一条 ROLE 认定并钉死房主身份。
+    // **不要**默认成 peerId，否则不知情的加入者会把自己错当成房主，短暂拿到控场权。
     // roles 显式记录每一个已知 peer 的角色（peerId -> 'admin'|'guest'），房主不入表。
     // 「显式记录游客」是必要的：角色表尚未同步的陌生人和游客都没有控场权，
     // 只有房主或明确授予的管理员可以发出全房控制指令。
@@ -197,7 +201,7 @@ export class SyncEngine extends Emitter {
     this._divergeRetries = 0;
     this.lastTick = null;
     this.pendingSeek = null; // 播放器还没起来时收到的房间位置，起来后补放
-    this.pendingSeekAt = 0;
+    this.pendingSeekOffset = 0; // 它和当时房间时钟差多少秒（有意偏离房间时才不是 0）
     this.seekTolerance = SEEK_TOLERANCE;
     this.eofReported = false;
     this._dataEndReported = false;
@@ -257,6 +261,7 @@ export class SyncEngine extends Emitter {
     this.sizeHint = 0;
     this.lastTick = null;
     this.pendingSeek = null;
+    this.pendingSeekOffset = 0;
     this.eofReported = false;
     this._dataEndReported = false;
     this._dataEndStall = false;
@@ -551,9 +556,10 @@ export class SyncEngine extends Emitter {
         changed = true;
       }
     }
+    const promoted = !wasController && this.canIControl();
     // 当游客时卡住只停自己、没有广播；刚被提升为控制者还卡着，就得补报一声。
     // 否则全房照常播放不等他，他本机的房间时钟却因为自己卡着停住，两边从此错开。
-    if (!wasController && this.canIControl() && this.localStalled) {
+    if (promoted && this.localStalled) {
       this.emit('outbound', {
         t: MSG.STALL,
         stalled: true,
@@ -567,7 +573,17 @@ export class SyncEngine extends Emitter {
     }
     this._syncClock();
     this.emit('roles', this.roleSnapshot());
-    if (changed) this._reconcile();
+    if (promoted && !this._manual()) {
+      // 游客自己按的暂停、自己缓冲不足停下，恢复时都是从停下的地方接着放，不回到房间的位置 ——
+      // 他可能早就落后房间一大截，或者还自己暂停着。刚成为控制者，第一次按暂停/播放报的就是这个位置，
+      // 全房会被拽回去。所以先对齐房间：位置跳到房间时钟，暂停状态也回到房间的。
+      // 手动同步的人按暂停/播放报的是房间位置（见 _actionPosition），和房间差着是他自己留的，不动。
+      // 播放器没开着就不用跳：它起来时本来就从房间此刻的位置起播（见 resyncToShared）。
+      this.intendedPaused = this.shared.paused;
+      this._reconcile(this.lastTick ? { seekTo: this.sharedPositionNow() } : {});
+    } else if (changed) {
+      this._reconcile();
+    }
   }
 
   /* -------------------------- 本地播放器事件 -------------------------- */
@@ -768,6 +784,13 @@ export class SyncEngine extends Emitter {
 
     this.emit('margin', { bytes: margin, seconds: marginSeconds, contiguousBytes, runBytes, playbackByte });
 
+    // 收完才播的人（安全模式）没收完时播放器根本没开，缓冲再少也不是「快要卡了」：
+    // 让全房等他攒够 15 秒毫无意义，「仍然开始」也会被他的卡顿抵消掉。只是不自己喊停，别人的卡顿照样听。
+    if (this.playAfterComplete) {
+      if (this.localStalled) this._setLocalStall(false, marginSeconds ?? 0, snap.position);
+      return;
+    }
+
     // 滞回：低于 stall 线才喊停，高于 resume 线才松口。中间地带保持原状。
     if (!this.localStalled && margin < this.stallThresholdBytes) {
       this._setLocalStall(true, marginSeconds ?? 0, snap.position);
@@ -883,10 +906,12 @@ export class SyncEngine extends Emitter {
    *
    * 「谁是房主」的锚点很关键，不能让消息自己说了算 —— 否则任何人把 hostId 填成自己
    * 就能篡夺角色权威。分两种情况：
-   *  - 已知房主（PC 端从邀请码拿到，或此前已认过）：只认这个 peer 发来的表。
-   *  - 尚不知道房主（安卓信令模式直接填房间号进来，手里没有邀请码）：首认为准 ——
+   *  - 已知房主（从邀请码 / 房间链接拿到，安卓信令模式用服务器 joined 里的 hostId，或此前已认过）：
+   *    只认这个 peer 发来的表。
+   *  - 尚不知道房主（兜底，现有的加入入口都拿得到房主身份）：首认为准 ——
    *    认「自称房主、且确实以该身份发消息」的第一个人，之后钉死，不再改。
-   *    发送方 peerId 由 P2P 通道本身担保，冒不了别人的身份。
+   *    发送方 peerId 由 P2P 通道本身担保，冒不了别人的身份；但房里的恶意成员只要抢在真房主前面
+   *    发一条就能钉住自己，所以有可信来源时一定要先把 hostId 设好。
    */
   _onRole(msg, fromPeer) {
     const from = fromPeer?.peerId;
@@ -1022,9 +1047,15 @@ export class SyncEngine extends Emitter {
     if (!from || from.origin === this.peerId || typeof msg.stalled !== 'boolean') return true;
     const id = from.origin;
 
-    // 房主替已经断开的成员撤销卡顿。不看编号：那个人不会再发消息了。
+    // 房主替已经和他断开的成员撤销卡顿。不看编号：那个人不会再经房主发消息了。
+    // 撤销的只是「经房主这条路径」得知的那份：网状下我和他本人可能还直连着、他也还卡着 ——
+    // 断的只是他和房主那一条。直连还在就留着，等他本人说好了（或者那条也断了，见 peerGone）。
     if (from.relayed && msg.release === true) {
-      if (msg.stalled !== false || !this.stalledPeers.delete(id)) return true;
+      const entry = this.stalledPeers.get(id);
+      if (msg.stalled !== false || !entry) return true;
+      entry.via.delete(from.senderId);
+      if (entry.via.size > 0) return true;
+      this.stalledPeers.delete(id);
       this._syncClock();
       this.emit('stall-change', { who: id, name: from.name, stalled: false, self: false });
       this._reconcile();
@@ -1232,8 +1263,11 @@ export class SyncEngine extends Emitter {
         // 之后再没有任何路径会补下发 —— 观众的 mpv 是在收到房间位置之后才启动的，
         // 于是必然从 0:00 开始播，和房间里其他人差着半部片子。
         // 记下来，等 resyncToShared() 在播放器起来后重放。
+        // 记成「和房间时钟差多少」，不记墙钟时刻：房间时钟只在没暂停、没人卡着时往前走，
+        // 按墙钟外推会把这期间全房停着等人缓冲的时间也算成在播，播放器起来后跳到房间前面。
+        // 同步指令的目标就是房间时钟刚定下的起点，差值是 0。
         this.pendingSeek = seekTo;
-        this.pendingSeekAt = this.now();
+        this.pendingSeekOffset = seekTo - this.sharedPositionNow();
       }
       await this.emit_pause(targetPaused);
     } finally {
@@ -1278,15 +1312,12 @@ export class SyncEngine extends Emitter {
    */
   async resyncToShared() {
     if (!this.started) return;
-    let target;
-    if (typeof this.pendingSeek === 'number') {
-      // 记下来之后房间一直在播的话，要把这段时间补上
-      const waited = this._clockRunning() ? Math.max(0, this.now() - this.pendingSeekAt) / 1000 : 0;
-      target = this.pendingSeek + waited;
-    } else {
-      target = this.sharedPositionNow();
-    }
+    // 目标就是房间此刻的位置：记下之后房间播了多久、停了多久，房间时钟都已经算好了。
+    // 记下的位置和房间有意差着一点的（比如数据尽头的重放往回退半秒），把那点差值带上。
+    const offset = typeof this.pendingSeek === 'number' ? this.pendingSeekOffset : 0;
+    const target = Math.max(0, this.sharedPositionNow() + offset);
     this.pendingSeek = null;
+    this.pendingSeekOffset = 0;
     if (!(target >= 0)) return;
     await this._reconcile({ seekTo: target });
   }

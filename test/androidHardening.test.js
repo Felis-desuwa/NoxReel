@@ -720,7 +720,7 @@ test('信令模式：进了房但还没人连上时可以换个房间号重进�
   phone.$('join').click();
   const ws = CountingWebSocket.instances.at(-1);
   ws.onopen();
-  ws.onmessage({ data: JSON.stringify({ t: 'joined', peers: [] }) });
+  ws.onmessage({ data: JSON.stringify({ t: 'joined', peers: [], hostId: 'HOSTSRV1' }) });
   await until(() => phone.logged('已进入房间') === 1, '进房');
 
   phone.open(await inviteFrom(phone.h, 'HOSTAAAA'));
@@ -734,6 +734,63 @@ test('信令模式：进了房但还没人连上时可以换个房间号重进�
   await flush();
   assert.equal(CountingWebSocket.instances.length, before + 2, '还没人连上时应该能换个房间号重进');
   assert.equal(ws.closed, true, '旧信令没关：同一个身份挂在两个房间里');
+});
+
+/** 填服务器地址和房间号加入，服务器回 joined（hostId 由测试给）。 */
+async function serverJoin(phone, joined) {
+  phone.$('url').value = 'ws://127.0.0.1:9';
+  phone.$('room').value = 'room';
+  phone.$('join').click();
+  const ws = CountingWebSocket.instances.at(-1);
+  ws.onopen();
+  ws.onmessage({ data: JSON.stringify({ t: 'joined', peers: [], ...joined }) });
+  await flush();
+  return ws;
+}
+
+test('信令模式：房主身份用服务器 joined 里的 hostId，房里抢先发 ROLE 的人钉不住自己', async (t) => {
+  const phone = await loadPhone(t);
+  await serverJoin(phone, { hostId: 'HOSTSRV1' });
+  assert.equal(phone.logged('已进入房间'), 1);
+  const sync = phone.h.syncs.at(-1);
+  assert.equal(sync.hostId, 'HOSTSRV1', '服务器担保的房主身份没用上，只能等首条 ROLE「首认为准」');
+
+  // 房里的恶意成员抢在真房主前面发一条自称房主的 ROLE
+  const swarm = phone.swarm();
+  swarm.emit('ctrl', { msg: { t: 'role', hostId: 'EVIL0001', roles: [['EVIL0001', 'admin']] }, peer: { peerId: 'EVIL0001' } });
+  await flush();
+  assert.equal(sync.hostId, 'HOSTSRV1', '冒名的 ROLE 把房主身份抢走了');
+  assert.equal(sync.isController('EVIL0001'), false);
+
+  // 真房主之后发来的角色表和列表照收
+  swarm.emit('ctrl', { msg: { t: 'role', hostId: 'HOSTSRV1', roles: [[sync.peerId, 'admin']] }, peer: { peerId: 'HOSTSRV1' } });
+  swarm.emit('ctrl', { msg: emptyPlaylist(1), peer: { peerId: 'HOSTSRV1' } });
+  await flush();
+  assert.equal(sync.myRole(), 'admin', '真房主的角色表被当成冒名的丢了');
+  assert.equal(phone.logged('已忽略非房主发来的播放列表'), 0, '真房主的列表被当成非房主的丢了');
+});
+
+test('信令模式：服务器说房主就是自己（房间号没人开过）时不当房主，这次加入作废', async (t) => {
+  const phone = await loadPhone(t);
+  phone.$('url').value = 'ws://127.0.0.1:9';
+  phone.$('room').value = 'room-typo';
+  phone.$('join').click();
+  const sync = phone.h.syncs.at(-1);
+  const ws = CountingWebSocket.instances.at(-1);
+  ws.onopen();
+  // 服务器上没有这个房间：以我为建房人新建，joined.hostId 就是我自己
+  ws.onmessage({ data: JSON.stringify({ t: 'joined', peers: [], hostId: sync.peerId }) });
+  await flush();
+  assert.equal(phone.logged('连接失败：这个房间号还没有人开房'), 1, '要说清楚是房间号没人开过');
+  assert.equal(phone.logged('已进入房间'), 0);
+  assert.equal(ws.closed, true, '留着信令就一直占着这个房间号');
+  assert.notEqual(sync.hostId, sync.peerId, 'hostId 绝不能默认成自身 peerId');
+  assert.equal(sync.canIControl(), false, '把自己当成了房主');
+
+  // 没说房主是谁的 joined 同样不进
+  await serverJoin(phone, {});
+  assert.equal(phone.logged('连接失败：信令服务器没有告诉我们谁是房主'), 1);
+  assert.equal(phone.logged('已进入房间'), 0);
 });
 
 /* ============================== ⑤ 日志刷屏 ============================== */
@@ -1113,7 +1170,7 @@ test('信令那头刷人：同时挂着的连接有上限，同一个人刷 offe
   phone.$('join').click();
   const ws = CountingWebSocket.instances.at(-1);
   ws.onopen();
-  ws.onmessage({ data: JSON.stringify({ t: 'joined', peers: [] }) });
+  ws.onmessage({ data: JSON.stringify({ t: 'joined', peers: [], hostId: 'HOSTSRV1' }) });
   await until(() => phone.logged('已进入房间') === 1, '进房');
   const swarm = phone.swarm();
 
@@ -1140,7 +1197,7 @@ test('信令说「你被移出房间」（房间链接的房主一直没和你�
   phone.$('join').click();
   const ws = CountingWebSocket.instances.at(-1);
   ws.onopen();
-  ws.onmessage({ data: JSON.stringify({ t: 'joined', peers: [] }) });
+  ws.onmessage({ data: JSON.stringify({ t: 'joined', peers: [], hostId: 'HOSTSRV1' }) });
   await until(() => phone.logged('已进入房间') === 1, '进房');
   ws.onmessage({ data: JSON.stringify({ t: 'error', code: 'REMOVED', message: 'removed' }) });
   await flush();

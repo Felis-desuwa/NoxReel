@@ -184,6 +184,7 @@ const EN = new Map(Object.entries({
   '未知站点': 'Unknown site',
   '你的缓冲不够，先暂停你自己（不影响他人）': 'Your buffer is low, so only your playback is paused',
   '缓冲不足，暂停你自己…': 'Buffer low—pausing your playback…',
+  '缓冲不足，只暂停你自己，房间照常播放': 'Buffer low — only your playback is paused; the room keeps playing',
   '你是游客，不能跳转进度': 'Guests cannot seek',
   '游客不能跳转进度': 'Guests cannot seek',
   '文件已全部接收并校验，正在执行本机安全扫描…': 'The file is fully received and verified. Running a local security scan…',
@@ -1258,6 +1259,10 @@ const EN_PATTERNS = [
   [
     /^全员暂停中 —— 在等 (.+) 把缓冲攒够$/,
     (_all, who) => `Paused for everyone — waiting for ${joinWaiting(who)} to buffer`,
+  ],
+  [
+    /^缓冲不足，只暂停你自己，房间照常播放 —— 约 (.+) 后继续$/,
+    'Buffer low — only your playback is paused; the room keeps playing. Resuming in about $1',
   ],
   [/^缓冲还不够，约 (.+) 后自动继续$/, 'Not enough buffer yet — resuming automatically in about $1'],
   [/^启动失败：(.+)$/, 'Startup failed: $1'],

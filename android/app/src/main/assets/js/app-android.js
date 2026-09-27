@@ -65,7 +65,7 @@ const securityModeLabel = (mode) => (normalizeSecurityMode(mode) === 'trusted' ?
 const S = {
   peerId: randomPeerId(),
   name: '',
-  hostId: null, // 房主 peerId：极简模式和房间链接从链接里得来；信令模式手里没码，靠首个 ROLE 认定
+  hostId: null, // 房主 peerId：极简模式和房间链接从链接里得来；信令模式用服务器 joined 里的 hostId（见 adoptSignalHost）
   swarm: null,
   sync: null,
   signaling: null,
@@ -559,7 +559,11 @@ function initSwarmAndSync() {
     peerId: S.peerId,
     name: S.name,
     isSeeder: false,
-    hostId: S.hostId, // 极简模式=邀请码里的房主 id；信令模式=null，先当游客，等首个 ROLE 认定
+    // 极简模式、房间链接=链接里的房主 id；信令模式这时还是 null（先当游客），
+    // 连上信令后改用服务器 joined 里的 hostId（见 adoptSignalHost）
+    hostId: S.hostId,
+    // 安全模式收完才播（见 maybeLaunchPlayer）：没收完时手机是管理员也不因为自己缓冲不足让全房等
+    playAfterComplete: S.securityMode === 'safe',
   });
 
   // 同步引擎驱动原生播放器（对应 PC 端驱动 mpv）
@@ -1132,13 +1136,10 @@ function startPlayerTicks() {
     // 新播放器的第一条 tick：把房间状态补放给它。播放器起来之前收到的 SYNC 只能记着
     // （没有 lastTick 时引擎不下发跳转），新建的 ExoPlayer 又固定停在 0:00、暂停；
     // 不补的话手机会从片头播、或一直停着，管理员再点一下暂停就把全房拉回片头。
-    // 目标位置用房间时钟：它只在没暂停、没人卡着时往前走。记下的 pendingSeek 加上墙钟等待时间
-    // 会把全房卡着等本机收片的那段也算进去（安全模式下能差出好几分钟）。
+    // 目标位置用房间时钟（resyncToShared 自己就按它算）：它只在没暂停、没人卡着时往前走，
+    // 全房卡着等本机收片的那段不会算进去。
     // 原生层的 load / seek / setPause 按先后投递到主线程，这时发出的命令一定落在新播放器上。
-    if (first) {
-      S.sync.pendingSeek = null;
-      Promise.resolve(S.sync.resyncToShared()).catch(() => {});
-    }
+    if (first) Promise.resolve(S.sync.resyncToShared()).catch(() => {});
 
     renderPlayback(snap);
   }, 250);
@@ -1319,6 +1320,26 @@ async function connectSignaling(url, roomId, relay = null) {
   });
 
   return sig.connect();
+}
+
+/**
+ * 信令服务器模式（直接填地址和房间号）的房主身份：用服务器 joined 里的 hostId。
+ *
+ * 手里没有邀请码，以前只能「首认为准」—— 房里的恶意成员（改过的客户端）只要抢在真房主前面
+ * 发一条自称房主的 ROLE，房主身份就钉在了他身上：真房主的角色表、播放列表从此被当成非房主丢掉，
+ * 他的 SYNC / STALL 倒成了房主指令。服务器填的发信人本来就由它担保，它说的建房人可靠得多，
+ * 拿到就立刻钉上（S.sync 已经在 initSwarmAndSync 里建好了，两处一起设）。
+ *
+ * 等于自己：服务器上原本没有这个房间，是我刚刚把它建了出来（房间号填错了，或者房主还没开房、已经走了）。
+ * 绝不能因此把自己当房主（hostId 不能默认成自身 peerId），这次加入作废。
+ * 服务器的答案也不是绝对的：房间空了之后被别人重建，它指向的是重建的人 —— 但那种情况下首认为准一样会认下他。
+ */
+function adoptSignalHost(joined) {
+  const hostId = typeof joined?.hostId === 'string' ? joined.hostId : '';
+  if (!hostId) throw new Error('信令服务器没有告诉我们谁是房主，已拒绝加入');
+  if (hostId === S.peerId) throw new Error('这个房间号还没有人开房：可能填错了，或者房主还没开房、已经离开');
+  S.hostId = hostId;
+  if (S.sync) S.sync.hostId = hostId;
 }
 
 /**
@@ -2991,7 +3012,9 @@ $('join').addEventListener('click', async () => {
     S.serverJoined = false;
     for (const p of [...S.swarm.peers.values()]) if (!p.authenticated) S.swarm.removePeer(p.peerId);
     // 连上了却一直不回「已进房」的服务器会让这一步永远挂着，「正在加入」的闸门也就再没人放开
-    await withTimeout(connectSignaling(url, room), JOIN_STEP_TIMEOUT_MS, '信令服务器一直没有回应');
+    const joined = await withTimeout(connectSignaling(url, room), JOIN_STEP_TIMEOUT_MS, '信令服务器一直没有回应');
+    // 房主身份要在任何人连进来之前钉上：老成员收到 peer-join 才来建连，ROLE 更在握手之后
+    adoptSignalHost(joined);
     S.serverJoined = true;
     log('已进入房间，等待房主供片…', 'good');
   } catch (e) {

@@ -4448,6 +4448,9 @@ function initSwarmAndSync() {
     name: S.name,
     isSeeder: S.isSeeder,
     hostId: S.hostId, // 房主=自身 peerId；加入者=邀请码里的房主 id。两条路都已提前设好
+    // 安全模式收完、扫描通过才开播放器（见 playbackAllowed）：没收完的人不因为自己缓冲不足让全房等。
+    // 模式和 Swarm 取同一个，不是 trusted 的一律按安全模式算（同 normalizeSecurityMode）
+    playAfterComplete: (S.roomSecurityMode || S.settings.securityMode) !== 'trusted',
   });
 
   S.sync.onSetPause = (p) => whilePlayerBusy(window.sw.player.setPause(p).catch(() => {}));
@@ -7816,31 +7819,42 @@ function myBufferLead() {
  *
  * 这里按 peerId 取预判，而不是用 status().waitingFor —— 那个返回的是名字，
  * 和 lastForecasts 的键对不上。
+ *
+ * room 为真时只算让房间停下的人：游客自己缓冲不足只停他自己，房间不等他。
  */
-function stallWaitSeconds() {
+function stallWaitSeconds({ room = false } = {}) {
   if (!S.sync) return null;
   const leads = [];
-  if (S.sync.localStalled) leads.push(myBufferLead());
+  if (S.sync.localStalled && (!room || S.sync.canIControl())) leads.push(myBufferLead());
   for (const peerId of S.sync.stalledPeers.keys()) leads.push(lastForecasts.get(peerId)?.lead);
   return worstWaitSeconds(leads);
 }
 
 function stallBannerText(waitingFor) {
   const who = waitingFor.join('、');
-  const wait = stallWaitSeconds();
+  const wait = stallWaitSeconds({ room: true });
   return wait
     ? `全员暂停中 —— 在等 ${who} 把缓冲攒够，约 ${fmtTime(wait)}`
     : `全员暂停中 —— 在等 ${who} 把缓冲攒够`;
 }
 
+/** 只有本机游客在卡（房间照常播放）时的横幅：别说成「全员暂停」，让人以为自己拖停了全房。 */
+function selfStallBannerText() {
+  const wait = stallWaitSeconds();
+  return wait
+    ? `缓冲不足，只暂停你自己，房间照常播放 —— 约 ${fmtTime(wait)} 后继续`
+    : '缓冲不足，只暂停你自己，房间照常播放';
+}
+
 /**
- * 全员暂停在等谁。和 status().waitingFor 同一批人、同一个顺序，但名字按成员表同一套显示名（重名编号），
+ * 全员暂停在等谁。和 status().waitingFor 基本是同一批人、同一个顺序，但名字按成员表同一套显示名（重名编号），
  * 两个「小明」时分得清是哪一个在卡；不在表里的（星型房间里经房主转来的别人）用他报的名字。
+ * 游客自己卡着不列进去：他的卡顿只停他自己，房间不是在等他（status() 里仍然有他）。
  */
 function stallWaitingNames() {
   const shown = roomDisplayNames();
   const out = [...S.sync.stalledPeers].map(([peerId, v]) => shown.get(peerId) || v.name);
-  if (S.sync.localStalled) out.unshift('你'); // 和 status() 一样，由 t() 统一翻译
+  if (S.sync.localStalled && S.sync.canIControl()) out.unshift('你'); // 和 status() 一样，由 t() 统一翻译
   return out;
 }
 
@@ -8247,11 +8261,15 @@ function renderStatus() {
   const playFailed = linkPlayFailed();
   // 房间在播不等于本机播放器起来了：还在等授权、或者解析失败的时候，横幅得说清在等什么
   const linkWaiting = cur?.kind === 'link' && ((!S.mpvRunning && (asking || failed)) || playFailed);
+  // 安全模式收完才播：房间在播、本机还在收（播放器没开，也还不许开）的人不参与卡顿，
+  // 横幅不能说「播放中」，要走到最后说他在等什么
+  const receivingOnly = !st.paused && cur?.kind === 'file' && !S.mpvRunning && !playbackAllowed();
 
   if (st.stalled) {
     banner.className = 'status-banner waiting';
-    banner.textContent = stallBannerText(stallWaitingNames());
-  } else if (!st.paused && !linkWaiting) {
+    // 有人卡着不一定是全员暂停：游客自己缓冲不足只停他自己，房间照常播放（roomStalled 为假）
+    banner.textContent = S.sync.roomStalled ? stallBannerText(stallWaitingNames()) : selfStallBannerText();
+  } else if (!st.paused && !linkWaiting && !receivingOnly) {
     // 在播但本机和房主没对上：用提醒的黄色，别亮「一切正常」的绿
     banner.className = driftShown() ? 'status-banner waiting' : 'status-banner playing';
     banner.textContent = driftShown()

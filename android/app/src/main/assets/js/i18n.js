@@ -136,6 +136,10 @@ const EN = new Map(Object.entries({
   '邀请链接异常过长，已忽略': 'The invite link is unexpectedly long and was ignored',
   '正在加入房间，请稍候': 'Joining the room, please wait',
   '信令服务器一直没有回应': 'The signaling server never responded',
+  // 信令模式按服务器给的房主身份认房主（见 app-android.js 的 adoptSignalHost），接在「连接失败：」后面
+  '信令服务器没有告诉我们谁是房主，已拒绝加入': 'The signaling server did not say who the host is; join refused',
+  '这个房间号还没有人开房：可能填错了，或者房主还没开房、已经离开':
+    'Nobody has opened a room with this number: it may be mistyped, or the host has not opened it yet or has already left',
   '生成应答链接超时': 'Generating the answer link timed out',
   // 原生层核对清单时给出的原因（接在「打开接收会话失败：」「没法接收这一部：」后面）
   '同时打开的接收会话太多': 'Too many receive sessions are open at once',
