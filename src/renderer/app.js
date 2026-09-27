@@ -4113,6 +4113,10 @@ function scheduleReconnect(peer, sig, { retry = false } = {}) {
   // 房主强退、崩溃、正常退出都是这个顺序：先断信令，数据通道后关
   if (sig.hasLeft?.(peerId)) {
     cancelRecovery(peerId);
+    // 手上这条连接也摘掉：对面进程没了，SCTP 却可能一直认为通道开着（ctrl 还是 open），
+    // 留着就是一条永远不会再通的僵尸连接，占着名额和一条 RTCPeerConnection。退避用尽那一支会摘，这里以前漏了
+    const stale = S.swarm.peers.get(peerId);
+    if (stale && !directLinkUp(stale)) S.swarm.removePeer(peerId);
     if (peerId === S.hostId) hostReallyGone('left', peer);
     return;
   }

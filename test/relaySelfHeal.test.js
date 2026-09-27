@@ -22,6 +22,11 @@ const RELAYS = ['wss://a', 'wss://b'];
  *  - cut(owner, 'silent')：连接看着还开着，但两个方向都一个字节不走（半开的 TCP）；
  *  - restore(owner)：网络回来了。
  * EVENT 收到后回 OK，并把事件推给所有匹配的订阅（含发送者自己的），实时推送也按 since 过滤。
+ * REQ 之后回 EOSE。中继存着的临时事件回不回放按中继分（replay），和实测的公共中继一样：
+ *  - 'limit'：strfry 那样，订阅不带 limit:0 就在 EOSE 之前把存着的全回放；
+ *  - 'always'：不理 limit，照样回放（实测 bucket.coracle.social）；
+ *  - 不设：什么都不存。
+ * noEose 里的中继从不回 EOSE（实测 nostr-relay.corb.net 对带 limit:0 的订阅）。
  */
 class FakeNet {
   constructor() {
@@ -31,10 +36,17 @@ class FakeNet {
     this.reqs = [];
     this.opens = new Map(); // url -> 连上的次数
     this.kick = new Set(); // 这些中继握手后立刻把人踢掉
+    this.replay = new Map(); // url -> 'limit' | 'always'
+    this.noEose = new Set();
+    this.replayed = []; // [{ url, owner, ev }]：回放出去的事件
   }
   relay(url) {
     if (!this.relays.has(url)) this.relays.set(url, { subs: new Set(), events: [] });
     return this.relays.get(url);
+  }
+  static matches(f, ev) {
+    if (!f.kinds.includes(ev.kind) || ev.created_at < (f.since ?? 0)) return false;
+    return ev.tags.some((t) => t[0] === 'x' && f['#x'].includes(t[1]));
   }
   cut(owner, mode = 'close') {
     this.down.set(owner, mode);
@@ -79,8 +91,19 @@ class FakeNet {
         const msg = JSON.parse(text);
         const relay = net.relay(this.url);
         if (msg[0] === 'REQ') {
-          net.reqs.push({ url: this.url, owner: this.owner, filter: msg[2], at: Math.floor(Date.now() / 1000) });
-          relay.subs.add({ ws: this, id: msg[1], filter: msg[2] });
+          const [, id, filter] = msg;
+          net.reqs.push({ url: this.url, owner: this.owner, id, filter, at: Math.floor(Date.now() / 1000) });
+          relay.subs.add({ ws: this, id, filter });
+          // 回放和 EOSE 走同一个投递队列，先后次序和真中继一样：存着的在前，EOSE 在后
+          const mode = net.replay.get(this.url);
+          if (mode === 'always' || (mode === 'limit' && filter.limit !== 0)) {
+            for (const ev of relay.events) {
+              if (!FakeNet.matches(filter, ev)) continue;
+              net.replayed.push({ url: this.url, owner: this.owner, ev });
+              this._deliver(JSON.stringify(['EVENT', id, ev]));
+            }
+          }
+          if (!net.noEose.has(this.url)) this._deliver(JSON.stringify(['EOSE', id]));
         } else if (msg[0] === 'CLOSE') {
           for (const s of relay.subs) if (s.ws === this && s.id === msg[1]) relay.subs.delete(s);
         } else if (msg[0] === 'EVENT') {
@@ -88,10 +111,7 @@ class FakeNet {
           relay.events.push(ev);
           this._deliver(JSON.stringify(['OK', ev.id, true, '']));
           for (const s of relay.subs) {
-            const f = s.filter;
-            if (!f.kinds.includes(ev.kind) || ev.created_at < (f.since ?? 0)) continue;
-            if (!ev.tags.some((t) => t[0] === 'x' && f['#x'].includes(t[1]))) continue;
-            s.ws._deliver(JSON.stringify(['EVENT', s.id, ev]));
+            if (FakeNet.matches(s.filter, ev)) s.ws._deliver(JSON.stringify(['EVENT', s.id, ev]));
           }
         }
       }
@@ -103,9 +123,8 @@ class FakeNet {
 }
 
 /** 一个房间：房主带 isLinked（直连状态由 linked 这张表说了算），成员按需加。 */
-async function room(t, dir, { grace = 300, host: hostOpts = {}, timing = {} } = {}) {
+async function room(t, dir, { grace = 300, host: hostOpts = {}, timing = {}, net = new FakeNet() } = {}) {
   const lib = await import(dir + 'relaySignaling.js');
-  const net = new FakeNet();
   const secret = lib.newRoomSecret();
   const made = [];
   const logs = new Map();
@@ -350,13 +369,100 @@ for (const { name, dir } of IMPLS) {
     assert.equal(ok.retry, 1, '连稳了的中继断开后退避没从头算');
   });
 
-  test(`${name}：订阅的 since 和新鲜窗口一样宽（600 秒）：时钟比房主慢几分钟的人也收得到`, async (t) => {
+  test(`${name}：订阅的 since 和新鲜窗口一样宽（600 秒）：时钟比房主慢几分钟的人也收得到；同时带 limit: 0，不要中继回放`, async (t) => {
     const r = await room(t, dir);
     const a = r.guest('a');
     await a.connect();
+    assert.ok(r.net.reqs.length >= 4);
     for (const { filter, at } of r.net.reqs) {
       assert.ok(at - filter.since >= 599 && at - filter.since <= 601, `since 只往前放了 ${at - filter.since} 秒`);
+      assert.equal(filter.limit, 0, '订阅没带 limit: 0，中继会把存着的约 5 分钟临时事件全回放');
     }
+  });
+
+  // E2-A（实测 r7）：批次 3 把 since 放宽到 now − 600 之后，真实中继在 EOSE 之前回放约 5 分钟内的临时事件。
+  // 房主中继断着时有人点了链接（HOST_OFFLINE、早已放弃），房主恢复时收到回放的旧 hello 把他放行成待定成员；
+  // 他再点链接得 DUP_PEER，60 秒后又被当成「一直没直连」封禁，本次运行再也进不来
+  test(`${name}：房主断网时有人点过链接又放弃了：中继恢复后在 EOSE 之前回放那几条旧 hello，房主不放行；那人再来照常进房、不会被封`, async (t) => {
+    const net = new FakeNet();
+    net.replay.set('wss://a', 'limit'); // strfry：订阅不带 limit:0 才回放
+    net.replay.set('wss://b', 'always'); // 不理 limit 的
+    const r = await room(t, dir, { net });
+    r.net.cut('host');
+    await until(() => r.host.connected === false, '房主发现中继全断');
+    const late = r.guest('late');
+    await assert.rejects(late.connect(), (e) => e.code === 'HOST_OFFLINE');
+    late.close();
+    const stale = r.net.relay('wss://b').events.filter((ev) => ev.pubkey === late.publicKey);
+    assert.ok(stale.length > 0, '断网期间的 hello 没存到中继上，测不出回放');
+
+    r.net.restore('host');
+    await until(() => r.events(r.host, 'reconnected').length === 1, '房主恢复');
+    await until(() => r.net.replayed.some((x) => x.owner === 'host' && x.ev.pubkey === late.publicKey), '不理 limit 的中继回放了旧 hello');
+    await sleep(120);
+    assert.ok(!r.net.replayed.some((x) => x.url === 'wss://a'), '订阅带了 limit:0，strfry 那样的中继就不该回放');
+    assert.deepEqual(r.events(r.host, 'peer-join'), [], '回放的旧 hello 被放行了');
+    assert.equal(r.host._members.size, 0, '早已放弃的人占着待定名额');
+
+    // 他重新点链接：同一个 peerId、新的签名公钥，照常放行（不是 DUP_PEER）
+    const again = r.guest('late');
+    await again.connect();
+    r.linked.add('late');
+    await sleep(400); // 超过宽限期（300）
+    assert.ok(r.host._members.has('late'));
+    assert.ok(!r.host._isBanned('late', again.publicKey), '被回放那一次连累封禁了');
+    assert.deepEqual(r.events(again, 'error'), []);
+  });
+
+  test(`${name}：成员断网期间别人发给他的 offer：恢复时不理 limit 的中继在 EOSE 之前回放，不交给 app；恢复后实时发来的照常收`, async (t) => {
+    const net = new FakeNet();
+    for (const url of RELAYS) net.replay.set(url, 'always');
+    const r = await room(t, dir, { grace: 5000, net });
+    const a = r.guest('a');
+    await a.connect();
+    r.linked.add('a');
+    await sleep(80);
+    r.net.cut('a');
+    await until(() => a.connected === false, 'a 发现中继全断');
+    r.host.signal('a', { kind: 'offer', sdp: { type: 'offer', sdp: 'v=0 old' } });
+    await sleep(30);
+    r.net.restore('a');
+    await until(() => r.events(a, 'reconnected').length === 1, 'a 恢复');
+    await until(() => r.net.replayed.some((x) => x.owner === 'a'), '中继向 a 回放了');
+    await sleep(60);
+    assert.deepEqual(r.events(a, 'signal'), [], '回放的旧 offer 交给了 app：它会拆掉正在重建的连接');
+    r.host.signal('a', { kind: 'offer', sdp: { type: 'offer', sdp: 'v=0 new' } });
+    await until(() => r.events(a, 'signal').length > 0, 'a 收到恢复之后的 offer');
+    await sleep(30);
+    assert.deepEqual(r.events(a, 'signal').map((s) => s.payload.sdp.sdp), ['v=0 new']);
+  });
+
+  test(`${name}：带 limit:0 时不回 EOSE 的中继：等 eoseWait 之后按实时算，照常放行、照常收信令；只认当前这次订阅的 EOSE`, async (t) => {
+    const net = new FakeNet();
+    for (const url of RELAYS) net.noEose.add(url);
+    const eoseWait = 250;
+    // 进房超时放宽：前 eoseWait 里的 hello 都被丢掉，高负载时别卡在默认的 600 毫秒上
+    const r = await room(t, dir, { net, grace: 5000, timing: { eoseWait, join: 3000 } });
+    const t0 = Date.now(); // 房主刚订阅完
+    const a = r.guest('a');
+    await a.connect();
+    assert.ok(Date.now() - t0 >= eoseWait - 50, `等不到 EOSE 的那段时间里 hello 就被放行了（${Date.now() - t0}ms）`);
+    await sleep(eoseWait + 50);
+    r.host.signal('a', { kind: 'offer', sdp: { type: 'offer', sdp: 'v=0 x' } });
+    await until(() => r.events(a, 'signal').length === 1, 'a 收到 offer');
+
+    // EOSE 只认当前订阅的 id；换话题重新订阅之后要重新等
+    const url = RELAYS[0];
+    const slot = r.host._sockets.get(url);
+    r.host._t.eoseWait = 60_000;
+    const before = slot.sub;
+    await r.host._moveTo(r.lib.newRoomSecret());
+    assert.notEqual(slot.sub, before, '换话题要换一个订阅 id');
+    assert.equal(r.host._live(url), false);
+    r.host._onRelayMessage(url, JSON.stringify(['EOSE', before]));
+    assert.equal(r.host._live(url), false, '上一次订阅迟到的 EOSE 被当成了这一次的');
+    r.host._onRelayMessage(url, JSON.stringify(['EOSE', slot.sub]));
+    assert.equal(r.host._live(url), true);
   });
 
   test(`${name}：换链接：连上过、正在重连的成员（还在宽限期里）也拿到新密钥；从没连上过的不给，并报给房主`, async (t) => {

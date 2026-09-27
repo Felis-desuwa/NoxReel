@@ -1788,6 +1788,9 @@ function scheduleReconnect(peer, sig, { retry = false } = {}) {
   // 退避只是空等（和电脑端一样；房间链接的信令没有 hasLeft，不走这条）
   if (sig.hasLeft?.(peerId)) {
     cancelRecovery(peerId);
+    // 手上这条连接也摘掉：对面进程没了，SCTP 却可能一直认为通道开着，留着就是僵尸连接（和电脑端一样）
+    const stale = S.swarm.peers.get(peerId);
+    if (stale && !directLinkUp(stale)) S.swarm.removePeer(peerId);
     return;
   }
   const st = RECOVERY.get(peerId) || { attempts: 0, timer: null, watch: null };

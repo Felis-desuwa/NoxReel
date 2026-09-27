@@ -66,6 +66,8 @@ export class Peer extends Emitter {
     this.allowIdentityRename = allowIdentityRename === true;
     this.authenticated = false;
     this.closed = false;
+    this._failed = false; // 已经报过 failed（见 _fail）
+    this._closeEmitted = false; // 已经报过 close（见 _emitClose）
 
     this.ctrl = null;
     this.data = null;
@@ -143,11 +145,20 @@ export class Peer extends Emitter {
     };
     this.pc.oniceconnectionstatechange = () => {
       const s = this.pc.iceConnectionState;
+      if (s === 'failed') return this._fail();
       this.emit('statechange', s);
-      if (s === 'failed' || s === 'closed') this.emit('failed', s);
+      if (s === 'closed') this.emit('failed', s);
       if (s === 'disconnected') this.emit('disconnected', s);
     };
-    this.pc.onconnectionstatechange = () => this.emit('connectionstate', this.pc.connectionState);
+    // 连接状态（ICE 加 DTLS）报 failed 也算直连失败。Electron 43 实测：对方整个断网（渲染进程挂起、
+    // 进程被杀）时，应答方这边 ICE 停在 disconnected 不再往下走，connectionState 二十来秒就到 failed，
+    // SCTP 却还认为通道开着 —— 只看 ICE 的话这条连接永远不算失败：不出 peer-gone、不说「离开了」，
+    // 成员表里一直显示连着
+    this.pc.onconnectionstatechange = () => {
+      const s = this.pc.connectionState;
+      this.emit('connectionstate', s);
+      if (s === 'failed') this._fail();
+    };
 
     if (initiator) {
       this._setupChannel((this.ctrl = this.pc.createDataChannel('ctrl', { ordered: true })), 'ctrl');
@@ -174,7 +185,7 @@ export class Peer extends Emitter {
       }
     };
     ch.onclose = () => {
-      if (!this.closed) this.emit('close');
+      if (!this.closed) this._emitClose();
     };
     ch.onerror = (e) => this.emit('error', e?.error || new Error(`${kind} 通道出错`));
 
@@ -454,6 +465,27 @@ export class Peer extends Emitter {
     });
   }
 
+  /**
+   * 直连失败：ICE 状态和连接状态谁先报 failed 都走这里，上层只收到一次。
+   * statechange 也补一条 'failed'，上层按 ICE failed 那一套处理（说明原因、排重连）。
+   */
+  _fail() {
+    if (this._failed || this.closed) return;
+    this._failed = true;
+    this.emit('statechange', 'failed');
+    this.emit('failed', 'failed');
+  }
+
+  /**
+   * 连接没了，只报一次：ctrl、data 两条通道各会报一次关闭，close() 自己也要报。
+   * 报两次的话上层「X 断开了」写两行、sync.peerGone 也调两次。
+   */
+  _emitClose() {
+    if (this._closeEmitted) return;
+    this._closeEmitted = true;
+    this.emit('close');
+  }
+
   close() {
     if (this.closed) return;
     this.closed = true;
@@ -464,7 +496,7 @@ export class Peer extends Emitter {
       this.data?.close();
       this.pc.close();
     } catch {}
-    this.emit('close');
+    this._emitClose();
     this.removeAll();
   }
 }

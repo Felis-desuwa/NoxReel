@@ -115,7 +115,7 @@ function recoveryBox() {
     },
   };
   const ctx = sandbox({
-    fns: ['scheduleReconnect', 'cancelRecovery', 'peerLinked'],
+    fns: ['scheduleReconnect', 'cancelRecovery', 'peerLinked', 'directLinkUp'],
     decls: ['RECONNECT_BACKOFF_MS', 'HANDSHAKE_TIMEOUT_MS', 'RECOVERY'],
     globals: {
       S,
@@ -183,7 +183,11 @@ test('重连退避用尽：最后一轮停在半路的连接摘掉（房主先�
 
 test('安卓端：信令宣布离开的人不空等重连；退避用尽时同样摘掉停在半路的连接', () => {
   const body = fnSource('scheduleReconnect', ANDROID);
-  assert.match(body, /if \(sig\.hasLeft\?\.\(peerId\)\) \{\s*cancelRecovery\(peerId\);\s*return;\s*\}/);
+  // 手上的僵尸连接也摘掉（E3-C），行为测试见 peerFailure.test.js
+  assert.match(
+    body,
+    /if \(sig\.hasLeft\?\.\(peerId\)\) \{\s*cancelRecovery\(peerId\);\s*(?:\/\/[^\n]*\n\s*)*const stale = S\.swarm\.peers\.get\(peerId\);\s*if \(stale && !directLinkUp\(stale\)\) S\.swarm\.removePeer\(peerId\);\s*return;\s*\}/
+  );
   assert.match(body, /const stuck = S\.swarm\.peers\.get\(peerId\);\s*if \(stuck && stuck\.ctrl\?\.readyState !== 'open'\) S\.swarm\.removePeer\(peerId\);/);
 });
 

@@ -30,7 +30,8 @@ import { schnorr, getSharedSecret } from './third_party/secp256k1.js';
  * 断线自愈：本机中继全断的那段时间里，谁都「没动静」、谁的直连都「连不上」—— 那是自己的问题，
  * 不是别人的。所以全断期间不做静默清理、不做未直连移出；恢复时把这两项计时从头算，再发
  * reconnected（带上信令知道的每个人和该由谁发起），app 据此把断着的直连重新拉起来 ——
- * 中继上都是临时事件，断着时发出去的 offer / renegotiate 早就丢了，没有别的东西会再补发。
+ * 中继上都是临时事件（有的中继会在内存里留几分钟，但订阅时不要回放，见 _subscribe），
+ * 断着时发出去的 offer / renegotiate 等于丢了，没有别的东西会再补发。
  * 成员恢复时还会重新 hello 一次：还在房里的，房主回一份带名册的 welcome（补上断线期间进来的人）；
  * 已经被移出的，房主回 REMOVED，别停在一个谁都连不上的房间里。
  */
@@ -48,7 +49,7 @@ export const DEFAULT_RELAYS = [
   'wss://schnorr.me',
 ];
 
-// 20000–29999 是 Nostr 的临时事件：中继只转发、不落盘。
+// 20000–29999 是 Nostr 的临时事件：中继只转发、不落盘（有的会在内存里留约 5 分钟，见 _subscribe）。
 export const RELAY_EVENT_KIND = 23473;
 // 消息结构的版本。和 P2P 协议版本无关：这一层变了，老客户端只会等不到 welcome。
 // 0.7.5 在消息里加了 n（发送计数）和 pk（签名公钥），老客户端不认识这两项、原样忽略，
@@ -68,6 +69,9 @@ const RELAY_STABLE_MS = 30000;
 const RELAY_QUIET_MS = 45000;
 // 新鲜窗口：发送方时钟可能不准，created_at 与本机相差超过这个范围的事件一律当重放丢掉
 const MAX_SKEW_SEC = 600;
+// 订阅后等中继回 EOSE（「存着的发完了，后面都是实时的」）最多这么久。实测默认中继 0.1–0.6 秒就回；
+// 带 limit:0 时有的中继（nostr-relay.corb.net）压根不回 EOSE，过了这个时间就当它已经是实时的
+const EOSE_WAIT_MS = 3000;
 // 去重表按时间淘汰，不按条数：一条事件的 id 一直留到它自己的新鲜窗口过去之后（见 _remember），
 // 「已经被忘掉」和「还会被接受」两段时间没有交集，灌多少垃圾都冲不掉。
 // 条数上限只是兜底 —— 只有验签、解密都通过又没超限速的事件才会记进来，按限速算正常到不了；
@@ -317,6 +321,7 @@ export class RelaySignaling extends Emitter {
       pendingMax: PENDING_MAX,
       relayStable: RELAY_STABLE_MS,
       relayQuiet: RELAY_QUIET_MS,
+      eoseWait: EOSE_WAIT_MS,
       ...(o.timing || {}),
     };
     this._pendingMax = Math.max(1, Math.floor(Number(o.pendingMax ?? this._t.pendingMax)) || PENDING_MAX);
@@ -332,9 +337,11 @@ export class RelaySignaling extends Emitter {
     this.trickle = false;
     this.connected = false;
 
-    // url -> { ws, retry, timer, open, openedAt, rxAt, heard }：rxAt 是最后收到任何东西的时刻，
-    // heard 表示这条连接回应过我们自己发的东西（见 RELAY_QUIET_MS）
+    // url -> { ws, retry, timer, open, openedAt, rxAt, heard, sub, subAt, eose }：rxAt 是最后收到任何东西的时刻，
+    // heard 表示这条连接回应过我们自己发的东西（见 RELAY_QUIET_MS）；sub / subAt / eose 是当前这次订阅的
+    // id、发出的时刻、中继回没回过 EOSE（见 _subscribe）
     this._sockets = new Map();
+    this._subSeq = 0;
     this._downSince = 0; // 中继全断的时刻（全断时才非零）
     this._closedByUs = false;
     this._room = null; // { topic, key }
@@ -542,7 +549,7 @@ export class RelaySignaling extends Emitter {
 
   _openRelay(url, first = null) {
     if (this._closedByUs) return;
-    const slot = this._sockets.get(url) || { ws: null, retry: 0, timer: null, open: false, openedAt: 0, rxAt: 0, heard: false };
+    const slot = this._sockets.get(url) || { ws: null, retry: 0, timer: null, open: false, openedAt: 0, rxAt: 0, heard: false, sub: '', subAt: 0, eose: false };
     this._sockets.set(url, slot);
     let ws;
     try {
@@ -560,7 +567,7 @@ export class RelaySignaling extends Emitter {
       slot.openedAt = slot.rxAt = Date.now();
       slot.heard = false;
       this.connected = true;
-      this._subscribe(ws);
+      this._subscribe(slot);
       first?.onOpen();
       first = null;
       if (this._downSince) this._recovered();
@@ -674,15 +681,31 @@ export class RelaySignaling extends Emitter {
     slot.timer = setTimeout(() => this._openRelay(url), this._backoff(slot.retry++));
   }
 
-  _subscribe(ws) {
-    if (!this._room) return;
-    // since 和本地的新鲜窗口一样宽：中继对实时推送也按整条过滤器（含 since）匹配，
-    // 窄了的话发送方时钟比我慢几十秒，他的消息就被中继挡在外面。临时事件中继本来不存，
-    // since 挡不了什么历史；重放照旧由去重表和发送计数挡
-    const filter = { kinds: [RELAY_EVENT_KIND], '#x': [this._room.topic], since: Math.floor(Date.now() / 1000) - MAX_SKEW_SEC };
+  /**
+   * 订阅本房间的话题。since 和本地的新鲜窗口一样宽：中继对实时推送也按整条过滤器（含 since）匹配，
+   * 窄了的话发送方时钟比我慢几十秒，他的消息就被中继挡在外面。
+   *
+   * 临时事件不等于中继不存：实测 8 个默认中继里有 5 个（strfry 默认）把临时事件在内存里留约 5 分钟，
+   * 新订阅一来就在 EOSE 之前全部回放。房主断网恢复时收到回放的旧 hello，会把早已放弃的人放行成待定成员，
+   * 60 秒后又按「一直没连上直连」封禁他 —— 他再点链接永远进不来。所以带 limit: 0（「存着的一条都不要」），
+   * 只收订阅之后的实时推送。不理 limit 的中继（实测 bucket.coracle.social）还有一道保险：
+   * EOSE 之前送来的 hello / signal 丢掉（见 _process）。别的重放照旧由去重表和发送计数挡。
+   */
+  _subscribe(slot) {
+    if (!this._room || !slot.ws) return;
+    slot.sub = `nr${++this._subSeq}`;
+    slot.subAt = Date.now();
+    slot.eose = false;
+    const filter = { kinds: [RELAY_EVENT_KIND], '#x': [this._room.topic], since: Math.floor(Date.now() / 1000) - MAX_SKEW_SEC, limit: 0 };
     try {
-      ws.send(JSON.stringify(['REQ', 'nr', filter]));
+      slot.ws.send(JSON.stringify(['REQ', slot.sub, filter]));
     } catch {}
+  }
+
+  /** 这个中继送来的现在算不算实时推送：回过 EOSE，或者订阅之后等了 eoseWait 还没回（有的中继带 limit:0 不回 EOSE）。 */
+  _live(url) {
+    const slot = this._sockets.get(url);
+    return Boolean(slot?.sub) && (slot.eose || Date.now() - slot.subAt >= this._t.eoseWait);
   }
 
   async _moveTo(secret, derived = null) {
@@ -693,9 +716,9 @@ export class RelaySignaling extends Emitter {
     for (const s of this._sockets.values()) {
       if (!s.open) continue;
       try {
-        s.ws.send(JSON.stringify(['CLOSE', 'nr']));
+        s.ws.send(JSON.stringify(['CLOSE', s.sub]));
       } catch {}
-      this._subscribe(s.ws);
+      this._subscribe(s);
     }
   }
 
@@ -836,6 +859,12 @@ export class RelaySignaling extends Emitter {
       const slot = this._sockets.get(url);
       if (slot) slot.heard = true;
     }
+    if (msg[0] === 'EOSE') {
+      // 只认当前这次订阅的：换话题（rekey）之前那次订阅迟到的 EOSE 不算
+      const slot = this._sockets.get(url);
+      if (slot?.sub && msg[1] === slot.sub) slot.eose = true;
+      return;
+    }
     if (msg[0] !== 'EVENT') return;
     const ev = msg[2];
     if (!wellFormed(ev) || !ev.tags.some((t) => t[0] === 'x' && t[1] === room.topic)) return;
@@ -845,11 +874,13 @@ export class RelaySignaling extends Emitter {
     const busy = this._inflight.get(url) || 0;
     if (busy >= MAX_INFLIGHT_PER_RELAY) return;
     this._inflight.set(url, busy + 1);
+    // 收到的这一刻算不算实时：排队、解密要花时间，等轮到它时 EOSE 可能已经到了
+    const live = this._live(url);
     // 同一个 id 的几份排队处理：前一份被接受了，后面的直接丢；前一份是假的（签名或内容被改过），
     // 才轮到下一份。先按 id 登记、再验签的话，恶意中继抢先送一份改过签名的，
     // 各家诚实中继送来的真事件就全被当成重复丢掉了。
     const prev = this._chains.get(ev.id);
-    const run = (prev || Promise.resolve()).then(() => this._process(url, ev, room)).catch(() => {});
+    const run = (prev || Promise.resolve()).then(() => this._process(url, ev, room, live)).catch(() => {});
     this._chains.set(ev.id, run);
     return run.finally(() => {
       this._inflight.set(url, Math.max(0, (this._inflight.get(url) || 0) - 1));
@@ -857,7 +888,7 @@ export class RelaySignaling extends Emitter {
     });
   }
 
-  async _process(url, ev, room) {
+  async _process(url, ev, room, live = true) {
     if (this._room !== room || this._seen.has(ev.id)) return;
     // 解密比验签便宜得多，而且没有房间密钥的人造不出能解开的密文：局外人的垃圾在这一步就停了
     const body = await open(room.key, ev.content);
@@ -865,6 +896,10 @@ export class RelaySignaling extends Emitter {
     if (!Number.isFinite(body.ts) || Math.abs(Date.now() - body.ts) > MAX_SKEW_SEC * 1000) return;
     // 密文里写着签它的公钥（0.7.4 的没有这一项）：别人照抄密文、自己另签一份的，对不上
     if (body.pk !== undefined && body.pk !== ev.pubkey) return;
+    // 中继在 EOSE 之前送来的是它存着的旧事件（不理 limit:0 的中继，见 _subscribe）。
+    // 进房请求和握手只认实时的：旧 hello 会放行一个早就不等了的人，旧 offer 会拆掉活连接。
+    // 不验签、不记去重表 —— 同一条要是从别的中继实时送来，照常收
+    if (!live && (body.t === 'hello' || body.t === 'signal')) return;
     const cls = this._classify(body, ev.pubkey);
     if (!cls) return;
     const limit = cls === 'host' ? LIMITS.verifyHost : cls === 'stranger' ? LIMITS.verifyStranger : LIMITS.verifyMember;

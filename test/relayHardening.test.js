@@ -74,6 +74,8 @@ class FakeNet {
         const relay = net.relay(this.url);
         if (msg[0] === 'REQ') {
           relay.subs.add({ ws: this, id: msg[1], filter: msg[2] });
+          // 和真中继一样回 EOSE：存着的发完了（这里什么都不存），之后都是实时推送
+          setTimeout(() => this.readyState === 1 && this.onmessage?.({ data: JSON.stringify(['EOSE', msg[1]]) }), 1);
         } else if (msg[0] === 'CLOSE') {
           for (const s of relay.subs) if (s.ws === this && s.id === msg[1]) relay.subs.delete(s);
         } else if (msg[0] === 'EVENT') {
