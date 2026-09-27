@@ -929,9 +929,30 @@ test('安卓端：房间链接、连接设置、Cloudflare、列表编辑的新�
     '你是管理员：点一行可以调整；改动由房主那边执行',
     '列表还是空的，在上面加一个在线链接。',
     '本月用量已超过上限的 80%，快到上限了。',
+    // 收尾批次：和电脑端对齐的「清除」二次确认、隐藏我的 IP 的保存提醒、取号退避
+    '确认清除',
+    '再点一次「确认清除」才会删掉本机保存的 Cloudflare 凭据。之后要重新填 API Token 才能再用 —— Cloudflare 只在新建 Key 时显示一次 Token，没另外留底的话得去后台新建一个 Key。',
+    '「隐藏我的 IP」开着：清除之后新建的连接会被拦下，已经连着的不受影响。',
+    '现在还没有能用的 TURN 中继：「隐藏我的 IP」打开之后，新建的连接会一律被拦下，直到配好 TURN。确定这样保存就再点一次「保存连接设置」。',
+    'Cloudflare TURN 账号拿到了，之后新建的连接会带上中继',
+    '显示',
+    '隐藏',
   ]) {
     assert.doesNotMatch(translate(zh, 'en'), cjk, `安卓端漏翻：${zh}`);
   }
+  // 带状态码、带（UTC）的动态句式
+  assert.equal(
+    translate('Cloudflare TURN 账号没拿到（Cloudflare 暂时不可用（限流或服务故障），稍后再试），这次先不走中继、只尝试直连', 'en'),
+    'Could not get Cloudflare TURN credentials (Cloudflare is temporarily unavailable (rate limiting or an outage); try again later); trying a direct connection only this time'
+  );
+  assert.equal(
+    translate('没保存：Cloudflare 的回应看不懂（HTTP 418）', 'en'),
+    'Not saved: Cloudflare sent a response that could not be understood (HTTP 418)'
+  );
+  assert.match(
+    translate('本月 Cloudflare TURN 用量已到你设的上限（900 GB），为免扣费已停用；下个月 1 日（UTC）自动恢复，或者在连接设置里调高上限。「隐藏我的 IP」开着，没有中继就不连接。', 'en'),
+    /^This month’s Cloudflare TURN usage has reached your limit \(900 GB\).*1st of next month \(UTC\).*“Hide my IP” is on/
+  );
 });
 
 /**

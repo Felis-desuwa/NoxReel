@@ -512,6 +512,75 @@ for (const { name, dir } of IMPLS) {
     assert.deepEqual(signals.map((m) => m.payload.n), [1], '进房前的信令发出去了');
   });
 
+  test(`${name}：WsSignaling 构造时不知道房主（手机直接填地址进房）也记下首次 joined 里的摘要，认下同一个房主后重连就带上`, { timeout: 10000 }, async (t) => {
+    const { WsSignaling } = await import(dir + 'signaling.js');
+    const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    await new Promise((resolve) => wss.once('listening', resolve));
+    const joins = [];
+    // 每个客户端连上来时服务器说的房主和摘要（按连接次序取）
+    let replies = [];
+    wss.on('connection', (ws) => {
+      ws.on('message', (raw) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.t !== 'join') return;
+        joins.push(msg);
+        const reply = replies.shift() || { hostId: 'host' };
+        ws.send(JSON.stringify({ t: 'joined', peerId: msg.peerId, peers: [], maxMembers: 6, ...reply }));
+        if (reply.drop) setTimeout(() => ws.terminate(), 30);
+      });
+    });
+    const sigs = [];
+    t.after(() => {
+      for (const s of sigs) s.close();
+      for (const c of wss.clients) c.terminate();
+      return new Promise((resolve) => wss.close(resolve));
+    });
+    const url = `ws://127.0.0.1:${wss.address().port}`;
+    const reconnect = async (sig, adopt) => {
+      const count = joins.length;
+      const first = await sig.connect();
+      assert.ok(!('hostKey' in first), '摘要留在 WsSignaling 里，不交给调用方');
+      adopt(first);
+      await withTimeout(
+        new Promise((resolve) => sig.on('joined', () => joins.length === count + 2 && resolve())),
+        5000,
+        '重连'
+      );
+      return joins.slice(count);
+    };
+
+    // 手机：构造时 hostId 是 null，进房之后调用方认下服务器说的房主（adoptSignalHost 做的就是这个）
+    replies = [{ hostId: 'host', hostKey: 'k'.repeat(43), drop: true }, { hostId: 'host' }];
+    const phone = new WsSignaling({ url, roomId: 'room', peerId: 'g', name: 'G' });
+    sigs.push(phone);
+    let [firstJoin, again] = await reconnect(phone, (joined) => {
+      phone.hostId = joined.hostId;
+    });
+    assert.ok(!('hostHint' in firstJoin) && !('hostKey' in firstJoin));
+    assert.equal(again.hostHint, 'host');
+    assert.equal(again.hostKey, 'k'.repeat(43), '第一次重连的提示没带首次 joined 里的摘要');
+
+    // 调用方后来认的房主换了人：摘要是上一个房主的，不作数
+    replies = [{ hostId: 'host', hostKey: 'm'.repeat(43), drop: true }, { hostId: 'other' }];
+    const other = new WsSignaling({ url, roomId: 'room2', peerId: 'g2', name: 'G2' });
+    sigs.push(other);
+    [firstJoin, again] = await reconnect(other, () => {
+      other.hostId = 'other';
+    });
+    assert.equal(again.hostHint, 'other');
+    assert.ok(!('hostKey' in again), '把别的房主的摘要交了上去');
+
+    // 服务器说房主就是自己（房间号没人开过）：不记
+    replies = [{ hostId: 'g3', hostKey: 'n'.repeat(43), drop: true }, { hostId: 'host' }];
+    const self = new WsSignaling({ url, roomId: 'room3', peerId: 'g3', name: 'G3' });
+    sigs.push(self);
+    [firstJoin, again] = await reconnect(self, () => {
+      self.hostId = 'host';
+    });
+    assert.equal(again.hostHint, 'host');
+    assert.ok(!('hostKey' in again));
+  });
+
   test(`${name}：WsSignaling 撞 DUP_PEER（自己的旧连接还挂着）时按固定的短间隔重试，有上限；平时照旧指数退避`, (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     return import(dir + 'signaling.js').then(({ WsSignaling }) => {

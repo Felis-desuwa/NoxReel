@@ -163,6 +163,12 @@
   .choice { display:flex; gap:18px; flex-wrap:wrap; }
   #net-settings .row { flex-wrap:wrap; }
   #net-settings .row button { flex:1; }
+  /* 密码框和「显示」按钮排在一行：框占满，按钮按内容宽 */
+  #net-settings .pass-row { flex-wrap:nowrap; }
+  #net-settings .pass-row input { flex:1; min-width:0; width:auto; }
+  #net-settings .pass-row button { flex:0 0 auto; padding:10px 14px; }
+  /* 「清除」撤不回：危险色、只按内容宽，和「验证并保存」拉开一段 */
+  #net-settings .cf-actions button.danger { flex:0 0 auto; margin-left:24px; color:var(--bad); background:transparent; border:1px solid var(--bad); }
 
   /* -------- 播放列表：管理员的编辑入口 -------- */
   #playlist-edit { padding:8px 14px 0; }
@@ -247,7 +253,11 @@
         <div class="hint">会自动同时尝试 UDP 和 TCP —— 酒店、公司和校园网经常只放行 TCP。</div>
         <label>TURN 用户名 / 密码</label>
         <input id="turn-user" placeholder="用户名" autocomplete="off" spellcheck="false" />
-        <input id="turn-pass" placeholder="密码" autocomplete="off" spellcheck="false" style="margin-top:6px" />
+        <!-- 密码默认遮住：放映时常开着屏幕共享、投屏，要核对就点「显示」 -->
+        <div class="row pass-row" style="margin-top:6px">
+          <input id="turn-pass" type="password" placeholder="密码" autocomplete="new-password" spellcheck="false" />
+          <button id="turn-pass-toggle" type="button">显示</button>
+        </div>
       </div>
 
       <div id="turn-cf" style="display:none">
@@ -257,9 +267,10 @@
         <!-- 只进不出：从不预填，保存成功就清空 -->
         <input id="cf-token" type="password" autocomplete="new-password" spellcheck="false" />
         <div class="hint">在 Cloudflare 后台 Realtime → TURN Server 新建一个 Key，把 Turn Token ID 和 API Token 填进来，点「验证并保存」。API Token 用手机系统的密钥库加密保存，只有 NoxReel 的原生层拿它换 24 小时有效的临时账号，界面上不会再显示。</div>
-        <div class="row" style="margin-top:10px">
+        <!-- 「清除」删掉本机加密保存的 Token，撤不回：危险样式、和「验证并保存」拉开，点两次才真删 -->
+        <div class="row cf-actions" style="margin-top:10px">
           <button id="cf-save">验证并保存</button>
-          <button id="cf-clear">清除</button>
+          <button id="cf-clear" class="danger">清除</button>
         </div>
         <div class="hint">这两个按钮点了立即生效，不用再点下面的「保存连接设置」；验证通过时 TURN 来源一并改成 Cloudflare。</div>
         <div class="hint" id="cf-result"></div>

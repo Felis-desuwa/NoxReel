@@ -151,8 +151,23 @@ test('请求：只认 turn.cloudflare.com、去掉 53 端口、不跟随跳转�
   // Turn Token ID 的字符集两边一样窄
   assert.match(desktopSrc, /\^\[A-Za-z0-9\]\{8,128\}\$/);
   assert.match(cfSrc, /\^\[A-Za-z0-9\]\{8,128\}\$/);
-  // 401/403 算未授权，其余非 2xx 算看不懂
+  // 401/403 算未授权，429 / 5xx 算暂时不可用（和桌面端一样），其余非 2xx 算看不懂
   assert.match(cfSrc, /status == 401 \|\| status == 403\) throw CfException\("CF_UNAUTHORIZED"/);
+  const gen = cfSrc.slice(cfSrc.indexOf('private fun generate('), cfSrc.indexOf('private fun readLimited('));
+  const unauthorized = gen.indexOf('status == 401 || status == 403');
+  const unavailable = gen.indexOf('if (status == 429 || status in 500..599) throw CfException("CF_UNAVAILABLE", "HTTP $status")');
+  const bad = gen.indexOf('if (status !in 200..299) throw CfException("CF_BAD_RESPONSE"');
+  assert.ok(unauthorized > 0 && unavailable > unauthorized && bad > unavailable, '429 / 5xx 要在「其余非 2xx 算看不懂」之前单独归类');
+  assert.match(desktopSrc, /status === 429 \|\| \(status >= 500 && status < 600\)[\s\S]{0,120}CF_UNAVAILABLE/);
+});
+
+test('调高月上限或跨了月（不再超）：status() 和 setLimit() 都撤掉 CF_QUOTA 那条旧错误，和桌面端 _settleQuotaError 一致', () => {
+  assert.match(cfSrc, /private fun settleQuotaError\(u: JSONObject\) \{\s*if \(lastError == "CF_QUOTA" && !u\.getBoolean\("exceeded"\)\) lastError = null\s*\}/);
+  const status = cfSrc.slice(cfSrc.indexOf('fun status()'), cfSrc.indexOf('private fun settleQuotaError('));
+  assert.match(status, /val u = usageJson\(\)\s*settleQuotaError\(u\)/);
+  const setLimit = cfSrc.slice(cfSrc.indexOf('fun setLimit('), cfSrc.indexOf('/* ---------------------------- 系统密钥库'));
+  assert.match(setLimit, /val next = usageJson\(\)\s*settleQuotaError\(next\)\s*return next/);
+  assert.match(desktopSrc, /_settleQuotaError\(usage\) \{\s*if \(this\.lastError === 'CF_QUOTA' && !usage\.exceeded\) this\.lastError = null;/);
 });
 
 test('临时账号和月用量的几个数和桌面端一致', () => {

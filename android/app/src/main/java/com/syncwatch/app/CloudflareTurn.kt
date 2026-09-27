@@ -140,11 +140,24 @@ class CloudflareTurn(private val dir: File) {
     }
 
     /** 设置里要的状态。没有 Token，也没有 Turn Token ID。 */
-    fun status(): JSONObject = JSONObject()
-        .put("configured", credFile.exists())
-        .put("expiresAt", cache?.expiresAt ?: JSONObject.NULL)
-        .put("lastError", lastError ?: JSONObject.NULL)
-        .put("usage", usageJson())
+    fun status(): JSONObject {
+        val u = usageJson()
+        settleQuotaError(u)
+        return JSONObject()
+            .put("configured", credFile.exists())
+            .put("expiresAt", cache?.expiresAt ?: JSONObject.NULL)
+            .put("lastError", lastError ?: JSONObject.NULL)
+            .put("usage", u)
+    }
+
+    /**
+     * 上一次取号撞上了月上限（lastError 是 CF_QUOTA），而现在已经不超了（调高了上限、或者跨了月）：
+     * 这条旧错误撤掉。不然连接设置的状态行还说「已到上限、已停用」，下面的用量行却是「本月已用 X / 新上限」，
+     * 要等下一次取号成功才清得掉。和桌面端 _settleQuotaError 同一条规则。
+     */
+    private fun settleQuotaError(u: JSONObject) {
+        if (lastError == "CF_QUOTA" && !u.getBoolean("exceeded")) lastError = null
+    }
 
     private fun credsJson(c: Creds): JSONObject = JSONObject()
         .put("urls", JSONArray(c.urls))
@@ -180,6 +193,8 @@ class CloudflareTurn(private val dir: File) {
                 throw CfException("CF_NETWORK", "连不上 Cloudflare")
             }
             if (status == 401 || status == 403) throw CfException("CF_UNAUTHORIZED", "HTTP $status")
+            // 限流和服务端故障是「过一会儿再试就好」，和「回应看不懂」分开：用户该等一等，页面也会在后台接着取
+            if (status == 429 || status in 500..599) throw CfException("CF_UNAVAILABLE", "HTTP $status")
             if (status !in 200..299) throw CfException("CF_BAD_RESPONSE", "HTTP $status")
             if (conn.contentLengthLong > MAX_RESPONSE_BYTES) throw CfException("CF_BAD_RESPONSE", "响应体过大")
             val text = try {
@@ -289,13 +304,18 @@ class CloudflareTurn(private val dir: File) {
         return usageJson().put("crossedWarn", crossedWarn)
     }
 
-    /** 改月上限（GB，1–1000）。调高到 80% 以下时，80% 的提醒下次还会再来一次。 */
+    /**
+     * 改月上限（GB，1–1000）。调高到 80% 以下时，80% 的提醒下次还会再来一次；
+     * 调到用量以上时，「已到上限」那条旧错误跟着撤掉（见 settleQuotaError）。
+     */
     fun setLimit(limitGB: Int): JSONObject {
         val u = rollover()
         u.limitGB = limitGB
         if (u.usedBytes < limitGB.toLong() * BYTES_PER_GB * WARN_PERCENT / 100) u.warned = false
         persistUsage()
-        return usageJson()
+        val next = usageJson()
+        settleQuotaError(next)
+        return next
     }
 
     /* ---------------------------- 系统密钥库 ---------------------------- */
@@ -361,8 +381,8 @@ class CloudflareTurn(private val dir: File) {
         const val MIN_LIMIT_GB = 1
         const val MAX_LIMIT_GB = 1000
         private const val WARN_PERCENT = 80L
-        // 和桌面端主进程的校验上限一致
-        const val MAX_MIN_VALID_MS = 3 * 60 * 60 * 1000L
+        // 和桌面端主进程的校验上限一致：页面离过期不到 12 小时就换一组，要的最短有效期是 12 小时，这里放到 13 小时
+        const val MAX_MIN_VALID_MS = 13 * 60 * 60 * 1000L
         const val MAX_USAGE_REPORT = 64L * BYTES_PER_GB
 
         /** Turn Token ID：只能是字母数字，8–128 位。它会拼进请求路径，字符集必须收得很窄。 */

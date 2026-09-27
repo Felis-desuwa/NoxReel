@@ -909,7 +909,8 @@ test('一对一应答把房主邀请的编号原样写回，房主据此拒掉�
 
 test('信令服务器模式：进房后把服务器认的房主和房间人数交给 WsSignaling，服务器重启后重连时当建房提示', async (t) => {
   const phone = await loadPhone(t);
-  const ws = await serverJoin(phone, { hostId: 'HOSTSRV1', maxMembers: 6 });
+  // 首次 joined 里带着房主凭据的摘要：手机建 WsSignaling 时还不知道房主是谁，也得记下，第一次重连就带上
+  const ws = await serverJoin(phone, { hostId: 'HOSTSRV1', maxMembers: 6, hostKey: 'k'.repeat(43) });
   const firstJoin = ws.sent.find((m) => m.t === 'join');
   assert.equal(firstJoin.hostHint, undefined, '首次加入不带提示（房间不在就是关了）');
 
@@ -921,6 +922,7 @@ test('信令服务器模式：进房后把服务器认的房主和房间人数�
   again.onopen();
   const join = again.sent.find((m) => m.t === 'join');
   assert.equal(join.hostHint, 'HOSTSRV1', '重连时不带房主提示，房间会由先重连上的人重建、他成了房主');
+  assert.equal(join.hostKey, 'k'.repeat(43), '第一次重连的提示不带摘要：服务器没法核对回来认领的是不是真房主');
   assert.equal(join.maxMembers, 6);
 });
 

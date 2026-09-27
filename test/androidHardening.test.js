@@ -406,6 +406,14 @@ class FakePC {
   createDataChannel() {
     return { close() {}, readyState: 'connecting' };
   }
+  // 换到新的 Cloudflare 临时账号时，还连着的连接经 setConfiguration 换上（见 refreshLiveCfTurn）
+  getConfiguration() {
+    return { ...this.config };
+  }
+  setConfiguration(config) {
+    this.config = config;
+    this.reconfigured = (this.reconfigured || 0) + 1;
+  }
   addEventListener() {}
   removeEventListener() {}
 }
@@ -1148,9 +1156,8 @@ test('连接设置：写错了当场说；保存后用的是和电脑端同一�
   phone.$('turn-pass').value = '';
   assert.match(await save(), /要填用户名和密码/);
   phone.$('turn-pass').value = 'p';
+  // 来源是「自己填」：藏着的 Cloudflare 那组填了东西也不拦 —— 报错指过去用户也看不见、改不了
   phone.$('cf-key').value = 'abcdef1234';
-  assert.match(await save(), /Cloudflare 凭据还没保存/);
-  phone.$('cf-key').value = '';
   phone.$('relay-only').checked = true;
   assert.equal(await save(), '');
   const get = (k) => globalThis.localStorage.getItem(k);
@@ -1161,6 +1168,67 @@ test('连接设置：写错了当场说；保存后用的是和电脑端同一�
   assert.equal(get('sw.turnPass'), 'p');
   assert.equal(get('sw.relayOnly'), '1');
   assert.equal(phone.logged('连接设置已保存'), 1);
+
+  // 来源是 Cloudflare：凭据填了没点「验证并保存」才拦，别让人以为存上了
+  phone.$('turn-source-manual').checked = false;
+  phone.$('turn-source-cf').checked = true;
+  assert.match(await save(), /Cloudflare 凭据还没保存/);
+  assert.equal(get('sw.turnSource'), 'manual', '没保存成功就不改');
+  assert.equal(phone.logged('连接设置已保存'), 1);
+});
+
+test('连接设置：打开「隐藏我的 IP」却还没有能用的中继，第一次点保存先提醒并停下，再点一次照存', { timeout: 60_000 }, async (t) => {
+  const phone = await loadPhone(t);
+  const get = (k) => globalThis.localStorage.getItem(k);
+  const save = async () => {
+    phone.$('net-save').click();
+    await flush();
+    return phone.$('net-err').textContent;
+  };
+  phone.$('turn-on').checked = false;
+  phone.$('relay-only').checked = true;
+  assert.match(await save(), /现在还没有能用的 TURN 中继：「隐藏我的 IP」打开之后，新建的连接会一律被拦下/);
+  assert.notEqual(get('sw.relayOnly'), '1', '第一次只提醒，不存');
+  assert.equal(await save(), '', '再点一次照存');
+  assert.equal(get('sw.relayOnly'), '1');
+
+  // 已经存过「隐藏我的 IP」，这次什么都没动：不再念叨
+  assert.equal(await save(), '');
+  // 开关动过就重新判断
+  phone.$('relay-only').checked = false;
+  phone.$('relay-only').dispatch('change');
+  assert.equal(await save(), '');
+  phone.$('relay-only').checked = true;
+  phone.$('relay-only').dispatch('change');
+  assert.match(await save(), /现在还没有能用的 TURN 中继/);
+  assert.equal(get('sw.relayOnly'), '0');
+  // 配好了中继就不提醒（先动一下开关，上一轮「提醒过了」作废）
+  phone.$('relay-only').dispatch('change');
+  phone.$('turn-on').checked = true;
+  phone.$('turn-url').value = 'turn:turn.example.org:3478';
+  phone.$('turn-user').value = 'u';
+  phone.$('turn-pass').value = 'p';
+  assert.equal(await save(), '');
+  assert.equal(get('sw.relayOnly'), '1');
+  assert.equal(get('sw.turnUrl'), 'turn:turn.example.org:3478');
+});
+
+test('连接设置：手填 TURN 的密码框遮住（type=password、new-password），「显示」能切换', async (t) => {
+  const block = indexHtml.slice(indexHtml.indexOf('<div id="turn-manual">'), indexHtml.indexOf('<div id="turn-cf"'));
+  const pass = /<input id="turn-pass"[^>]*>/.exec(block)?.[0] || '';
+  assert.match(pass, /type="password"/, '密码明文亮着：放映时常开着屏幕共享');
+  assert.match(pass, /autocomplete="new-password"/);
+  assert.match(block, /<button id="turn-pass-toggle" type="button">显示<\/button>/);
+
+  const phone = await loadPhone(t);
+  const input = phone.$('turn-pass');
+  input.type = 'password'; // 假 DOM 不读 HTML，照页面上的初始值摆好
+  phone.$('turn-pass-toggle').click();
+  assert.equal(input.type, 'text');
+  assert.equal(phone.$('turn-pass-toggle').textContent, '隐藏');
+  phone.$('turn-pass-toggle').click();
+  assert.equal(input.type, 'password');
+  assert.equal(phone.$('turn-pass-toggle').textContent, '显示');
 });
 
 test('信令那头刷人：同时挂着的连接有上限，同一个人刷 offer 被限速', { timeout: 60_000 }, async (t) => {
@@ -1262,7 +1330,8 @@ test('Cloudflare 来源 + 隐藏我的 IP：生成应答前先取临时账号，
   assert.deepEqual(native.cfCalls.map((c) => c.action), ['status'], '打开就看一眼状态，Token 不回来');
   phone.open(await inviteFrom(phone.h, 'HOSTAAAA'));
   await until(() => phone.offers().length === 1, '生成应答');
-  assert.deepEqual(native.cfCalls.at(-1), { action: 'credentials', args: { minValidMs: 2 * 3600e3 } });
+  // 离过期不到 12 小时就换一组（和电脑端一样）：新建的连接至少带着 12 小时有效的凭据
+  assert.deepEqual(native.cfCalls.at(-1), { action: 'credentials', args: { minValidMs: 12 * 3600e3 } });
   const { peer } = phone.offers()[0];
   assert.equal(peer.iceTransportPolicy, 'relay');
   assert.deepEqual(peer.pc.config.iceServers, [{ urls: CF_URLS, username: 'cf-user', credential: 'cf-pass' }]);
@@ -1327,4 +1396,273 @@ test('连接设置里「验证并保存」：Token 交给原生层，成功后�
   await flush();
   assert.deepEqual(native.cfCalls.at(-1), { action: 'setLimit', args: { limitGB: 500 } });
   assert.equal(phone.$('cf-usage').textContent, '本月已用 0.00 GB / 500 GB');
+});
+
+test('「验证并保存」失败：Cloudflare 限流 / 故障归成「暂时不可用」，和「回应看不懂」一样带上 HTTP 状态码', { timeout: 60_000 }, async (t) => {
+  let error = '[CF_UNAVAILABLE] HTTP 503';
+  const native = cfNative({
+    status: () => ({ configured: false, expiresAt: null, lastError: null, usage: cfUsage() }),
+    save: () => {
+      throw new Error(error);
+    },
+  });
+  const phone = await loadPhone(t, { native });
+  const attempt = async () => {
+    phone.$('cf-key').value = 'abcdef1234';
+    phone.$('cf-token').value = 't'.repeat(40);
+    phone.$('cf-save').click();
+    await flush();
+    return phone.$('cf-result').textContent;
+  };
+  assert.equal(await attempt(), '没保存：Cloudflare 暂时不可用（限流或服务故障），稍后再试（HTTP 503）');
+  error = '[CF_UNAVAILABLE] HTTP 429';
+  assert.equal(await attempt(), '没保存：Cloudflare 暂时不可用（限流或服务故障），稍后再试（HTTP 429）');
+  error = '[CF_BAD_RESPONSE] HTTP 418';
+  assert.equal(await attempt(), '没保存：Cloudflare 的回应看不懂（HTTP 418）');
+  // 凭据被拒：状态码说明不了更多，照旧
+  error = '[CF_UNAUTHORIZED] HTTP 401';
+  assert.equal(await attempt(), '没保存：未授权：Cloudflare 不认这组 Turn Token ID 和 API Token');
+
+  const { translate: tr } = await import(assetUrl('i18n.js'));
+  assert.equal(
+    tr('没保存：Cloudflare 暂时不可用（限流或服务故障），稍后再试（HTTP 503）', 'en'),
+    'Not saved: Cloudflare is temporarily unavailable (rate limiting or an outage); try again later (HTTP 503)'
+  );
+  assert.equal(tr('没保存：Cloudflare 的回应看不懂（HTTP 418）', 'en'), 'Not saved: Cloudflare sent a response that could not be understood (HTTP 418)');
+});
+
+test('「清除」要点两次：第一次按钮换成「确认清除」并说清后果，5 秒内再点才删；没存过凭据时直接清', { timeout: 60_000 }, async (t) => {
+  let configured = true;
+  const native = cfNative({
+    status: () => ({ configured, expiresAt: null, lastError: null, usage: cfUsage() }),
+    clear: () => {
+      configured = false;
+      return { configured: false, expiresAt: null, lastError: null, usage: cfUsage() };
+    },
+  });
+  const phone = await loadPhone(t, { native, storage: { 'sw.turnSource': 'cloudflare', 'sw.relayOnly': '1' } });
+  await flush();
+  const clears = () => native.cfCalls.filter((c) => c.action === 'clear').length;
+  const button = phone.$('cf-clear');
+  const result = phone.$('cf-result');
+
+  button.click();
+  await flush();
+  assert.equal(clears(), 0, '点一下就删了：Token 只显示一次，删了得去后台新建 Key');
+  assert.equal(button.textContent, '确认清除');
+  assert.match(result.textContent, /^再点一次「确认清除」才会删掉本机保存的 Cloudflare 凭据/);
+  assert.match(result.textContent, /「隐藏我的 IP」开着：清除之后新建的连接会被拦下，已经连着的不受影响。$/);
+
+  // 过了 5 秒不点：还原，下一次点又是第一下
+  t.mock.timers.tick(5000);
+  assert.equal(button.textContent, '清除');
+  assert.equal(result.textContent, '');
+  button.click();
+  await flush();
+  assert.equal(clears(), 0);
+
+  // 5 秒内再点：真删
+  t.mock.timers.tick(2000);
+  button.click();
+  await flush();
+  assert.equal(clears(), 1);
+  assert.equal(button.textContent, '清除');
+  assert.equal(result.textContent, '已清除');
+  // 上一次「确认」的计时到点也不会把「已清除」抹掉
+  t.mock.timers.tick(5000);
+  assert.equal(result.textContent, '已清除');
+
+  // 已经没存凭据了：没什么可删的，不用确认
+  button.click();
+  await flush();
+  assert.equal(clears(), 2);
+
+  const src = read('android/app/src/main/assets/js/app-android.js');
+  const fn = src.slice(src.indexOf('async function clearCfTurnCredentials('), src.indexOf('async function saveCfLimit('));
+  assert.doesNotMatch(fn, /\b(?:confirm|alert)\(/, '不用系统对话框');
+  assert.match(indexHtml, /<button id="cf-clear" class="danger">清除<\/button>/, '「清除」要危险样式');
+  assert.match(indexHtml, /#net-settings \.cf-actions button\.danger \{[^}]*margin-left:24px;[^}]*color:var\(--bad\)/, '和「验证并保存」拉开');
+});
+
+test('取号失败后台按退避接着取（30 秒起翻倍），日志只在第一次失败和恢复时各说一句；凭据被拒不重试', { timeout: 60_000 }, async (t) => {
+  let failures = 3;
+  let code = 'CF_NETWORK';
+  const native = cfNative({
+    status: () => ({ configured: true, expiresAt: null, lastError: null, usage: cfUsage() }),
+    credentials: () => {
+      if (failures > 0) {
+        failures--;
+        throw new Error(`[${code}] 连不上 Cloudflare`);
+      }
+      return { urls: CF_URLS, username: 'cf-user', credential: 'cf-pass', expiresAt: Date.now() + 23 * 3600e3 };
+    },
+  });
+  const phone = await loadPhone(t, { native, storage: { 'sw.turnSource': 'cloudflare' } });
+  const creds = () => native.cfCalls.filter((c) => c.action === 'credentials').length;
+  phone.open(await inviteFrom(phone.h, 'HOSTAAAA'));
+  await until(() => phone.offers().length === 1, '取号失败照常直连、生成应答');
+  assert.equal(creds(), 1);
+  assert.equal(phone.logged('Cloudflare TURN 账号没拿到（网络不通：连不上 Cloudflare），这次先不走中继、只尝试直连'), 1);
+  const { peer } = phone.offers()[0];
+  assert.ok(!peer.pc.config.iceServers.some((s) => s.username === 'cf-user'));
+  phone.offers()[0].resolve('v=0 answer');
+  await until(() => !!phone.$('answer-out').value, '应答生成');
+  peer.authenticated = true; // 房主点开了应答，握手完成：这条连接一直连着
+
+  const step = async (ms) => {
+    t.mock.timers.tick(ms);
+    await flush();
+  };
+  await step(29_000);
+  assert.equal(creds(), 1, '30 秒还没到');
+  await step(1000);
+  assert.equal(creds(), 2, '30 秒后在后台重取');
+  await step(59_000);
+  assert.equal(creds(), 2, '第二次失败后隔 60 秒');
+  await step(1000);
+  assert.equal(creds(), 3);
+  await step(120_000);
+  assert.equal(creds(), 4, '再翻倍到 120 秒，这次拿到了');
+  assert.equal(phone.logged('Cloudflare TURN 账号没拿到'), 1, '同一件事只在第一次失败时说');
+  assert.equal(phone.logged('Cloudflare TURN 账号拿到了，之后新建的连接会带上中继'), 1);
+  // 本来没带 Cloudflare 中继的连接不往里加
+  assert.equal(peer.pc.reconfigured || 0, 0);
+  // 拿到了就不再重试，下一次是离过期不到 12 小时时换新
+  await step(10 * 60_000);
+  assert.equal(creds(), 4);
+  assert.ok(phone.swarm().peers.get('HOSTAAAA') === peer, '测的这段时间里连接一直在');
+});
+
+test('取号失败但要用户动手（凭据被拒）：后台不重试', { timeout: 60_000 }, async (t) => {
+  const native = cfNative({
+    status: () => ({ configured: true, expiresAt: null, lastError: null, usage: cfUsage() }),
+    credentials: () => {
+      throw new Error('[CF_UNAUTHORIZED] HTTP 401');
+    },
+  });
+  const phone = await loadPhone(t, { native, storage: { 'sw.turnSource': 'cloudflare' } });
+  const creds = () => native.cfCalls.filter((c) => c.action === 'credentials').length;
+  phone.open(await inviteFrom(phone.h, 'HOSTBBBB'));
+  await until(() => phone.offers().length === 1, '生成应答');
+  assert.equal(creds(), 1);
+  for (let i = 0; i < 20; i++) {
+    t.mock.timers.tick(60_000);
+    await flush();
+  }
+  assert.equal(creds(), 1, '凭据被拒重试也没用');
+});
+
+test('临时账号离过期不到 12 小时自己换新；还连着的连接只换 Cloudflare 那一条，别的服务器和策略原样留着', { timeout: 60_000 }, async (t) => {
+  let n = 0;
+  const native = cfNative({
+    status: () => ({ configured: true, expiresAt: null, lastError: null, usage: cfUsage() }),
+    // 第一组只剩 12 小时出头：61 秒后就到了换新的时候
+    credentials: () => {
+      n++;
+      return { urls: CF_URLS, username: `cf-user-${n}`, credential: `cf-pass-${n}`, expiresAt: Date.now() + (n === 1 ? 12 * 3600e3 + 61_000 : 23 * 3600e3) };
+    },
+  });
+  const phone = await loadPhone(t, { native, storage: { 'sw.turnSource': 'cloudflare' } });
+  phone.open(await inviteFrom(phone.h, 'HOSTAAAA'));
+  await until(() => phone.offers().length === 1, '生成应答');
+  const { peer } = phone.offers()[0];
+  phone.offers()[0].resolve('v=0 answer');
+  await until(() => !!phone.$('answer-out').value, '应答生成');
+  peer.authenticated = true; // 房主点开了应答，握手完成
+  const before = peer.pc.config.iceServers;
+  assert.equal(peer.pc.config.iceTransportPolicy, 'all');
+  assert.ok(before.some((s) => s.username === 'cf-user-1'), JSON.stringify(before));
+  const stun = before.filter((s) => s.username !== 'cf-user-1');
+  assert.ok(stun.length > 0 && stun.every((s) => s.urls.every((u) => u.startsWith('stun:'))));
+
+  t.mock.timers.tick(61_000);
+  await flush();
+  assert.equal(n, 2, '离过期不到 12 小时没去换新');
+  assert.deepEqual(native.cfCalls.filter((c) => c.action === 'credentials').at(-1).args, { minValidMs: 12 * 3600e3 });
+  assert.equal(peer.pc.reconfigured, 1, '还连着的连接没换上新账号');
+  assert.deepEqual(peer.pc.config.iceServers, [...stun, { urls: CF_URLS, username: 'cf-user-2', credential: 'cf-pass-2' }]);
+  assert.equal(peer.pc.config.iceTransportPolicy, 'all');
+});
+
+test('信令事件里建连不等取号：手上没有 Cloudflare 账号就顺手在后台取一组，这一次照旧、下一条连接就带上', { timeout: 60_000 }, async (t) => {
+  let fail = true;
+  const native = cfNative({
+    status: () => ({ configured: true, expiresAt: null, lastError: null, usage: cfUsage() }),
+    credentials: () => {
+      if (fail) throw new Error('[CF_UNAUTHORIZED] HTTP 401');
+      return { urls: CF_URLS, username: 'cf-user', credential: 'cf-pass', expiresAt: Date.now() + 23 * 3600e3 };
+    },
+  });
+  const phone = await loadPhone(t, { native, storage: { 'sw.turnSource': 'cloudflare' } });
+  const { Peer } = await import(assetUrl('peer.js'));
+  const realCreateOffer = Peer.prototype.createOffer;
+  Peer.prototype.createOffer = () => new Promise(() => {});
+  t.after(() => {
+    Peer.prototype.createOffer = realCreateOffer;
+  });
+  const creds = () => native.cfCalls.filter((c) => c.action === 'credentials').length;
+  const sockets = CountingWebSocket.instances.length;
+  phone.$('url').value = 'ws://127.0.0.1:9';
+  phone.$('room').value = 'room';
+  phone.$('join').click();
+  await until(() => CountingWebSocket.instances.length > sockets, '连信令');
+  assert.equal(creds(), 1, '加入前先取了一次（失败了照常进）');
+  const ws = CountingWebSocket.instances.at(-1);
+  ws.onopen();
+  ws.onmessage({ data: JSON.stringify({ t: 'joined', peers: [], hostId: 'HOSTSRV1' }) });
+  await until(() => phone.logged('已进入房间') === 1, '进房');
+
+  // 30 秒的冷却过了，凭据也改好了：有人进房，建连不等，顺手取一组
+  fail = false;
+  t.mock.timers.tick(30_000);
+  const pcs = FakePC.instances.length;
+  ws.onmessage({ data: JSON.stringify({ t: 'peer-join', peerId: 'PEERAAA1', name: 'a' }) });
+  assert.equal(FakePC.instances.length, pcs + 1, '建连没有等取号');
+  const first = FakePC.instances.at(-1).config.iceServers;
+  assert.ok(!first.some((s) => s.username === 'cf-user'), '这一次照旧按现有的配置建连');
+  await flush();
+  assert.equal(creds(), 2, '顺手在后台取了一组');
+  ws.onmessage({ data: JSON.stringify({ t: 'peer-join', peerId: 'PEERBBB1', name: 'b' }) });
+  await flush();
+  assert.ok(FakePC.instances.at(-1).config.iceServers.some((s) => s.username === 'cf-user'), '下一条连接带上中继');
+  assert.equal(creds(), 2, '手上的新鲜，不再去取');
+});
+
+test('调高月上限到用量以上：撤掉「已到上限」那条旧错误，不等 30 秒冷却马上重取', { timeout: 60_000 }, async (t) => {
+  const used = 950e9;
+  let limitGB = 900;
+  const usage = () => cfUsage({ usedBytes: used, limitGB, limitBytes: limitGB * 1e9, exceeded: used >= limitGB * 1e9, nearLimit: true });
+  const native = cfNative({
+    status: () => ({ configured: true, expiresAt: null, lastError: null, usage: usage() }),
+    credentials: () => {
+      if (used >= limitGB * 1e9) throw new Error(`[CF_QUOTA] 本月用量已到上限（${limitGB} GB）`);
+      return { urls: CF_URLS, username: 'cf-user', credential: 'cf-pass', expiresAt: Date.now() + 23 * 3600e3 };
+    },
+    setLimit: (args) => {
+      limitGB = args.limitGB;
+      return usage();
+    },
+  });
+  const phone = await loadPhone(t, { native, storage: { 'sw.turnSource': 'cloudflare', 'sw.relayOnly': '1' } });
+  await flush();
+  phone.open(await inviteFrom(phone.h, 'HOSTAAAA'));
+  await flush();
+  await flush();
+  assert.equal(phone.offers().length, 0, '到上限、只走中继：不连');
+  assert.match(phone.$('cf-status').textContent, /用量已到你设的上限（900 GB），为免扣费已停用；下个月 1 日（UTC）自动恢复/);
+  const creds = () => native.cfCalls.filter((c) => c.action === 'credentials').length;
+  const before = creds();
+
+  phone.$('cf-limit').value = '1000';
+  phone.$('cf-limit-save').click();
+  await flush();
+  assert.equal(creds(), before + 1, '上限调高了不用等 30 秒冷却');
+  assert.match(phone.$('cf-status').textContent, /^Cloudflare TURN：已配置，账号有效至/, '状态行还说已停用，和用量行对不上');
+  assert.equal(phone.$('cf-usage').textContent, '本月已用 950.0 GB / 1000 GB');
+
+  const { translate: tr } = await import(assetUrl('i18n.js'));
+  assert.equal(
+    tr('本月 Cloudflare TURN 用量已到你设的上限（900 GB），为免扣费已停用；下个月 1 日（UTC）自动恢复，或者在连接设置里调高上限', 'en'),
+    'This month’s Cloudflare TURN usage has reached your limit (900 GB) and was turned off to avoid charges; it comes back on the 1st of next month (UTC), or raise the limit in the connection settings'
+  );
 });

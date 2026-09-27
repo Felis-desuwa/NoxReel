@@ -22,6 +22,20 @@ const FAST = { hello: 40, join: 600, connect: 300, alive: 60, silent: 250, sweep
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const RELAYS = ['wss://a', 'wss://b', 'wss://c'];
 
+/**
+ * 轮询到条件成立，最多等 maxMs。到时限还不成立就直接返回，由后面的断言报出具体哪里不对。
+ * 用来代替「睡固定的几十毫秒」：全套测试高负载时，验签和假中继的投递都会慢下来，固定的等待不够就偶发失败。
+ */
+async function waitUntil(cond, maxMs = 2000) {
+  const deadline = Date.now() + maxMs;
+  while (!cond() && Date.now() < deadline) await sleep(5);
+}
+
+/** 这一端手上的中继事件都处理完了：没有排队中的事件，每个中继都没有在处理的。 */
+function drained(sig) {
+  return sig._chains.size === 0 && [...sig._inflight.values()].every((n) => n === 0);
+}
+
 /** 按 Nostr 中继协议（REQ / EVENT / CLOSE）工作的假中继网络。hooks：url -> (ev, deliverNow) => 是否照常投递 */
 class FakeNet {
   constructor() {
@@ -438,16 +452,25 @@ test('拿着链接的人用几百个不同身份刷 hello：放行不超过人�
     handled++;
     return onHello(...args);
   };
+  // 房主发出去的 welcome / 回绝要先加密、签名（异步），数着还没发完的，等它们都落到假中继上再数回绝
+  let sending = 0;
+  const send = r.host._send.bind(r.host);
+  r.host._send = (...args) => {
+    sending++;
+    return Promise.resolve(send(...args)).finally(() => sending--);
+  };
   for (let i = 0; i < hellos.length; i++) await r.net.deliverNow(RELAYS[i % 3], hellos[i]);
-  await sleep(60);
+  // 等房主把收下的 hello 全部处理完、跟着要发的也都发完。以前固定睡 60 毫秒：高负载时房主还在验签，
+  // 每个中继的在途名额被 hello 占满，后面 a 的信令被当成洪水丢掉，偶发失败
+  await waitUntil(() => drained(r.host) && sending === 0);
   assert.ok(handled <= 90, `300 条 hello 验了 ${handled} 条签名`);
   const admitted = r.events(r.host, 'peer-join').map((p) => p.peerId).filter((id) => id !== 'a');
   assert.ok(admitted.length <= 2, `放行了 ${admitted.length} 个（上限 4 人，房主和 a 已经占了两个）`);
   const rejects = (await findEvents(r, r.secret, (b) => b.t === 'reject')).filter((x) => !before.has(x.ev.id));
   assert.ok(rejects.length <= 12, `房主跟着发了 ${rejects.length} 条回绝`);
-  // 已经在房里的人不受影响
+  // 已经在房里的人不受影响。等到收到、而且三个中继各来的那份都处理完（重复的要被去重，不能多出来）
   a.signal('host', OFFER('still works'));
-  await sleep(80);
+  await waitUntil(() => r.events(r.host, 'signal').length > 0 && drained(r.host));
   assert.deepEqual(r.events(r.host, 'signal').map((s) => s.payload.sdp.sdp), ['still works']);
 });
 

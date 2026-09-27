@@ -230,6 +230,15 @@ const EN = new Map(Object.entries({
     'In the Cloudflare dashboard, create a key under Realtime → TURN Server, enter its Turn Token ID and API Token here, and tap “Verify and save”. The API Token is encrypted with the phone’s system keystore; only NoxReel’s native layer uses it to fetch 24-hour credentials, and it is never shown again.',
   '验证并保存': 'Verify and save',
   '清除': 'Clear',
+  // 「清除」要点两次：第一次按钮换成「确认清除」、把后果说清楚
+  '确认清除': 'Confirm clear',
+  '再点一次「确认清除」才会删掉本机保存的 Cloudflare 凭据。之后要重新填 API Token 才能再用 —— Cloudflare 只在新建 Key 时显示一次 Token，没另外留底的话得去后台新建一个 Key。':
+    'Tap “Confirm clear” to delete the Cloudflare credentials saved on this phone. You will need to enter the API Token again to use it—Cloudflare shows the token only once, when the key is created, so without your own copy you will have to create a new key in the dashboard.',
+  '「隐藏我的 IP」开着：清除之后新建的连接会被拦下，已经连着的不受影响。':
+    '“Hide my IP” is on: after clearing, new connections will be blocked; existing ones are not affected.',
+  // 手填 TURN 的密码框默认遮住，旁边的切换按钮
+  '显示': 'Show',
+  '隐藏': 'Hide',
   'Cloudflare TURN 月用量上限': 'Cloudflare TURN monthly limit',
   '每月最多用': 'Use at most',
   'GB（本机统计）': 'GB per month (counted on this device)',
@@ -262,6 +271,8 @@ const EN = new Map(Object.entries({
     'A TURN relay needs a username and password (the relay server uses them to authenticate you). If you do not have them, uncheck “Enable TURN relay fallback”.',
   'Cloudflare 凭据还没保存：先点「验证并保存」，或者把这两个框清空。':
     'The Cloudflare credentials are not saved yet: tap “Verify and save” first, or clear both fields.',
+  '现在还没有能用的 TURN 中继：「隐藏我的 IP」打开之后，新建的连接会一律被拦下，直到配好 TURN。确定这样保存就再点一次「保存连接设置」。':
+    'No TURN relay is usable yet: with “Hide my IP” on, every new connection will be blocked until TURN is set up. To save anyway, tap “Save connection settings” again.',
   'Cloudflare TURN 每月上限要填 1 到 1000 之间的整数（GB）。': 'The Cloudflare TURN monthly limit must be a whole number from 1 to 1000 (GB).',
   'TURN 中继开着但没填用户名或密码，这次先不走中继、只尝试直连。到连接设置里补全，或者把中继关掉。':
     'The TURN relay is on but has no username or password, so it is skipped this time and only direct connections are tried. Complete it in the connection settings, or turn the relay off.',
@@ -281,6 +292,8 @@ const EN = new Map(Object.entries({
   '已清除': 'Cleared',
   '未授权：Cloudflare 不认这组 Turn Token ID 和 API Token': 'Unauthorized: Cloudflare rejected this Turn Token ID and API Token',
   '网络不通：连不上 Cloudflare': 'Network problem: cannot reach Cloudflare',
+  'Cloudflare 暂时不可用（限流或服务故障），稍后再试': 'Cloudflare is temporarily unavailable (rate limiting or an outage); try again later',
+  'Cloudflare TURN 账号拿到了，之后新建的连接会带上中继': 'Got Cloudflare TURN credentials; new connections will use the relay',
   'Cloudflare 的回应看不懂': 'Cloudflare sent a response that could not be understood',
   '还没保存 Cloudflare 凭据': 'No Cloudflare credentials saved yet',
   '本机的加密服务不可用，不能安全地保存 API Token': 'This phone’s encryption service is unavailable, so the API Token cannot be stored safely',
@@ -402,11 +415,11 @@ const PATTERNS = [
     'These TURN addresses use port 53, which the browser blocks: $1. Use another port—3478 or 443 are common',
   ],
   [
-    /^本月 Cloudflare TURN 用量已到你设的上限（(.+) GB），为免扣费已停用；下个月 1 日自动恢复，或者在连接设置里调高上限(。「隐藏我的 IP」开着，没有中继就不连接。)?$/,
-    (_all, gb, relayOnly) =>
-      `This month’s Cloudflare TURN usage has reached your limit (${gb} GB) and was turned off to avoid charges; it comes back on the 1st of next month, or raise the limit in the connection settings${
-        relayOnly ? '. “Hide my IP” is on, so without a relay no connection is made.' : ''
-      }`,
+    /^本月 Cloudflare TURN 用量已到你设的上限（(.+) GB），为免扣费已停用；下个月 1 日(（UTC）)?自动恢复，或者在连接设置里调高上限(。「隐藏我的 IP」开着，没有中继就不连接。)?$/,
+    (_all, gb, utc, relayOnly) =>
+      `This month’s Cloudflare TURN usage has reached your limit (${gb} GB) and was turned off to avoid charges; it comes back on the 1st of next month${
+        utc ? ' (UTC)' : ''
+      }, or raise the limit in the connection settings${relayOnly ? '. “Hide my IP” is on, so without a relay no connection is made.' : ''}`,
   ],
   [/^Cloudflare TURN：已配置，账号有效至 (\d{1,2}:\d{2})$/, 'Cloudflare TURN: set up, credentials valid until $1'],
   [/^Cloudflare TURN：(.+)$/, (_all, detail) => `Cloudflare TURN: ${translate(detail, 'en')}`],
@@ -418,6 +431,8 @@ const PATTERNS = [
   [/^本月 Cloudflare TURN 用量已超过你设的上限的 80%（([\d.]+) \/ (\d+) GB）$/, 'This month’s Cloudflare TURN usage is past 80% of your limit ($1 / $2 GB)'],
   [/^本月已用 ([\d.]+) GB \/ (\d+) GB$/, 'Used this month: $1 GB / $2 GB'],
   [/^没保存：(.+)$/, (_all, detail) => `Not saved: ${translate(detail, 'en')}`],
+  // 保存 Cloudflare 凭据失败时带着 HTTP 状态码的那几种（限流、服务故障、回应不对）
+  [/^(Cloudflare .+)（HTTP (\d{3})）$/, (_all, detail, status) => `${translate(detail, 'en')} (HTTP ${status})`],
   [/^没清除：(.+)$/, (_all, detail) => `Not cleared: ${translate(detail, 'en')}`],
   [/^没保存上限：(.+)$/, (_all, detail) => `Limit not saved: ${translate(detail, 'en')}`],
   [/^Cloudflare TURN 每月上限已设为 (\d+) GB$/, 'Cloudflare TURN monthly limit set to $1 GB'],

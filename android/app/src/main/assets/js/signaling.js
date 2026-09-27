@@ -439,8 +439,10 @@ export class WsSignaling extends Emitter {
     // 只放在这个实例里：不交给调用方、不进邀请码、不广播。
     this._hostToken = null;
     // 房主凭据的摘要（服务器发给房主以外的人）。房间被重建时随建房提示交上去，服务器拿它核对
-    // 回来认领的是不是真房主。同样只放在这个实例里
+    // 回来认领的是不是真房主。同样只放在这个实例里。_hostKeyFor 记它是哪个房主的：构造时还不知道
+    // 房主是谁（手机直接填地址和房间号进来，没有邀请码），也照样记下，调用方认下同一个房主之后才带上
     this._hostKey = null;
+    this._hostKeyFor = null;
     // 不经这台服务器进房的人数（房主用：一对一邀请、房间链接进来的），服务器判满时要算上
     this.outside = 0;
     // 信令服务器宣布离开、之后没再出现的人（见 hasLeft）
@@ -463,6 +465,8 @@ export class WsSignaling extends Emitter {
         // 指数退避形同虚设，变成每秒一次的重连风暴。真正加入成功才算数，见 joined 分支。
         // 建房提示只在重连时带：首次加入时房间不在，就是房间已经关了，不该替房主把它建起来
         const hint = this._joinedOnce && this.hostId && this.hostId !== this.peerId;
+        // 摘要只交给它所属的那个房主的提示：调用方后来认的房主换了人，旧摘要就不作数
+        const key = hint && this._hostKey && this._hostKeyFor === this.hostId ? this._hostKey : null;
         this._send({
           t: 'join',
           roomId: this.roomId,
@@ -470,7 +474,7 @@ export class WsSignaling extends Emitter {
           name: this.name,
           maxMembers: this.maxMembers,
           ...(this._hostToken ? { hostToken: this._hostToken } : {}),
-          ...(hint ? { hostHint: this.hostId, ...(this._hostKey ? { hostKey: this._hostKey } : {}) } : {}),
+          ...(hint ? { hostHint: this.hostId, ...(key ? { hostKey: key } : {}) } : {}),
           ...(this.outside > 0 ? { outside: this.outside } : {}),
         });
       };
@@ -493,9 +497,17 @@ export class WsSignaling extends Emitter {
           // 每次进房都以服务器这次的答复为准：房间被重建、自己不再是房主时它就没有这一项
           const { hostToken, hostKey, ...joined } = msg;
           this._hostToken = typeof hostToken === 'string' && hostToken ? hostToken : null;
-          // 服务器认的房主和本机认的一致，才记它给的摘要和人数（下次重建房间时的提示）
+          const serverHost = typeof joined.hostId === 'string' && joined.hostId ? joined.hostId : null;
+          // 服务器给的房主摘要：本机还不知道房主是谁（没有邀请码），或者认的就是这个房主，都记下，
+          // 连同它属于哪个房主（见 _hostKeyFor）。房主是自己、或者和本机认的不是同一个人，不记
+          if (serverHost && serverHost !== this.peerId && (!this.hostId || serverHost === this.hostId)) {
+            if (typeof hostKey === 'string' && HOST_KEY_RE.test(hostKey)) {
+              this._hostKey = hostKey;
+              this._hostKeyFor = serverHost;
+            }
+          }
+          // 服务器认的房主和本机认的一致，才记它给的人数（下次重建房间时的提示）
           if (this.hostId && joined.hostId === this.hostId && this.hostId !== this.peerId) {
-            if (typeof hostKey === 'string' && HOST_KEY_RE.test(hostKey)) this._hostKey = hostKey;
             this._noteCapacity(joined.maxMembers);
           }
           for (const p of Array.isArray(joined.peers) ? joined.peers : []) this._left.delete(p?.peerId);
@@ -521,7 +533,10 @@ export class WsSignaling extends Emitter {
           this._left.delete(msg.peerId);
           const { hostKey, ...join } = msg;
           // 房主回来认领重建的房间时摘要会换成他那张凭据的，跟着更新
-          if (msg.peerId === this.hostId && typeof hostKey === 'string' && HOST_KEY_RE.test(hostKey)) this._hostKey = hostKey;
+          if (this.hostId && msg.peerId === this.hostId && typeof hostKey === 'string' && HOST_KEY_RE.test(hostKey)) {
+            this._hostKey = hostKey;
+            this._hostKeyFor = msg.peerId;
+          }
           this.emit('peer-join', join);
           return;
         }
