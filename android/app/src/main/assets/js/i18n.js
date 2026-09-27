@@ -171,8 +171,11 @@ const EN = new Map(Object.entries({
     'Could not find the host: they may have left the room or replaced the room link. Ask the host for a new one.',
   '连不上公共中继（所在网络可能拦了它们）。请让房主改发「一对一邀请」，那个不经过任何第三方。':
     'Could not reach the public relays (your network may block them). Ask the host for a one-to-one invite instead; it involves no third party.',
-  '房主那边一直没能和你直连，你已被移出房间。可以请房主改发一对一邀请，或者双方配置 TURN 后再试。':
-    'The host could never connect to you directly, so you were removed from the room. Ask the host for a one-to-one invite, or both set up TURN and try again.',
+  '房主那边一直没能和你直连，你已被移出这一场。重启 NoxReel 后再点链接，或者请房主改发一对一邀请；双方配好 TURN 更容易连上。':
+    'The host could never connect to you directly, so you were removed from this screening. Restart NoxReel before opening the link again, or ask the host for a one-to-one invite; setting up TURN on both sides makes connecting easier.',
+  '你和房主的直连断开太久，已被移出房间。重新点一次房间链接就能回来。':
+    'Your direct connection to the host was down for too long, so you were removed from the room. Open the room link again to come back.',
+  '信令已恢复': 'Signaling is back',
   '房间里正有好几个人在连接，稍后再点一次链接试试。': 'Several people are connecting to the room right now. Open the link again in a moment.',
   '等房主放行超时': 'Timed out waiting for the host to let you in',
   '房主离开了房间': 'The host left the room',
@@ -387,6 +390,7 @@ const PATTERNS = [
   ],
   [/^和房主差了 ([\d.]+) 秒，自动对齐$/, '$1 seconds off from the host; realigned automatically'],
   [/^信令断开，(\d+) 秒后重连（已建立的直连不受影响）$/, 'Signaling disconnected. Reconnecting in $1 seconds.'],
+  [/^和 (.+) 的连接迟迟没建起来，重新协商$/, 'The connection to $1 is taking too long to come up; negotiating again'],
   [/^信令错误：(.*)$/, 'Signaling error: $1']
 ];
 

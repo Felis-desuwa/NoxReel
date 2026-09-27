@@ -1230,10 +1230,13 @@ async function connectSignaling(url, roomId, relay = null) {
     const ice = signalPeerIce();
     if (!ice) return;
     const peer = new Peer({ peerId, name, initiator: true, ...ice, trickle });
+    // offerTag：应答要原样带回的标记。两轮重建交叉时，上一轮的 answer 可能比这一轮的先到，
+    // 套到新连接上这条连接就废了（和电脑端同一个办法）。建好就记上：收集候选的那几秒里旧 answer 也可能到
+    peer.offerTag = crypto.getRandomValues(new Uint32Array(1))[0].toString(36);
     wirePeer(peer, sig);
     S.swarm.addPeer(peer);
     const offer = await peer.createOffer();
-    sig.signal(peerId, { kind: 'offer', sdp: offer });
+    sig.signal(peerId, { kind: 'offer', sdp: offer, tag: peer.offerTag });
   });
 
   sig.on('signal', async ({ from, name, payload }) => {
@@ -1250,11 +1253,15 @@ async function connectSignaling(url, roomId, relay = null) {
       const ice = signalPeerIce();
       if (!ice) return;
       if (peer) S.swarm.removePeer(from);
+      // 对面已经在重建：撤掉我排着的 renegotiate（次数不退，见 cancelRecovery）
+      cancelRecovery(from, { keepCount: true });
       peer = new Peer({ peerId: from, name: peerName(name, from), initiator: false, ...ice, trickle });
       wirePeer(peer, sig);
       S.swarm.addPeer(peer);
       const answer = await peer.acceptOffer(payload.sdp);
-      sig.signal(from, { kind: 'answer', sdp: answer });
+      // offer 的标记原样带回（老版本的 offer 没有，就不带）
+      const tag = typeof payload.tag === 'string' ? { tag: payload.tag.slice(0, 16) } : {};
+      sig.signal(from, { kind: 'answer', sdp: answer, ...tag });
       return;
     }
     if (payload.kind === 'renegotiate') {
@@ -1272,6 +1279,8 @@ async function connectSignaling(url, roomId, relay = null) {
 
     if (!peer || peer.closed) return;
     if (payload.kind === 'answer') {
+      // 标记对不上的是上一轮 offer 的应答（见 peer-join 里 offerTag 的说明），老版本不带标记照旧收
+      if (peer.offerTag && typeof payload.tag === 'string' && payload.tag !== peer.offerTag) return;
       // 重协商期间可能收到上一轮的 answer，此时 pc 已是 stable，
       // setRemoteDescription 会抛 InvalidStateError。这条本来就该丢掉。
       await peer.acceptAnswer(payload.sdp).catch((e) => console.warn('[android] 丢弃对不上的应答：', e.message));
@@ -1295,6 +1304,13 @@ async function connectSignaling(url, roomId, relay = null) {
   sig.on('reconnecting', ({ in: ms }) => {
     if (live()) logThrottled(`信令断开，${Math.round(ms / 1000)} 秒后重连（已建立的直连不受影响）`, 'warn');
   });
+  // 中继信令从全断里恢复（房间链接）：断着时双方发的 offer / renegotiate 都丢了，没有别的东西
+  // 会再把直连拉起来。信令给出它知道的每个人和该由谁发起，直连不通的重新排上（和电脑端一样）
+  sig.on('reconnected', ({ peers } = {}) => {
+    if (!live() || !S.swarm) return;
+    logThrottled('信令已恢复', 'good', 2000);
+    for (const p of Array.isArray(peers) ? peers.slice(0, MAX_LIVE_PEERS) : []) resumeRecovery(sig, p);
+  });
   sig.on('error', (e) => {
     if (!live()) return;
     // 房间链接的房主一直没和我直连上，收回了名额
@@ -1305,14 +1321,19 @@ async function connectSignaling(url, roomId, relay = null) {
   return sig.connect();
 }
 
-/** 房间链接加入失败时，按原因说人话（和电脑端同一套说法）。 */
+/**
+ * 房间链接加入失败时，按原因说人话（和电脑端同一套说法）。
+ * 被移出分进房前、进房后两种：房主按 peerId 和公钥封禁本场，peerId 要到页面重新加载才换 ——
+ * 进房前被移出的，这次运行里再点链接一定还是被拒；进房后被移出的会整页重载、换了身份，重新点链接就能回来。
+ */
 function relayJoinError(e) {
   if (e?.code === 'HOST_OFFLINE') return '找不到房主：他可能已经离开房间，或者换过房间链接。请让房主重新发一条。';
   if (e?.code === 'RELAY_UNREACHABLE') {
     return '连不上公共中继（所在网络可能拦了它们）。请让房主改发「一对一邀请」，那个不经过任何第三方。';
   }
   if (e?.code === 'REMOVED') {
-    return '房主那边一直没能和你直连，你已被移出房间。可以请房主改发一对一邀请，或者双方配置 TURN 后再试。';
+    if (e.entered) return '你和房主的直连断开太久，已被移出房间。重新点一次房间链接就能回来。';
+    return '房主那边一直没能和你直连，你已被移出这一场。重启 NoxReel 后再点链接，或者请房主改发一对一邀请；双方配好 TURN 更容易连上。';
   }
   if (e?.code === 'BUSY') return '房间里正有好几个人在连接，稍后再点一次链接试试。';
   return e?.message || String(e);
@@ -1321,12 +1342,12 @@ function relayJoinError(e) {
 const LOBBY_NOTICE_KEY = 'sw.lobbyNotice';
 
 /**
- * 房间链接的房主把我移出了房间（一直没和我直连上，名额收回了）。
+ * 房间链接的房主把我移出了房间（一直没和我直连上，或者连上后又断开太久，名额收回了）。
  * 还没进房（正在打洞）就停在大厅把原因说清楚；已经在房间里的，干净地退回大厅 ——
  * 和「离开并加入」一样整页重载（原生会话、缓存一并收掉），原因记下来，回到大厅再说一遍。
  */
 function removedFromRoom() {
-  const text = relayJoinError({ code: 'REMOVED' });
+  const text = relayJoinError({ code: 'REMOVED', entered: S.entered });
   if (!S.entered) {
     S.signaling?.close();
     S.signaling = null;
@@ -1349,20 +1370,32 @@ function removedFromRoom() {
 // 这条链路上没有自动重连，用户只能退房重来。
 const RECONNECT_BACKOFF_MS = [1500, 4000, 10000];
 const DISCONNECT_GRACE_MS = 6000;
-const RECOVERY = new Map(); // peerId -> {attempts, timer}
+// 一轮握手最多等这么久（和电脑端一样）：中继上的 offer / answer / renegotiate 丢了，
+// 新建的连接就停在半路，既不 connected 也不 failed，没有这道兜底就再也不会有下一次重连
+const HANDSHAKE_TIMEOUT_MS = 30_000;
+const RECOVERY = new Map(); // peerId -> {attempts, timer, watch}
 const RENEGOTIATING = new Map(); // peerId -> 正在跑的重协商 Promise
 
-function cancelRecovery(peerId) {
+/** 撤掉排着的重连。keepCount：只撤定时器、次数留着（对面发来 offer 时用，和电脑端一样）。 */
+function cancelRecovery(peerId, { keepCount = false } = {}) {
   const st = RECOVERY.get(peerId);
   if (st?.timer) clearTimeout(st.timer);
-  RECOVERY.delete(peerId);
+  if (st?.watch) clearTimeout(st.watch);
+  if (keepCount && st) st.timer = st.watch = null;
+  else RECOVERY.delete(peerId);
 }
 
-function scheduleReconnect(peer, sig) {
-  if (!sig || !S.swarm || peer.closed) return;
+/**
+ * retry：上一轮的请求没有下文（renegotiate 丢了），或者信令刚恢复要补一轮 ——
+ * 这时 peer 可能是已经摘掉的旧连接、甚至只是 { peerId, name, initiator }，照样排。
+ */
+function scheduleReconnect(peer, sig, { retry = false } = {}) {
+  if (!sig || !S.swarm || (peer.closed && !retry)) return;
   const peerId = peer.peerId;
-  const st = RECOVERY.get(peerId) || { attempts: 0, timer: null };
+  const st = RECOVERY.get(peerId) || { attempts: 0, timer: null, watch: null };
   if (st.timer) return;
+  clearTimeout(st.watch);
+  st.watch = null;
   if (st.attempts >= RECONNECT_BACKOFF_MS.length) {
     log('和 ' + peer.name + ' 的直连试了 ' + st.attempts + ' 次都没恢复。双方都在严格 NAT 后面时需要 TURN 中继兜底。', 'bad');
     return;
@@ -1376,6 +1409,8 @@ function scheduleReconnect(peer, sig) {
   st.timer = setTimeout(() => {
     st.timer = null;
     if (!sig.connected) {
+      // 信令也断着：这一次不算数，次数退回去，等信令回来由 reconnected 重新排上
+      st.attempts = Math.max(0, st.attempts - 1);
       log('信令还没恢复，暂时没法重连 ' + name, 'warn');
       return;
     }
@@ -1383,10 +1418,31 @@ function scheduleReconnect(peer, sig) {
       reconnectPeer(peerId, name, sig).catch((e) => log('重连 ' + name + ' 失败：' + e.message, 'bad'));
     } else {
       sig.signal(peerId, { kind: 'renegotiate' });
+      // 这条请求也可能丢：过一阵还没连上、对面也没发 offer 过来（发来了会撤掉这个定时器），接着退避
+      st.watch = setTimeout(() => {
+        st.watch = null;
+        if (RECOVERY.get(peerId) !== st || S.swarm?.peers.get(peerId)?.ctrl?.readyState === 'open') return;
+        scheduleReconnect(peer, sig, { retry: true });
+      }, HANDSHAKE_TIMEOUT_MS);
     }
   }, wait);
 
   RECOVERY.set(peerId, st);
+}
+
+/**
+ * 信令从全断里恢复（中继信令的 reconnected）：直连不通的人重新排上，次数从头算 ——
+ * 信令断着时的那几次不算数（和电脑端一样）。
+ */
+function resumeRecovery(sig, { peerId, name, initiator } = {}) {
+  if (!S.swarm || typeof peerId !== 'string' || !peerId || peerId === S.peerId) return false;
+  if (S.swarm.versionRejected?.has(peerId)) return false;
+  const peer = S.swarm.peers.get(peerId);
+  if (directLinkUp(peer)) return false;
+  cancelRecovery(peerId);
+  // 手上还有这个人的连接就按它原来的角色来；没有了才用信令给的
+  scheduleReconnect(peer || { peerId, name: peerName(name, peerId), initiator: initiator === true }, sig, { retry: true });
+  return true;
 }
 
 /** 以 initiator 身份重建一条到 peerId 的连接。同一个人同时只允许一次。 */
@@ -1405,11 +1461,13 @@ async function reconnectPeer(peerId, name, sig) {
       ...ice,
       trickle: sig.trickle !== false,
     });
+    // 应答要带回的标记，见 connectSignaling 的 peer-join 里 offerTag 的说明
+    peer.offerTag = crypto.getRandomValues(new Uint32Array(1))[0].toString(36);
     wirePeer(peer, sig);
     S.swarm.addPeer(peer);
     const offer = await peer.createOffer();
     if (S.swarm.peers.get(peerId) !== peer) return; // 等 ICE 的这几秒里被顶替了
-    sig.signal(peerId, { kind: 'offer', sdp: offer });
+    sig.signal(peerId, { kind: 'offer', sdp: offer, tag: peer.offerTag });
   })();
 
   RENEGOTIATING.set(peerId, run);
@@ -1429,7 +1487,22 @@ function wirePeer(peer, sig) {
     graceTimer = null;
   };
 
+  // 握手兜底（和电脑端一样）：offer 或 answer 丢了，这条连接就停在半路。到时还没打开数据通道
+  // 就按失败处理、接着退避；应答的一方多等一会儿，让发起方先重发 offer
+  const handshakeTimer = sig
+    ? setTimeout(
+        () => {
+          if (peer.closed || S.swarm?.peers.get(peer.peerId) !== peer || peer.ctrl?.readyState === 'open') return;
+          log(`和 ${peer.name} 的连接迟迟没建起来，重新协商`, 'warn');
+          scheduleReconnect(peer, sig);
+        },
+        peer.initiator ? HANDSHAKE_TIMEOUT_MS : HANDSHAKE_TIMEOUT_MS * 1.5
+      )
+    : null;
+  peer.on('close', () => clearTimeout(handshakeTimer));
+
   peer.on('open', () => {
+    clearTimeout(handshakeTimer);
     clearGrace();
     cancelRecovery(peer.peerId);
     log(`已和 ${peer.name} 建立数据通道，正在校验房间模式…`);

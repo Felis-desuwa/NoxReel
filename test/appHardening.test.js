@@ -59,8 +59,9 @@ test.before(async () => {
 });
 
 function sandbox({ fns = [], decls = [], globals = {} }) {
-  // myPlatform：HELLO 里报的本机系统（成员表上的设备标记），这些测试不关心
-  const ctx = { console, inviteGen: 0, myPlatform: () => 'windows', clampName, ...TURN_GATE_OPEN, ...globals };
+  // myPlatform：HELLO 里报的本机系统（成员表上的设备标记），这些测试不关心。
+  // crypto：发 offer 时生成应答要带回的标记（offerTag）
+  const ctx = { console, crypto: globalThis.crypto, inviteGen: 0, myPlatform: () => 'windows', clampName, ...TURN_GATE_OPEN, ...globals };
   vm.createContext(ctx);
   vm.runInContext([...decls.map(declSource), ...fns.map(fnSource)].join('\n\n'), ctx, { filename: 'app.js（节选）' });
   return ctx;
@@ -890,9 +891,15 @@ test('房主建中继信令时交出 isLinked：只看这个人的数据通道�
 
 test('加入房间链接失败：REMOVED、BUSY 都说人话', () => {
   const ctx = sandbox({ fns: ['relayJoinError'] });
+  // 进房前被移出：本场按 peerId 封禁，这次运行里再点链接一定还被拒 —— 不能叫他「配好 TURN 再试」
   assert.equal(
     ctx.relayJoinError({ code: 'REMOVED', message: 'x' }),
-    '房主那边一直没能和你直连，你已被移出房间。可以请房主改发一对一邀请，或者双方在设置里配置 TURN 后再试。'
+    '房主那边一直没能和你直连，你已被移出这一场。重启 NoxReel 后再点链接，或者请房主改发一对一邀请；双方配好 TURN 更容易连上。'
+  );
+  // 进房后被移出：退房会重载、换身份，重新点链接就能回来
+  assert.equal(
+    ctx.relayJoinError({ code: 'REMOVED', entered: true }),
+    '你和房主的直连断开太久，已被移出房间。重新点一次房间链接就能回来。'
   );
   assert.equal(ctx.relayJoinError({ code: 'BUSY', message: 'x' }), '房间里正有好几个人在连接，稍后再点一次链接试试。');
   // 加入流程里的报错走的就是它
@@ -903,7 +910,7 @@ test('房间里被房主移出：干净地退回大厅，回到首页再说一�
   const r = await relayRoom({ role: 'guest', inRoom: true });
   await r.sig.emit('error', Object.assign(new Error('removed'), { code: 'REMOVED' }));
   assert.equal(r.calls.leaves, 1, '被移出了还留在房间里');
-  const text = r.ctx.relayJoinError({ code: 'REMOVED' });
+  const text = r.ctx.relayJoinError({ code: 'REMOVED', entered: true });
   assert.equal(r.storage.getItem('sw.lobbyNotice'), text);
   assert.deepEqual(r.calls.fail, []);
   assert.equal(r.ctx.takeLobbyNotice(), text);
@@ -1666,7 +1673,8 @@ test('这一轮新增的文案都有英文', async () => {
     '同时连着的人太多了，多出来的连接请求已忽略',
     '只影响以后新开的房间；这个房间的人数上限请在邀请区调整。',
     '操作太频繁了，稍后再试',
-    '房主那边一直没能和你直连，你已被移出房间。可以请房主改发一对一邀请，或者双方在设置里配置 TURN 后再试。',
+    '房主那边一直没能和你直连，你已被移出这一场。重启 NoxReel 后再点链接，或者请房主改发一对一邀请；双方配好 TURN 更容易连上。',
+    '你和房主的直连断开太久，已被移出房间。重新点一次房间链接就能回来。',
     '房间里正有好几个人在连接，稍后再点一次链接试试。',
     '取消',
   ]) {

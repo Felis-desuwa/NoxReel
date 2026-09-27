@@ -896,8 +896,11 @@ const EN = new Map(Object.entries({
   '你已经在这个房间里了。': 'You are already in this room.',
   '同时连着的人太多了，多出来的连接请求已忽略': 'Too many simultaneous connections; the extra connection requests were ignored',
   '操作太频繁了，稍后再试': 'Too many changes at once; try again in a moment',
-  '房主那边一直没能和你直连，你已被移出房间。可以请房主改发一对一邀请，或者双方在设置里配置 TURN 后再试。':
-    'The host could never connect to you directly, so you were removed from the room. Ask the host for a one-to-one invite, or both set up TURN in Settings and try again.',
+  '房主那边一直没能和你直连，你已被移出这一场。重启 NoxReel 后再点链接，或者请房主改发一对一邀请；双方配好 TURN 更容易连上。':
+    'The host could never connect to you directly, so you were removed from this screening. Restart NoxReel before opening the link again, or ask the host for a one-to-one invite; setting up TURN on both sides makes connecting easier.',
+  '你和房主的直连断开太久，已被移出房间。重新点一次房间链接就能回来。':
+    'Your direct connection to the host was down for too long, so you were removed from the room. Open the room link again to come back.',
+  '信令已恢复': 'Signaling is back',
   '房间里正有好几个人在连接，稍后再点一次链接试试。': 'Several people are connecting to the room right now. Open the link again in a moment.',
   '只影响以后新开的房间；这个房间的人数上限请在邀请区调整。':
     'Only affects rooms you open later; change this room’s limit in the invite area.',
@@ -1103,6 +1106,19 @@ const EN_PATTERNS = [
   ],
   [/^重连 (.+) 失败：(.*)$/, (_all, name, detail) => `Failed to reconnect to ${name}: ${translate(detail, 'en')}`],
   [/^信令还没恢复，暂时没法重连 (.+)$/, 'Signaling has not recovered yet, so $1 cannot be reconnected for now'],
+  [/^和 (.+) 的连接迟迟没建起来，重新协商$/, 'The connection to $1 is taking too long to come up; negotiating again'],
+  [
+    /^还在连接中的 (.+) 没跟着换过来，要进房请把新链接发给他们$/,
+    (_all, names) =>
+      `Still connecting and did not move to the new link: ${names.split('、').join(', ')}. Send them the new link if they should join`,
+  ],
+  [
+    /^已停用房间链接：经它进来的 (\d+) 人之后和你断开的话没法自动重连，要重新发邀请$/,
+    (_all, n) =>
+      n === '1'
+        ? 'Room link turned off: if the person who joined through it loses their connection to you, they can’t reconnect automatically and will need a new invite'
+        : `Room link turned off: if the ${n} people who joined through it lose their connection to you, they can’t reconnect automatically and will need a new invite`,
+  ],
   [/^(\d+) 条多余音轨$/, (_all, n) => `${n} extra audio track${n === '1' ? '' : 's'}`],
   [/^(\d+) 条图形字幕$/, (_all, n) => `${n} image-based subtitle track${n === '1' ? '' : 's'}`],
   [/^(.*)\n\n如果对方没有部署信令服务器，让他改用「极简模式」生成邀请码 —— 那个不需要服务器。$/, '$1\n\nIf the other person has no signaling server, ask them to use Manual mode, which requires no server.'],

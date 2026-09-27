@@ -5,7 +5,8 @@ import { schnorr, getSharedSecret } from './third_party/secp256k1.js';
  * 经公共 Nostr 中继交换连接握手的信令（「房间链接」）。
  *
  * 接口与 WsSignaling 一致（connect / signal / setMaxMembers / close，事件 joined / peer-join /
- * signal / peer-leave / room-config / reconnecting / error），app.js 的 connectSignaling 原样复用：
+ * signal / peer-leave / room-config / reconnecting / error；另有 reconnected、rekey），
+ * app.js 的 connectSignaling 原样复用：
  * 网状建连、断线重协商、房主离开的判定都不用另写一套。视频照旧点对点直传，中继只转握手。
  *
  * 信令服务器替我们做的几件事，在这里全部由房主的签名来做：
@@ -25,6 +26,13 @@ import { schnorr, getSharedSecret } from './third_party/secp256k1.js';
  * 所以房主（app 传了 isLinked 时）盯着每个放行的人和自己的直连：放行后 linkGraceMs 内
  * 一直没连上、或者连上后又连续断开这么久，就移出并记进本场的封禁表；还没连上的待定名额
  * 也有上限（PENDING_MAX），满了新来的先回 BUSY，让他稍后自己重试。
+ *
+ * 断线自愈：本机中继全断的那段时间里，谁都「没动静」、谁的直连都「连不上」—— 那是自己的问题，
+ * 不是别人的。所以全断期间不做静默清理、不做未直连移出；恢复时把这两项计时从头算，再发
+ * reconnected（带上信令知道的每个人和该由谁发起），app 据此把断着的直连重新拉起来 ——
+ * 中继上都是临时事件，断着时发出去的 offer / renegotiate 早就丢了，没有别的东西会再补发。
+ * 成员恢复时还会重新 hello 一次：还在房里的，房主回一份带名册的 welcome（补上断线期间进来的人）；
+ * 已经被移出的，房主回 REMOVED，别停在一个谁都连不上的房间里。
  */
 
 // 实测挑出来的（2026-09-21，32 个候选里连通、收临时事件、2 秒内送达、6KB 事件和连发都不限流的）。
@@ -52,6 +60,12 @@ const JOIN_TIMEOUT_MS = 30000;
 const CONNECT_TIMEOUT_MS = 8000;
 const ALIVE_INTERVAL_MS = 30000;
 const SILENT_AFTER_MS = 100000;
+// 中继连接要稳稳地连住这么久，退避才从头算。连上就被踢（握手后按 IP 拒绝、反代立刻拆连接）的，
+// 在 onopen 里清零的话会变成每秒重连一次、永不停
+const RELAY_STABLE_MS = 30000;
+// 连着却什么都收不到：本机网络断了，TCP 却要等好几分钟才报关闭（半开）。每 30 秒发一次心跳，
+// 正常的中继每次都回 OK、也把事件推回我们自己的订阅；回过话的中继这么久一声不吭，就当它断了
+const RELAY_QUIET_MS = 45000;
 // 新鲜窗口：发送方时钟可能不准，created_at 与本机相差超过这个范围的事件一律当重放丢掉
 const MAX_SKEW_SEC = 600;
 // 去重表按时间淘汰，不按条数：一条事件的 id 一直留到它自己的新鲜窗口过去之后（见 _remember），
@@ -85,6 +99,9 @@ const LINK_GRACE_MS = 60000;
 const PENDING_MAX = 4;
 // 本场封禁表（被移出的 peerId 和公钥）的上限：假身份要多少有多少，封禁表不能跟着无限涨
 const BANNED_MAX = 512;
+// 因为没动静被清掉（没封禁）的成员记下原来的序号：同一把公钥回来重新 hello 时按原序号放行，
+// 老成员之间「谁向谁发 offer」的约定不会因为他换了序号而两边都以为该自己发
+const DROPPED_MAX = 64;
 
 // 限速，令牌桶：[容量, 每秒补充]。验签是这一层最贵的一步（纯 JS 的椭圆曲线运算，一次一毫秒多，
 // 跑在渲染进程主线程上），所以验签前按「哪个中继送来的、自称是谁」分开记账：
@@ -298,9 +315,14 @@ export class RelaySignaling extends Emitter {
       sweep: 20000,
       linkGraceMs: LINK_GRACE_MS,
       pendingMax: PENDING_MAX,
+      relayStable: RELAY_STABLE_MS,
+      relayQuiet: RELAY_QUIET_MS,
       ...(o.timing || {}),
     };
     this._pendingMax = Math.max(1, Math.floor(Number(o.pendingMax ?? this._t.pendingMax)) || PENDING_MAX);
+    // 系统的「网络恢复」事件（online）从哪儿听：页面里是 window，测试可以注入；Node 里没有就不听
+    this._netEvents = o.netEvents || (typeof globalThis.addEventListener === 'function' ? globalThis : null);
+    this._onOnline = () => this._retryNow();
     this.key = newSigningKey();
     this.publicKey = this.key.publicKey;
     this.hostKey = this.isHost ? this.publicKey : o.hostKey;
@@ -310,7 +332,10 @@ export class RelaySignaling extends Emitter {
     this.trickle = false;
     this.connected = false;
 
-    this._sockets = new Map(); // url -> { ws, retry, timer, open }
+    // url -> { ws, retry, timer, open, openedAt, rxAt, heard }：rxAt 是最后收到任何东西的时刻，
+    // heard 表示这条连接回应过我们自己发的东西（见 RELAY_QUIET_MS）
+    this._sockets = new Map();
+    this._downSince = 0; // 中继全断的时刻（全断时才非零）
     this._closedByUs = false;
     this._room = null; // { topic, key }
     this._seen = new Map(); // 事件 id -> 本机时间过了这一刻才可以忘掉它（毫秒）
@@ -327,6 +352,7 @@ export class RelaySignaling extends Emitter {
     // 房主：peerId -> { pubkey, name, seq, lastSeen, welcomedAt, linkedEver, unlinkedSince }
     this._members = new Map();
     this._banned = new Map(); // 房主：本场被移出的 'p:peerId' / 'k:公钥'
+    this._dropped = new Map(); // 房主：peerId -> { pubkey, seq }，没动静被清掉（没封禁）的成员
     this._busySeen = false; // 新人：这次进房有没有被房主回过 BUSY
     this._removedOnce = false;
     this._nextSeq = 1;
@@ -341,10 +367,12 @@ export class RelaySignaling extends Emitter {
     if (!this.isHost && !HEX64.test(String(this.hostKey || ''))) {
       throw relayError('房间链接里的房主公钥不对', 'BAD_LINK');
     }
+    this._netEvents?.addEventListener('online', this._onOnline);
     await this._openRelays();
 
     this._every(this._t.alive, () => this._send({ t: 'alive' }));
     this._every(this._t.sweep, () => {
+      this._checkRelays();
       this._sweepSilent();
       this._prune();
     });
@@ -402,21 +430,34 @@ export class RelaySignaling extends Emitter {
    * 新密钥不能放进房间广播：广播用的是旧房间密钥，拿着旧链接、一直挂在旧话题上的人
    * 都解得开，「旧的作废」对他们就不成立。所以每个成员单独一份，用房主签名私钥和该成员
    * 在 hello 里登记的公钥做 ECDH 派生的密钥加密（见 pairKey）。已经被静默清理掉的成员不在名单里；
-   * app 传了 isLinked 时，还没和房主连上直连的也不给 —— 放行了但没连上的，可能正是来占位的假身份。
+   * app 传了 isLinked 时，从没和房主连上过直连的也不给 —— 放行了但一直没连上的，可能正是来占位的假身份。
+   * 连上过、这会儿正断着在重连的（还在 linkGraceMs 宽限期里）照给：他只是恰好在重协商，
+   * 不给的话他被留在旧话题上，房主再也听不到他的重连请求，宽限期一过就被当成连不上移出。
    *
    * 0.7.4 的成员不认这种逐人加密的格式，收到后留在旧话题上：已经建好的直连不受影响，
    * 只是换链接之后进来的人和他们之间不会再经中继建连。
+   *
+   * 返回 { left }：已放行、却因为从没连上过而没拿到新密钥的人（昵称），好让房主知道谁没跟过来。
    */
   async rekey(newSecret) {
     if (!this.isHost) throw new Error('只有房主能换房间链接');
     const next = await deriveRoom(newSecret); // 格式不对就在这里抛，别先把旧话题上的人送走
     const topic = this._room?.topic;
-    const cutoff = Date.now() - this._t.silent;
+    const now = Date.now();
+    const cutoff = now - this._t.silent;
     const keys = [];
+    const left = [];
+    this._refreshLinks(now);
     if (topic) {
       for (const [peerId, m] of this._members) {
         if (m.lastSeen < cutoff) continue;
-        if (this._isLinked && !this._linkedNow(peerId)) continue;
+        if (this._isLinked && !this._linkedNow(peerId)) {
+          if (!m.linkedEver) {
+            left.push(m.name || peerId);
+            continue;
+          }
+          if (m.unlinkedSince && now - m.unlinkedSince >= this._t.linkGraceMs) continue; // 马上要被移出的
+        }
         try {
           keys.push([peerId, await seal(await pairKey(this.key.secretKey, m.pubkey, topic, peerId), { s: newSecret })]);
         } catch {
@@ -427,6 +468,7 @@ export class RelaySignaling extends Emitter {
     await this._send({ t: 'rekey', keys });
     await this._moveTo(newSecret, next);
     this.emit('rekey', { secret: newSecret });
+    return { left };
   }
 
   /**
@@ -448,6 +490,7 @@ export class RelaySignaling extends Emitter {
 
   close() {
     if (this._closedByUs) return;
+    this._netEvents?.removeEventListener('online', this._onOnline);
     // 先尽量说一声再走；发不出去也无所谓，房主 100 秒收不到心跳也会认定离开
     this._send({ t: 'bye' }).finally(() => {
       this._closedByUs = true;
@@ -499,7 +542,7 @@ export class RelaySignaling extends Emitter {
 
   _openRelay(url, first = null) {
     if (this._closedByUs) return;
-    const slot = this._sockets.get(url) || { ws: null, retry: 0, timer: null, open: false };
+    const slot = this._sockets.get(url) || { ws: null, retry: 0, timer: null, open: false, openedAt: 0, rxAt: 0, heard: false };
     this._sockets.set(url, slot);
     let ws;
     try {
@@ -513,30 +556,114 @@ export class RelaySignaling extends Emitter {
     ws.onopen = () => {
       opened = true;
       slot.open = true;
-      slot.retry = 0;
+      // 退避不在这里清零：连稳了才清（见 _relayClosed）
+      slot.openedAt = slot.rxAt = Date.now();
+      slot.heard = false;
       this.connected = true;
       this._subscribe(ws);
       first?.onOpen();
       first = null;
+      if (this._downSince) this._recovered();
     };
-    ws.onmessage = (m) => this._onRelayMessage(url, m.data);
+    ws.onmessage = (m) => {
+      slot.rxAt = Date.now();
+      this._onRelayMessage(url, m.data);
+    };
     ws.onerror = () => {};
     ws.onclose = () => {
-      slot.open = false;
       if (!opened) first?.onFail();
       first = null;
-      const anyOpen = [...this._sockets.values()].some((s) => s.open);
-      if (!anyOpen && this.connected) {
-        this.connected = false;
-        this.emit('disconnected');
-        this.emit('reconnecting', { in: this._backoff(slot.retry) });
-      }
-      this._retryRelay(url);
+      if (slot.ws === ws) this._relayClosed(url, slot);
     };
+  }
+
+  /** 一条中继断了：记账、判断是不是全断了，然后按退避重连。 */
+  _relayClosed(url, slot) {
+    if (this._closedByUs) return;
+    // 稳稳连住过一阵才断的，退避从头算；连上就断的接着累加
+    if (slot.open && Date.now() - slot.openedAt >= this._t.relayStable) slot.retry = 0;
+    slot.open = false;
+    slot.ws = null;
+    const anyOpen = [...this._sockets.values()].some((s) => s.open);
+    if (!anyOpen && this.connected) {
+      this.connected = false;
+      this._downSince = Date.now();
+      this.emit('disconnected');
+      this.emit('reconnecting', { in: this._backoff(slot.retry) });
+    }
+    this._retryRelay(url);
+  }
+
+  /**
+   * 半开的连接自己关掉：回应过我们的中继（heard）超过 relayQuiet 一声不吭，多半是本机网络已经断了、
+   * TCP 还没报错。不关的话 connected 一直是 true，「全断期间暂停计时」和恢复后的补救都不会发生。
+   * 从没回应过的中继（不回 OK、也不回推）不在此列，免得把一个只是不爱说话的中继反复踢掉。
+   */
+  _checkRelays(now = Date.now()) {
+    for (const [url, s] of this._sockets) {
+      if (!s.open || !s.heard || now - s.rxAt <= this._t.relayQuiet) continue;
+      const ws = s.ws;
+      if (ws) {
+        ws.onopen = ws.onmessage = ws.onclose = null;
+        try {
+          ws.close();
+        } catch {}
+      }
+      // 不等 onclose：对着一条死连接，浏览器的关闭握手要等很久才报
+      this._relayClosed(url, s);
+    }
+  }
+
+  /**
+   * 中继从全断里恢复。全断那段时间里别人「没动静」「没连上直连」都怪不到他们头上：
+   * 静默清理和未直连移出的计时从现在重新算。然后告诉 app 该把谁的直连重新拉起来。
+   */
+  _recovered() {
+    const now = Date.now();
+    const downMs = now - this._downSince;
+    this._downSince = 0;
+    if (this.isHost) {
+      for (const m of this._members.values()) {
+        m.lastSeen = now;
+        if (m.unlinkedSince) m.unlinkedSince = now;
+      }
+    } else {
+      for (const b of this._bindings.values()) b.lastSeen = now;
+      if (this._hostSeen) this._hostSeen = now;
+      // 断线期间可能错过了房主移出我的 leave、后来进房的人的 welcome：重新打个招呼。
+      // 还在房里的，房主回一份带名册的 welcome；已经被移出的，房主回 REMOVED
+      if (this._joined) this._sayHello();
+    }
+    this.emit('reconnected', { downMs, peers: this._recoverPeers() });
+  }
+
+  /** 信令知道的每个人，和这条直连该由谁发起（房主向所有人发；成员之间序号小的向序号大的发）。 */
+  _recoverPeers() {
+    if (this.isHost) return [...this._members].map(([peerId, m]) => ({ peerId, name: m.name, initiator: true }));
+    if (!this._joined) return [];
+    const out = [{ peerId: this.hostId, name: this._hostName || '', initiator: false }];
+    for (const [peerId, b] of this._bindings) {
+      out.push({ peerId, name: b.name, initiator: this._mySeq != null && b.seq > this._mySeq });
+    }
+    return out;
   }
 
   _backoff(retry) {
     return Math.min(30000, 1000 * 2 ** retry);
+  }
+
+  /**
+   * 系统报网络恢复（online）：断着的中继别再等退避。全断期间退避一路涨到 30 秒，
+   * 等它慢慢轮到的话，房主那边给我的宽限期可能已经过了。连着的、正在连的不动。
+   */
+  _retryNow() {
+    if (this._closedByUs) return;
+    for (const [url, s] of this._sockets) {
+      if (s.open || s.ws) continue;
+      clearTimeout(s.timer);
+      s.timer = null;
+      this._openRelay(url);
+    }
   }
 
   _retryRelay(url) {
@@ -549,7 +676,10 @@ export class RelaySignaling extends Emitter {
 
   _subscribe(ws) {
     if (!this._room) return;
-    const filter = { kinds: [RELAY_EVENT_KIND], '#x': [this._room.topic], since: Math.floor(Date.now() / 1000) - 30 };
+    // since 和本地的新鲜窗口一样宽：中继对实时推送也按整条过滤器（含 since）匹配，
+    // 窄了的话发送方时钟比我慢几十秒，他的消息就被中继挡在外面。临时事件中继本来不存，
+    // since 挡不了什么历史；重放照旧由去重表和发送计数挡
+    const filter = { kinds: [RELAY_EVENT_KIND], '#x': [this._room.topic], since: Math.floor(Date.now() / 1000) - MAX_SKEW_SEC };
     try {
       ws.send(JSON.stringify(['REQ', 'nr', filter]));
     } catch {}
@@ -700,7 +830,13 @@ export class RelaySignaling extends Emitter {
     } catch {
       return;
     }
-    if (!Array.isArray(msg) || msg[0] !== 'EVENT') return;
+    if (!Array.isArray(msg)) return;
+    // 这个中继回应过我们自己发的东西（OK，或者把我们的事件推了回来）：之后长时间一声不吭就是连接死了
+    if (msg[0] === 'OK' || msg[2]?.pubkey === this.publicKey) {
+      const slot = this._sockets.get(url);
+      if (slot) slot.heard = true;
+    }
+    if (msg[0] !== 'EVENT') return;
     const ev = msg[2];
     if (!wellFormed(ev) || !ev.tags.some((t) => t[0] === 'x' && t[1] === room.topic)) return;
     if (Math.abs(Math.floor(Date.now() / 1000) - ev.created_at) > MAX_SKEW_SEC) return;
@@ -776,7 +912,10 @@ export class RelaySignaling extends Emitter {
   _touch(peerId) {
     const b = this.isHost ? this._members.get(peerId) : this._bindings.get(peerId);
     if (b) b.lastSeen = Date.now();
-    if (peerId === this.hostId) this._hostSeen = Date.now();
+    if (peerId === this.hostId) {
+      this._hostSeen = Date.now();
+      this._hostGoneSent = false; // 房主又有动静了：以后再静默，还要再报一次
+    }
   }
 
   _handle(body, pubkey) {
@@ -859,7 +998,11 @@ export class RelaySignaling extends Emitter {
       return reject('BUSY', '房主这边还有人在连接，请稍后再试');
     }
     const now = Date.now();
-    const member = { pubkey, name, seq: this._nextSeq++, lastSeen: now, welcomedAt: 0, linkedEver: false, unlinkedSince: now };
+    // 因为没动静被清掉、又拿同一把公钥回来的（他那边中继断过一阵）：按原来的序号放行
+    const back = this._dropped.get(peerId);
+    this._dropped.delete(peerId);
+    const seq = back && back.pubkey === pubkey ? back.seq : this._nextSeq++;
+    const member = { pubkey, name, seq, lastSeen: now, welcomedAt: 0, linkedEver: false, unlinkedSince: now };
     this._members.set(peerId, member);
     this._sendWelcome(peerId, member);
     // 房主是房里的老成员，和信令服务器下一样由它向新人发 offer
@@ -887,7 +1030,12 @@ export class RelaySignaling extends Emitter {
   }
 
   _dropMember(peerId) {
-    if (!this._members.delete(peerId)) return;
+    const m = this._members.get(peerId);
+    if (!m) return;
+    this._members.delete(peerId);
+    this._dropped.delete(peerId);
+    this._dropped.set(peerId, { pubkey: m.pubkey, seq: m.seq });
+    while (this._dropped.size > DROPPED_MAX) this._dropped.delete(this._dropped.keys().next().value);
     this._send({ t: 'leave', peerId });
     this.emit('peer-leave', { peerId });
   }
@@ -914,9 +1062,15 @@ export class RelaySignaling extends Emitter {
     }
   }
 
-  /** 放行后一直没连上、或连上后又连续断开超过 linkGraceMs 的，移出并封禁。 */
+  /**
+   * 放行后一直没连上、或连上后又连续断开超过 linkGraceMs 的，移出并封禁。
+   * 本机中继全断时不判：那会儿谁的直连断了都重连不上（重连请求发不出去），怪不到他们头上；
+   * 恢复时计时从头算（见 _recovered）。
+   */
   _checkLinks() {
     if (!this.isHost || !this._isLinked) return;
+    this._checkRelays();
+    if (!this.connected) return;
     const now = Date.now();
     this._refreshLinks(now);
     for (const [peerId, m] of this._members) {
@@ -966,6 +1120,8 @@ export class RelaySignaling extends Emitter {
   }
 
   _sweepSilent() {
+    // 本机中继全断时谁都「没动静」：那是我这边听不见，不是他们走了。恢复时计时从头算（见 _recovered）
+    if (!this.connected) return;
     const cutoff = Date.now() - this._t.silent;
     if (this.isHost) {
       for (const [peerId, m] of this._members) if (m.lastSeen < cutoff) this._dropMember(peerId);
@@ -999,14 +1155,22 @@ export class RelaySignaling extends Emitter {
       if (body.pubkey !== this.publicKey) return; // 别人顶着我的 id？不是给我的
       this._hostGoneSent = false;
       // 名册里是比我早进房的人：记下他们的公钥好认他们的 offer，但不发 peer-join —— 由他们向我发起
+      const added = [];
       for (const r of Array.isArray(body.roster) ? body.roster.slice(0, MAX_MEMBERS) : []) {
         const id = String(r?.peerId || '');
         const rseq = Number(r?.seq);
         if (!ID_RE.test(id) || id === this.peerId || !HEX64.test(String(r?.pubkey)) || !Number.isSafeInteger(rseq)) continue;
         if (this._bindings.has(id) || this._bindings.size >= MAX_BINDINGS) continue;
-        this._bindings.set(id, { pubkey: r.pubkey, name: safeName(r.name), seq: rseq, lastSeen: Date.now() });
+        const binding = { pubkey: r.pubkey, name: safeName(r.name), seq: rseq, lastSeen: Date.now() };
+        this._bindings.set(id, binding);
+        added.push([id, binding]);
       }
-      if (this._joined) return;
+      if (this._joined) {
+        // 进房之后又收到给我的 welcome（中继恢复后重新 hello 的回复）：名册里多出来的是我断线期间
+        // 进房的人，他们的 welcome 我没收到。序号比我大的由我向他发起，跟平时一样
+        for (const [id, b] of added) this._maybeAnnounce(id, b);
+        return;
+      }
       this._joined = true;
       this._mySeq = seq;
       const joined = { hostId: this.hostId, maxMembers: this.maxMembers, peers: [] };
@@ -1037,8 +1201,11 @@ export class RelaySignaling extends Emitter {
   }
 
   _onReject(body) {
-    if (body.to !== this.peerId || body.key !== this.publicKey || this._joined) return;
+    if (body.to !== this.peerId || body.key !== this.publicKey) return;
     const code = String(body.code || 'REJECTED').slice(0, 40);
+    // 进房之后也认 REMOVED：断线期间被房主移出、错过了那条 leave，恢复后重新 hello 才知道。
+    // 别的回绝对已经进房的人没有意义（多半是中继乱序送来的旧回绝）
+    if (this._joined && code !== 'REMOVED') return;
     // 房主那边待定的人满了：不算失败，照常每隔一个 hello 周期重发，直到进房超时
     if (code === 'BUSY') {
       this._busySeen = true;

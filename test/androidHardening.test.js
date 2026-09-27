@@ -1144,15 +1144,16 @@ test('信令说「你被移出房间」（房间链接的房主一直没和你�
   await until(() => phone.logged('已进入房间') === 1, '进房');
   ws.onmessage({ data: JSON.stringify({ t: 'error', code: 'REMOVED', message: 'removed' }) });
   await flush();
-  assert.equal(phone.logged('房主那边一直没能和你直连，你已被移出房间'), 1);
+  // 进房前被移出：本场按 peerId 封禁，这次运行里再点也进不来 —— 说清楚要重启，不叫他「配好 TURN 再试」
+  assert.equal(phone.logged('房主那边一直没能和你直连，你已被移出这一场。重启 NoxReel 后再点链接'), 1);
   assert.equal(ws.closed, true, '信令收掉');
   assert.equal(phone.reloads.length, 0, '还没进房不用整页重载');
 });
 
 test('被移出前已经在房间里：整页重载回大厅，原因留到大厅再说一遍（只说一次）', { timeout: 60_000 }, async (t) => {
-  const session = new Map([['sw.lobbyNotice', '房主那边一直没能和你直连，你已被移出房间。']]);
+  const session = new Map([['sw.lobbyNotice', '你和房主的直连断开太久，已被移出房间。重新点一次房间链接就能回来。']]);
   const phone = await loadPhone(t, { session });
-  assert.equal(phone.logged('你已被移出房间'), 1);
+  assert.equal(phone.logged('直连断开太久，已被移出房间'), 1);
   assert.equal(session.has('sw.lobbyNotice'), false, '说完就删');
   const src = fs.readFileSync(path.join(root, 'android', 'app', 'src', 'main', 'assets', 'js', 'app-android.js'), 'utf8');
   const fn = src.slice(src.indexOf('function removedFromRoom()'), src.indexOf('\n}\n', src.indexOf('function removedFromRoom()')));

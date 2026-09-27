@@ -136,7 +136,11 @@ test('连不上任何中继：退回一对一邀请，并说明原因', async ()
 
 test('从房间链接切到信令服务器：先关掉中继那条，不拿空房间号编码', () => {
   const body = fnSource('inviteViaServer');
-  assert.match(body, /if \(S\.signaling && S\.signalTransport !== 'ws'\) \{\s*S\.signaling\.close\(\);\s*S\.signaling = null;\s*\}/);
+  // 关之前先数一下经房间链接进来的人（关掉之后他们断线就没法自动重连，要提醒房主）
+  assert.match(
+    body,
+    /if \(S\.signaling && S\.signalTransport !== 'ws'\) \{\s*(?:\/\/[^\n]*\n\s*)*const viaLink = [^\n]+\n\s*S\.signaling\.close\(\);\s*S\.signaling = null;\s*if \(viaLink\) log\([^\n]+\n\s*\}\s*if \(!S\.signaling\)/
+  );
 });
 
 test('connectSignaling：传了 relay 就建 RelaySignaling，带上协议版本、满员判定和中继列表', async () => {
