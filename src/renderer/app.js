@@ -57,6 +57,7 @@ import {
   worstWaitSeconds,
   RateMeter,
 } from './lib/stallForecast.js';
+import { unpackBitfield } from './lib/protocol.js';
 
 startI18n();
 
@@ -1454,6 +1455,8 @@ async function startHostLink(rawUrl) {
 const isRoomHost = () => S.role === 'host' && S.hostId === S.peerId;
 const PLAYLIST_OP_TIMEOUT_MS = 45_000;
 const MANIFEST_RETRY_MS = 5000;
+// 缓存位置用不了（盘拔了）时隔多久再试一次
+const CACHE_IO_RETRY_MS = 30_000;
 // 加片等房主回音超时之后的宽限期：房主那边的列表操作是一条串行链，排队就可能耗光 45 秒，
 // 他其实还在处理。这段时间里先别撤会话和清单，免得留下一个谁都供不了的条目。
 const ADD_GRACE_MS = 60_000;
@@ -1484,6 +1487,8 @@ function newSession({ manifest, state, filePath, sourcePath = null, isSeeder }) 
     // fileId 会变，按 fileId 的去重拦不住）
     sourcePath,
     isSeeder: !!isSeeder,
+    // 接收的文件在长期缓存文件夹里（手动模式收的、复用了登记过的持久副本）：「打开…位置」按它说
+    persistent: !isSeeder && !!state.persistent,
     state,
     safety: { sessionId: state.sessionId, status: isSeeder ? 'trusted-local' : 'waiting-download' },
   };
@@ -2314,6 +2319,12 @@ async function openLeechFor(item) {
             log('清掉已播放的缓存也放不下这一部，缓存先都留着', 'warn');
           }
           log(`没法接收《${item.name}》：${diskFull[0]}`, 'bad');
+        } else if (/缓存位置用不了：/.test(message)) {
+          // 缓存所在的盘拔了、没权限：不是片子的问题，不记成拒收、也不说成清单不安全。
+          // 过一会儿再试（盘可能插回来了）；这段时间本机先不参与这一部（下面 skipCurrentLocally），别让全房等我
+          S.manifestRetryAt.set(fileId, Date.now() + CACHE_IO_RETRY_MS);
+          setTimeout(scheduleTransferUpdate, CACHE_IO_RETRY_MS + 50);
+          log(`没法接收《${item.name}》：${message.match(/缓存位置用不了：[^\n]*/)[0]}`, 'bad');
         } else {
           S.blockedFiles.add(fileId);
           log(`已拒绝不安全的媒体清单：${message}`, 'bad');
@@ -2366,6 +2377,16 @@ function releaseUnreferenced() {
     S.hostOffered.delete(fileId);
     if (!S.sessions.has(fileId)) S.swarm?.withdrawManifest(fileId);
   }
+}
+
+/**
+ * 腾出了空间（在「管理缓存文件」里删了文件、清掉了残留）：之前放不下、被跳过的那几部再试一次。
+ * 还是放不下 openLeechFor 会再把它记回 diskFull，不会来回打转。
+ */
+function retryDiskFull() {
+  if (!S.diskFull.size) return;
+  S.diskFull.clear();
+  scheduleTransferUpdate();
 }
 
 /**
@@ -5347,6 +5368,8 @@ async function maybeSaveDownload(session) {
   if (!S.downloadWanted.has(fileId) || S.downloadSaving.has(fileId)) return;
   if (!downloadAllowed(session.safety?.status)) return;
   S.downloadSaving.add(fileId);
+  // 缓存和下载位置不在同一个盘上时要整部复制，几十 GB 得好几分钟：开始时就说一声
+  log(`正在把《${session.manifest.name}》另存到下载位置…`);
   try {
     const r = await window.sw.download.saveSession(session.sessionId);
     if (r?.fresh) log(`《${session.manifest.name}》已存到下载位置`, 'good');
@@ -5445,7 +5468,11 @@ function linkNotice(item) {
 function localMenu(item) {
   const menu = [];
   const sess = item.kind === 'file' ? S.sessions.get(item.fileId) : null;
-  if (sess?.filePath) menu.push({ key: 'reveal', label: sess.isSeeder ? '打开源文件位置' : '打开临时缓存位置' });
+  if (sess?.filePath) {
+    // 按文件真正在哪儿说：手动模式收的、复用了持久副本的在长期缓存文件夹里，不是退房就删的临时文件
+    const label = sess.isSeeder ? '打开源文件位置' : sess.persistent ? '打开长期缓存位置' : '打开临时缓存位置';
+    menu.push({ key: 'reveal', label });
+  }
   if (item.kind === 'link') {
     const cache = linkCacheOf(item);
     if (linkCacheBusy(cache)) menu.push({ key: 'cancel-cache', label: '取消缓存' });
@@ -5824,7 +5851,11 @@ function refreshMediaUi() {
   renderFilmInfo();
   renderProgress(S.swarm?.progress());
   $('btn-reveal').classList.toggle('hidden', S.sourceType !== 'file' || !S.filePath);
-  $('btn-reveal').textContent = S.isSeeder ? '打开源文件位置' : '打开临时缓存位置';
+  $('btn-reveal').textContent = S.isSeeder
+    ? '打开源文件位置'
+    : currentSession()?.persistent
+    ? '打开长期缓存位置'
+    : '打开临时缓存位置';
   // 按钮只画一个文件夹图标，文字放到悬停提示里
   $('btn-reveal').title = t($('btn-reveal').textContent);
   $('buffer').classList.toggle('link-mode', S.sourceType === 'link');
@@ -6051,14 +6082,20 @@ async function applyScanResult(session, result, before) {
   }
 
   if (outcome.status === 'clean') {
+    // 缓存什么时候清按文件真正在哪儿说：退房从来不删 —— 临时缓存关软件时清，长期缓存文件夹里的从不自动删
+    const kept = !!session.persistent;
     log(
       S.mpvRunning
-        ? '完整文件安全扫描通过；退出房间后会自动删除缓存'
-        : '安全扫描通过，正在打开播放器；退出房间后会自动删除缓存',
+        ? kept
+          ? '完整文件安全扫描通过；这部片存在长期缓存文件夹里，可在设置里清理'
+          : '完整文件安全扫描通过；缓存在关软件时清掉'
+        : kept
+        ? '安全扫描通过，正在打开播放器；这部片存在长期缓存文件夹里，可在设置里清理'
+        : '安全扫描通过，正在打开播放器；缓存在关软件时清掉',
       'good'
     );
     if (!S.mpvRunning) await launchPlayer();
-    window.sw.player.osd(t('安全扫描通过 · 缓存退出后自动清理'), 2500);
+    window.sw.player.osd(t(kept ? '安全扫描通过 · 已存进长期缓存文件夹' : '安全扫描通过 · 缓存关软件时清掉'), 2500);
     return;
   }
 
@@ -8417,10 +8454,51 @@ function handlePlayerExit({ code }) {
 
 window.sw.player.onError((payload) => handlePlayerError(payload || {}));
 
-// 本机有这部片收完的副本（这次运行里收过、或者手动模式存在长期缓存文件夹里）：打开接收会话前逐片核对，
-// 对得上的片就不用再传。大片子要核对一阵子，日志里说一声
+/**
+ * 复用本机副本时，主进程先抽查片头片尾就把会话开出来，其余的在后台逐片核对（见 fileStore.tryReuse），
+ * 每半秒报一次最新的 state。核对上的片并进传输层：进度、起播门槛、卡顿判断马上用得上，
+ * 也告诉对端我有了；调度器不再去向别人要这些片。对端送来的片照常收（主进程不会记两遍）。
+ */
+function mergeVerifiedChunks(e) {
+  if (!e?.sessionId || typeof e.state?.bitfield !== 'string') return;
+  const sess = [...S.sessions.values()].find((s) => s.sessionId === e.sessionId);
+  if (!sess || sess.isSeeder) return;
+  // 还没挂进 swarm 的，挂的时候用这份（attachLocalFiles 按 sess.state 建传输上下文）
+  sess.state = e.state;
+  const ctx = sess.slot !== null ? S.swarm?.files.get(sess.slot) : null;
+  if (!ctx || ctx.sessionId !== e.sessionId) return;
+  const total = ctx.manifest.chunkCount;
+  const have = unpackBitfield(e.state.bitfield, total);
+  let added = 0;
+  for (let i = 0; i < total; i++) {
+    if (have[i] === 1 && ctx.have[i] !== 1) {
+      ctx.have[i] = 1;
+      added++;
+    }
+  }
+  if (!added) return;
+  // 两边的位图都只记落了盘、验过哈希的片，并起来仍是主进程那份的子集：按并集重算计数和水位线
+  let count = 0;
+  let lead = -1;
+  for (let i = 0; i < total; i++) {
+    if (ctx.have[i] === 1) count++;
+    else if (lead < 0) lead = i;
+  }
+  const justCompleted = !ctx.complete && count === total;
+  ctx.haveCount = count;
+  ctx.contiguousBytes = lead < 0 ? ctx.manifest.size : lead * ctx.manifest.chunkSize;
+  ctx.complete = count === total;
+  // 位图整张重发（大文件分段），不逐片发 HAVE：核对一秒能过几百片，逐片发会撞上对端的控制消息预算
+  for (const peer of S.swarm.peers.values()) if (peer.authenticated) S.swarm._sendBitfield(peer, ctx);
+  S.swarm.emit('progress', S.swarm.progress(ctx.slot));
+  if (justCompleted) S.swarm.emit('complete', { slot: ctx.slot, fileId: ctx.manifest.fileId });
+}
+
+// 本机有这部片收完的副本（这次运行里收过、或者手动模式存在长期缓存文件夹里）：抽查对得上就先开会话，
+// 其余的在后台核对，核对上的片就不用再传。大片子要核对一阵子，日志里说一声
 window.sw.store.onReuse?.((e) => {
   if (!e || typeof e.name !== 'string') return;
+  mergeVerifiedChunks(e);
   if (e.stage === 'start') log(`本机已有《${e.name}》，正在核对…`);
   else if (e.stage === 'done') {
     if (e.matched === e.total) log(`本机已有的《${e.name}》核对通过，不用再传`, 'good');
@@ -8651,6 +8729,9 @@ function downloadFields() {
   ];
 }
 
+// 设置弹窗里「管理缓存文件」那张表的刷新函数（cachePolicyFields 建表时挂上），「换个位置」换完要调它
+let refreshCacheFileList = null;
+
 /**
  * 设置里的「缓存清理」「长期缓存文件夹」「管理缓存文件」三栏（见主进程 fileStore.setPolicy / mediaLibrary.js）。
  * 都是改完立刻生效，和「换个位置」一样；文件列表直接嵌在设置里 —— 设置本身是弹窗，
@@ -8694,7 +8775,12 @@ function cachePolicyFields() {
   const listBox = make('div', { className: 'cache-files' });
   const checked = () => [...listBox.querySelectorAll('input[type="checkbox"]')].filter((box) => box.checked);
   const fileRow = (file) => {
-    const box = make('input', { attrs: { type: 'checkbox', 'data-id': file.id }, props: { disabled: !!file.inUse } });
+    // 所在的盘这会儿不在（移动硬盘没插）：登记留着，但删不了 —— 等盘插回来再删
+    const unavailable = file.available === false;
+    const box = make('input', {
+      attrs: { type: 'checkbox', 'data-id': file.id },
+      props: { disabled: !!file.inUse || unavailable },
+    });
     box.onchange = () => {
       deleteButton.disabled = checked().length === 0;
     };
@@ -8705,6 +8791,7 @@ function cachePolicyFields() {
       make('span', { className: 'cache-file-meta', text: file.persistent ? '长期缓存' : '临时缓存' }),
       make('span', { className: 'cache-file-meta', text: fmtBytes(file.size) }),
       file.inUse ? make('span', { className: 'cache-file-meta busy', text: '正在用' }) : null,
+      unavailable ? make('span', { className: 'cache-file-meta busy', text: '暂不可用（所在的盘不在）' }) : null,
     ]);
   };
   const refreshList = async () => {
@@ -8730,11 +8817,15 @@ function cachePolicyFields() {
       log(`删掉了 ${r.removed} 个缓存文件`, 'good');
       if (r.skipped) log(`${r.skipped} 个正在用，没删`, 'warn');
       if (r.failed) showError(`${r.failed} 个删不掉（可能被别的程序占着）`);
+      // 磁盘满时软件自己提示的就是「来这里腾地方」：腾出来了，之前放不下的那几部再试一次
+      if (r.removed > 0) retryDiskFull();
     } catch (error) {
       showError(`删不掉：${error.message || error}`);
     }
     refreshList();
   };
+  // 同一个弹窗里「换个位置」会清掉本次运行的临时缓存：换完要跟着刷新这张表
+  refreshCacheFileList = refreshList;
   refreshList();
 
   return [
@@ -8750,7 +8841,7 @@ function cachePolicyFields() {
     field(
       '长期缓存文件夹',
       keptPath,
-      hint('手动清理模式收的片、手动缓存的在线视频放在这里。它跟着上面的缓存位置走；缓存位置是默认的系统临时目录时，放在本机应用数据目录里，免得被系统的磁盘清理删掉。')
+      hint('手动清理模式下收的片和手动缓存的在线视频放在这里（自动模式下手动缓存的在线视频放在临时缓存里）。它跟着上面的缓存位置走；缓存位置是默认的系统临时目录时，放在本机应用数据目录里，免得被系统的磁盘清理删掉。')
     ),
     field(
       '管理缓存文件',
@@ -8768,7 +8859,24 @@ function cacheField() {
   const changeButton = make('button', { className: 'ghost tiny', text: '换个位置' });
   const purgeButton = make('button', { className: 'ghost tiny', text: '清理残留' });
   const errorLine = make('div', { className: 'field-error hidden' });
+  // 换位置前的确认：本次运行的临时缓存会被立刻清掉（设置本身是弹窗，弹窗里不能再开确认框，就在这一栏里问）
+  const confirmLine = make('div', { className: 'field-error hidden' });
   const locked = roomEntered || !!S.swarm;
+  let confirmed = false;
+  // 「你配置的 X 这次用不了」：换到能用的位置之后就撤掉
+  const fallbackLine = S.env?.cacheFallback
+    ? make('span', {}, [
+        make('br'),
+        `你配置的 ${S.env.cacheFallback.configured} 这次用不了（${S.env.cacheFallback.reason}），已临时用回系统临时目录。`,
+      ])
+    : null;
+
+  /** 本次运行里自动缓存的片（临时条目）有几个、多大：换位置会把它们清掉。读不出来当没有。 */
+  const tempCaches = async () => {
+    const files = await Promise.resolve(window.sw.cache.listFiles?.()).catch(() => null);
+    const temp = (files || []).filter((file) => !file.persistent);
+    return { count: temp.length, bytes: temp.reduce((sum, file) => sum + (file.size || 0), 0) };
+  };
 
   const refresh = async () => {
     try {
@@ -8788,14 +8896,33 @@ function cacheField() {
   changeButton.disabled = locked;
   changeButton.onclick = async () => {
     errorLine.classList.add('hidden');
+    if (!confirmed) {
+      const temp = await tempCaches();
+      if (temp.count) {
+        // 先说清楚会丢什么，再点一次才真换
+        confirmed = true;
+        confirmLine.textContent = t(
+          `换位置会立刻清掉本次运行里缓存的 ${temp.count} 个文件（${fmtBytes(temp.bytes)}），再放要重新接收。确定要换就再点一次「换个位置」。`
+        );
+        confirmLine.classList.remove('hidden');
+        return;
+      }
+    }
+    confirmed = false;
+    confirmLine.classList.add('hidden');
     const dir = await window.sw.dialog.pickCacheDir();
     if (!dir) return;
     try {
       const r = await window.sw.cache.setRoot(dir);
       pathLine.textContent = r.cacheDir;
       S.env.cacheDir = r.cacheDir;
+      // 主进程换位置时已经把「配置的目录这次用不了」清掉了，这里照抄，提示跟着撤
+      S.env.cacheFallback = r.fallback || null;
+      if (!S.env.cacheFallback) fallbackLine?.remove();
       log(`缓存目录已改到 ${r.cacheDir}`, 'good');
       refresh();
+      // 旧运行目录连同临时缓存一起清掉了：「管理缓存文件」那张表跟着刷新
+      refreshCacheFileList?.();
       // 长期缓存文件夹跟着缓存位置走
       const policy = await Promise.resolve(window.sw.cache.policy?.()).catch(() => null);
       if (policy) {
@@ -8814,6 +8941,8 @@ function cacheField() {
       const { removed } = await window.sw.cache.purge();
       log(`清掉了 ${removed} 处残留缓存`, 'good');
       refresh();
+      // 腾出了空间：之前放不下的那几部再试一次
+      if (removed > 0) retryDiskFull();
     } catch (error) {
       errorLine.textContent = t(`清不掉：${error.message || error}`);
       errorLine.classList.remove('hidden');
@@ -8824,18 +8953,15 @@ function cacheField() {
     '缓存位置',
     make('div', { className: 'cmd-row' }, [pathLine, changeButton, purgeButton]),
     usageLine,
+    confirmLine,
     errorLine,
     hint(
       locked ? '放映进行中不能换位置，退出房间后可改。' : '自动清理模式下，接收到的片子放在这里，关软件时清掉。',
       '换到空间大的盘上，才收得下大文件。',
+      '换位置会立刻清掉本次运行里自动缓存的片，长期缓存文件夹里的不动。',
       // 让用户指定任意目录，最大的顾虑就是「会不会把我原来的东西删了」
       '清理只认本软件自己建的目录，同目录下你自己的文件一个都不会动。',
-      ...(S.env?.cacheFallback
-        ? [
-            make('br'),
-            `你配置的 ${S.env.cacheFallback.configured} 这次用不了（${S.env.cacheFallback.reason}），已临时用回系统临时目录。`,
-          ]
-        : [])
+      ...(fallbackLine ? [fallbackLine] : [])
     )
   );
 }

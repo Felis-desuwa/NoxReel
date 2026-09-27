@@ -66,6 +66,29 @@ async function uniquePath(dir, name) {
   throw new Error('同名文件太多了');
 }
 
+/**
+ * 把工作目录里做好的文件挪到 dir 下，用不重名的名字，绝不覆盖已有文件。
+ * 先硬链接到目标名（目标已存在就 EEXIST，挑下一个名字），成了再删掉原来那个 ——
+ * 不能直接 rename：挑好名字和改名之间有人抢先建了同名文件，rename 会把它覆盖掉。
+ * 文件系统不支持硬链接（FAT32/exFAT）时才退回 rename。
+ * @returns {Promise<string>} 挪到的路径
+ */
+async function moveNoOverwrite(file, dir, name) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const target = await uniquePath(dir, name);
+    try {
+      await fsp.link(file, target);
+    } catch (error) {
+      if (error?.code === 'EEXIST') continue;
+      await fsp.rename(file, target);
+      return target;
+    }
+    await fsp.rm(file, { force: true }).catch(() => {});
+    return target;
+  }
+  throw new Error('同名文件太多了');
+}
+
 /** 路径是不是在 dir 里面（yt-dlp 报回来的文件路径不能跑到工作目录外面去）。 */
 function inside(dir, target) {
   const rel = path.relative(dir, target);
@@ -150,6 +173,18 @@ class LinkCache extends EventEmitter {
 
   status() {
     return [...this.jobs.values()].map((job) => this.view(job));
+  }
+
+  /**
+   * 有没有这种用途、正在下、工作目录满足 inDir 的任务。在下却还没定下工作目录的（placement 正在建）也算 ——
+   * 马上就要建在当前的位置上。排队的不算：轮到时才 placement，那时用的是换过之后的位置。
+   */
+  hasActive(purpose, inDir = () => true) {
+    for (const job of this.jobs.values()) {
+      if (job.purpose !== purpose || job.state !== 'downloading') continue;
+      if (!job.workDir || inDir(job.workDir)) return true;
+    }
+    return false;
   }
 
   _emit(job) {
@@ -357,4 +392,4 @@ class LinkCache extends EventEmitter {
   }
 }
 
-module.exports = { LinkCache, safeTitle, uniquePath, WORK_DIR, FORMAT, MAX_PARALLEL, PURPOSES };
+module.exports = { LinkCache, safeTitle, uniquePath, moveNoOverwrite, WORK_DIR, FORMAT, MAX_PARALLEL, PURPOSES };

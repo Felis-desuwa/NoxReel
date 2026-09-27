@@ -48,7 +48,7 @@ const { sharedProxy, closeSharedProxy } = require('./publicProxy');
 const { lockDownPermissions } = require('./permissions');
 const { CloudflareTurn } = require('./cloudflareTurn');
 const { MediaLibrary } = require('./mediaLibrary');
-const { LinkCache, uniquePath: uniqueFilePath, WORK_DIR: DOWNLOAD_WORK_DIR } = require('./linkCache');
+const { LinkCache, moveNoOverwrite, WORK_DIR: DOWNLOAD_WORK_DIR } = require('./linkCache');
 const { DownloadSaver } = require('./downloadSaver');
 const { labelProtocolHandler } = require('./protocolName');
 const { displayVersion, readBuildNumber } = require('./appVersion');
@@ -146,8 +146,8 @@ async function workDirIn(dir, id, onFinish = async () => {}) {
   return {
     workDir: work,
     finish: async (file, meta) => {
-      const target = await uniqueFilePath(dir, path.basename(file));
-      await fsp.rename(file, target);
+      // 不覆盖：挑好名字和挪过去之间有人抢先建了同名文件，也另起名字
+      const target = await moveNoOverwrite(file, dir, path.basename(file));
       await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
       await onFinish(target, meta);
       return target;
@@ -182,14 +182,18 @@ const linkCache = new LinkCache({
         mediaLibrary.addLink({ url: meta.url, title: meta.title, filePath: target, size: meta.size })
       );
     }
-    const owned = await cache.createOwnedDir('link');
+    // 工作目录归建它的那个缓存管理器管：收拾残局、登记都认它，不认之后换上来的
+    const owner = cache;
+    const owned = await owner.createOwnedDir('link');
     return {
       workDir: owned,
       finish: async (file, meta) => {
+        // 缓存位置在这期间换过（setCacheRoot 本来会拦）：旧运行目录已经不归现在的缓存管，别登记进去
+        if (owner !== cache) throw new Error('缓存位置已经换了，这份缓存作废');
         mediaLibrary.addTempLink({ url: meta.url, title: meta.title, filePath: file, size: meta.size, ownedDir: owned });
         return file;
       },
-      abort: () => cache.removeOwned(owned),
+      abort: () => owner.removeOwned(owned),
     };
   },
   childEnv: () => linkMedia.childEnv(),
@@ -404,6 +408,12 @@ function createWindow() {
     overlay.destroy();
     app.quit();
   });
+  // Windows 关机、重启、注销时 Electron 不发 before-quit，上面那套收尾一行都不跑。
+  // 趁窗口收到 session-end 尽力收一次尾；来不及做完也不要紧 —— 没收完的片、没复制完的另存
+  // 都在运行目录或 .noxreel-downloading 工作目录里，下次启动回收，不会顶着正式片名留下来。
+  win.on('session-end', () => {
+    cleanup().catch(() => {});
+  });
 
   // 外链一律走系统浏览器，不在应用里开新窗口
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -469,6 +479,8 @@ overlay.attachIpc(ipcMain);
 let playerWindow = null;
 /** 播放器内那个输入条的提示语，由渲染进程随启动参数给（主进程不做 i18n）。 */
 let playerChatPrompt = '';
+/** 播放器最近一次打开的本地文件（在线链接是 null）。手动清理要据此把正在放的缓存标成「正在用」。 */
+let playerSource = null;
 /** 弹幕快捷键。Ctrl+Enter 被 PotPlayer 和 MPC-BE 都占了（P0 实测），统一改成这个。 */
 const CHAT_HOTKEY = 'Control+Shift+D';
 let hotkeyOn = false;
@@ -655,6 +667,9 @@ async function cleanup() {
     for (const controller of tasks.values()) controller.abort();
     // 在线视频的手动缓存和下载：yt-dlp 杀掉，没下完的工作目录由它自己删
     linkCache.cancelAll();
+    // 边下边播正在跨盘复制的另存：取消，半截文件连工作目录删掉（不取消的话进程要在后台等复制做完才退，
+    // 而且它还读着缓存那份，关会话、删缓存都得等它）
+    const savesStopped = downloadSaver.cancelAll().catch(() => {});
     // 转封装／精简的 ffmpeg 也要收，否则它会变成孤儿进程继续满速写盘，
     // 而且持着输出文件的句柄让 cleanupRun() 当次删不掉缓存目录。
     media.cancelAll();
@@ -671,6 +686,7 @@ async function cleanup() {
         /* 还没 ready 就退出 */
       }
     }
+    await savesStopped;
     await store.closeAll().catch(() => {});
     await Promise.all(
       [...remuxOutputs.values()].map((ownedDir) => cache.removeOwned(ownedDir).catch(() => false))
@@ -1206,6 +1222,7 @@ secureHandle('player:launch', async (payload) => {
   // 这里只把它交给 mpv 的 --script-opt。空串就用 Lua 脚本自带的默认值。
   const prompt = chatPrompt === '' ? '' : validate.scriptOptValue(chatPrompt, '弹幕输入提示');
   playerChatPrompt = prompt;
+  playerSource = remote ? null : source;
   try {
     if (want !== 'mpv') {
       // 外部播放器：exe 只能由主进程从探测结果或用户在对话框里挑的路径里取，渲染进程碰不到它。
@@ -1334,6 +1351,11 @@ secureHandle('settings:setCacheRoot', async (payload) => {
   if (store.hasOpenSessions()) throw new Error('正在放映时不能换缓存目录，退出房间后再改');
   if (tempJobs) throw new Error('正在转封装或精简，完成后再换缓存目录');
   if (remuxOutputs.size) throw new Error('还有临时文件没回收，退出房间后再改');
+  // 同一个道理：自动模式下「开始手动缓存」的在线视频，yt-dlp 正往运行目录里写（退房不取消，见 reclaimAfterRendererGone）。
+  // 换目录会把运行目录连同它的工作目录一起端走。手动模式的写在长期缓存文件夹、边下边播的写在下载文件夹，不拦
+  if (linkCache.hasActive('cache', (workDir) => cache.owns(workDir))) {
+    throw new Error('在线视频还在缓存，完成或取消后再换缓存目录');
+  }
   const target = validate.absolutePath(dir, '缓存目录');
   // 只认用户刚在对话框里挑的目录（或者默认目录）：页面自己拼的路径不行，理由同 approvedSources
   const key = pathKey(target);
@@ -1358,7 +1380,8 @@ secureHandle('settings:setCacheRoot', async (payload) => {
   // 长期缓存文件夹跟着缓存位置走；已经存下的片留在原处，登记表里照样找得到
   store.setPolicy({ mode: cacheMode, keptDir: keptCacheDir() });
   await cache.initialize();
-  return { cacheDir: cache.rootDir };
+  // fallback 已经清掉了：界面照抄，「这次用不了，已临时用回系统临时目录」的提示跟着撤
+  return { cacheDir: cache.rootDir, fallback: cacheFallback };
 });
 
 /* ------------------------------ 清理方式、下载位置、手动清理 ------------------------------ */
@@ -1481,17 +1504,17 @@ secureHandle('linkCache:cancel', async (payload) => {
 });
 
 /**
- * 缓存好的本地文件：交给播放器之前由主进程核准（approvedSources）。文件没了、大小不对就摘掉登记。
+ * 缓存好的本地文件：交给播放器之前由主进程核准（approvedSources）。文件确实没了、大小不对就摘掉登记；
+ * 所在的盘这会儿访问不了（移动硬盘没插）就只是这次不用它，登记留着。
  * @returns {Promise<{path: string, title: string}|null>}
  */
 secureHandle('linkCache:localPath', async (url) => {
   const key = validate.string(url, '视频链接', { max: 16_384 });
   const entry = mediaLibrary.findLink(key);
   if (!entry) return null;
-  try {
-    const stat = await fsp.stat(entry.path);
-    if (!stat.isFile() || stat.size !== entry.size) throw new Error('变了');
-  } catch {
+  const where = await mediaLibrary.probe(entry.path).catch(() => ({ status: 'unavailable' }));
+  if (where.status === 'unavailable') return null;
+  if (where.status !== 'ok' || !where.stat.isFile() || where.stat.size !== entry.size) {
     await mediaLibrary.forgetPath(entry.path).catch(() => {});
     return null;
   }
@@ -1506,13 +1529,25 @@ secureHandle('linkCache:localPath', async (url) => {
   return { path: realPath, title: entry.name };
 });
 
-/** 手动清理列的清单：登记过的片子（临时的、保存位置里的、手动缓存的在线视频），标出哪些正在用。 */
+/**
+ * 这个缓存文件现在有没有人在用：开着的接收会话的文件，或者播放器正打开着的本地文件
+ * （缓存好的在线视频从本地播时没有会话，只有播放器攥着它）。
+ */
+async function cacheFileInUse(filePath) {
+  if (store.isSessionFile(filePath)) return true;
+  if (!players.running || !playerSource) return false;
+  // 播放器拿到的是 realpath 过的路径，登记表里记的是当初的路径：两边都归一了再比
+  const real = await fsp.realpath(filePath).catch(() => filePath);
+  return pathKey(real) === pathKey(playerSource) || pathKey(filePath) === pathKey(playerSource);
+}
+
+/** 手动清理列的清单：登记过的片子（临时的、保存位置里的、手动缓存的在线视频），标出哪些正在用、哪些所在的盘不在。 */
 secureHandle('cache:listFiles', async () => {
   const entries = await mediaLibrary.list();
-  return entries.map((e) => ({ ...e, inUse: store.isSessionFile(e.path) }));
+  return Promise.all(entries.map(async (e) => ({ ...e, inUse: await cacheFileInUse(e.path) })));
 });
 
-/** 删勾选的那几条。正在用的不删；删不掉的（被别的程序占着）报回去。 */
+/** 删勾选的那几条。正在用的不删；删不掉的（被别的程序占着、所在的盘不在）报回去。 */
 secureHandle('cache:deleteFiles', async (ids) => {
   if (!Array.isArray(ids) || ids.length > 5000) throw new TypeError('无效的删除列表');
   const entries = await mediaLibrary.list();
@@ -1521,7 +1556,7 @@ secureHandle('cache:deleteFiles', async (ids) => {
   for (const raw of ids) {
     const entry = typeof raw === 'string' ? byId.get(raw) : null;
     if (!entry) continue;
-    if (store.isSessionFile(entry.path)) {
+    if (await cacheFileInUse(entry.path)) {
       result.skipped++;
       continue;
     }

@@ -32,6 +32,7 @@ const EN = new Map(Object.entries({
   '重新打开播放器': 'Reopen player',
   '打开源文件位置': 'Open source file location',
   '打开临时缓存位置': 'Open temporary cache location',
+  '打开长期缓存位置': 'Open long-term cache location',
   '成员': 'Members',
   '邀请': 'Invite',
   '传输': 'Transfer',
@@ -196,10 +197,15 @@ const EN = new Map(Object.entries({
   '接收中': 'Receiving',
   '可信房间已达到片头缓冲，正在边接收边播放；完整接收后仍会执行安全扫描。': 'The trusted room has enough initial data. Progressive playback is starting; a full scan will still run after download.',
   '可信房间 · 边下边播风险较高': 'Trusted room · Progressive playback has higher risk',
-  '完整文件安全扫描通过；退出房间后会自动删除缓存': 'Full-file security scan passed. The cache will be deleted when you leave.',
-  '安全扫描通过，正在打开播放器；退出房间后会自动删除缓存': 'Security scan passed. Opening the player; the cache will be deleted when you leave.',
+  '完整文件安全扫描通过；缓存在关软件时清掉': 'Full-file security scan passed. The cache is cleared when NoxReel closes.',
+  '完整文件安全扫描通过；这部片存在长期缓存文件夹里，可在设置里清理':
+    'Full-file security scan passed. This video is kept in the long-term cache folder; you can clean it up in Settings.',
+  '安全扫描通过，正在打开播放器；缓存在关软件时清掉': 'Security scan passed. Opening the player; the cache is cleared when NoxReel closes.',
+  '安全扫描通过，正在打开播放器；这部片存在长期缓存文件夹里，可在设置里清理':
+    'Security scan passed. Opening the player; this video is kept in the long-term cache folder and can be cleaned up in Settings.',
   '未经本机扫描 · 请自行确认片源': 'Not scanned locally · Verify the source yourself',
-  '安全扫描通过 · 缓存退出后自动清理': 'Security scan passed · Cache is cleared on exit',
+  '安全扫描通过 · 缓存关软件时清掉': 'Security scan passed · Cache is cleared when NoxReel closes',
+  '安全扫描通过 · 已存进长期缓存文件夹': 'Security scan passed · Kept in the long-term cache folder',
   '安全扫描未通过': 'Security scan did not pass',
   'mpv 已启动（先暂停着，等所有人就绪）': 'mpv started and is paused while everyone gets ready',
   '没找到 mpv，无法播放。装好 mpv 后点右上角「重新检测」。': 'mpv was not found. Install it, then select “Check again” in the top-right corner.',
@@ -338,6 +344,8 @@ const EN = new Map(Object.entries({
   '放映进行中不能换位置，退出房间后可改。': 'The location cannot change during a screening; leave the room first.',
   '自动清理模式下，接收到的片子放在这里，关软件时清掉。':
     'In automatic cleanup mode, received videos live here and are cleared when NoxReel closes.',
+  '换位置会立刻清掉本次运行里自动缓存的片，长期缓存文件夹里的不动。':
+    'Changing the location immediately clears the videos cached automatically during this session; the long-term cache folder is left alone.',
   // 缓存清理方式、长期缓存文件夹、手动清理
   '缓存清理': 'Cache cleanup',
   '自动：关软件时清掉': 'Automatic: cleared when NoxReel closes',
@@ -348,13 +356,14 @@ const EN = new Map(Object.entries({
     'Manual: received videos are kept in the long-term cache folder and never deleted automatically; the same video is reused later. When the disk is full, NoxReel stops and asks you to clean up here.',
   '只影响之后开始接收的片。': 'Applies only to videos received from now on.',
   '长期缓存文件夹': 'Long-term cache folder',
-  '手动清理模式收的片、手动缓存的在线视频放在这里。它跟着上面的缓存位置走；缓存位置是默认的系统临时目录时，放在本机应用数据目录里，免得被系统的磁盘清理删掉。':
-    'Videos received in manual cleanup mode and online videos you cache yourself are kept here. It follows the cache location above; when that is the default system temp directory, it lives in the local app data directory instead so system disk cleanup does not delete it.',
+  '手动清理模式下收的片和手动缓存的在线视频放在这里（自动模式下手动缓存的在线视频放在临时缓存里）。它跟着上面的缓存位置走；缓存位置是默认的系统临时目录时，放在本机应用数据目录里，免得被系统的磁盘清理删掉。':
+    'In manual cleanup mode, received videos and online videos you cache yourself are kept here (in automatic mode, cached online videos go to the temporary cache). It follows the cache location above; when that is the default system temp directory, it lives in the local app data directory instead so system disk cleanup does not delete it.',
   '管理缓存文件': 'Manage cached files',
   '删除所选': 'Delete selected',
   '长期缓存': 'Long-term cache',
   '临时缓存': 'Temporary cache',
   '正在用': 'In use',
+  '暂不可用（所在的盘不在）': 'Unavailable for now (its drive is not connected)',
   '还没有缓存文件': 'No cached files yet',
   '只列出本软件存下的片子，删的也只是这些；正在用的删不了。':
     'Only videos NoxReel saved are listed, and only those get deleted; files in use cannot be deleted.',
@@ -1069,6 +1078,7 @@ const EN_PATTERNS = [
     /^没法接收《(.+)》：磁盘空间不够：这部片子需要 ([\d.]+)GB，缓存所在的磁盘只剩 ([\d.]+)GB$/,
     'Cannot receive “$1”: not enough disk space. It needs $2 GB, but the cache disk has only $3 GB free',
   ],
+  [/^没法接收《(.+)》：缓存位置用不了：(.*)$/, 'Cannot receive “$1”: the cache location is unavailable: $2'],
   [/^观众-(\d+)$/, 'Viewer-$1'],
   [/^已复制完整 (\d+) 字符 ✓$/, 'Copied all $1 characters ✓'],
   [/^复制邀请码失败：(.*)$/, (_all, detail) => `Failed to copy invite code: ${translate(detail, 'en')}`],
@@ -1246,6 +1256,10 @@ const EN_PATTERNS = [
   [/^换不了：(.+)$/, 'Could not change it: $1'],
   [/^清不掉：(.+)$/, 'Could not clean up: $1'],
   [/^缓存目录已改到 (.+)$/, 'Cache directory moved to $1'],
+  [
+    /^换位置会立刻清掉本次运行里缓存的 (\d+) 个文件（(.+)），再放要重新接收。确定要换就再点一次「换个位置」。$/,
+    'Changing the location immediately clears $1 file(s) cached during this session ($2); playing them again means receiving them again. Select “Change location” again to go ahead.',
+  ],
   [/^清掉了 (\d+) 处残留缓存$/, 'Cleaned up $1 leftover cache director(ies)'],
   // 缓存清理方式、下载位置、手动清理、复用收完的片
   [/^改不了：(.+)$/, 'Could not change it: $1'],
@@ -1262,6 +1276,7 @@ const EN_PATTERNS = [
   // 在线视频的手动缓存
   [/^缓存中 (.+)$/, 'Caching $1'],
   [/^下载中 (.+)$/, 'Downloading $1'],
+  [/^正在把《(.+)》另存到下载位置…$/, 'Saving a copy of “$1” to the download folder…'],
   [/^《(.+)》已存到下载位置$/, '“$1” saved to the download folder'],
   [/^《(.+)》下载失败：(.+)$/, 'Could not download “$1”: $2'],
   [/^《(.+)》存不到下载位置：(.+)$/, 'Could not save “$1” to the download folder: $2'],
@@ -1279,6 +1294,7 @@ const EN_PATTERNS = [
   [/^正在放映时不能换缓存目录，退出房间后再改$/, 'The cache directory cannot change during a screening; leave the room first'],
   [/^还有临时文件没回收，退出房间后再改$/, 'Temporary files are still in use; leave the room first'],
   [/^正在转封装或精简，完成后再换缓存目录$/, 'A remux or slim job is running; change the cache directory after it finishes'],
+  [/^在线视频还在缓存，完成或取消后再换缓存目录$/, 'An online video is still being cached; change the cache directory after it finishes or is canceled'],
   [
     /^本机在对称 NAT 后面（几台 STUN 服务器各看到一个不同的公网端口）—— 这种网络打洞必定失败，只能走 TURN 中继。请在设置里配一个。$/,
     'This machine is behind a symmetric NAT (several STUN servers each saw a different public port). Hole punching always fails on such a network — only a TURN relay works. Configure one in Settings.',

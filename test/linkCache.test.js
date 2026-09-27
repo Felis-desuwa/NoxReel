@@ -336,3 +336,24 @@ test('手动缓存和边下边播下载的文案都有英文', async () => {
     assert.notEqual(en(zh), zh, zh);
   }
 });
+
+test('hasActive：换缓存位置前查「在线视频还在往这里缓存」—— 只认在下的、工作目录在范围内的', async (t) => {
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  const { cache, keptDir } = await setup(t, {
+    behave: async (args, child) => {
+      await gate;
+      await succeed(args, child);
+    },
+  });
+  const url = 'https://video.example.org/watch?v=active';
+  cache.start({ url, title: '在下' });
+  await until(() => cache.status()[0]?.state === 'downloading' && cache.jobs.values().next().value.workDir, '开始下');
+  const inKept = (dir) => dir.startsWith(keptDir);
+  assert.equal(cache.hasActive('cache', inKept), true, '正在往这个位置写');
+  assert.equal(cache.hasActive('cache', () => false), false, '工作目录不在范围内（手动模式写在长期缓存文件夹）不拦');
+  assert.equal(cache.hasActive('download'), false, '别的用途不算');
+  release();
+  await until(() => cache.status()[0]?.state === 'done', '下完');
+  assert.equal(cache.hasActive('cache', inKept), false, '下完了就不算');
+});

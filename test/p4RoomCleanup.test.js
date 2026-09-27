@@ -683,6 +683,120 @@ test('磁盘余量读得出来，删了等于没删就停手', () => {
   assert.equal(ctx.evictionVictim(50 * GB, null, null).fileId, 'b');
 });
 
+test('缓存位置用不了（盘拔了）不记成拒收、不说成清单不安全，过一会儿再试', async () => {
+  const manifest = { fileId: 'f-io', name: 'IO.mkv', size: 4 * GB, chunkCount: 2048 };
+  const item = { kind: 'file', fileId: 'f-io', slot: 0, name: 'IO.mkv', size: 4 * GB };
+  const { ctx, S, calls } = leechBox({
+    queue: [item],
+    sessions: new Map(),
+    manifest,
+    openLeech: () =>
+      Promise.reject(
+        new Error(
+          "Error invoking remote method 'store:openLeech': Error: 缓存位置用不了：ENOENT: no such file or directory, mkdir 'E:\\NoxReel\\kept'"
+        )
+      ),
+  });
+  ctx.CACHE_IO_RETRY_MS = 30_000;
+  const before = Date.now();
+  await ctx.openLeechFor(item);
+  assert.equal(S.blockedFiles.has('f-io'), false, '盘插回来还要接着收，不能拉黑');
+  assert.equal(S.diskFull.has('f-io'), false);
+  assert.ok(S.manifestRetryAt.get('f-io') >= before + 30_000, '隔一会儿再试');
+  assert.ok(calls.some((c) => c.includes('没法接收《IO.mkv》：缓存位置用不了：ENOENT')), calls.join('\n'));
+  assert.ok(!calls.some((c) => c.includes('不安全')), '不是清单的问题');
+
+  // 清单本身不对的仍然照旧拒收
+  const bad = leechBox({
+    queue: [item],
+    sessions: new Map(),
+    manifest,
+    openLeech: () => Promise.reject(new Error('无效的媒体清单')),
+  });
+  await bad.ctx.openLeechFor(item);
+  assert.equal(bad.S.blockedFiles.has('f-io'), true);
+});
+
+test('在「管理缓存文件」里删掉了东西：之前放不下的那几部再试一次', () => {
+  const calls = [];
+  const S = { diskFull: new Set(['a', 'b']) };
+  const ctx = sandbox(fns('retryDiskFull'), { S, scheduleTransferUpdate: () => calls.push('schedule') });
+  ctx.retryDiskFull();
+  assert.equal(S.diskFull.size, 0);
+  assert.deepEqual(calls, ['schedule']);
+  ctx.retryDiskFull();
+  assert.deepEqual(calls, ['schedule'], '没有放不下的就不用重排');
+});
+
+async function mergeBox({ slot = 4, have = [1, 0, 0, 0], complete = false } = {}) {
+  const { unpackBitfield, packBitfield } = await import('../src/renderer/lib/protocol.js');
+  const manifest = { fileId: 'f-r', name: 'R.mkv', size: 4 * 2 * 1024 * 1024, chunkSize: 2 * 1024 * 1024, chunkCount: 4 };
+  const ctxHave = Uint8Array.from(have);
+  const fileCtx = {
+    slot,
+    sessionId: 's-r',
+    manifest,
+    have: ctxHave,
+    haveCount: have.filter(Boolean).length,
+    contiguousBytes: 0,
+    complete,
+  };
+  const sent = [];
+  const emitted = [];
+  const S = {
+    sessions: new Map([['f-r', { fileId: 'f-r', sessionId: 's-r', slot, isSeeder: false, state: { haveCount: 1 } }]]),
+    swarm: {
+      files: new Map([[slot, fileCtx]]),
+      peers: new Map([
+        ['v1', { authenticated: true, peerId: 'v1' }],
+        ['v2', { authenticated: false, peerId: 'v2' }],
+      ]),
+      _sendBitfield: (peer, c) => sent.push([peer.peerId, c.complete]),
+      emit: (name, payload) => emitted.push([name, payload]),
+      progress: (s) => ({ slot: s, haveCount: fileCtx.haveCount }),
+    },
+  };
+  const ctx = sandbox(fns('mergeVerifiedChunks'), { S, unpackBitfield });
+  const stateOf = (bits) => ({ bitfield: packBitfield(Uint8Array.from(bits)), haveCount: bits.filter(Boolean).length });
+  return { ctx, S, fileCtx, sent, emitted, stateOf };
+}
+
+test('复用副本后台核对上的片并进传输层：计数、水位线重算，告诉对端，收齐了照常发 complete', async () => {
+  const { ctx, S, fileCtx, sent, emitted, stateOf } = await mergeBox();
+  // 渲染进程自己已经收了第 0 片；主进程核对上了 1、2
+  ctx.mergeVerifiedChunks({ stage: 'progress', sessionId: 's-r', state: stateOf([0, 1, 1, 0]) });
+  assert.deepEqual([...fileCtx.have], [1, 1, 1, 0], '并集，不是覆盖');
+  assert.equal(fileCtx.haveCount, 3);
+  assert.equal(fileCtx.contiguousBytes, 3 * 2 * 1024 * 1024);
+  assert.equal(fileCtx.complete, false);
+  assert.deepEqual(sent, [['v1', false]], '只告诉已认证的人，整张位图发，不逐片发 HAVE');
+  assert.deepEqual(emitted.map((e) => e[0]), ['progress']);
+  assert.equal(S.sessions.get('f-r').state.haveCount, 2, '记下最新 state，之后挂进 swarm 时用它');
+
+  ctx.mergeVerifiedChunks({ stage: 'progress', sessionId: 's-r', state: stateOf([0, 1, 1, 0]) });
+  assert.equal(sent.length, 1, '没有新核对上的片就什么都不发');
+
+  ctx.mergeVerifiedChunks({ stage: 'done', sessionId: 's-r', state: stateOf([1, 1, 1, 1]) });
+  assert.equal(fileCtx.complete, true);
+  assert.equal(fileCtx.contiguousBytes, fileCtx.manifest.size);
+  assert.deepEqual(sent.at(-1), ['v1', true]);
+  assert.deepEqual(emitted.map((e) => e[0]), ['progress', 'progress', 'complete']);
+  assert.equal(JSON.stringify(emitted.at(-1)[1]), JSON.stringify({ slot: 4, fileId: 'f-r' }));
+});
+
+test('核对进度：会话还没挂进 swarm 时只记 state；别的会话、不带 sessionId 的一概不碰', async () => {
+  const { ctx, S, fileCtx, sent, stateOf } = await mergeBox();
+  S.sessions.get('f-r').slot = null;
+  ctx.mergeVerifiedChunks({ stage: 'progress', sessionId: 's-r', state: stateOf([1, 1, 0, 0]) });
+  assert.equal(S.sessions.get('f-r').state.haveCount, 2, '挂进 swarm 时按这份建上下文');
+  assert.deepEqual([...fileCtx.have], [1, 0, 0, 0]);
+  S.sessions.get('f-r').slot = 4;
+  ctx.mergeVerifiedChunks({ stage: 'progress', sessionId: 'other', state: stateOf([1, 1, 1, 1]) });
+  ctx.mergeVerifiedChunks({ stage: 'done', matched: 0 });
+  assert.deepEqual([...fileCtx.have], [1, 0, 0, 0]);
+  assert.equal(sent.length, 0);
+});
+
 /* --------------------------- 六、房主是走了还是断了 --------------------------- */
 
 function hostLinkBox() {

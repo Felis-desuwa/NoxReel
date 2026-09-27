@@ -402,4 +402,23 @@ test('渲染进程刷新后主进程自己收干净转封装产物和没人管�
   assert.equal(await invoke('dialog:pickCacheDir'), path.join(TMP, 'after-reload'));
   const moved = await invoke('settings:setCacheRoot', { dir: path.join(TMP, 'after-reload') });
   assert.equal(moved.cacheDir, path.join(TMP, 'after-reload'));
+  assert.equal(moved.fallback, null, '换到能用的位置后回传 fallback: null，界面据此撤掉「这次用不了」的提示');
+});
+
+test('换缓存目录还要拦住正往运行目录里写的在线视频缓存；退出时取消另存复制；关机注销时尽力收尾', () => {
+  const src = fs.readFileSync(path.join(REPO, 'src', 'main', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const handler = src.slice(src.indexOf("secureHandle('settings:setCacheRoot'"));
+  const guard = handler.indexOf("linkCache.hasActive('cache', (workDir) => cache.owns(workDir))");
+  assert.ok(guard > 0, 'setCacheRoot 没查进行中的在线视频缓存');
+  assert.ok(guard < handler.indexOf('cache.cleanupRun()'), '要在端掉运行目录之前拦');
+  // placement 的收拾残局绑定建工作目录时的那个缓存管理器
+  assert.match(src, /const owner = cache;\n\s+const owned = await owner\.createOwnedDir\('link'\);/);
+  assert.match(src, /abort: \(\) => owner\.removeOwned\(owned\),/);
+  const cleanup = src.slice(src.indexOf('async function cleanup()'));
+  assert.ok(cleanup.indexOf('downloadSaver.cancelAll()') > 0, '退出时取消正在复制的另存');
+  assert.ok(cleanup.indexOf('await savesStopped;') < cleanup.indexOf('await store.closeAll()'), '先停复制再关会话删缓存');
+  assert.match(src, /win\.on\('session-end', \(\) => \{\n\s+cleanup\(\)\.catch\(\(\) => \{\}\);/);
+  // 手动清理的「正在用」也认播放器正打开着的本地文件（缓存好的在线视频从本地播时没有会话）
+  assert.match(src, /playerSource = remote \? null : source;/);
+  assert.match(src, /inUse: await cacheFileInUse\(e\.path\)/);
 });
