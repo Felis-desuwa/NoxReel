@@ -200,7 +200,7 @@ function relayGuest({ fail = null, settingsMode = 'trusted' } = {}) {
     return errs[id];
   };
   const S = { settings: { securityMode: settingsMode, relays: '' }, roomCapacity: 4 };
-  const ctx = sandbox(['joinViaRelay', 'relayJoinError', 'refreshRoomLink'], {
+  const ctx = sandbox(['joinViaRelay', 'relayJoinError', 'refreshRoomLink', 'modeMismatchText'], {
     S,
     $: el,
     PROTOCOL_VERSION: 2,
@@ -225,7 +225,9 @@ function relayGuest({ fail = null, settingsMode = 'trusted' } = {}) {
       calls.push(['connect', relay]);
       if (fail) throw Object.assign(new Error(fail.message), { code: fail.code });
     },
-    prepFail: (msg) => calls.push(['fail', msg]),
+    // 加入失败的标题是「没能加入房间」：走 joinFail，不再借开房准备文件的 prepFail
+    prepFail: (msg) => calls.push(['prepFail', msg]),
+    joinFail: (msg) => calls.push(['fail', msg]),
   });
   return { ctx, S, calls, errs };
 }

@@ -159,6 +159,7 @@ const EN = new Map(Object.entries({
   '生成一个新文件，原文件不动。': 'A new temporary file is created; the original remains unchanged.',
   '转封装并继续': 'Remux and continue',
   '没法用这个文件': 'This file cannot be used',
+  '没能加入房间': 'Could not join the room',
   '这是一个应答码，应该由发起方粘贴，不是你。': 'This is an answer code. It should be pasted by the host, not here.',
   '这是一个应答链接，应该由发起方打开。': 'This is an answer link. The host should open it.',
   '无法识别的邀请码类型。': 'Unrecognized invite code type.',
@@ -257,6 +258,14 @@ const EN = new Map(Object.entries({
     'Connectivity checks with the host failed: the host’s invite link may have sat too long and its network addresses expired, or both sides are behind strict NAT. Generate a new answer link, send it back to the host, and try again; if it still fails, both sides should configure the same TURN relay in Settings.',
   '重新生成应答链接': 'Generate a new answer link',
   '还没能连上房主': 'Still not connected to the host',
+  // 信令加入卡在打洞上：房主走了、退避用尽、两分钟兜底
+  '房主离开了房间': 'The host left the room',
+  '还没和房主连上，信令服务器就说他离开了。他只是掉线的话，回来后会自动接着连；否则请让房主重新发一条邀请。':
+    'The signaling server reported that the host left before you connected. If they only dropped offline, the connection picks up again automatically when they are back; otherwise ask the host to send a new invite.',
+  '和房主的直连试了几次都没打通，多半是双方都在严格 NAT 后面。双方在设置里配同一个 TURN 中继后，再点「重试」。':
+    'Several attempts to connect directly to the host failed—most likely both sides are behind strict NAT. Both of you should configure the same TURN relay in Settings, then select “Retry”.',
+  '等了两分钟还是没和房间里的人连上。多半是打洞没成功：双方都在严格 NAT 后面时，需要各自在设置里配同一个 TURN 中继。也可能是房主那边的网络断了。':
+    'Still not connected to anyone in the room after two minutes. The direct connection most likely failed: when both sides are behind strict NAT, each of you needs the same TURN relay configured in Settings. The host’s network may also have dropped.',
   '等了几分钟还是没连上。如果你已经把应答链接发回给房主了，那多半是打洞没成功：双方都在严格 NAT 后面时，需要各自在设置里配同一个 TURN 中继。如果房主还没打开你的应答链接，就重新生成一条再发一次 —— 链接放太久，里面的网络地址会过期。':
     'Still no connection after several minutes. If you already sent the answer link back to the host, the direct connection most likely failed: when both sides are behind strict NAT, each of you needs the same TURN relay configured in Settings. If the host has not opened your answer link yet, generate a new one and send it again—links that sit too long have expired network addresses inside.',
   '来源': 'Source',
@@ -902,6 +911,15 @@ const EN = new Map(Object.entries({
   '收到了一条新的邀请。加入它要先停下正在准备的这部片。':
     'You received a new invite. Joining it means stopping the video you are preparing.',
   '放弃并加入': 'Abandon and join',
+  // 顶栏「离开房间」的确认：有没收完的接收，或者自己是房主而房里还有人
+  '要离开房间吗？': 'Leave the room?',
+  '这几部片还没收完：': 'These videos have not finished transferring:',
+  '离开后接收就停了。没有断点续传：没收完的片一般不会保留，下次进房要重新下载。':
+    'Leaving stops the transfer. There is no resume: unfinished videos are usually not kept, so you will have to download them again next time.',
+  '他们都是经一对一邀请连到你这里的：你一走，所有人一起断开，这一场就结束了。':
+    'They are all connected to you through one-to-one invites: once you leave, everyone is disconnected and this session ends.',
+  '你一走这一场就没有房主了：播放列表停止更新，经一对一邀请进来的人会直接断开。':
+    'Once you leave, this session has no host: the playlist stops updating, and anyone who joined through a one-to-one invite is disconnected.',
   '你已经在这个房间里了。': 'You are already in this room.',
   '同时连着的人太多了，多出来的连接请求已忽略': 'Too many simultaneous connections; the extra connection requests were ignored',
   '操作太频繁了，稍后再试': 'Too many changes at once; try again in a moment',
@@ -1131,7 +1149,12 @@ const EN_PATTERNS = [
   [/^(\d+) 条多余音轨$/, (_all, n) => `${n} extra audio track${n === '1' ? '' : 's'}`],
   [/^(\d+) 条图形字幕$/, (_all, n) => `${n} image-based subtitle track${n === '1' ? '' : 's'}`],
   [/^(.*)\n\n如果对方没有部署信令服务器，让他改用「极简模式」生成邀请码 —— 那个不需要服务器。$/, '$1\n\nIf the other person has no signaling server, ask them to use Manual mode, which requires no server.'],
-  [/^房间使用(.+)，你的本机设置是(.+)。请先在设置中切换为相同模式，再重新粘贴邀请码。$/, 'The room uses $1, while your local setting is $2. Select the same mode in Settings, then paste the invite code again.'],
+  // 三种加入（邀请码、信令、房间链接）同一句：邀请已经在加入框里，改完设置点「加入」即可
+  [/^房间使用(.+)，你的本机设置是(.+)。请在设置里切换为相同模式，再点「加入」重试。$/, 'The room uses $1, while your local setting is $2. Switch to the same mode in Settings, then select “Join” to try again.'],
+  [
+    /^你是房主，房间里还有 (\d+) 个人。$/,
+    (_all, n) => (n === '1' ? 'You are the host, and 1 other person is in the room.' : `You are the host, and ${n} other people are in the room.`),
+  ],
   [/^(.+) 加入了房间$/, '$1 joined the room'],
   // 改昵称：「你改名为」要排在通用的「X 改名为 Y」前面，否则「你」会被当成一个人名
   [/^你改名为 (.+)$/, 'You are now $1'],
@@ -1478,10 +1501,6 @@ const EN_PATTERNS = [
     (_all, why) => `Could not reach public relays (${translate(why, 'en')}), so here is a one-to-one invite: one link per person.`,
   ],
   [/^换链接失败：(.+)$/, (_all, why) => `Could not replace the link: ${translate(why, 'en')}`],
-  [
-    /^房间使用(.+)，你的本机设置是(.+)。请先在设置中切换为相同模式，再重新打开房间链接。$/,
-    'The room uses $1, while your local setting is $2. Select the same mode in Settings, then open the room link again.',
-  ],
   [/^房间已满（上限 (\d+) 人）$/, 'The room is full (limit $1)'],
   [
     /^这些中继地址认不出来：(.+)。地址要形如 wss:\/\/relay\.example\.com$/,

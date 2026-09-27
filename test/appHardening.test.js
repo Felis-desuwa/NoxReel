@@ -246,6 +246,7 @@ const ATTEMPT_FNS = [
   'inviteKey',
   'backHome',
   'prepFail',
+  'joinFail',
   'prepStop',
   'hint',
   'cancelJoinButton',
@@ -354,6 +355,12 @@ async function lobby({ securityMode = 'trusted', capacity = '4' } = {}) {
   ctx.prepFail = (msg, extra) => {
     calls.fail.push(msg);
     return origFail(msg, extra);
+  };
+  // 加入流程的失败走 joinFail（标题「没能加入房间」），一样记进 calls.fail
+  const origJoinFail = ctx.joinFail;
+  ctx.joinFail = (msg, extra) => {
+    calls.fail.push(msg);
+    return origJoinFail(msg, extra);
   };
   return { ctx, S, $, sigs, peers, calls, swarms: built };
 }
@@ -664,7 +671,7 @@ test('正在退房时来的邀请记下来，刷新后接着开', async () => {
   await r.ctx.openInviteLink(link(LINK_B));
   assert.equal(r.calls.modals.length, 0);
   assert.equal(JSON.parse(r.storage.getItem('sw.pendingInvite')).from, 'host-B');
-  assert.match(APP, /const stashed = takeStashedInvite\(\);\s*const initialLink = \(await window\.sw\.app\.takeDeepLink\(\)\) \|\| stashed;/);
+  assert.match(APP, /const stashed = takeStashedInvite\(\);\s*const initialLink = releaseBootLinks\(await window\.sw\.app\.takeDeepLink\(\), stashed\);/);
 });
 
 /* --------------------------- 信令重连与刷屏 --------------------------- */
@@ -842,6 +849,7 @@ async function relayRoom({ role = 'host', inRoom = true } = {}) {
       sessionStorage: storage,
       log: (text, tone) => calls.logs.push([text, tone]),
       prepFail: (msg) => calls.fail.push(msg),
+      joinFail: (msg) => calls.fail.push(msg),
       leaveRoom: async () => {
         calls.leaves += 1;
       },
@@ -903,7 +911,7 @@ test('加入房间链接失败：REMOVED、BUSY 都说人话', () => {
   );
   assert.equal(ctx.relayJoinError({ code: 'BUSY', message: 'x' }), '房间里正有好几个人在连接，稍后再点一次链接试试。');
   // 加入流程里的报错走的就是它
-  assert.match(fnSource('joinViaRelay'), /return prepFail\(relayJoinError\(e\)\);/);
+  assert.match(fnSource('joinViaRelay'), /return joinFail\(relayJoinError\(e\)\);/);
 });
 
 test('房间里被房主移出：干净地退回大厅，回到首页再说一遍原因', async () => {

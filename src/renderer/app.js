@@ -1039,7 +1039,9 @@ function pageReporter(filePath, gen) {
   $('prep-title').textContent = '正在准备文件';
   $('prep-file').textContent = filePath;
   $('prep-bar').style.width = '0%';
-  replace('prep-actions');
+  // 大文件的转封装、算哈希要好几分钟：一直留着「取消」（回首页，这次尝试整个拆掉 ——
+  // 换代让 cancelled() 变真，挂在这次尝试收尾上的哈希、转封装任务一起叫停）
+  replace('prep-actions', ...(gen === undefined ? [] : [cancelJoinButton()]));
   $('prep-note').textContent = '';
   const stage = (index) => {
     steps.forEach((step, i) => {
@@ -1060,9 +1062,13 @@ function pageReporter(filePath, gen) {
     progress: (ratio) => {
       $('prep-bar').style.width = `${(Math.max(0, Math.min(1, ratio)) * 100).toFixed(1)}%`;
     },
-    finish: () => stage(steps.length),
-    // 这一页只能被「换了一次尝试」叫停（开房准备到一半，用户确认改去加入别人的邀请）：
-    // 代次过期就算取消，正在算的哈希、转封装和弹着的选择框都挂在这次尝试的收尾上
+    finish: () => {
+      stage(steps.length);
+      // 做种会话已经开好、交给 addLocalFile 去建房了，这一步很快：这时再拆，会留下半个房间
+      replace('prep-actions');
+    },
+    // 换了一次尝试就算取消（点了准备页上的「取消」，或者确认改去加入别人的邀请）：
+    // 正在算的哈希、转封装和弹着的选择框都挂在这次尝试的收尾上
     cancelled: () => gen !== undefined && !attemptLive(gen),
     onCancel: (fn) => {
       if (gen === undefined) return;
@@ -1434,7 +1440,8 @@ async function startHostLink(rawUrl) {
   $('prep-file').textContent = url;
   $('prep-bar').style.width = '35%';
   $('prep-note').textContent = '只读取媒体信息，不下载视频。每位参与者会直接从原始网站播放。';
-  replace('prep-actions');
+  // 解析最长要等一分钟：给个「取消」（回首页，这次尝试整个拆掉；解析回来一看代次过期就什么都不动）
+  replace('prep-actions', ...(roomEntered ? [] : [cancelJoinButton()]));
   setSteps([
     { label: '验证链接', state: 'done' },
     { label: '解析视频信息', state: 'active' },
@@ -1444,6 +1451,8 @@ async function startHostLink(rawUrl) {
   try {
     const linkInfo = await window.sw.media.inspectLink(url);
     if (!attemptLive(gen)) return;
+    // 接下来建房很快，这时再拆会留下半个房间
+    replace('prep-actions');
     $('prep-bar').style.width = '85%';
     setSteps([
       { label: '验证链接', state: 'done' },
@@ -2899,8 +2908,14 @@ function choosePrepPlan(info, { needsRemux, optionalRemux = false, mustConvert =
   });
 }
 
+/** 开房准备文件时的失败。加入流程的失败走 joinFail —— 标题别说成文件的问题。 */
 function prepFail(msg, extra = '') {
   prepStop('没法用这个文件', msg, extra);
+}
+
+/** 加入流程的失败（找不到房主、连不上信令或中继、被移出、模式或版本对不上）。 */
+function joinFail(msg, extra = '') {
+  prepStop('没能加入房间', msg, extra);
 }
 
 /** 准备页上的一条结论：标题 + 说明 +（可选）补一行没处理完的文件，只留「返回」。 */
@@ -2939,7 +2954,8 @@ function backHome() {
  */
 const joinAttempt = {
   gen: 0,
-  // 正在进行、还没有结论的那次：{ gen, kind: 'host' | 'join', key }。失败、取消、进房后置 null
+  // 正在进行、还没有结论的那次：{ gen, kind: 'host' | 'join', key }。失败、取消、进房后置 null。
+  // 信令加入连上服务器后还挂着 onHostGone(why, peer)：还没进房时房主走了或者连不上，由它给结论（见 watchServerJoin）
   busy: null,
   // 这次尝试挂着的收尾（定时器、正在跑的任务、弹着的选择框），换代时一并执行
   cleanups: [],
@@ -3025,7 +3041,10 @@ function inviteFileLine(file) {
   return file ? `${String(file.name || '').slice(0, 200)} · ${fmtBytes(file.size)}` : '';
 }
 
-/** 等房主放行、打洞那会儿，准备页上唯一的按钮：不等了，回首页（这次尝试整个拆掉）。 */
+/**
+ * 准备页上的「取消」：不等了，回首页（这次尝试整个拆掉）。加入时等房主放行、打洞、等房主打开应答链接，
+ * 开房时转封装、算哈希、解析链接，都靠它离开 —— 挂在这次尝试上的定时器和任务由 resetAttempt 一并收掉。
+ */
 function cancelJoinButton() {
   const cancel = make('button', { className: 'ghost', text: '取消' });
   cancel.onclick = backHome;
@@ -3065,11 +3084,19 @@ function inviteVersionText(remote) {
     : '这个邀请来自更新版本的 NoxReel，和本机不互通。请先升级本机的 NoxReel。';
 }
 
+/**
+ * 邀请的安全模式和本机设置对不上时写在加入框下面的话。邀请已经在加入框里了（粘贴的、点开的深链接都是），
+ * 改完设置点「加入」就行，不用回聊天软件再点一次链接。
+ */
+function modeMismatchText(inviteMode) {
+  return `房间使用${securityModeLabel(inviteMode)}，你的本机设置是${securityModeLabel(S.settings.securityMode)}。请在设置里切换为相同模式，再点「加入」重试。`;
+}
+
 /** 极简模式：收到 offer，产出 answer 让对方粘回去。 */
 async function joinViaManual(payload) {
   const inviteMode = normalizeSecurityMode(payload.securityMode);
   if (inviteMode !== normalizeSecurityMode(S.settings.securityMode)) {
-    $('join-err').textContent = `房间使用${securityModeLabel(inviteMode)}，你的本机设置是${securityModeLabel(S.settings.securityMode)}。请先在设置中切换为相同模式，再重新粘贴邀请码。`;
+    $('join-err').textContent = modeMismatchText(inviteMode);
     return;
   }
   if (payload.protocolVersion !== PROTOCOL_VERSION) {
@@ -3090,6 +3117,9 @@ async function joinViaManual(payload) {
   S.roomCapacity = clampCapacity(payload.maxMembers || S.roomCapacity);
 
   show('view-prepare');
+  // 从一开始就能取消：房主可能好几分钟才打开应答链接，最长要等 MANUAL_JOIN_WAIT_TIMEOUT_MS。
+  // 顺带清掉上一次留下的按钮 —— 上一次结论页的「重新生成应答链接」攥着旧邀请，误点会把这一次拆掉、改连旧的
+  replace('prep-actions', cancelJoinButton());
   $('prep-title').textContent = '正在建立点对点连接';
   $('prep-file').textContent = inviteFileLine(payload.file);
   $('prep-note').textContent = '正在收集网络候选地址，通常需要几秒钟…';
@@ -3153,7 +3183,7 @@ async function joinViaManual(payload) {
     $('prep-note').textContent = advice?.text ? `${note}\n\n诊断：${advice.text}` : note;
     $('prep-bar').style.width = '0%';
     const retry = make('button', { className: 'primary', text: '重新生成应答链接' });
-    retry.onclick = () => joinViaManual(payload).catch((error) => prepFail(error.message || String(error)));
+    retry.onclick = () => joinViaManual(payload).catch((error) => joinFail(error.message || String(error)));
     const back = make('button', { className: 'ghost', text: '返回' });
     back.onclick = backHome;
     replace('prep-actions', retry, back, copyDiagnosticsButton());
@@ -3195,7 +3225,7 @@ async function joinViaManual(payload) {
     });
   } catch (error) {
     // 以前这里的异常落到没人接住的地方，准备页永远停在「正在收集网络候选地址」
-    if (attemptLive(gen)) prepFail(error.message || String(error));
+    if (attemptLive(gen)) joinFail(error.message || String(error));
     return;
   }
   // 收集候选要几秒，这期间可能已经换了一次尝试：界面归那边，这条应答不再往外交
@@ -3224,7 +3254,8 @@ async function joinViaManual(payload) {
   answerAnchor.href = answerLink;
   answerAnchor.onclick = (event) => { event.preventDefault(); copyCode(answerLink, $('copy-answer'), '复制应答链接'); };
   const copyAnswer = make('button', { id: 'copy-answer', className: 'primary', text: '复制应答链接' });
-  replace('prep-actions', answerAnchor, copyAnswer, answerArea);
+  // 「取消」一直留着：发错了人、房主已经下线，不必干等到兜底定时器给结论
+  replace('prep-actions', answerAnchor, copyAnswer, cancelJoinButton(), answerArea);
   $('answer-code').value = answerLink;
   $('answer-code').select();
   $('copy-answer').onclick = () => copyCode(answerLink, $('copy-answer'), '复制应答链接');
@@ -3237,7 +3268,7 @@ async function joinViaManual(payload) {
 async function joinViaServer(payload) {
   const inviteMode = normalizeSecurityMode(payload.securityMode);
   if (inviteMode !== normalizeSecurityMode(S.settings.securityMode)) {
-    $('join-err').textContent = `房间使用${securityModeLabel(inviteMode)}，你的本机设置是${securityModeLabel(S.settings.securityMode)}。请先在设置中切换为相同模式，再重新粘贴邀请码。`;
+    $('join-err').textContent = modeMismatchText(inviteMode);
     return;
   }
   if (payload.protocolVersion !== PROTOCOL_VERSION) {
@@ -3288,6 +3319,7 @@ async function joinViaServer(payload) {
     ]);
     $('prep-bar').style.width = '70%';
     $('prep-note').textContent = '已进入房间，正在和其他成员打洞…';
+    watchServerJoin(payload, gen);
   } catch (e) {
     // 已经换了一次尝试：这条信令在换代时就关掉了，眼下的 S.signaling 是后来那次的，碰不得
     if (!attemptLive(gen)) return;
@@ -3298,12 +3330,80 @@ async function joinViaServer(payload) {
     S.signaling = null;
     // 房间已经关了：服务器是好的，别再叫人去折腾部署
     if (e.code === 'ROOM_CLOSED') return prepStop('房间已关闭', e.message);
-    return prepFail(
+    return joinFail(
       e.code === 'REGION_BLOCKED'
         ? e.message
         : `${e.message}\n\n如果对方没有部署信令服务器，让他改用「极简模式」生成邀请码 —— 那个不需要服务器。`
     );
   }
+}
+
+// 信令加入连上服务器之后，最多等这么久还没进房就给个结论。退避重连走完三轮前 ICE 可能一直停在 checking、
+// 永远不进 failed，那样就只能靠它；两分钟足够正常的打洞，比一对一邀请短 —— 这里不用等人转发链接
+const SERVER_JOIN_WAIT_TIMEOUT_MS = 120_000;
+
+/**
+ * 信令加入连上了服务器，却可能一直进不了房：和房主打洞打不通（严格 NAT、没配 TURN），或者还没连上房主他就走了。
+ * 三条路谁先到谁给结论：房主那一路退避用尽、房主离开（都经 hostReallyGone 转过来）、兜底定时器。
+ * 结论只画在准备页上，不拆连接 —— 退避重连还在跑，晚一点连上照样进房；点「返回」「重试」才整个拆掉重来。
+ */
+function watchServerJoin(payload, gen) {
+  const busy = joinAttempt.busy;
+  if (!busy || busy.gen !== gen) return;
+  let timer = null;
+  const conclude = (why, peer = null) => {
+    // 进了房、换了一次尝试、已经给过结论（endAttempt 把 busy 清掉了）：都不再动界面
+    if (roomEntered || !attemptLive(gen) || joinAttempt.busy !== busy) return;
+    clearTimeout(timer);
+    // 诊断要一条真连接（有 pc、攒过候选）：信令恢复时补排的重连只带着 { peerId, name }，拿它诊断会说成「一个候选都没收集到」
+    const host = [S.swarm?.peers.get(S.hostId), peer].find((p) => p?.pc) || null;
+    if (why === 'left') {
+      serverJoinStuck(
+        payload,
+        '房主离开了房间',
+        '还没和房主连上，信令服务器就说他离开了。他只是掉线的话，回来后会自动接着连；否则请让房主重新发一条邀请。',
+        null
+      );
+    } else if (why === 'unreachable') {
+      serverJoinStuck(
+        payload,
+        '直连没建立起来',
+        '和房主的直连试了几次都没打通，多半是双方都在严格 NAT 后面。双方在设置里配同一个 TURN 中继后，再点「重试」。',
+        host
+      );
+    } else {
+      serverJoinStuck(
+        payload,
+        '还没能连上房主',
+        '等了两分钟还是没和房间里的人连上。多半是打洞没成功：双方都在严格 NAT 后面时，需要各自在设置里配同一个 TURN 中继。也可能是房主那边的网络断了。',
+        host
+      );
+    }
+  };
+  // 挂在这次尝试上：结论、进房、换代之后 busy 都会换掉，hostReallyGone 就不会再找到它
+  busy.onHostGone = conclude;
+  timer = setTimeout(() => conclude('timeout'), SERVER_JOIN_WAIT_TIMEOUT_MS);
+  joinAttempt.cleanups.push(() => clearTimeout(timer));
+}
+
+/** 信令加入卡住时准备页上的结论：原因 + 候选诊断 +「重试 / 返回 / 复制诊断信息」。 */
+function serverJoinStuck(payload, title, note, peer) {
+  endAttempt();
+  show('view-prepare');
+  $('prep-title').textContent = title;
+  // 诊断单独一行：拼进同一段文字的话，英文界面按整句翻不出来
+  const advice = peer ? connectionAdvice(peer) : null;
+  replace('prep-note', make('div', { text: note }), advice?.text ? make('div', { text: `诊断：${advice.text}` }) : null);
+  $('prep-bar').style.width = '0%';
+  const retry = make('button', { className: 'primary', text: '重试' });
+  retry.onclick = () => {
+    // 先回首页把这次的残局拆掉：设置里改过安全模式的话，报错写在首页的加入框下面，得让人看得见
+    backHome();
+    joinViaServer(payload).catch((error) => joinFail(error.message || String(error)));
+  };
+  const back = make('button', { className: 'ghost', text: '返回' });
+  back.onclick = backHome;
+  replace('prep-actions', retry, back, copyDiagnosticsButton());
 }
 
 /**
@@ -3313,7 +3413,7 @@ async function joinViaServer(payload) {
 async function joinViaRelay(payload) {
   const inviteMode = normalizeSecurityMode(payload.securityMode);
   if (inviteMode !== normalizeSecurityMode(S.settings.securityMode)) {
-    $('join-err').textContent = `房间使用${securityModeLabel(inviteMode)}，你的本机设置是${securityModeLabel(S.settings.securityMode)}。请先在设置中切换为相同模式，再重新打开房间链接。`;
+    $('join-err').textContent = modeMismatchText(inviteMode);
     return;
   }
   if (payload.protocolVersion !== PROTOCOL_VERSION) {
@@ -3389,7 +3489,7 @@ async function joinViaRelay(payload) {
     if (!attemptLive(gen)) return;
     S.signaling?.close();
     S.signaling = null;
-    return prepFail(relayJoinError(e));
+    return joinFail(relayJoinError(e));
   }
 }
 
@@ -3433,7 +3533,7 @@ function removedFromRoom() {
   if (!roomEntered) {
     S.signaling?.close();
     S.signaling = null;
-    prepFail(text);
+    joinFail(text);
     return;
   }
   if (S.leaving) return;
@@ -3707,7 +3807,7 @@ async function connectSignaling(url, roomId, relay = null) {
       sigLog('leave', `${peer.name} 的信令连接断了，但直连还在，传输继续`, 'warn');
       return;
     }
-    if (peerId === S.hostId) hostReallyGone();
+    if (peerId === S.hostId) hostReallyGone('left', peer);
     S.swarm.removePeer(peerId);
   });
   let joinedBefore = false;
@@ -3831,9 +3931,17 @@ function cancelRecovery(peerId, { keepCount = false } = {}) {
  * 免得两边同时发 offer 撞车。极简模式没有信令通道，重连无从谈起，原样保持
  * 「重新生成一条应答链接」的手工路径。
  */
-/** 确认房主真的走了：信令说他离开了，或者重连退避已经用尽。 */
-function hostReallyGone() {
-  if (isRoomHost() || !roomEntered || S.hostGone) return;
+/**
+ * 确认房主真的走了：信令说他离开了（why = 'left'），或者重连退避已经用尽（'unreachable'）。
+ * 还没进房（信令加入正在打洞）时没有横幅可改：交给准备页上等着的那次加入给结论（见 watchServerJoin）。
+ */
+function hostReallyGone(why = 'unreachable', peer = null) {
+  if (isRoomHost()) return;
+  if (!roomEntered) {
+    joinAttempt.busy?.onHostGone?.(why, peer);
+    return;
+  }
+  if (S.hostGone) return;
   S.hostGone = true;
   S.hostLink = null;
   log('房主已离开，列表暂停更新；已经连上的成员之间照常传输', 'warn');
@@ -3852,7 +3960,7 @@ function scheduleReconnect(peer, sig, { retry = false } = {}) {
   // 房主强退、崩溃、正常退出都是这个顺序：先断信令，数据通道后关
   if (sig.hasLeft?.(peerId)) {
     cancelRecovery(peerId);
-    if (peerId === S.hostId) hostReallyGone();
+    if (peerId === S.hostId) hostReallyGone('left', peer);
     return;
   }
   const st = RECOVERY.get(peerId) || { attempts: 0, timer: null, watch: null };
@@ -3864,7 +3972,7 @@ function scheduleReconnect(peer, sig, { retry = false } = {}) {
     const advice = connectionAdvice(peer);
     log(`和 ${peer.name} 的直连试了 ${st.attempts} 次都没恢复。${advice.text}`, 'bad');
     // 退避用尽才承认失联：在这之前列表横幅只说「正在重连」，别把 ICE 抖一下说成房主走了
-    if (peerId === S.hostId) hostReallyGone();
+    if (peerId === S.hostId) hostReallyGone('unreachable', peer);
     // 最后一轮新建的连接还停在半路（对面一直没应答）：摘掉，别让它一直占着名额和一条 RTCPeerConnection
     const stuck = S.swarm.peers.get(peerId);
     if (stuck && stuck.ctrl?.readyState !== 'open') S.swarm.removePeer(peerId);
@@ -4776,7 +4884,7 @@ function initSwarmAndSync() {
     log(message, 'bad');
     if (!roomEntered && S.role === 'guest') {
       S.signaling?.close();
-      prepFail(`${message}\n请双方分别在设置里选择相同模式后重试。`);
+      joinFail(`${message}\n请双方分别在设置里选择相同模式后重试。`);
     }
   });
   // 0.7 和 0.6 的线缆格式不互通。说清楚是哪一边旧，别让人以为是网络问题。
@@ -4789,7 +4897,7 @@ function initSwarmAndSync() {
     log(message, 'bad');
     if (!roomEntered && S.role === 'guest') {
       S.signaling?.close();
-      prepFail(message);
+      joinFail(message);
     }
   });
   S.swarm.on('complete', ({ fileId }) => {
@@ -8947,7 +9055,73 @@ async function leaveRoom() {
   location.reload();
 }
 
-$('btn-leave').onclick = leaveRoom;
+/**
+ * 离开会丢掉什么，一条一行；什么都不丢时是空的。
+ * 两件事值得问一句：还有没收完的接收（离开会关会话，没收完的新文件删掉，没有断点续传），
+ * 以及自己是房主而房里还有人（一对一邀请都连在房主身上，房主一走这一场就散了）。
+ */
+function leaveRoomLosses() {
+  const lines = [];
+  const unfinished = [];
+  for (const sess of S.sessions.values()) {
+    if (sess.isSeeder) continue;
+    const prog = sess.slot !== null && S.swarm?.files.get(sess.slot) ? S.swarm.progress(sess.slot) : null;
+    const have = prog ? prog.haveCount : sess.state?.haveCount || 0;
+    const complete = prog ? prog.complete : !!sess.state?.complete;
+    const total = sess.manifest?.chunkCount || 0;
+    // 一片都还没收到的，离开也不丢什么
+    if (complete || !(have > 0) || !total) continue;
+    unfinished.push({ name: sess.manifest.name, ratio: have / total });
+  }
+  if (unfinished.length) {
+    lines.push(make('p', { text: '这几部片还没收完：' }));
+    // 片名是房主那边来的，原样显示、不参与翻译
+    for (const f of unfinished) lines.push(make('p', { raw: true, text: `《${f.name}》 ${pct(f.ratio)}` }));
+    lines.push(make('p', { text: '离开后接收就停了。没有断点续传：没收完的片一般不会保留，下次进房要重新下载。' }));
+  }
+  const others = connectedPeerCount();
+  if (isRoomHost() && others > 0) {
+    lines.push(make('p', { text: `你是房主，房间里还有 ${others} 个人。` }));
+    lines.push(
+      make('p', {
+        text:
+          S.mode === 'manual'
+            ? '他们都是经一对一邀请连到你这里的：你一走，所有人一起断开，这一场就结束了。'
+            : '你一走这一场就没有房主了：播放列表停止更新，经一对一邀请进来的人会直接断开。',
+      })
+    );
+  }
+  return lines;
+}
+
+let leaveAsk = null;
+
+/** 顶栏「离开房间」：会丢东西时先问一句（确认框说清楚丢什么），不丢就直接走。连点不会重入。 */
+function confirmLeaveRoom() {
+  if (S.leaving || leaveAsk) return;
+  const lines = leaveRoomLosses();
+  if (!lines.length) {
+    leaveRoom();
+    return;
+  }
+  const ask = openModal({
+    title: '要离开房间吗？',
+    body: () => lines,
+    okText: '离开房间',
+    onOk: () => {
+      leaveAsk = null;
+      $('btn-leave').disabled = true;
+      leaveRoom();
+      return true;
+    },
+    onCancel: () => {
+      if (leaveAsk === ask) leaveAsk = null;
+    },
+  });
+  leaveAsk = ask;
+}
+
+$('btn-leave').onclick = confirmLeaveRoom;
 $('btn-invite-next').onclick = openInvite;
 $('btn-invite-close').onclick = closeInvite;
 
@@ -9852,7 +10026,11 @@ async function routeInviteLink(raw) {
     }
     if (roomEntered) {
       if (payload.k === 'answer') {
-        log('请先退出当前房间，再打开新的邀请链接。', 'warn');
+        // 应答链接和「换一个房间」无关，别叫人退房（房主照做就把整场散了）。等着它的房主上面已经接走了；
+        // 走到这里的是房主又点了一次用过的（交给 acceptManualAnswer 说「已经用过或已失效」），
+        // 或者观众点开了自己复制的那条
+        if (S.role === 'host') await acceptManualAnswer(raw);
+        else log('这是一个应答链接，应该由发起方打开。', 'warn');
       } else if (payload.from && payload.from === S.hostId) {
         log('你已经在这个房间里了。', 'warn');
       } else {
@@ -9956,7 +10134,32 @@ function takeStashedInvite() {
   }
 }
 
-window.sw.app.onDeepLink(openInviteLink);
+/*
+ * 启动检查（boot）跑完之前经 second-instance 送来的深链接先存着，只留最新一条。
+ * 页面一加载完主进程就直接派发深链接了，而 boot 还在等 Defender 状态、缓存目录这几步：
+ * 这时就开始加入的话，boot 结尾那一下 show('view-home') 会把准备页盖掉 ——
+ * 一对一邀请的应答链接就在那一页上，用户看不到，也就不知道要发回给房主。
+ */
+const bootLinks = { ready: false, latest: null };
+
+function onDeepLinkArrived(raw) {
+  if (!raw) return;
+  if (bootLinks.ready) {
+    openInviteLink(raw);
+    return;
+  }
+  bootLinks.latest = String(raw);
+}
+
+/** boot 跑完：交出该打开的那条（最新优先：启动期间又点开的 > 冷启动带来的 > 退房前记下的），之后来的直接打开。 */
+function releaseBootLinks(cold, stashed) {
+  const link = bootLinks.latest || cold || stashed || null;
+  bootLinks.ready = true;
+  bootLinks.latest = null;
+  return link;
+}
+
+window.sw.app.onDeepLink(onDeepLinkArrived);
 
 window.sw.discord?.onStatus?.(setDiscordStatus);
 window.sw.discord?.status?.().then(setDiscordStatus, () => {});
@@ -9968,7 +10171,7 @@ boot()
     if (notice) $('join-err').textContent = notice;
     // 退房去加入新邀请时记下的那条：刷新之后接着打开（这时又来了新的深链接就以新的为准）
     const stashed = takeStashedInvite();
-    const initialLink = (await window.sw.app.takeDeepLink()) || stashed;
+    const initialLink = releaseBootLinks(await window.sw.app.takeDeepLink(), stashed);
     if (initialLink) await openInviteLink(initialLink);
   })
   // 最后一道兜底。以前这里只有 then，启动阶段任何一个没接住的错误都会让用户
