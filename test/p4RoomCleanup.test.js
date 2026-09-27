@@ -809,10 +809,12 @@ function hostLinkBox() {
     mode: 'server',
     hostGone: false,
     hostLink: null,
+    pendingOps: new Map(),
     swarm: { on: (name, fn) => handlers.set(name, fn), peers: new Map(), removePeer: (id) => logs.push(`remove:${id}`) },
   };
   const src = [
     fnSource('hostReallyGone'),
+    fnSource('settlePendingOpsHostLost'),
     fnSource('playlistView'),
     `function wire() {\n${stmtSource("  S.swarm.on('peer-gone', (peerId) => {", '\n  });')}\n}`,
   ];

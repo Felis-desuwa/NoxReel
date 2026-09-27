@@ -54,6 +54,8 @@ const { labelProtocolHandler } = require('./protocolName');
 const { displayVersion, readBuildNumber } = require('./appVersion');
 
 let win = null;
+// 启动时建窗口之前的准备跑完了（不论成败）。这之后还没有主窗口，只可能是建窗口本身出过错
+let startupSettled = false;
 // 同一时刻只有一个播放器；换播放器或重开时旧的先彻底退掉，迟到的事件按代丢弃
 const players = new PlayerManager({
   send: (channel, payload) => send(channel, payload),
@@ -102,7 +104,8 @@ let playerPaths = settings.playerPaths(mainConfig);
 // Cloudflare TURN 的凭据和本机月用量。API Token 只在主进程里：加密落盘，从不回传给渲染进程。
 // 构造时不碰磁盘也不碰 safeStorage（它要等 app ready），第一次用到时才读。
 const cfTurn = new CloudflareTurn({ userDataDir: USER_DATA_DIR, safeStorage });
-let cache = new CacheManager({ rootDir: cacheChoice.root, extraRoots: cacheKnownRoots });
+// 旧根（换过缓存目录留下的，可能在离线的网盘上）不在启动时扫：窗口出来之后在后台收，见 whenReady
+let cache = new CacheManager({ rootDir: cacheChoice.root, extraRoots: cacheKnownRoots, deferExtraRoots: true });
 // 缓存清理方式（见 fileStore.setPolicy / mediaLibrary.js）和「边下边播」的下载位置。
 // 下载位置默认在「视频」文件夹下；拿不到「视频」目录（极少数精简系统、测试里的假 Electron）就放用户数据目录下
 function defaultDownloadDir() {
@@ -269,6 +272,15 @@ else {
   // 已经开着一个 NoxReel 时再双击图标：第二个进程拿不到锁直接退出，这边必须把窗口唤出来 ——
   // 不带深链接也一样，不然用户看到的就是「点了没反应」
   app.on('second-instance', (_event, argv) => {
+    // 启动时窗口没建出来：这时再双击图标得把它补出来，不然又是「点了没反应」。
+    // 准备工作还没跑完时不抢着建（那边跑完马上就建），正在退出时也不建
+    if (!win && startupSettled && !quitRequested) {
+      try {
+        ensureMainWindow();
+      } catch (error) {
+        console.error('[main] 补建主窗口失败：', error);
+      }
+    }
     revealMainWindow();
     dispatchDeepLink(deepLinkFromArgv(argv));
   });
@@ -618,35 +630,65 @@ async function ensureCacheReady() {
     if (cache.rootDir === DEFAULT_CACHE_ROOT) throw error;
     cacheFallback = { configured: cache.rootDir, reason: error.message || String(error) };
     cacheChoice = { root: DEFAULT_CACHE_ROOT, source: 'default' };
-    cache = new CacheManager({ rootDir: DEFAULT_CACHE_ROOT, extraRoots: cacheKnownRoots });
+    // 刚刚用不了的那个根不再当旧根去扫：它多半是离线的网盘，再 opendir 一次又要等一轮网络超时
+    const failedRoot = pathKey(cache.rootDir);
+    cache = new CacheManager({
+      rootDir: DEFAULT_CACHE_ROOT,
+      extraRoots: cacheKnownRoots.filter((root) => pathKey(root) !== failedRoot),
+      deferExtraRoots: true,
+    });
     store.configureCache(cache);
     store.setPolicy({ mode: cacheMode, keptDir: keptCacheDir() });
     return cache.initialize();
   }
 }
 
-app.whenReady().then(async () => {
-  // 多开的测试实例不去改系统的 noxreel:// 协议关联
-  if (!DEV_USER_DATA) {
-    const registered =
-      process.defaultApp && process.argv[1]
-        ? app.setAsDefaultProtocolClient('noxreel', process.execPath, [path.resolve(process.argv[1])])
-        : app.setAsDefaultProtocolClient('noxreel');
-    // 源码运行时登记的是 electron.exe，浏览器会问「要打开 Electron 吗？」—— 补上显示名。
-    // 不等它：写不上只是弹窗里的名字不对，不耽误开窗口
-    if (registered) labelProtocolHandler().catch(() => {});
-  }
-  await ensureCacheReady();
-  // 登记表（手动模式存的片、手动缓存的在线视频）。读不出来就当空的，不挡启动
-  await mediaLibrary.load().catch(() => {});
-  // 上次没缓存完就退出留下的工作目录
-  await linkCache.cleanupLeftovers([keptCacheDir(), downloadDir]);
-  await cleanupLegacySidecars(LEGACY_DOWNLOAD_DIR);
+/** 主窗口还没有（或者已经销毁）就建一个。启动收尾和「再双击一次图标」两条路共用，不会建出两个。 */
+function ensureMainWindow() {
+  if (win && !win.isDestroyed()) return;
   createWindow();
+}
+
+app.whenReady().then(async () => {
+  // 建窗口之前的准备，任何一步出错都不能挡住开窗口：以前默认缓存目录也建不出来
+  // （%TEMP%\NoxReel 是个同名文件、TEMP 指向不存在的盘、没权限）时整个回调就此中断，
+  // 窗口永远不出来，进程却一直占着单实例锁 —— 再双击图标也没反应，只能去任务管理器结束。
+  // 缓存用不了时窗口照样出来，页面启动时调 app:ensureDirs 会再试一次、把原因报出来。
+  try {
+    // 多开的测试实例不去改系统的 noxreel:// 协议关联
+    if (!DEV_USER_DATA) {
+      try {
+        const registered =
+          process.defaultApp && process.argv[1]
+            ? app.setAsDefaultProtocolClient('noxreel', process.execPath, [path.resolve(process.argv[1])])
+            : app.setAsDefaultProtocolClient('noxreel');
+        // 源码运行时登记的是 electron.exe，浏览器会问「要打开 Electron 吗？」—— 补上显示名。
+        // 不等它：写不上只是弹窗里的名字不对，不耽误开窗口
+        if (registered) labelProtocolHandler().catch(() => {});
+      } catch (error) {
+        console.warn(`[main] 登记 noxreel:// 协议失败：${error?.message || error}`);
+      }
+    }
+    try {
+      await ensureCacheReady();
+    } catch (error) {
+      console.warn(`[main] 缓存目录准备失败：${error?.message || error}`);
+    }
+    // 登记表（手动模式存的片、手动缓存的在线视频）。读不出来就当空的，不挡启动
+    await mediaLibrary.load().catch(() => {});
+    // 上次没缓存完就退出留下的工作目录
+    await linkCache.cleanupLeftovers([keptCacheDir(), downloadDir]).catch(() => {});
+    await cleanupLegacySidecars(LEGACY_DOWNLOAD_DIR).catch(() => {});
+  } finally {
+    startupSettled = true;
+    ensureMainWindow();
+  }
+  // 换过缓存目录留下的旧根：窗口出来之后在后台收。它可能在离线的网盘上，opendir 要等网络超时
+  cache.cleanupExtraRoots().catch(() => {});
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
-});
+}).catch((error) => console.error('[main] 启动时建窗口失败：', error));
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
@@ -1329,7 +1371,8 @@ secureHandle('app:ensureDirs', async () => {
   return { cacheDir: cache.rootDir, runDir, fallback: cacheFallback };
 });
 
-secureHandle('cache:usage', async () => cache.usage());
+// 正在接收的片按已经写进去的字节数兜底：Windows 上稀疏文件的块数要等脏页写回才跟上（见 cacheManager.dirBytes）
+secureHandle('cache:usage', async () => cache.usage({ writtenBytesOf: store.writtenBytesOf }));
 
 secureHandle('cache:purge', async () => ({ removed: await cache.purgeStale() }));
 

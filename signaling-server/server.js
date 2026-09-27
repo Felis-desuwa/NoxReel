@@ -19,8 +19,9 @@
  * 环境变量：
  *   PORT              监听端口，默认 8080
  *   MAXMIND_DB        GeoLite2-Country.mmdb 路径。不配则退化为只信任边缘头部
- *   TRUST_PROXY       =1 时信任 X-Forwarded-For / X-Real-IP / CF-IPCountry（放在反代、CDN/WAF 后面时开）。
- *                     开了以后限流和局域网豁免都按反代转述的客户端地址算，反代必须**追加**写 X-Forwarded-For
+ *   TRUST_PROXY       前面有几层反代（1 = 一层 nginx / Caddy，或 CDN 直接回源；CDN 后面再叠一层 nginx 填 2）。
+ *                     开了以后信任 X-Forwarded-For / X-Real-IP / CF-IPCountry，限流和局域网豁免都按反代转述的
+ *                     客户端地址算，取 X-Forwarded-For 的倒数第 N 段。每层反代都必须**追加**写 X-Forwarded-For
  *                     （nginx：proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for）
  *   BLOCKED_COUNTRIES 逗号分隔的 ISO 国家码，默认空 —— 即不拦任何人
  *   ALLOW_UNKNOWN     =0 时查不到地区就拒绝（默认 1，放行）
@@ -73,7 +74,21 @@ function envPositive(name, fallback, min) {
 }
 
 const PORT = parseInt(process.env.PORT, 10) || 8080;
-const TRUST_PROXY = process.env.TRUST_PROXY === '1';
+
+/**
+ * TRUST_PROXY 填前面有几层反代。每一层都把自己看到的对端追加到 X-Forwarded-For 末尾，
+ * 所以末尾 N 段是我们信得过的那 N 层写的，倒数第 N 段就是最外层反代看到的客户端；再往前是客户端自己带来的，随便填。
+ * 空、0 是没开；不是正整数的也按没开处理（原来只认 '1'，'true' 之类一直是没开），但要说一声。
+ */
+function parseTrustProxy(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s || s === '0') return 0;
+  if (/^\d+$/.test(s)) return Math.min(Number(s), 10);
+  console.warn(`[signal] 环境变量 TRUST_PROXY=${raw} 看不懂：填前面反代的层数（一层反代填 1，CDN 后面再叠一层 nginx 填 2），按没开处理`);
+  return 0;
+}
+const TRUST_PROXY_HOPS = parseTrustProxy(process.env.TRUST_PROXY);
+const TRUST_PROXY = TRUST_PROXY_HOPS > 0;
 const ALLOW_UNKNOWN = process.env.ALLOW_UNKNOWN !== '0'; // 默认放行
 const BLOCKED = new Set(
   (process.env.BLOCKED_COUNTRIES || '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean)
@@ -168,14 +183,22 @@ let lookup = null;
  * 都是把自己看到的对端 IP 接在已有值后面。所以链条里唯一不可伪造的是**最后一段**
  * （由紧挨着我们的那层反代写入），而第一段是客户端自己带来的，随便填。
  * 原来取第一段，等于让任何人自称 127.0.0.1 —— 而局域网豁免会据此直接放行。
+ *
+ * 前面叠着几层反代（CDN → nginx → 这里）时，末尾那段是 nginx 看到的 CDN 节点，不是客户端：
+ * TRUST_PROXY=N 取倒数第 N 段。段数不够 N 的请求没走满那几层，分不清哪段是客户端自己填的，
+ * 退回最后一段 —— 它总是紧挨着我们的那层写的，最多是多人共用一份额度，不会被冒名。
  */
+function forwardedHops(req) {
+  return String(req.headers['x-forwarded-for'] || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 function clientIp(req) {
   if (TRUST_PROXY) {
-    const xff = req.headers['x-forwarded-for'];
-    if (xff) {
-      const hops = String(xff).split(',').map((s) => s.trim()).filter(Boolean);
-      if (hops.length) return hops[hops.length - 1];
-    }
+    const hops = forwardedHops(req);
+    if (hops.length) return hops.length >= TRUST_PROXY_HOPS ? hops[hops.length - TRUST_PROXY_HOPS] : hops[hops.length - 1];
     const real = String(req.headers['x-real-ip'] || '').trim();
     if (real) return real;
   }
@@ -185,22 +208,27 @@ function clientIp(req) {
 /** 反代有没有转述客户端地址。没转述时 clientIp() 退回的套接字地址只是反代自己。 */
 function hasForwardedIp(req) {
   if (!TRUST_PROXY) return false;
-  const xff = String(req.headers['x-forwarded-for'] || '');
-  return xff.split(',').some((s) => s.trim() !== '') || String(req.headers['x-real-ip'] || '').trim() !== '';
+  return forwardedHops(req).length > 0 || String(req.headers['x-real-ip'] || '').trim() !== '';
 }
 
 // 反代配置不对时，每 IP 上限会把所有人算在反代一个地址头上 —— 表现是「人一多就连不上」，
 // 很难从现象猜到原因。各提示一次，不刷屏。
 let warnedNoForwardedIp = false;
 let warnedUntrustedProxy = false;
+let warnedExtraHop = false;
 function warnIfProxyMisconfigured(req) {
   if (TRUST_PROXY) {
-    if (warnedNoForwardedIp || hasForwardedIp(req)) return;
-    warnedNoForwardedIp = true;
-    console.warn(
-      '[signal] TRUST_PROXY=1，但请求里没有 X-Forwarded-For / X-Real-IP：所有连接都会被当成来自反代自己，' +
-        '共用同一份每 IP 上限，局域网豁免也不会生效。请让反代追加写 X-Forwarded-For。'
-    );
+    if (!hasForwardedIp(req)) {
+      if (warnedNoForwardedIp) return;
+      warnedNoForwardedIp = true;
+      console.warn(
+        `[signal] TRUST_PROXY=${TRUST_PROXY_HOPS}，但请求里没有 X-Forwarded-For / X-Real-IP：所有连接都会被当成来自反代自己，` +
+          '共用同一份每 IP 上限，局域网豁免也不会生效。请让反代追加写 X-Forwarded-For。'
+      );
+      return;
+    }
+    warnIfShortChain(req);
+    warnIfExtraHop(req);
     return;
   }
   if (warnedUntrustedProxy || !req.headers['x-forwarded-for']) return;
@@ -208,6 +236,42 @@ function warnIfProxyMisconfigured(req) {
   console.warn(
     '[signal] 请求带着 X-Forwarded-For，看起来前面有反代，但没开 TRUST_PROXY：经反代来的连接都会算在' +
       '反代自己的地址上，共用同一份每 IP 上限。放在反代后面时请设 TRUST_PROXY=1。'
+  );
+}
+
+/** 层数填多了（或者有请求绕过前面的 CDN 直接连到了 nginx）：X-Forwarded-For 的段数比 TRUST_PROXY 少。 */
+let warnedShortChain = false;
+function warnIfShortChain(req) {
+  if (warnedShortChain || TRUST_PROXY_HOPS < 2) return;
+  const n = forwardedHops(req).length;
+  if (!n || n >= TRUST_PROXY_HOPS) return;
+  warnedShortChain = true;
+  console.warn(
+    `[signal] TRUST_PROXY=${TRUST_PROXY_HOPS}，但有请求的 X-Forwarded-For 只有 ${n} 段：要么层数填多了，` +
+      '要么有人绕过了最外层的反代直接连到这里。这种请求按最后一段计，不会被冒名，但多人可能共用一份每 IP 上限。'
+  );
+}
+
+/**
+ * Cloudflare 后面又叠了一层 nginx，而 TRUST_PROXY 只算了一层：X-Forwarded-For 是「客户端, CF 节点」，
+ * 取到的是 CF 节点，同一个机房回源的人全挤在一份每 IP 上限里，请求里又确实有 X-Forwarded-For，
+ * 上面那两条提示都不会出。Cloudflare 会带上它看到的客户端地址（CF-Connecting-IP）：
+ * 它恰好落在我们取的那段再往前一段上，就是少算了一层。
+ *
+ * 只提示，不拿它做任何判断：这两个头谁都能填。所以提示里也不能只甩一句「改成 N+1」——
+ * 真只有一层反代的部署照着改了，客户端自己填的那段就成了限流的键。
+ */
+function warnIfExtraHop(req) {
+  if (warnedExtraHop) return;
+  const cfIp = String(req.headers['cf-connecting-ip'] || '').trim();
+  const hops = forwardedHops(req);
+  if (!cfIp || hops.length <= TRUST_PROXY_HOPS || hops[hops.length - 1 - TRUST_PROXY_HOPS] !== cfIp) return;
+  warnedExtraHop = true;
+  console.warn(
+    `[signal] 请求头看起来像是 Cloudflare 和本服务之间还隔着一层反代（比如 nginx），而 TRUST_PROXY=${TRUST_PROXY_HOPS} ` +
+      `只算了 ${TRUST_PROXY_HOPS} 层：限流取到的会是 Cloudflare 节点的地址，同一个机房回源的人共用一份每 IP 上限，人一多就连不上。` +
+      '请求头可以伪造，先确认部署确实如此。确认之后，最稳妥的是让那一层反代用 real_ip 还原客户端地址' +
+      `（见 README「自建信令服务器」）；也可以把 TRUST_PROXY 设成 ${TRUST_PROXY_HOPS + 1}，前提是源站只接受 Cloudflare 回源的连接。`
   );
 }
 
@@ -349,6 +413,28 @@ function ipLimiter(perMin) {
 
 const joinLimiter = ipLimiter(JOINS_PER_MIN);
 const roomLimiter = ipLimiter(ROOMS_PER_MIN);
+
+/**
+ * 每 IP 上限拒掉连接时在日志里说一声。这道闸有意放在 TCP 层（反代后面是 HTTP 429），
+ * 不给被拒的一方做 HTTP 解析和 WebSocket 握手 —— 代价是浏览器读不到原因，用户那边只看到
+ * 「连不上信令服务器」。校园网、公司 NAT 这种很多人共用一个出口的场合最容易撞上，
+ * 只有服务器这边说出来，管理员才知道该调 MAX_CONN_PER_IP。每分钟最多一条，其余只计数。
+ */
+const perIpRejects = { at: -Infinity, suppressed: 0 };
+function notePerIpReject(key) {
+  const t = now();
+  if (t - perIpRejects.at < 60000) {
+    perIpRejects.suppressed++;
+    return;
+  }
+  const more = perIpRejects.suppressed ? `（上一条提示之后另有 ${perIpRejects.suppressed} 条连接同样被拒）` : '';
+  perIpRejects.at = t;
+  perIpRejects.suppressed = 0;
+  console.warn(
+    `[signal] ${key} 同时在线的连接数到了每 IP 上限 MAX_CONN_PER_IP=${MAX_CONN_PER_IP}，新连接被拒${more}。` +
+      '客户端那边只会看到「连不上信令服务器」；很多人共用一个网络出口（校园网、公司 NAT）时可以调高这个数。'
+  );
+}
 
 /** 每个 IP 当前占着的连接数。连接一断（socket 'close'）就还回去，只会还一次。 */
 const connsByIp = new Map();
@@ -823,7 +909,10 @@ server.on('connection', (socket) =>
     'connection',
     () => {
       if (TRUST_PROXY) return;
-      if (!acquireConnSlot(ipKey(socket.remoteAddress), socket)) socket.destroy();
+      const key = ipKey(socket.remoteAddress);
+      if (acquireConnSlot(key, socket)) return;
+      socket.destroy();
+      notePerIpReject(key);
     },
     () => socket.destroy()
   )
@@ -845,7 +934,10 @@ server.on('upgrade', (req, socket, head) => {
     () => {
       warnIfProxyMisconfigured(req);
       const key = ipKey(clientIp(req));
-      if (TRUST_PROXY && !acquireConnSlot(key, socket)) return rejectUpgrade(socket, 429, 'Too Many Requests');
+      if (TRUST_PROXY && !acquireConnSlot(key, socket)) {
+        notePerIpReject(key);
+        return rejectUpgrade(socket, 429, 'Too Many Requests');
+      }
       wss.handleUpgrade(req, socket, head, (ws) => {
         ws.ipKey = key;
         wss.emit('connection', ws, req);
@@ -951,10 +1043,11 @@ server.listen(PORT, () => {
   if (BLOCKED.size) {
     console.log(`[signal] 拦截地区：${[...BLOCKED].join(', ')}`);
     console.log(`[signal] 地区未知时：${ALLOW_UNKNOWN ? '放行' : '拒绝'}`);
-    console.log(`[signal] 信任代理头部：${TRUST_PROXY ? '是' : '否'}`);
   } else {
     console.log('[signal] 地区限制：未启用（设置 BLOCKED_COUNTRIES 可开启强制拦截）');
   }
+  // 限流也看它，不只是地区拦截：放在反代后面却没开，或者层数不对，都是「人一多就连不上」
+  console.log(`[signal] 信任代理头部：${TRUST_PROXY ? `是（前面 ${TRUST_PROXY_HOPS} 层反代）` : '否'}`);
   const limit = (n) => (n ? String(n) : '不限');
   console.log(
     `[signal] 上限：连接 ${limit(MAX_CONNECTIONS)}，每 IP ${limit(MAX_CONN_PER_IP)}，房间 ${limit(MAX_ROOMS)}，` +

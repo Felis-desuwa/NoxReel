@@ -271,7 +271,7 @@ PORT=8080 BLOCKED_COUNTRIES=CN ALLOW_UNKNOWN=0 MAXMIND_DB=./GeoLite2-Country.mmd
 | `BLOCKED_COUNTRIES` | empty | Comma-separated country codes; region blocking is on only when set |
 | `ALLOW_UNKNOWN` | `1` | Set to `0` to reject clients whose region cannot be determined |
 | `MAXMIND_DB` | empty | Path to a GeoLite2-Country database; without it only CDN region headers are used |
-| `TRUST_PROXY` | off | Set to `1` to trust `X-Forwarded-For` / `X-Real-IP` / `CF-IPCountry` from your reverse proxy; rate limits and the LAN exemption then use the client address the proxy reports |
+| `TRUST_PROXY` | off | Set to the number of reverse proxies in front of the server (`1` for one) to trust `X-Forwarded-For` / `X-Real-IP` / `CF-IPCountry`; rate limits and the LAN exemption then use the client address the proxy reports (the N-th entry from the end of `X-Forwarded-For`) |
 | `MAX_CONNECTIONS` | `800` | Concurrent connections server-wide |
 | `MAX_CONN_PER_IP` | `32` | Concurrent connections per IP (IPv6 grouped by /64) |
 | `MAX_ROOMS` | `400` | Rooms that may exist at once |
@@ -287,8 +287,33 @@ PORT=8080 BLOCKED_COUNTRIES=CN ALLOW_UNKNOWN=0 MAXMIND_DB=./GeoLite2-Country.mmd
 
 - Set a count or rate limit to `0` to disable it (`MSG_RATE=0` turns off message rate limiting); sizes and durations cannot be `0` and fall back to their defaults. The defaults leave ample room for several devices of one household behind the same NAT and for a 16-person room exchanging SDP/ICE all at once.
 - Behind nginx, Caddy, or a CDN, always set `TRUST_PROXY=1` and make the proxy **append** to `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`). Otherwise every client appears to come from the proxy itself and shares one per-IP limit.
+- The per-IP limit (`MAX_CONN_PER_IP`) rejects a connection as soon as it opens, so the client only sees “Cannot connect to signaling server”; the reason is written to the server log (at most once a minute). Campus networks and office NATs, where many people share one public address, hit it first; raise it when you see that log line.
 - When raising `MAX_CONNECTIONS`, raise the process file descriptor limit as well (`ulimit -n` on Linux is often 1024 by default).
 - After the server restarts (a deploy or a crash), rooms come back with their original host and capacity, and a member who switches networks no longer waits a minute to reconnect. This needs both the server and the clients to be up to date: after an older server restarts, the room is rebuilt by whoever reconnects first, new people can’t join with the invite, and the host has to open a new room.
+
+**nginx behind a CDN (two proxy layers)**: a CDN such as Cloudflare writes the client address into `X-Forwarded-For`, then nginx appends the peer it sees—the CDN node. With only `TRUST_PROXY=1`, the server picks up the CDN node’s address, so everyone coming through the same data center shares one per-IP limit and connections start failing once enough people join. Pick one of these fixes:
+
+1. **Recommended**: have nginx restore the client address with the real_ip module and keep `TRUST_PROXY=1` on the signaling server. List only the CDN’s origin ranges in `set_real_ip_from` ([Cloudflare’s ranges](https://www.cloudflare.com/ips/)) so forged headers from anyone else are ignored:
+
+   ```nginx
+   # Example only: add one line for every range listed at https://www.cloudflare.com/ips/ (IPv4 and IPv6)
+   set_real_ip_from 173.245.48.0/20;
+   set_real_ip_from 2400:cb00::/32;
+   real_ip_header CF-Connecting-IP;
+
+   location / {
+       proxy_pass http://127.0.0.1:8080;
+       proxy_http_version 1.1;
+       proxy_set_header Upgrade $http_upgrade;
+       proxy_set_header Connection "upgrade";
+       # With real_ip in effect, $remote_addr is the real client, and that is what gets appended
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+   }
+   ```
+
+2. Set `TRUST_PROXY` to the total number of proxy layers (`2` for CDN + nginx); the server then takes the second entry from the end of `X-Forwarded-For`. **Only do this if the origin accepts connections from the CDN alone** (a firewall that admits only the CDN’s ranges): otherwise anyone who bypasses the CDN and talks to nginx directly can supply an address of their choice and use up someone else’s per-IP allowance.
+
+When the request headers look like there is one more proxy behind the CDN than `TRUST_PROXY` counts, the server logs a one-time hint.
 
 ## Contributing
 

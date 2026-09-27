@@ -53,7 +53,8 @@ test.before(async () => {
 });
 
 function sandbox({ fns = [], decls = [], globals = {} }) {
-  const ctx = { console, crypto: globalThis.crypto, clampName, ...globals };
+  // settlePendingOpsHostLost：hostReallyGone 顺手结算挂着的列表操作（批次 15），这里的用例不关心
+  const ctx = { console, crypto: globalThis.crypto, clampName, settlePendingOpsHostLost: () => {}, ...globals };
   vm.createContext(ctx);
   vm.runInContext([...decls.map(declSource), ...fns.map(fnSource)].join('\n\n'), ctx, { filename: 'app.js（节选）' });
   return ctx;

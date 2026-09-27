@@ -248,6 +248,8 @@ const EN = new Map(Object.entries({
     'The link carries this computer’s current network addresses and goes stale over time—try to have the other side open it within a few minutes. Just generate a new one if it expires.',
   '这条邀请已经用过或已失效，请用当前这条邀请链接重新走一遍。':
     'That invite was already used or has expired. Start again with the current invite link.',
+  '这是上一条邀请的应答，和眼下这条邀请对不上，已忽略；当前的邀请链接照常有效。请让对方用当前这条邀请链接重新生成应答。':
+    'This answer belongs to an earlier invite and does not match the current one, so it was ignored; the current invite link still works. Ask the other person to generate a new answer from the current invite link.',
   '打洞一直没成功：对方可能在严格 NAT 后面，也可能是邀请链接放太久、里面的网络地址已经过期。已经给你备好一条新的邀请链接，重发一次试试；还是不行就在设置里配一个 TURN 中继。':
     'The direct connection never came up: the other side may be behind a strict NAT, or the invite link sat too long and its network addresses expired. A fresh invite link is ready—send it again; if it still fails, configure a TURN relay in Settings.',
   '直连没建立起来。已经给你备好一条新的邀请链接，重发一次试试；双方都在严格 NAT 后面时需要在设置里配 TURN 中继。':
@@ -425,7 +427,6 @@ const EN = new Map(Object.entries({
   '安全模式（默认）': 'Safe mode (default)',
   '安全模式（完整接收后播放）': 'Safe mode (play after full receipt)',
   '可信房间（默认，边下边播）': 'Trusted room (default, progressive playback)',
-  '请先退出当前房间，再打开新的邀请链接。': 'Leave the current room before opening another invite link.',
   '当前没有等待应答的零服务器邀请': 'There is no serverless invite currently waiting for an answer.',
   'NoxReel 邀请链接不完整': 'Incomplete NoxReel invite link',
   '网站拒绝了自动解析，隔离浏览器也没有捕获到可播放媒体': 'The website rejected automatic parsing, and the isolated browser did not detect playable media',
@@ -608,6 +609,7 @@ const EN = new Map(Object.entries({
   '你没有编辑播放列表的权限': 'You do not have permission to edit the playlist',
   '没能加进播放列表': 'Could not add it to the playlist',
   '和房主的连接断了': 'The connection to the host is lost',
+  '和房主的连接断了，结果以列表为准': 'The connection to the host was lost; check the playlist to see whether it went through',
   '房主没有回应': 'The host did not respond',
   '房间已关闭': 'The room is closed',
   '无效的操作': 'Invalid operation',
@@ -712,6 +714,7 @@ const EN = new Map(Object.entries({
   '正在取消': 'Cancelling',
   '没加进列表': 'Not added',
   '房主没有接受': 'The host did not accept it',
+  '没等到房主确认': 'No confirmation from the host',
   '你已不是管理员，还没加进列表的片撤回了': 'You are no longer a moderator, so videos not yet added were withdrawn',
   '拿不到拖进来的文件的路径，请改用「+ 本地视频」选择': 'Could not get the path of the dropped file. Use “+ Local video” instead.',
   // 拖进来的文件为什么用不了
@@ -1056,7 +1059,9 @@ const EN_PATTERNS = [
   [/^等待 (\d+) 人准备好：$/, (_all, n) => `Waiting for ${n} ${n === '1' ? 'person' : 'people'} to get ready: `],
   [/^正在放的这部排到下一位，回头从 (.+) 接着放。$/, 'The current video moves to the next position and resumes from $1 later.'],
   [/^列表没改成：(.*)$/, (_all, detail) => `The playlist was not changed: ${translate(detail, 'en')}`],
+  [/^没等到房主确认：(.*)$/, (_all, detail) => `No confirmation from the host: ${translate(detail, 'en')}`],
   [/^《(.+)》没加进列表：(.*)$/, (_all, name, detail) => `“${name}” was not added to the playlist: ${translate(detail, 'en')}`],
+  [/^《(.+)》没等到房主确认：(.*)$/, (_all, name, detail) => `“${name}”: no confirmation from the host: ${translate(detail, 'en')}`],
   [/^《(.+)》已经在列表里了，跳过$/, '“$1” is already in the playlist; skipped'],
   [
     /^还有 (\d+) 部没有加入，要用它们开房请重新选择。$/,
@@ -1402,7 +1407,10 @@ const EN_PATTERNS = [
   [/^播放器已关闭（code (.+)），可在房间里重新打开$/, 'Player closed (code $1). You can reopen it from the room.'],
   [/^mpv 错误：(.*)$/, (_all, detail) => `mpv error: ${translate(detail, 'en')}`],
   [/^信令地址无效：(.*)$/, 'Invalid signaling URL: $1'],
-  [/^连不上信令服务器：(.*)$/, 'Cannot connect to signaling server: $1'],
+  [
+    /^连不上信令服务器：(.*)（服务器没开、满载，或者网络不通）$/,
+    'Cannot connect to signaling server: $1 (the server is down or full, or the network is unreachable)',
+  ],
   [/^无法解析这个视频链接(?:：(.*))?$/, 'Unable to parse this video URL$1'],
   [/^(.+) 索引已在文件头，可直接边下边播$/, '$1 index is at the beginning and supports progressive playback'],
   [/^(.+) 的 moov 索引在文件末尾，顺序下载时要等整个文件下完才能起播。转封装把索引挪到开头即可，无损且不重编码。$/, '$1 has its moov index at the end, so sequential download cannot start early. Remuxing moves it to the beginning without re-encoding or quality loss.'],

@@ -1618,15 +1618,16 @@ async function addLocalFile({ manifest, state, filePath, sourcePath = null, moov
       const res = await submitPlaylistOp({ type: 'add', item: fileItemOf(manifest) });
       if (!res.ok) {
         // 房主没回音不等于他拒绝了：他那边的列表操作串行排队，前面有人加片要先取清单
-        // （最长 30 秒），排队就能把这 45 秒耗光。这时立刻撤掉会话和清单，万一房主随后
-        // 拼齐入列，列表里就留下一个谁都供不了的条目。先留一段宽限期，等列表快照说了算。
-        if (res.reason === '房主没有回应') {
+        // （最长 30 秒），排队就能把这 45 秒耗光；直连断了也一样，请求可能已经在他那边执行了。
+        // 这时立刻撤掉会话和清单，万一房主随后拼齐入列，列表里就留下一个谁都供不了的条目。
+        // 先留一段宽限期，等列表快照说了算。
+        if (res.uncertain) {
           S.addGrace.set(fileId, Date.now() + ADD_GRACE_MS);
           setTimeout(() => {
             if (!inAddGrace(fileId)) releaseUnreferenced();
           }, ADD_GRACE_MS + 50);
         }
-        throw new Error(res.reason || '没能加进播放列表');
+        throw playlistOpError(res);
       }
     } else {
       // 列表里本来就有：会话换过了，重新挂到它的槽位上
@@ -1656,7 +1657,7 @@ async function addLinkItem(linkInfo) {
       type: 'add',
       item: { kind: 'link', url: key, title: linkInfo.title || '', durationSec: linkInfo.duration || 0 },
     });
-    if (!res.ok) throw new Error(res.reason || '没能加进播放列表');
+    if (!res.ok) throw playlistOpError(res);
   }
   if (!roomEntered) await enterRoom();
 }
@@ -1794,9 +1795,15 @@ function failPrepJob(job, error) {
   job.state = 'failed';
   job.tone = 'bad';
   job.ratio = null;
-  job.text = blamedHost ? (isRoomHost() ? '没加进列表' : '房主没有接受') : '没法用这个文件';
   job.detail = String(error?.message || error || '');
-  log(`《${job.name}》没加进列表：${job.detail}`, 'warn');
+  if (blamedHost && error?.uncertain) {
+    // 请求交出去了、回执没等到（超时或直连断了）：房主那边可能已经加上了，别说成他不接受
+    job.text = '没等到房主确认';
+    log(`《${job.name}》没等到房主确认：${job.detail}`, 'warn');
+  } else {
+    job.text = blamedHost ? (isRoomHost() ? '没加进列表' : '房主没有接受') : '没法用这个文件';
+    log(`《${job.name}》没加进列表：${job.detail}`, 'warn');
+  }
   renderPlaylist();
 }
 
@@ -1877,7 +1884,8 @@ function submitPlaylistOp(op) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       S.pendingOps.delete(reqId);
-      resolve({ ok: false, reason: '房主没有回应' });
+      // uncertain：请求已经交给房主了，只是没等到回执 —— 他那边可能已经改了，结果以列表为准
+      resolve({ ok: false, reason: '房主没有回应', uncertain: true });
     }, PLAYLIST_OP_TIMEOUT_MS);
     S.pendingOps.set(reqId, (result) => {
       clearTimeout(timer);
@@ -1888,6 +1896,24 @@ function submitPlaylistOp(op) {
       S.pendingOps.get(reqId)?.({ ok: false, reason: '和房主的连接断了' });
     }
   });
+}
+
+/**
+ * 和房主的直连断了（正在重连，或者他真的走了）：还在等回执的列表操作当场结束。
+ * 回执走的是那条旧连接，断了就再也送不回来 —— 不结算的话要干等 45 秒超时，
+ * 准备行这期间连个取消按钮都没有。请求可能已经在房主那边执行了，所以不说「没改成」。
+ */
+function settlePendingOpsHostLost() {
+  for (const settle of [...S.pendingOps.values()]) {
+    settle({ ok: false, reason: '和房主的连接断了，结果以列表为准', uncertain: true });
+  }
+}
+
+/** 列表操作没成功时抛给准备行的错误。uncertain 跟着带过去：没等到回执和房主明确拒绝，说法不一样。 */
+function playlistOpError(res) {
+  const error = new Error(res.reason || '没能加进播放列表');
+  if (res.uncertain) error.uncertain = true;
+  return error;
 }
 
 // 房主这边的列表操作一个接一个执行：管理员加片要先异步取清单，不能和别的操作交错。
@@ -2024,7 +2050,10 @@ function onPlaylistOp(msg, peer) {
       const left = (playlistOpQueued.get(peer.peerId) || 1) - 1;
       if (left > 0) playlistOpQueued.set(peer.peerId, left);
       else playlistOpQueued.delete(peer.peerId);
-      peer.send({
+      // 按 peerId 取他眼下的连接回执：排在前面的加片要等清单，这期间直连可能已经重连成一条新的，
+      // 发到收请求时那条旧连接上就丢了
+      const to = S.swarm?.peers.get(peer.peerId) || peer;
+      to.send({
         t: MSG.PLAYLIST_ACK,
         reqId: msg.reqId,
         ok: res.ok === true,
@@ -3223,6 +3252,8 @@ async function joinViaManual(payload) {
       name: S.name,
       sdp: answer,
       securityMode: S.roomSecurityMode,
+      // 邀请的编号原样带回去：房主据此认出这是哪一条邀请的应答
+      invite: payload.invite,
     });
   } catch (error) {
     // 以前这里的异常落到没人接住的地方，准备页永远停在「正在收集网络候选地址」
@@ -3331,8 +3362,10 @@ async function joinViaServer(payload) {
     S.signaling = null;
     // 房间已经关了：服务器是好的，别再叫人去折腾部署
     if (e.code === 'ROOM_CLOSED') return prepStop('房间已关闭', e.message);
+    // 服务器明确回了原因（房间满、限流、地区拦截、身份冲突……）就只说原因：服务器是通的，
+    // 叫人改用极简模式是误导。只有压根没拿到回复（没有 code）时才可能是对方没部署服务器
     return joinFail(
-      e.code === 'REGION_BLOCKED'
+      e.code
         ? e.message
         : `${e.message}\n\n如果对方没有部署信令服务器，让他改用「极简模式」生成邀请码 —— 那个不需要服务器。`
     );
@@ -3945,6 +3978,7 @@ function hostReallyGone(why = 'unreachable', peer = null) {
   if (S.hostGone) return;
   S.hostGone = true;
   S.hostLink = null;
+  settlePendingOpsHostLost();
   log('房主已离开，列表暂停更新；已经连上的成员之间照常传输', 'warn');
   renderPlaylistSoon();
 }
@@ -4717,6 +4751,8 @@ function initSwarmAndSync() {
       // 直连断了会自动重连：「离开了」先压几秒，这期间连回来就不说
       noteLeaveLater(peerId, gone);
     }
+    // 和房主的这条连接没了（不管是在重连还是他真走了）：等它回执的列表操作不必再等
+    if (peerId === S.hostId && !isRoomHost()) settlePendingOpsHostLost();
     if (peerId === S.hostId && !isRoomHost() && roomEntered && !S.hostGone) {
       if (S.mode === 'manual') {
         // 极简模式没有信令、也没有重连的路子：直连断了就是这一场结束了
@@ -5820,7 +5856,10 @@ function playlistView() {
 
 async function runPlaylistOp(op) {
   const res = await submitPlaylistOp(op);
-  if (!res.ok && res.reason !== 'needs-confirm') log(`列表没改成：${res.reason || '未知原因'}`, 'warn');
+  if (res.ok || res.reason === 'needs-confirm') return res;
+  // 没等到回执的，房主那边可能已经改了：别说成「没改成」
+  if (res.uncertain) log(`没等到房主确认：${res.reason || '未知原因'}`, 'warn');
+  else log(`列表没改成：${res.reason || '未知原因'}`, 'warn');
   return res;
 }
 
@@ -7445,6 +7484,9 @@ async function createManualInvite(out, notice, gen = inviteGen) {
     ...peerIce(),
     trickle: false,
   });
+  // 这条邀请的编号，加入方原样写进应答码。房主重新生成过邀请、或者点开一条用过的旧应答时，
+  // 应答对不上号就直接拒掉 —— 不然它会被套到眼下这条（可能已经发给别人的）邀请上，把它白白废掉
+  peer.manualInviteId = randomId(6);
   S.pendingManualPeer = peer;
 
   const offer = await peer.createOffer();
@@ -7456,6 +7498,7 @@ async function createManualInvite(out, notice, gen = inviteGen) {
     file: inviteMediaInfo(),
     maxMembers: S.roomCapacity,
     securityMode: S.roomSecurityMode,
+    invite: peer.manualInviteId,
   });
   const link = shareLink(code, 'join');
   // 收集候选那几秒里房主改点了别的邀请方式：这条作废，别盖掉人家的邀请卡
@@ -7610,6 +7653,12 @@ async function acceptManualAnswer(rawInput) {
           ? '对方是旧版 NoxReel（0.6.x），和 0.7 不互通。请让他升级到 0.7 再加入。'
           : '对方用的是更新版本的 NoxReel，和本机不互通。请先升级本机的 NoxReel。'
       );
+    }
+    // 应答对应的是之前那条邀请（手动重新生成过，或者点开了一条用过的旧应答）：
+    // 套到眼下这条上必然连不上，还会把它废掉，连带作废已经发给别人的邀请。
+    // 旧版本发来的应答没有编号，照旧收
+    if (payload.invite && payload.invite !== peer.manualInviteId) {
+      throw new Error('这是上一条邀请的应答，和眼下这条邀请对不上，已忽略；当前的邀请链接照常有效。请让对方用当前这条邀请链接重新生成应答。');
     }
     if (normalizeSecurityMode(payload.securityMode) !== normalizeSecurityMode(S.roomSecurityMode)) {
       throw new Error(

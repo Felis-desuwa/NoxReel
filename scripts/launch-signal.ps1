@@ -27,9 +27,18 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
   exit 1
 }
 
-if (-not (Test-Path (Join-Path $root 'node_modules'))) {
+# 不能只看 node_modules 目录在不在：安装中途关了窗口、进程被杀，会留下一个残缺的目录，
+# 以后每次都跳过安装、一直报 Cannot find module 'ws'。信令服务器只依赖 ws，就看它装全了没有
+$wsPackage = Join-Path $root 'node_modules\ws\package.json'
+if (-not (Test-Path $wsPackage)) {
   Write-Host '   [·] 正在安装依赖…' -ForegroundColor Yellow
   & npm install --no-audit --no-fund
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $wsPackage)) {
+    Write-Host ''
+    Write-Host '   [×] 依赖安装失败，看看上面的报错。没联网的话，联网后重新打开即可' -ForegroundColor Red
+    Read-Host '按回车退出'
+    exit 1
+  }
   Write-Host ''
 }
 

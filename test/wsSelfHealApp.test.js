@@ -198,10 +198,11 @@ function hostLinkBox(signaling) {
     hostGone: false,
     hostLink: null,
     signaling,
+    pendingOps: new Map(),
     swarm: { on: (name, fn) => handlers.set(name, fn), peers: new Map() },
   };
   const ctx = sandbox({
-    fns: ['hostReallyGone'],
+    fns: ['hostReallyGone', 'settlePendingOpsHostLost'],
     extra: [`function wire() {\n${stmtSource("  S.swarm.on('peer-gone', (peerId) => {", '\n  });')}\n}`],
     globals: {
       S,

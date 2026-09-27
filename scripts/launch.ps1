@@ -27,11 +27,15 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
 }
 
 # --- 依赖 ---
-if (-not (Test-Path (Join-Path $root 'node_modules'))) {
+# 不能只看 node_modules 目录在不在：安装中途关了窗口、进程被杀，会留下一个残缺的目录，
+# 以后每次都跳过安装、一直启动失败。看关键包的 package.json 装上了没有
+# （Electron 本体那 180MB 另外由下面单独检查、修复）
+$electronPackage = Join-Path $root 'node_modules\electron\package.json'
+if (-not (Test-Path $electronPackage)) {
   Say '[·] 首次运行，正在安装依赖，请稍候…' 'Yellow'
   Write-Host ''
   & npm install --no-audit --no-fund
-  if ($LASTEXITCODE -ne 0) {
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $electronPackage)) {
     Write-Host ''
     Say '[×] 依赖安装失败，看看上面的报错' 'Red'
     Read-Host '按回车退出'
@@ -72,12 +76,8 @@ if (-not $mpvFound) {
 Say '[·] 启动中…' 'Green'
 Write-Host ''
 
+# electron.exe 是 GUI 程序，PowerShell 不会等它退出：这里拉起来就结束，控制台窗口随之关掉。
+# 所以这之后拿不到 Electron 的退出码，$LASTEXITCODE 还是前面 npm / repair 留下的值 ——
+# 以前在这里按它报「异常退出」，是一段永远接不住真崩溃、偶尔还会误报的死代码。
 & $electronExe . @args
-
-if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne $null) {
-  Write-Host ''
-  Say "[×] 异常退出（代码 $LASTEXITCODE），报错在上面" 'Red'
-  Write-Host ''
-  Read-Host '按回车退出'
-  exit 1
-}
+exit 0

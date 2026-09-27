@@ -324,6 +324,11 @@ const PATTERNS = [
   [/^(.+) · (安全模式|可信房间|Safe mode|Trusted room) · 在线$/, (_all, title, mode) => `${title} · ${translate(mode, 'en')} · Online`],
   [/^正在连接 (.+) …$/, 'Connecting to $1 …'],
   [/^连接失败：(.*)$/, (_all, detail) => `Connection failed: ${translate(detail, 'en')}`],
+  // 自建信令服务器连不上（WsSignaling，接在「连接失败：」后面）
+  [
+    /^连不上信令服务器：(.*)（服务器没开、满载，或者网络不通）$/,
+    'Cannot connect to signaling server: $1 (the server is down or full, or the network is unreachable)',
+  ],
   [/^邀请码无效：(.*)$/, (_all, detail) => `Invalid invite code: ${translate(detail, 'en')}`],
   [/^房间使用(.+)，本机设置是(.+)。请切换为相同模式后重试。$/, 'The room uses $1 while this device uses $2. Select the same mode and try again.'],
   [/^房主的片子：(.+) · (.+)$/, 'Host video: $1 · $2'],

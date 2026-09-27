@@ -271,7 +271,7 @@ PORT=8080 BLOCKED_COUNTRIES=CN ALLOW_UNKNOWN=0 MAXMIND_DB=./GeoLite2-Country.mmd
 | `BLOCKED_COUNTRIES` | 空 | 逗号分隔的国家码，填了才开启地区拦截 |
 | `ALLOW_UNKNOWN` | `1` | 设为 `0` 时查不到地区就拒绝 |
 | `MAXMIND_DB` | 空 | GeoLite2-Country 数据库路径；不填只看 CDN 给的地区头 |
-| `TRUST_PROXY` | 关 | 设为 `1` 时信任反代写入的 `X-Forwarded-For` / `X-Real-IP` / `CF-IPCountry`，限流和局域网豁免都按反代转述的客户端地址算 |
+| `TRUST_PROXY` | 关 | 填前面有几层反代（一层填 `1`）时信任反代写入的 `X-Forwarded-For` / `X-Real-IP` / `CF-IPCountry`，限流和局域网豁免都按反代转述的客户端地址算（取 `X-Forwarded-For` 的倒数第 N 段） |
 | `MAX_CONNECTIONS` | `800` | 全服同时在线的连接数 |
 | `MAX_CONN_PER_IP` | `32` | 同一 IP 同时在线的连接数（IPv6 按 /64 合并计） |
 | `MAX_ROOMS` | `400` | 全服同时存在的房间数 |
@@ -287,8 +287,33 @@ PORT=8080 BLOCKED_COUNTRIES=CN ALLOW_UNKNOWN=0 MAXMIND_DB=./GeoLite2-Country.mmd
 
 - 数量和速率类的上限填 `0` 表示不限（`MSG_RATE=0` 即不限速）；大小和时长类填 `0` 无效，按默认值处理。默认值按「一家人在同一个 NAT 后面开几台设备」「16 人房间一口气交换 SDP/ICE」留足了余量。
 - 放在 nginx、Caddy 或 CDN 后面时务必设 `TRUST_PROXY=1`，并让反代**追加**写 `X-Forwarded-For`（nginx：`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`）。否则所有人都会被当成来自反代自己，共用一份每 IP 上限。
+- 每 IP 上限（`MAX_CONN_PER_IP`）是在连接一建立时就拒的，客户端那边只会看到「连不上信令服务器」，原因只写在服务器日志里（每分钟最多一条）。校园网、公司 NAT 这种很多人共用一个出口的场合最容易撞上，看到这条日志就调高它。
 - 调大 `MAX_CONNECTIONS` 时，记得同时调高进程的文件句柄上限（Linux 上的 `ulimit -n` 默认常是 1024）。
 - 服务器重启（部署、崩溃）后房间会按原来的房主和人数上限恢复，成员换网络重连也不用再等一分钟。这要求服务器和客户端都是新版本：旧版服务器重启后，房间会由最先重连上的人重建，新人拿邀请码进不来，只能重新开房。
+
+**CDN 后面再叠一层 nginx（两层反代）**：Cloudflare 这类 CDN 把客户端地址写进 `X-Forwarded-For`，nginx 再把它看到的对端 —— CDN 节点 —— 追加在后面。只设 `TRUST_PROXY=1` 的话，取到的是 CDN 节点的地址，同一个机房回源的人会挤在同一份每 IP 上限里，人一多就连不上。两种改法任选其一：
+
+1. **推荐**：让 nginx 用 real_ip 模块把客户端地址还原出来，信令服务器照旧 `TRUST_PROXY=1`。`set_real_ip_from` 只列 CDN 的回源网段（[Cloudflare 的网段](https://www.cloudflare.com/ips/)），别人伪造的头不会被采信：
+
+   ```nginx
+   # 只是示例：把 https://www.cloudflare.com/ips/ 上列的每个网段（IPv4、IPv6）都写一行
+   set_real_ip_from 173.245.48.0/20;
+   set_real_ip_from 2400:cb00::/32;
+   real_ip_header CF-Connecting-IP;
+
+   location / {
+       proxy_pass http://127.0.0.1:8080;
+       proxy_http_version 1.1;
+       proxy_set_header Upgrade $http_upgrade;
+       proxy_set_header Connection "upgrade";
+       # real_ip 生效后 $remote_addr 就是真实客户端，追加到末尾的正是它
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+   }
+   ```
+
+2. 把 `TRUST_PROXY` 设成反代的总层数（CDN + nginx 就是 `2`），服务器取 `X-Forwarded-For` 的倒数第 2 段。**前提是源站只接受 CDN 回源的连接**（防火墙只放行 CDN 网段）：不然绕过 CDN 直连 nginx 的人可以自己填一段地址，冒充别人的每 IP 额度。
+
+服务器看到请求头像是「CDN 后面还有一层、`TRUST_PROXY` 少算了一层」时，会在日志里提示一次。
 
 ## 参与项目
 

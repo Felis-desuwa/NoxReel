@@ -924,6 +924,20 @@ function isSessionFile(filePath) {
   return false;
 }
 
+/**
+ * 开着的接收会话往这个文件里写了多少字节（不是接收文件就是 0）。缓存占用统计拿它给块数兜底：
+ * Windows 上稀疏文件的块数要等缓存里的脏页写回磁盘才跟上，按块数算，接收中的片会少算最近写的那一截。
+ * 它只数真写进去的，没写的空洞不算。
+ */
+function writtenBytesOf(filePath) {
+  if (typeof filePath !== 'string' || !path.isAbsolute(filePath)) return 0;
+  const key = pathKey(filePath);
+  for (const session of sessions.values()) {
+    if (session.mode === 'leech' && !session.closed && pathKey(session.filePath) === key) return session.writtenBytes;
+  }
+  return 0;
+}
+
 function state(sessionId) {
   return get(sessionId).state();
 }
@@ -1055,6 +1069,7 @@ module.exports = {
   state,
   hasOpenSessions,
   isSessionFile,
+  writtenBytesOf,
   scanTarget,
   close,
   closeAll,

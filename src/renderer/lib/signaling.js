@@ -126,6 +126,23 @@ function sdpText(value) {
   return typeof value === 'string' ? value : String(value?.sdp || '');
 }
 
+// 一对一邀请的编号：房主每生成一条邀请换一个，加入方原样写回应答码。
+// 旧版本的码没有这一项；解码时认不出来的一律当没有。
+const INVITE_ID_RE = /^[A-Za-z0-9._-]{1,32}$/;
+
+function inviteIdOf(value) {
+  return typeof value === 'string' && INVITE_ID_RE.test(value) ? value : '';
+}
+
+/**
+ * 邀请编号接在版本号**后面**：旧版本解码只按下标取前几项，多出来的尾巴直接忽略，
+ * 版本号仍在原来的下标上，「粘贴那一刻就说清楚对方是旧版」照常成立。没有编号时一个字节都不多。
+ */
+function withInviteId(fields, invite) {
+  const id = inviteIdOf(invite);
+  return id ? [...fields, id] : fields;
+}
+
 function compactPayload(payload) {
   if (payload?.k === 'room') {
     return ['r', payload.url, payload.room, payload.from, Number(payload.maxMembers) || 0, packSecurityMode(payload.securityMode), PROTOCOL_VERSION];
@@ -133,10 +150,13 @@ function compactPayload(payload) {
   if (payload?.k === 'offer') {
     // NR3 不再重复携带 type、昵称和片名；昵称会在加密数据通道的 HELLO 中发送，
     // 视频信息则在握手后发送。SDP 仍完整保留，避免破坏 NAT 打洞。
-    return ['o', payload.from, sdpText(payload.sdp), Number(payload.maxMembers) || 0, packSecurityMode(payload.securityMode), PROTOCOL_VERSION];
+    return withInviteId(
+      ['o', payload.from, sdpText(payload.sdp), Number(payload.maxMembers) || 0, packSecurityMode(payload.securityMode), PROTOCOL_VERSION],
+      payload.invite
+    );
   }
   if (payload?.k === 'answer') {
-    return ['a', payload.from, sdpText(payload.sdp), packSecurityMode(payload.securityMode), PROTOCOL_VERSION];
+    return withInviteId(['a', payload.from, sdpText(payload.sdp), packSecurityMode(payload.securityMode), PROTOCOL_VERSION], payload.invite);
   }
   if (payload?.k === 'relay') {
     // 房间链接（经公共中继）：房间密钥、房主签名公钥、房主 peerId。中继列表只有房主改过才带。
@@ -181,7 +201,7 @@ function expandPayload(value, version = 3) {
       return {
         k: 'offer', from: value[1], name: '', sdp: { type: 'offer', sdp: value[2] }, file: null,
         maxMembers: Number(value[3]) || 0, securityMode: expandSecurityMode(value[4]),
-        protocolVersion: expandVersion(value[5]),
+        protocolVersion: expandVersion(value[5]), invite: inviteIdOf(value[6]),
       };
     }
     const f = value[4];
@@ -201,6 +221,7 @@ function expandPayload(value, version = 3) {
       return {
         k: 'answer', from: value[1], name: '', sdp: { type: 'answer', sdp: value[2] },
         securityMode: expandSecurityMode(value[3]), protocolVersion: expandVersion(value[4]),
+        invite: inviteIdOf(value[5]),
       };
     }
     return { k: 'answer', from: value[1], name: value[2], sdp: value[3], securityMode: expandSecurityMode(value[4]), protocolVersion: 1 };
@@ -517,7 +538,9 @@ export class WsSignaling extends Emitter {
       this.ws.onerror = () => {
         if (!settled) {
           settled = true;
-          reject(new Error(`连不上信令服务器：${this.url}`));
+          // 浏览器的 WebSocket 读不到失败原因：没开、不通，和服务器按连接数上限直接断开（全服满了，
+          // 或者同一个网络出口的连接太多）在这里是同一个 onerror。只能把几种可能都说出来，别只让人去怀疑「没部署」
+          reject(new Error(`连不上信令服务器：${this.url}（服务器没开、满载，或者网络不通）`));
         }
       };
 

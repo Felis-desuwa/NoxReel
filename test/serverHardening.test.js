@@ -433,6 +433,64 @@ test('TRUST_PROXY 时每 IP 上限按反代转述的地址算，IPv6 按 /64 合
   assert.equal((await tryConnect(srv.url, via('2001:db8:0:1::1'))).ok, true, '别的 /64 应该单独计数');
 });
 
+test('TRUST_PROXY=2（CDN 后面再叠一层 nginx）：按倒数第二段计，前面伪造的段不算；段数不够时退回最后一段', { timeout: 20000 }, async (t) => {
+  const clients = [];
+  t.after(() => Promise.all(clients.map((c) => c.close())));
+  const srv = await startServer(t, { TRUST_PROXY: '2', MAX_CONN_PER_IP: '1' });
+  const via = (xff) => ({ clients, headers: { 'x-forwarded-for': xff } });
+
+  // 「客户端, CDN 节点」：同一个 CDN 节点回源的不同客户端各算各的
+  assert.equal((await tryConnect(srv.url, via('198.51.100.1, 203.0.113.50'))).ok, true);
+  assert.equal((await tryConnect(srv.url, via('198.51.100.2, 203.0.113.50'))).ok, true, '同一个 CDN 节点后面的人被算成了一个');
+  // 同一个客户端换了个 CDN 节点，还是他
+  const again = await tryConnect(srv.url, via('198.51.100.1, 203.0.113.51'));
+  assert.equal(again.ok, false);
+  assert.match(again.error.message, /429/);
+  // 客户端自己往前塞的段不算数：换着塞也还是同一个人
+  assert.equal((await tryConnect(srv.url, via('6.6.6.6, 198.51.100.3, 203.0.113.50'))).ok, true);
+  assert.equal((await tryConnect(srv.url, via('7.7.7.7, 198.51.100.3, 203.0.113.50'))).ok, false, '伪造的第一段被当成了新身份');
+  // 只有一段（绕过了 CDN）：按最后一段、也就是 nginx 看到的对端计，不去猜
+  assert.equal((await tryConnect(srv.url, via('198.51.100.9'))).ok, true);
+  assert.equal((await tryConnect(srv.url, via('198.51.100.9'))).ok, false);
+  await waitForStderr(srv, 'X-Forwarded-For 只有 1 段');
+  assert.ok(srv.alive(), srv.stderr());
+});
+
+test('TRUST_PROXY=1 却像是 CDN 后面还有一层反代：日志提示一次，并说清楚别直接改层数', { timeout: 15000 }, async (t) => {
+  const clients = [];
+  t.after(() => Promise.all(clients.map((c) => c.close())));
+  const srv = await startServer(t, { TRUST_PROXY: '1' });
+  const headers = { 'x-forwarded-for': '198.51.100.1, 203.0.113.50', 'cf-connecting-ip': '198.51.100.1' };
+  await connect(srv.url, { clients, headers });
+  await connect(srv.url, { clients, headers });
+  await waitForStderr(srv, '只算了 1 层');
+  assert.equal(srv.stderr().split('只算了 1 层').length - 1, 1, '同一条提示刷了不止一次');
+  assert.match(srv.stderr(), /请求头可以伪造/);
+  assert.match(srv.stderr(), /real_ip/);
+});
+
+test('TRUST_PROXY 填了看不懂的值：说一声，按没开处理（请求头不被采信）', { timeout: 15000 }, async (t) => {
+  const clients = [];
+  t.after(() => Promise.all(clients.map((c) => c.close())));
+  const srv = await startServer(t, { TRUST_PROXY: 'true', MAX_CONN_PER_IP: '1' });
+  await waitForStderr(srv, 'TRUST_PROXY=true 看不懂');
+  assert.equal((await tryConnect(srv.url, { clients, headers: { 'x-forwarded-for': '198.51.100.1' } })).ok, true);
+  // 没开：都按套接字地址（127.0.0.1）计，换个 X-Forwarded-For 也还是同一个
+  assert.equal((await tryConnect(srv.url, { clients, headers: { 'x-forwarded-for': '198.51.100.2' } })).ok, false);
+});
+
+test('每 IP 上限拒掉连接时，服务器日志说清楚是哪一项上限，一分钟只说一次', { timeout: 15000 }, async (t) => {
+  const clients = [];
+  t.after(() => Promise.all(clients.map((c) => c.close())));
+  const srv = await startServer(t, { MAX_CONN_PER_IP: '1' });
+  await connect(srv.url, { clients });
+  for (let i = 0; i < 3; i++) assert.equal((await tryConnect(srv.url, { clients })).ok, false);
+  await waitForStderr(srv, 'MAX_CONN_PER_IP=1');
+  await sleep(200);
+  assert.equal(srv.stderr().split('MAX_CONN_PER_IP=1').length - 1, 1, '被拒一次就打一条，刷屏了');
+  assert.ok(srv.alive(), srv.stderr());
+});
+
 test('全服同时连接数有上限', { timeout: 15000 }, async (t) => {
   const clients = [];
   t.after(() => Promise.all(clients.map((c) => c.close())));

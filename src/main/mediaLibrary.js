@@ -73,8 +73,9 @@ async function locateFile(filePath) {
 
 /**
  * 这个文件删掉能腾出多少空间。还有别的硬链接指着它（另存到了下载文件夹）就是 0 —— 删了这一个名字，
- * 数据还在。能读出占用块数就按块数算；读出 0 块却有内容时按大小算：Windows 上 libuv 对稀疏文件
- * （接收文件都标了稀疏，见 fileStore.markSparse）报的块数恒为 0（实测），而临时条目都是收完的整部片。
+ * 数据还在。能读出占用块数就按块数算；读出 0 块却有内容时按大小算：Windows 上稀疏文件
+ * （接收文件都标了稀疏，见 fileStore.markSparse）的块数要等缓存里的脏页写回磁盘才跟上，
+ * 刚收完的片读出来是 0（实测，一两秒后才开始涨），而临时条目都是收完的整部片。
  */
 async function reclaimableBytes(filePath) {
   try {

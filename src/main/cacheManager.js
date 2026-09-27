@@ -136,6 +136,7 @@ class CacheManager {
     isAlive = processIsAlive,
     hostname = os.hostname,
     extraRoots = [],
+    deferExtraRoots = false,
   } = {}) {
     if (!rootDir || !path.isAbsolute(rootDir)) throw new TypeError('缓存根目录必须是绝对路径');
     this.rootDir = path.resolve(rootDir);
@@ -149,6 +150,9 @@ class CacheManager {
       .filter((r) => r && path.isAbsolute(r))
       .map((r) => path.resolve(r))
       .filter((r) => r !== this.rootDir);
+    // 旧根可能在没插的移动硬盘、离线的网盘上，opendir 要等到网络超时才返回。
+    // 开着这一项时 initialize() 只收当前根，旧根由调用方在窗口出来之后另调 cleanupExtraRoots() 慢慢收
+    this.deferExtraRoots = deferExtraRoots;
     const stamp = now().toString(36);
     const token = crypto.randomBytes(6).toString('hex');
     this.runDir = path.join(this.rootDir, `run-${pid}-${stamp}-${token}`);
@@ -159,7 +163,7 @@ class CacheManager {
   async initialize() {
     if (this.initialized) return this.runDir;
     await fsp.mkdir(this.rootDir, { recursive: true });
-    await this.cleanupStaleRuns();
+    await this.cleanupStaleRuns(this.deferExtraRoots ? [this.rootDir] : undefined);
     await fsp.mkdir(this.runDir, { recursive: true });
     // 标记这个目录是谁建的。缓存放在网盘上时，光看 PID 会把别的机器正在用的
     // 目录判成死进程直接删掉 —— 那可是人家正在接收的片子。
@@ -209,8 +213,8 @@ class CacheManager {
     return this._isStale(marker, Number(runMatch[1])) ? 'stale' : null;
   }
 
-  async cleanupStaleRuns() {
-    for (const root of [this.rootDir, ...this.extraRoots]) {
+  async cleanupStaleRuns(roots = [this.rootDir, ...this.extraRoots]) {
+    for (const root of roots) {
       const names = await candidateNames(root);
       await Promise.all(
         names.map(async (name) => {
@@ -220,19 +224,27 @@ class CacheManager {
     }
   }
 
+  /** 只收旧根上的残留（deferExtraRoots 时 initialize() 不管它们）。 */
+  cleanupExtraRoots() {
+    return this.cleanupStaleRuns(this.extraRoots);
+  }
+
   /**
    * 缓存占了多少。设置页要显示，用户才知道该不该清。
    * 只统计本软件自己的目录，别的东西一个字节都不数 —— 缓存根可能是用户指定的目录。
    * 别的实例（或别的机器）正在用的 run 目录既清不掉、也不该算成「残留」：
    * 界面会把它说成「上次退出没清掉」，诱着用户去点那个会删掉人家片子的按钮。
+   *
+   * writtenBytesOf(filePath)：正在接收的文件已经写进去多少字节（fileStore 知道），给本次运行目录的块数兜底，
+   * 见 dirBytes。
    */
-  async usage() {
+  async usage({ writtenBytesOf = null } = {}) {
     const out = { root: this.rootDir, runBytes: 0, staleBytes: 0, staleRuns: 0 };
     for (const root of [this.rootDir, ...this.extraRoots]) {
       for (const name of await candidateNames(root)) {
         const kind = await this._classify(root, name);
         if (!kind) continue;
-        const bytes = await dirBytes(path.join(root, name));
+        const bytes = await dirBytes(path.join(root, name), { writtenBytesOf: kind === 'mine' ? writtenBytesOf : null });
         if (kind === 'mine') out.runBytes += bytes;
         else {
           out.staleBytes += bytes;
@@ -313,7 +325,7 @@ class CacheManager {
  * 递归统计目录占用。只用在已确认是我们的目录上，正常只有个位数文件。
  * 最多数 maxEntries 项：有人往里塞了海量小文件时宁可少算，也不让一次统计没完没了。
  */
-async function dirBytes(dir, { maxEntries = MAX_SCAN_ENTRIES } = {}) {
+async function dirBytes(dir, { maxEntries = MAX_SCAN_ENTRIES, writtenBytesOf = null } = {}) {
   let total = 0;
   let seen = 0;
   const stack = [dir];
@@ -329,8 +341,14 @@ async function dirBytes(dir, { maxEntries = MAX_SCAN_ENTRIES } = {}) {
         }
         // 接收文件是稀疏文件（NTFS 上见 fileStore.markSparse），要按真正占用的块数算，
         // 不然一个刚开始接收的 50GB 文件会让「缓存占用」从第一秒起就显示 50GB，而磁盘其实没少多少。
+        // Windows 上稀疏文件的块数要等系统把缓存里的脏页写回磁盘才跟上（实测刚写完是 0，之后逐秒往上涨，
+        // 一口气写了 100MB 的，6 秒后才数到 38MB）：正在接收的片按块数算会少一截。所以拿接收会话
+        // 已经写进去的字节数兜底（writtenBytesOf），不按文件大小去补 —— 补了就把没写的空洞也算进去，
+        // 正是上面要避免的。这只是给界面显示的数，磁盘余量的判断不用它（见 fileStore.ensureFreeSpace）。
         const st = await fsp.stat(full).catch(() => null);
-        if (st) total += typeof st.blocks === 'number' && st.blocks >= 0 ? st.blocks * 512 : st.size;
+        if (!st) continue;
+        const onDisk = typeof st.blocks === 'number' && st.blocks >= 0 ? st.blocks * 512 : st.size;
+        total += Math.max(onDisk, Number(writtenBytesOf?.(full)) || 0);
       }
     } catch {
       // 读不了的子目录跳过，能数多少数多少
