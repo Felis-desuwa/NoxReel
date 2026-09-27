@@ -218,7 +218,10 @@ test('media.run：不取消时行为不变（成功收输出，失败报退出�
 test('media.remux / slim 把 signal 一路传给 run()', () => {
   const remux = functionBody(mediaSrc, 'async function remux(');
   assert.match(remux, /\{ onProgress, signal \} = \{\}/);
-  assert.match(remux, /await run\([\s\S]*signal \}/);
+  // 转封装有两三条 run() 路径（按轨道映射、读不出轨道时的退路），共用同一份带 signal 的选项
+  assert.match(remux, /const opts = \{ onStderr: [^\n]*signal \}/);
+  const runs = remux.match(/await run\([^\n]*\)/g) || [];
+  assert.ok(runs.length >= 1 && runs.every((line) => line.endsWith(', opts)')), runs.join('\n'));
   const slim = functionBody(mediaSrc, 'async function slim(');
   assert.match(slim, /onProgress, signal \} = \{\}/);
   assert.match(slim, /await run\(bin, slimArgs[\s\S]*signal,\s*\}\)/);

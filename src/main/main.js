@@ -779,7 +779,13 @@ secureHandle('dialog:pickVideos', async () => {
   return r.canceled ? [] : approveSources(r.filePaths);
 });
 
-secureHandle('dialog:approveDroppedVideo', async (filePath) => approveSource(filePath));
+secureHandle('dialog:approveDroppedVideo', async (filePath) => {
+  // 拖进来的是文件夹时，approveSource 先查名字、报的是「不支持这种视频格式」—— 说法不对，
+  // 用户会以为是格式问题。先把文件夹认出来，报错原样交给页面去提示。
+  const stat = await fsp.stat(validate.absolutePath(filePath)).catch(() => null);
+  if (stat?.isDirectory()) throw new Error('拖进来的是文件夹，请打开它，把里面的视频文件拖进来');
+  return approveSource(filePath);
+});
 
 // 手动补字幕（名字和片子对不上、或者放在别的文件夹里的）。某一个不合格只跳过它。
 secureHandle('dialog:pickSubtitles', async () => {
@@ -864,12 +870,13 @@ secureHandle('media:remux', async (payload) => {
       const source = await requireAllowedLocalPath(filePath);
       const ownedDir = await cache.createOwnedDir('remux');
       try {
-        const { outPath } = await media.remux(source, ownedDir, {
+        const { outPath, droppedSubtitles = [], subtitlesUnchecked = false } = await media.remux(source, ownedDir, {
           onProgress: (p) => send('media:remuxProgress', { progress: p, taskId }),
           signal,
         });
         remuxOutputs.set(outPath, ownedDir);
-        return { outPath };
+        // MP4 装不下、只能略过的字幕要让房主知道，别让大家开播才发现少了一条
+        return { outPath, droppedSubtitles, subtitlesUnchecked };
       } catch (error) {
         // 取消也走这里：ffmpeg 已经退出，半截产物连目录一起删
         await cache.removeOwned(ownedDir).catch(() => {});
@@ -893,14 +900,14 @@ secureHandle('media:slim', async (payload) => {
       const source = await requireAllowedLocalPath(filePath);
       const ownedDir = await cache.createOwnedDir('slim');
       try {
-        const { outPath, plan, inputSize, outputSize } = await media.slim(source, ownedDir, {
+        const { outPath, plan, inputSize, outputSize, droppedSubtitles = [] } = await media.slim(source, ownedDir, {
           keepIndexes: opts.keepIndexes,
           toFlac: opts.toFlac,
           onProgress: (p) => send('media:slimProgress', { progress: p, taskId }),
           signal,
         });
         remuxOutputs.set(outPath, ownedDir);
-        return { outPath, plan, inputSize, outputSize };
+        return { outPath, plan, inputSize, outputSize, droppedSubtitles };
       } catch (error) {
         await cache.removeOwned(ownedDir).catch(() => {});
         throw error;

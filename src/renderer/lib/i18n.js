@@ -65,6 +65,12 @@ const EN = new Map(Object.entries({
   '计算分片校验值': 'Calculate chunk hashes',
   '创建房间': 'Create room',
   '这个 MP4 需要转封装才能边下边播，但没找到 ffmpeg。装上 ffmpeg 后重试，或者换一个 MKV 文件。': 'This MP4 must be remuxed for progressive playback, but ffmpeg was not found. Install ffmpeg and try again, or use an MKV file.',
+  '这个文件的索引（moov）在文件末尾。安全模式下大家都是收完、扫描过才播，索引在哪不影响观看，可以原样传；转封装只是把索引挪到文件头，要多花一些时间和一份临时空间。':
+    'This file keeps its index (moov) at the end. In Safe mode everyone plays only after the full download and scan, so the index position does not matter and the file can be shared as is; remuxing just moves the index to the front, at the cost of some time and a temporary copy.',
+  '这个 MP4 的索引在文件末尾，可信房间要边下边播，得先转封装。请重新选择这个文件。':
+    'This MP4 keeps its index at the end. A trusted room plays while downloading, so it has to be remuxed first. Please choose the file again.',
+  '读不出这个片子的轨道信息（可能没装 ffprobe），片子里的字幕放不进 MP4，这次没带上':
+    'Could not read the tracks of this video (ffprobe may be missing), so its subtitles could not go into the MP4 and were left out this time',
   '正在转封装': 'Remuxing',
   '正在计算分片校验值': 'Calculating chunk hashes',
   '每个分片单独算一次 SHA-256。对方收到一片就能立刻验一片，不用等整个文件下完 —— 这就是「渐进式校验」。': 'Each chunk gets its own SHA-256 hash, so recipients can verify it immediately without waiting for the entire file.',
@@ -399,6 +405,7 @@ const EN = new Map(Object.entries({
   '网站拒绝了自动解析，隔离浏览器也没有捕获到可播放媒体': 'The website rejected automatic parsing, and the isolated browser did not detect playable media',
   '可信房间（边下边播，风险较高）': 'Trusted room (progressive playback, higher risk)',
   '房间进行中不能切换。退出后可更改。': 'The mode cannot be changed during a room. Leave the room first.',
+  '正在准备开房，这时不能切换。回到首页后可更改。': 'The mode cannot be changed while a room is being prepared. Go back to the home page to change it.',
   '房主和每位加入者必须分别选择相同模式才能握手。安全模式完整接收并扫描后播放；可信房间约 8 MB 片头就绪后边下边播。': 'The host and every member must select the same mode. Safe mode plays after full receipt and scanning; Trusted room starts progressive playback after about 8 MB.',
   '你的昵称': 'Display name',
   '界面语言': 'Interface language',
@@ -664,6 +671,13 @@ const EN = new Map(Object.entries({
   '房主没有接受': 'The host did not accept it',
   '你已不是管理员，还没加进列表的片撤回了': 'You are no longer a moderator, so videos not yet added were withdrawn',
   '拿不到拖进来的文件的路径，请改用「+ 本地视频」选择': 'Could not get the path of the dropped file. Use “+ Local video” instead.',
+  // 拖进来的文件为什么用不了
+  '拿不到这个文件的路径，请改用选择文件的方式添加': 'Could not get the path of this file. Add it with the file picker instead',
+  '拖进来的是文件夹，请打开它，把里面的视频文件拖进来': 'That is a folder. Open it and drag the video files inside',
+  'RM/RMVB 只能重新编码、没法无损封成 MKV，不支持': 'RM/RMVB is not supported: it can only be re-encoded, not packed losslessly into MKV',
+  '找不到这个文件，可能已被移动或删除': 'The file was not found; it may have been moved or deleted',
+  '没有权限读取这个文件': 'No permission to read this file',
+  '文件名太长或带有不支持的字符，改个名再试': 'The file name is too long or has unsupported characters. Rename it and try again',
   '正在给成员供片，这时测不准上行': 'You are serving members right now, so upload speed cannot be measured accurately',
   '操作已取消': 'Cancelled',
   '安全扫描没能完成': 'The security scan did not finish',
@@ -769,6 +783,7 @@ const EN = new Map(Object.entries({
   '不支持这种视频格式': 'This video format is not supported',
   '只支持 ASS、SSA、SRT、VTT 字幕': 'Only ASS, SSA, SRT and VTT subtitles are supported',
   '这个文件里没有能封进 MKV 的音视频轨': 'This file has no audio or video track that fits in MKV',
+  '这个文件里没有能放进 MP4 的音视频轨': 'This file has no audio or video track that fits in MP4',
   '读不出这个文件的轨道信息，没法封成 MKV': 'Could not read the tracks of this file, so it cannot be packed into MKV',
   '字幕未经用户选择，已拒绝访问': 'Subtitle access was rejected because it was not selected by the user',
   '无效的字幕列表': 'Invalid subtitle list',
@@ -1343,7 +1358,13 @@ const EN_PATTERNS = [
   [/^正在给 (\d+) 人供片$/, (_all, n) => `Seeding to ${n} ${n === '1' ? 'person' : 'people'}`],
   [/^下行是码率的 ([\d.]+) 倍，够用$/, 'Download is $1× the bitrate, plenty'],
   // 更多格式与外挂字幕（0.7.3）
-  [/^不支持这种视频格式：(.+)$/, 'This video format is not supported: $1'],
+  [
+    /^不支持这种视频格式：(.+)$/,
+    (_all, ext) => `This video format is not supported: ${ext === '(无扩展名)' ? '(no extension)' : ext}`,
+  ],
+  // 拖进来的文件没加上：片名原样保留，原因再翻一道
+  [/^没加上《(.+)》：(.+)$/, (_all, name, reason) => `Not added: “${name}” — ${translate(reason, 'en')}`],
+  [/^还有 (\d+) 个也没加上$/, (_all, n) => `${n} more ${n === '1' ? 'was' : 'were'} not added`],
   [
     /^(.+) 要先无损封成 MKV 才能传：只换容器、不重新编码，画质音质都不变。$/,
     '$1 has to be packed losslessly into MKV before it can be sent: only the container changes, nothing is re-encoded, picture and sound stay identical.',
@@ -1365,8 +1386,9 @@ const EN_PATTERNS = [
     (_all, n) => `Packed ${n} external subtitle${n === '1' ? '' : 's'} into the video`,
   ],
   [
-    /^片子里有 (\d+) 条字幕 MKV 装不下，已略过（(.+)）$/,
-    (_all, n, codecs) => `${n} subtitle track${n === '1' ? '' : 's'} in the video cannot go into MKV and ${n === '1' ? 'was' : 'were'} skipped (${codecs})`,
+    /^片子里有 (\d+) 条字幕 (MKV|MP4) 装不下，已略过（(.+)）$/,
+    (_all, n, container, codecs) =>
+      `${n} subtitle track${n === '1' ? '' : 's'} in the video cannot go into ${container} and ${n === '1' ? 'was' : 'were'} skipped (${codecs})`,
   ],
   [/^字幕 (.+) 用不了：(.+)$/, (_all, name, reason) => `Subtitle ${name} cannot be used: ${translate(reason, 'en')}`],
   [/^一部片最多封 (\d+) 条外挂字幕$/, 'At most $1 external subtitles can be packed into one video'],

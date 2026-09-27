@@ -901,6 +901,7 @@ function showDepsHelp() {
 
 const dz = $('dropzone');
 dz.addEventListener('click', async () => {
+  showDropFailures([]);
   const paths = await window.sw.dialog.pickVideos();
   if (paths?.length) startHostMany(paths);
 });
@@ -918,24 +919,71 @@ dz.addEventListener('drop', async (e) => {
   e.preventDefault();
   dz.classList.remove('over');
   if (!e.dataTransfer.files.length) return;
-  const paths = await approvedDropPaths(e.dataTransfer.files);
-  if (!paths.length) return alert(t('拿不到这个文件的路径，请改用点击选择。'));
+  const { paths, failures } = await approvedDropPaths(e.dataTransfer.files);
+  // 用不了的留在首页卡片上说清楚（别用 alert：会响提示音）。一起拖进来的其余文件照常开房，
+  // 跳过了哪几个另记进日志，进房后也看得到。
+  showDropFailures(failures);
+  if (!paths.length) return;
+  for (const failure of failures) log(dropFailureLine(failure), 'warn');
   startHostMany(paths);
 });
 
-/** 拖进来的文件逐个换成主进程批准过的路径，拿不到路径的跳过。 */
+/**
+ * 拖进来的文件逐个换成主进程批准过的路径。用不了的不再一声不吭地跳过：
+ * 连同原因记进 failures —— 格式不支持、拖进来的是文件夹、文件不见了，各有各的出路，
+ * 一律说成「拿不到路径」会让人去换一种选择方式，而点击选择的对话框本来就不收这些。
+ *
+ * @returns {Promise<{paths: string[], failures: {name: string, reason: string}[]}>}
+ */
 async function approvedDropPaths(fileList) {
   const paths = [];
+  const failures = [];
   for (const file of [...(fileList || [])]) {
-    let path = null;
+    const name = String(file?.name || '');
     try {
-      path = await window.sw.pathForFile(file);
-    } catch {
-      path = null;
+      const path = await window.sw.pathForFile(file);
+      if (path) paths.push(path);
+      else failures.push({ name, reason: '拿不到这个文件的路径，请改用选择文件的方式添加' });
+    } catch (error) {
+      failures.push({ name, reason: dropFailureReason(error, name) });
     }
-    if (path) paths.push(path);
   }
-  return paths;
+  return { paths, failures };
+}
+
+/**
+ * 拖进来的文件为什么用不了，换成一句看得懂、指得出路的话。
+ * 主进程的报错会被 Electron 套上「Error invoking remote method …」前缀，只取我们自己那句。
+ */
+function dropFailureReason(error, name) {
+  const message = String(error?.message || error || '')
+    .replace(/^Error invoking remote method '[^']*': /, '')
+    .replace(/^[A-Za-z]*Error: /, '');
+  if (message.includes('不支持这种视频格式')) {
+    const ext = (/\.[^.\\/]+$/.exec(name)?.[0] || '').toLowerCase();
+    // RM/RMVB 是有意不收的：ffmpeg 的 Matroska 封装器不认 RealVideo，只能重新编码
+    if (ext === '.rm' || ext === '.rmvb') return 'RM/RMVB 只能重新编码、没法无损封成 MKV，不支持';
+    return `不支持这种视频格式：${ext || '(无扩展名)'}`;
+  }
+  if (message.includes('ENOENT')) return '找不到这个文件，可能已被移动或删除';
+  if (/EACCES|EPERM/.test(message)) return '没有权限读取这个文件';
+  if (message.includes('无效的媒体文件名')) return '文件名太长或带有不支持的字符，改个名再试';
+  return message || '拿不到这个文件的路径，请改用选择文件的方式添加';
+}
+
+const dropFailureLine = ({ name, reason }) => `没加上《${name}》：${reason}`;
+
+// 首页卡片上最多列几条，拖进来一大把不支持的文件时别把卡片撑满
+const DROP_FAILURES_SHOWN = 5;
+
+function showDropFailures(failures) {
+  const box = $('drop-err');
+  if (!box) return;
+  const lines = failures.slice(0, DROP_FAILURES_SHOWN).map((f) => make('div', { text: dropFailureLine(f) }));
+  if (failures.length > DROP_FAILURES_SHOWN) {
+    lines.push(make('div', { text: `还有 ${failures.length - DROP_FAILURES_SHOWN} 个也没加上` }));
+  }
+  box.replaceChildren(...lines);
 }
 
 // 别让拖到窗口别处的文件把整个页面替换掉
@@ -1035,12 +1083,30 @@ function uplinkForPrecheck() {
 }
 
 /**
+ * ffmpeg 能不能用。启动时记下的「没有」不作数，重新问一次主进程再下结论 ——
+ * 用户多半是看了「装上 ffmpeg 后重试」才去装的，软件没关；主进程每次都会重新扫描各家落点，
+ * 渲染进程这份启动时的旧结论却会把重试原样拦下，外挂字幕也会被静默跳过。
+ */
+async function ffmpegReady() {
+  if (S.env?.ffmpeg) return true;
+  try {
+    S.env = await window.sw.env.status();
+    updateDepsPill();
+  } catch {}
+  return Boolean(S.env?.ffmpeg);
+}
+
+// 安全模式下 moov 在文件尾的 MP4：原样传就行，转封装只是可选项
+const SAFE_MOOV_NOTE =
+  '这个文件的索引（moov）在文件末尾。安全模式下大家都是收完、扫描过才播，索引在哪不影响观看，可以原样传；转封装只是把索引挪到文件头，要多花一些时间和一份临时空间。';
+
+/**
  * 准备一部本地片：检查格式 →（按需）精简或转封装 → 卡顿预判 → 算分片校验值 → 开做种会话。
  *
  * 用户中途取消（选方案时点了取消、看完预判决定不传、行内点了取消）返回 null，
  * 这时产生的临时文件和会话都已经收拾干净；出错直接抛。
  *
- * @returns {Promise<{manifest, state, filePath}|null>}
+ * @returns {Promise<{manifest, state, filePath, sourcePath, moovAtEnd}|null>}
  */
 async function prepareLocalFile(filePath, reporter) {
   // filePath 会被转封装/精简的产物覆盖，源文件路径单独留一份：判重时要用它
@@ -1068,15 +1134,28 @@ async function prepareLocalFile(filePath, reporter) {
     if (info.action === 'reject') throw new Error(info.reason);
     // AVI、TS 这类不直接进房，先在本机无损封成 MKV —— 接收方永远只见到 MP4/MKV 那几种容器
     const mustConvert = info.action === 'convert';
-    if (mustConvert && !S.env.ffmpeg) {
-      throw new Error(`${info.label} 要先无损封成 MKV 才能传，这一步需要 ffmpeg，但没找到。装上 ffmpeg 后重试。`);
-    }
+    // moov 索引在文件尾的 MP4 只有可信房间非转封装不可：那里要边下边播，读不到索引一帧都放不了。
+    // 安全模式下大家收完、扫描过才播，索引在哪都一样，原样传就行，转封装只是一个可选项。
+    // 准备期间房间模式是锁住的（见 securityModeLocked），进列表前 addLocalFile 还会按最终模式再核一次。
+    const moovAtEnd = info.action === 'remux';
+    const needsRemux = moovAtEnd && S.roomSecurityMode === 'trusted';
+    const optionalRemux = moovAtEnd && !needsRemux;
+    const canSlim = info.slim?.available === true;
     if (cancelled()) return null;
 
-    // 外挂字幕随片走的办法是封进 MKV，所以同样要 ffmpeg。没有的话照原样传，说一声就好 ——
-    // 为了字幕拦下整场放映不值得。
+    // 外挂字幕随片走的办法是封进 MKV，所以同样要 ffmpeg。
     const sidecars = await window.sw.media.findSubtitles(filePath).catch(() => []);
-    if (sidecars.length && !S.env.ffmpeg) {
+    if (cancelled()) return null;
+    // 用得上 ffmpeg 时，启动时记下的「没有」不作数，重新问一次（见 ffmpegReady）
+    const ffmpeg =
+      mustConvert || moovAtEnd || canSlim || sidecars.length > 0 ? await ffmpegReady() : Boolean(S.env?.ffmpeg);
+    if (cancelled()) return null;
+    if (mustConvert && !ffmpeg) {
+      throw new Error(`${info.label} 要先无损封成 MKV 才能传，这一步需要 ffmpeg，但没找到。装上 ffmpeg 后重试。`);
+    }
+
+    // 没有 ffmpeg 就封不了外挂字幕，照原样传，说一声就好 —— 为了字幕拦下整场放映不值得。
+    if (sidecars.length && !ffmpeg) {
       const text = `片子旁边有 ${sidecars.length} 个外挂字幕，但封进片子需要 ffmpeg，这次先不带字幕。`;
       reporter.note(text);
       log(text, 'warn');
@@ -1089,23 +1168,21 @@ async function prepareLocalFile(filePath, reporter) {
     let finalSize = info.size;
     let slimmed = false;
 
-    // 两种情况需要拿主意：非转封装不可，或者还有可无损省下的体积。
+    // 几种情况需要拿主意：非转封装不可、可以选择转封装、还有可无损省下的体积、旁边有字幕。
     // 都不沾边就别拿一个只有一个选项的弹窗去烦人。
-    const needsRemux = info.action === 'remux';
-    const canSlim = info.slim?.available === true;
-    const offerSubtitles = Boolean(S.env.ffmpeg) && sidecars.length > 0;
+    const offerSubtitles = ffmpeg && sidecars.length > 0;
 
-    if (needsRemux || mustConvert || canSlim || offerSubtitles) {
+    if (needsRemux || optionalRemux || mustConvert || canSlim || offerSubtitles) {
       reporter.stage(1);
-      reporter.note(info.reason);
+      reporter.note(optionalRemux ? SAFE_MOOV_NOTE : info.reason);
 
-      if (!S.env.ffmpeg && needsRemux) {
+      if (!ffmpeg && needsRemux) {
         throw new Error('这个 MP4 需要转封装才能边下边播，但没找到 ffmpeg。装上 ffmpeg 后重试，或者换一个 MKV 文件。');
       }
 
-      // 没有 ffmpeg 时「本来还能再省一点」不该拦住放映，照原样走就是了。
-      const choice = S.env.ffmpeg
-        ? await choosePrepPlan(info, { needsRemux, mustConvert, canSlim, subtitles: sidecars, reporter })
+      // 没有 ffmpeg 时「本来还能再省一点」「可以挪一下索引」都不该拦住放映，照原样走就是了。
+      const choice = ffmpeg
+        ? await choosePrepPlan(info, { needsRemux, optionalRemux, mustConvert, canSlim, subtitles: sidecars, reporter })
         : { plan: 'as-is' };
       if (!choice || cancelled()) return null;
 
@@ -1167,12 +1244,17 @@ async function prepareLocalFile(filePath, reporter) {
                 : `已转封装到：${result.outPath}`
           );
           if (result.subtitles > 0) log(`已把 ${result.subtitles} 条外挂字幕封进片子`, 'good');
-          // 片子里原有的字幕（图文电视、ARIB 这类）MKV 装不下，只能略过 —— 得让人知道少了什么
+          // 片子里原有的字幕（图文电视、ARIB、608 这类）产物的容器装不下，只能略过 —— 得让人知道少了什么
+          const toMkv = converting || String(result.outPath || '').toLowerCase().endsWith('.mkv');
+          const container = toMkv ? 'MKV' : 'MP4';
           if (result.droppedSubtitles?.length) {
             log(
-              `片子里有 ${result.droppedSubtitles.length} 条字幕 MKV 装不下，已略过（${result.droppedSubtitles.join('、')}）`,
+              `片子里有 ${result.droppedSubtitles.length} 条字幕 ${container} 装不下，已略过（${result.droppedSubtitles.join('、')}）`,
               'warn'
             );
+          }
+          if (result.subtitlesUnchecked) {
+            log('读不出这个片子的轨道信息（可能没装 ffprobe），片子里的字幕放不进 MP4，这次没带上', 'warn');
           }
         } finally {
           off();
@@ -1189,7 +1271,7 @@ async function prepareLocalFile(filePath, reporter) {
         duration: info.probe?.duration,
         uplinkPromise,
         // 只有这个片子确实能精简、而这次没选时，「改选无损精简」才是一条真建议。
-        canSlimMore: canSlim && !slimmed && Boolean(S.env.ffmpeg),
+        canSlimMore: canSlim && !slimmed && ffmpeg,
         reporter,
       });
       if (!proceed) {
@@ -1236,7 +1318,8 @@ async function prepareLocalFile(filePath, reporter) {
       await trackClosing(window.sw.store.close(state.sessionId).catch(() => {}));
       return null;
     }
-    return { manifest, state, filePath, sourcePath };
+    // 原样传出去的还是那个索引在文件尾的 MP4（安全模式下没选转封装）：addLocalFile 按最终模式再核一次
+    return { manifest, state, filePath, sourcePath, moovAtEnd: moovAtEnd && filePath === sourcePath };
   } catch (error) {
     if (preparedSessionId) await window.sw.store.close(preparedSessionId).catch(() => {});
     else await release();
@@ -1457,7 +1540,13 @@ function fileItemOf(manifest) {
 /**
  * 本机准备好的片加进列表。会话先登记（槽位要等列表分配），再提交 add；列表不收就把会话关掉。
  */
-async function addLocalFile({ manifest, state, filePath, sourcePath = null }) {
+async function addLocalFile({ manifest, state, filePath, sourcePath = null, moovAtEnd = false }) {
+  // 索引在文件尾的 MP4 只有安全模式能原样传。准备期间模式本该锁着，这里在建 Swarm 之前
+  // 按最终的房间模式再核一次：真变成了可信房间，就别把一部边下边播起不来的片子放进列表。
+  if (moovAtEnd && S.roomSecurityMode === 'trusted') {
+    await trackClosing(window.sw.store.close(state.sessionId).catch(() => {}));
+    throw new Error('这个 MP4 的索引在文件末尾，可信房间要边下边播，得先转封装。请重新选择这个文件。');
+  }
   initSwarmAndSync();
   const { fileId } = manifest;
   const existing = S.sessions.get(fileId);
@@ -1740,12 +1829,10 @@ function prepJobView(job) {
 /** 从资源管理器拖进列表的文件。 */
 async function addDroppedFiles(files) {
   if (!canEditPlaylist()) return;
-  const paths = await approvedDropPaths(files);
-  if (!paths.length) {
-    log('拿不到拖进来的文件的路径，请改用「+ 本地视频」选择', 'warn');
-    return;
-  }
-  queueLocalFiles(paths);
+  const { paths, failures } = await approvedDropPaths(files);
+  // 每个没加上的都说清楚为什么：一起拖进来的其余文件照常排队
+  for (const failure of failures) log(dropFailureLine(failure), 'warn');
+  if (paths.length) queueLocalFiles(paths);
 }
 
 /** 列表操作：房主直接执行，其他控制者发给房主等回音。 */
@@ -2508,7 +2595,10 @@ async function confirmStreamability({ size, duration, uplinkPromise, canSlimMore
   });
 }
 
-function choosePrepPlan(info, { needsRemux, mustConvert = false, canSlim, subtitles = [], reporter }) {
+// 精简时能随片走的轨道类型：音视频、字幕和 MKV 的字体附件。数据轨不在其列。
+const KEEPABLE_TRACK_TYPES = new Set(['video', 'audio', 'subtitle', 'attachment']);
+
+function choosePrepPlan(info, { needsRemux, optionalRemux = false, mustConvert = false, canSlim, subtitles = [], reporter }) {
   const slim = info.slim || {};
   const streams = info.probe?.streams || [];
   const audioTracks = streams.filter((s) => s.codecType === 'audio');
@@ -2520,8 +2610,10 @@ function choosePrepPlan(info, { needsRemux, mustConvert = false, canSlim, subtit
   // 输出容器：MKV 进 MKV 出；要封成 MKV 的（AVI 这类、或带外挂字幕）出 MKV；
   // 其余出 MP4（顺带加 +faststart）。字幕勾选会改变它，所以是个函数。
   const toMkv = () => String(info.ext || '').toLowerCase() === '.mkv' || converting();
-  // 不精简时那一项叫什么：封 MKV 时是「保留全部轨道」，否则是转封装或原样传
+  // 不精简时那一项叫什么：封 MKV 时是「保留全部轨道」，否则是转封装或原样传。
+  // 安全模式下 moov 在文件尾的 MP4 两样都给：默认原样传，转封装是可选的（optionalRemux）。
   const baseValue = () => (converting() ? 'convert' : needsRemux ? 'remux' : 'as-is');
+  const baseValues = () => (!converting() && optionalRemux ? ['as-is', 'remux'] : [baseValue()]);
   let keepAudioIndex = slim.keepAudioIndex;
 
   // 换了要保留的音轨，丢掉的那批和能不能转 FLAC 都得跟着重算。
@@ -2536,7 +2628,11 @@ function choosePrepPlan(info, { needsRemux, mustConvert = false, canSlim, subtit
       if (a.index === keepAudioIndex) dropped.delete(a.index);
       else dropped.add(a.index);
     }
-    const keepIndexes = streams.map((s) => s.index).filter((i) => !dropped.has(i));
+    // 数据轨（相机、剪辑软件导出的 MOV 常带 tmcd 时间码轨）哪种产物都放不进去，带上 ffmpeg 就整个失败 ——
+    // 这里不列它，主进程按产物容器还会再筛一遍（封面、MP4 装不下的字幕）
+    const keepIndexes = streams
+      .filter((s) => KEEPABLE_TRACK_TYPES.has(s.codecType) && !dropped.has(s.index))
+      .map((s) => s.index);
     const chosen = audioTracks.find((a) => a.index === keepAudioIndex);
     // flacRatio 是主进程对每条轨单独实测出来的（只有未压缩的 PCM 轨才有），
     // 换一条轨就得看那条自己的数字，不能沿用默认轨的结论。
@@ -2581,7 +2677,7 @@ function choosePrepPlan(info, { needsRemux, mustConvert = false, canSlim, subtit
         // 勾掉或勾上字幕会改变「不精简」那一项是什么，选项要跟着重建
         const buildOptions = () => [
           ...(canSlim ? [make('option', { attrs: { value: 'slim' }, text: '无损精简（推荐）' })] : []),
-          make('option', { attrs: { value: baseValue() }, text: baseText[baseValue()] }),
+          ...baseValues().map((value) => make('option', { attrs: { value }, text: baseText[value] })),
         ];
         const select = make('select', { id: 'prep-plan' }, buildOptions());
         select.value = picked;
@@ -2633,7 +2729,7 @@ function choosePrepPlan(info, { needsRemux, mustConvert = false, canSlim, subtit
           }
         };
         const subsChanged = () => {
-          if (picked !== 'slim') picked = baseValue();
+          if (picked !== 'slim' && !baseValues().includes(picked)) picked = baseValue();
           select.replaceChildren(...buildOptions());
           select.value = picked;
           current = recompute();
@@ -2728,6 +2824,7 @@ function choosePrepPlan(info, { needsRemux, mustConvert = false, canSlim, subtit
         // 房间里几部片排着准备时，得说清楚这是在问哪一部
         if (reporter?.label) parts.push(make('p', { raw: true, className: 'modal-name', text: reporter.label }));
         if (needsRemux || mustConvert) parts.push(make('p', { className: 'fine', text: info.reason }));
+        else if (optionalRemux) parts.push(make('p', { className: 'fine', text: SAFE_MOOV_NOTE }));
         parts.push(field('这一场传哪个版本', select));
         parts.push(detail);
         parts.push(field('外挂字幕', subsBox, subsNote));
@@ -8586,11 +8683,20 @@ async function clearCfTurnCredentials(result) {
   }
 }
 
+/**
+ * 房间安全模式现在能不能改。进了房、建了 Swarm 自然不行；房主从选片到进房这段也不行 ——
+ * 准备片子时按开房那一刻的模式做的决定（安全模式下 moov 在文件尾的 MP4 可以原样传、
+ * 可信房间才测上行），模式中途一改，这些决定就对不上了。
+ */
+function securityModeLocked() {
+  return roomEntered || !!S.swarm || S.role === 'host';
+}
+
 $('btn-settings').onclick = () => {
   openModal({
     title: '设置',
     body: () => {
-      const modeLocked = roomEntered || !!S.swarm;
+      const modeLocked = securityModeLocked();
       const languageLocked = roomEntered || S.role !== null;
       // 设置页开着时顺手把 Cloudflare TURN 的状态和本月用量刷一遍
       refreshCfTurnState();
@@ -8652,7 +8758,9 @@ $('btn-settings').onclick = () => {
           ),
           hint(
             modeLocked
-              ? '房间进行中不能切换。退出后可更改。'
+              ? roomEntered || S.swarm
+                ? '房间进行中不能切换。退出后可更改。'
+                : '正在准备开房，这时不能切换。回到首页后可更改。'
               : '房主和每位加入者必须分别选择相同模式才能握手。安全模式完整接收并扫描后播放；可信房间约 8 MB 片头就绪后边下边播。'
           )
         ),
@@ -8808,9 +8916,10 @@ $('btn-settings').onclick = () => {
       }
       // 昵称清空了就保留原来的；房间里改的会告诉连着的人（见 applyMyName）
       applyMyName($('set-name').value);
-      if (!roomEntered && !S.swarm) {
+      // 锁着的时候（进了房、建了 Swarm、正在准备开房）一律不改：房主准备片子时按的是开房那一刻的模式，
+      // 中途改了会让「安全模式下原样传的 moov 在尾 MP4」混进可信房间
+      if (!securityModeLocked()) {
         S.settings.securityMode = normalizeSecurityMode($('set-security-mode').value);
-        if (S.role === 'host') S.roomSecurityMode = S.settings.securityMode;
       }
       S.settings.signalUrl = $('set-signal').value.trim();
       S.settings.relays = relayLines.join('\n');

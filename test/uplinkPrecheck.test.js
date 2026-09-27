@@ -131,7 +131,9 @@ test('预判不拦截无法下结论的情况：测不出上行、或不知道�
  */
 test('建议只列真做得到的：没得精简不提精简，房间开着不提改安全模式', () => {
   const host = body('async function prepareLocalFile(', 'async function startHostMany(');
-  assert.match(host, /canSlimMore: canSlim && !slimmed && Boolean\(S\.env\.ffmpeg\)/);
+  // ffmpeg 是准备时重新探测过的那份结论（ffmpegReady），不是启动时的缓存
+  assert.match(host, /canSlimMore: canSlim && !slimmed && ffmpeg,/);
+  assert.match(host, /const ffmpeg =\r?\n\s*[^\n]*await ffmpegReady\(\)/);
   const fn = body('async function confirmStreamability(', 'function choosePrepPlan(');
   assert.match(fn, /if \(canSlimMore\) advice\.push\(/);
   assert.match(fn, /if \(!roomEntered\) advice\.push\('改用安全模式开房/);

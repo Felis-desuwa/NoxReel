@@ -322,6 +322,8 @@ function prepRoom({ info, sidecars = [], ffmpeg = true, choice = { plan: 'as-is'
     trackPending: (_set, p) => p,
     trackClosing: (p) => p,
     confirmStreamability: () => true,
+    updateDepsPill: () => {},
+    SAFE_MOOV_NOTE: 'safe-moov-note',
     choosePrepPlan: (_info, opts) => {
       calls.push(['choosePrepPlan', opts.mustConvert, opts.subtitles.length]);
       return choice;
@@ -329,6 +331,8 @@ function prepRoom({ info, sidecars = [], ffmpeg = true, choice = { plan: 'as-is'
     window: {
       sw: {
         tasks: { cancel: () => Promise.resolve(true) },
+        // 启动时记着「没有 ffmpeg」时，准备前会再问一次主进程（这里主进程也说没有）
+        env: { status: () => Promise.resolve({ ffmpeg }) },
         media: {
           inspect: () => Promise.resolve(info),
           findSubtitles: () => Promise.resolve(sidecars),
@@ -356,6 +360,7 @@ function prepRoom({ info, sidecars = [], ffmpeg = true, choice = { plan: 'as-is'
     },
   };
   vm.createContext(ctx);
+  vm.runInContext(fnSource('ffmpegReady'), ctx);
   vm.runInContext(fnSource('prepareLocalFile'), ctx);
   const reporter = {
     label: 'x',

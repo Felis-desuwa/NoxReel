@@ -46,6 +46,13 @@ const MKV_COPY_SUB_CODECS = new Set([
 ]);
 const MKV_TO_SRT_SUB_CODECS = new Set(['mov_text', 'text']);
 
+// 能原样拷进 MP4 的字幕编码。MP4 封装器收的文本字幕只有 mov_text（tx3g）一种：
+// MOV 里的 608 隐藏字幕、图形字幕这些拷进去，整个封装直接失败，只能略过并告诉用户。
+const MP4_COPY_SUB_CODECS = new Set(['mov_text']);
+
+// 精简成 MKV 时哪些类型的轨能留。数据轨（MP4 的 tmcd 这类）Matroska 不收，带上就整个失败。
+const MKV_KEEPABLE_TYPES = new Set(['video', 'audio', 'subtitle', 'attachment']);
+
 // 图形字幕是一帧帧位图，一集能占几十甚至上百 MB；文本字幕（ASS/SRT）只有几百 KB。
 // 所以只丢前者 —— 丢文本字幕省不下什么，观众却直接没字幕看了。
 const GRAPHIC_SUB_CODECS = new Set([
@@ -539,7 +546,14 @@ function slimPlan(probe, { toMkv = true } = {}) {
     ...audio.filter((s) => s !== keepAudio).map((s) => s.index),
     ...graphicSubs.map((s) => s.index),
   ]);
-  const keep = streams.filter((s) => !dropped.has(s.index));
+  // 留下的轨还得放得进产物的容器：数据轨（tmcd）哪边都不收，MP4 另外不收封面和 mov_text 以外的字幕。
+  // 这些不算「精简掉的」—— 它们本来就带不过去，也不占多少体积。
+  const keepIndexes = containerKeep(
+    streams,
+    streams.filter((s) => !dropped.has(s.index)).map((s) => s.index),
+    { toMkv }
+  ).map;
+  const keep = streams.filter((s) => keepIndexes.includes(s.index));
 
   const duration = probe.duration || 0;
   let savableBytes = 0;
@@ -602,7 +616,8 @@ function slimPlan(probe, { toMkv = true } = {}) {
  * 检查一个文件能不能直接进房。
  * 返回 action：
  *   'ok'      —— 直接用
- *   'remux'   —— 需要转封装（无损，几十秒内搞定）
+ *   'remux'   —— moov 在文件尾：可信房间要先转封装（无损，几十秒内搞定），
+ *                安全模式收完才播，可以原样传（由渲染进程按房间模式决定）
  *   'convert' —— AVI、TS 这类，要先无损封成 MKV 才能进房
  *   'reject'  —— 格式不支持
  * 另外带一份 slim 方案，告诉上层「还能无损省掉多少」。
@@ -660,9 +675,60 @@ async function inspect(filePath) {
 }
 
 /**
+ * 输出 MP4 时每条轨怎么处理：留下，还是只能略过。keepIndexes 为空表示全留。
+ *
+ * 不写 -map 时 ffmpeg 每类只挑一条流 —— 多出来的音轨、mov_text 字幕全被悄悄丢掉，
+ * 所以转封装和精简都要把留下的轨一条条显式列出来。略过的有三类：数据轨（tmcd 等，
+ * MP4 封装器认不出来就整个失败）、封面图、MP4 装不下的字幕编码。只有最后一类值得告诉用户。
+ */
+function mp4StreamPlan(streams, keepIndexes) {
+  const wanted = Array.isArray(keepIndexes) && keepIndexes.length ? new Set(keepIndexes) : null;
+  const plan = { map: [], droppedSubtitles: [] };
+  for (const s of streams || []) {
+    if (wanted && !wanted.has(s.index)) continue;
+    if (s.codecType === 'video') {
+      if (!s.attachedPic) plan.map.push(s.index);
+    } else if (s.codecType === 'audio') {
+      plan.map.push(s.index);
+    } else if (s.codecType === 'subtitle') {
+      if (MP4_COPY_SUB_CODECS.has(s.codecName)) plan.map.push(s.index);
+      else plan.droppedSubtitles.push(s.codecName || '?');
+    }
+  }
+  return plan;
+}
+
+/**
+ * 精简时按产物容器筛一遍要留的轨。MKV 源的轨本来就都放得进 MKV，只挡掉数据轨；
+ * MP4 走 mp4StreamPlan。
+ */
+function containerKeep(streams, keepIndexes, { toMkv }) {
+  if (!toMkv) return mp4StreamPlan(streams, keepIndexes);
+  const byIndex = new Map((streams || []).map((s) => [s.index, s]));
+  return {
+    map: (keepIndexes || []).filter((i) => MKV_KEEPABLE_TYPES.has(byIndex.get(i)?.codecType)),
+    droppedSubtitles: [],
+  };
+}
+
+/**
+ * 按映射拼转封装参数。maps 是输入流下标，或者读不出轨道信息时的类型选择符
+ * （大写 'V' 是去掉封面的视频，带问号表示这一类没有也不报错）。抽出来单独测。
+ */
+function remuxArgs(filePath, outPath, maps) {
+  const args = ['-y', '-i', filePath];
+  for (const m of maps) args.push('-map', `0:${m}`);
+  args.push('-c', 'copy', '-movflags', '+faststart', outPath);
+  return args;
+}
+
+/**
  * 转封装：只重写容器，-c copy 表示编码数据原样搬运，不重新编码。
+ * 全部音视频轨和 MP4 收得下的字幕都带上（见 mp4StreamPlan），只把 moov 挪到文件头。
  * onProgress 收到 0..1 的进度（从 ffmpeg stderr 的 time= 里解出来）。
  * signal 取消时结束 ffmpeg 并以「操作已取消」拒绝，输出目录由调用方回收。
+ *
+ * @returns {Promise<{outPath: string, droppedSubtitles: string[], subtitlesUnchecked?: boolean}>}
  */
 async function remux(filePath, outDir, { onProgress, signal } = {}) {
   const bin = requireFfmpeg();
@@ -672,14 +738,28 @@ async function remux(filePath, outDir, { onProgress, signal } = {}) {
   const outPath = path.join(outDir, `${base}.faststart.mp4`);
 
   const probe = await probeStreams(filePath).catch(() => null);
+  const opts = { onStderr: progressWatcher(probe?.duration || 0, onProgress), signal };
 
-  await run(
-    bin,
-    ['-y', '-i', filePath, '-c', 'copy', '-movflags', '+faststart', outPath],
-    { onStderr: progressWatcher(probe?.duration || 0, onProgress), signal }
-  );
+  if (probe) {
+    const plan = mp4StreamPlan(probe.streams);
+    const byIndex = new Map(probe.streams.map((s) => [s.index, s]));
+    if (!plan.map.some((i) => ['video', 'audio'].includes(byIndex.get(i)?.codecType))) {
+      throw new Error('这个文件里没有能放进 MP4 的音视频轨');
+    }
+    await run(bin, remuxArgs(filePath, outPath, plan.map), opts);
+    return { outPath, droppedSubtitles: plan.droppedSubtitles };
+  }
 
-  return { outPath };
+  // 读不出轨道信息（多半是没装 ffprobe）：按类型全带上。字幕编码不认得时整个封装会失败，
+  // 那就退一步不带字幕再来一次 —— 为了认不出的字幕拦下整场放映不值得，但要让人知道。
+  try {
+    await run(bin, remuxArgs(filePath, outPath, ['V?', 'a?', 's?']), opts);
+    return { outPath, droppedSubtitles: [] };
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    await run(bin, remuxArgs(filePath, outPath, ['V?', 'a?']), opts);
+    return { outPath, droppedSubtitles: [], subtitlesUnchecked: true };
+  }
 }
 
 /** 按精简方案拼 ffmpeg 参数。抽出来单独测，不用真跑一遍 ffmpeg。 */
@@ -720,7 +800,12 @@ async function slim(filePath, outDir, { keepIndexes, toFlac: toFlacIn, onProgres
   // 而界面上刚跟用户承诺过要省那一块。
   const probe = await probeStreams(filePath, { sample: true }).catch(() => null);
   const plan = slimPlan(probe, { toMkv: isMkv });
-  const indexes = Array.isArray(keepIndexes) && keepIndexes.length ? keepIndexes : plan.keep;
+  const requestedKeep = Array.isArray(keepIndexes) && keepIndexes.length ? keepIndexes : plan.keep;
+  // 调用方传来的保留列表是「除了丢掉的都留」，里面可能夹着数据轨（相机、剪辑软件导出的
+  // MOV 常带 tmcd 时间码轨）—— 原样 -map 进 MP4，ffmpeg 报 Could not find tag for codec none
+  // 直接失败，而这正是默认推荐的那一项。按产物容器再筛一遍；读不出轨道信息就只能照单全收。
+  const fitted = probe ? containerKeep(probe.streams, requestedKeep, { toMkv: isMkv }) : { map: requestedKeep, droppedSubtitles: [] };
+  const indexes = fitted.map;
   if (!indexes.length) throw new Error('没有可保留的轨道，无法精简');
   // 调用方换了要保留的音轨时，转 FLAC 的目标要跟着换 —— 否则会去转一条
   // 根本没保留的轨，ffmpeg 直接报错。留下的那条也得重新判一次能不能转。
@@ -749,6 +834,7 @@ async function slim(filePath, outDir, { keepIndexes, toFlac: toFlacIn, onProgres
     plan: { ...plan, toFlac, reencodesAudio: toFlac.length > 0 },
     inputSize,
     outputSize,
+    droppedSubtitles: fitted.droppedSubtitles,
   };
 }
 
@@ -897,6 +983,8 @@ function toolStatus() {
 module.exports = {
   inspect,
   remux,
+  remuxArgs,
+  mp4StreamPlan,
   slim,
   slimArgs,
   convert,

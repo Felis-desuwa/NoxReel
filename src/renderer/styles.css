@@ -357,6 +357,10 @@ select:disabled {
   font-size: 12px;
   min-height: 16px;
 }
+/* 拖进来用不了的文件：长文件名别把卡片撑破 */
+#drop-err {
+  overflow-wrap: anywhere;
+}
 
 /* 地区告知条：提示性质，不挡路 */
 .notice {
