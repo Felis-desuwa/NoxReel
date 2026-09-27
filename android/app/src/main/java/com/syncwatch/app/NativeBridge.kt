@@ -26,6 +26,8 @@ class NativeBridge(
     private val store: Store,
     private val player: SyncPlayer,
     private val cloudflare: CloudflareTurn,
+    // 沉浸全屏的开关交给 Activity 去做（它在主线程上动窗口），见 setImmersive
+    private val immersive: (on: Boolean) -> Unit = {},
     private val reply: (id: String, json: String) -> Unit,
 ) {
     // 单线程：Cloudflare 的调用一个接一个做，同时只有一个生成请求在路上
@@ -213,6 +215,13 @@ class NativeBridge(
     /** 安装包版本号（build.gradle 的 versionName），大厅里显示成「v0.7.4」。 */
     @JavascriptInterface
     fun appVersion(): String = BuildConfig.VERSION_NAME
+
+    /**
+     * 播放中控件收起时，系统状态栏和导航栏也一起藏起来（沉浸全屏），控件亮出来时还原。
+     * 只动窗口外观；从屏幕边缘滑一下能临时叫出系统栏。
+     */
+    @JavascriptInterface
+    fun setImmersive(on: Boolean) = immersive(on)
 
     /* ------------------------------ 杂项 ------------------------------ */
 

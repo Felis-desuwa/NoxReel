@@ -47,6 +47,9 @@ const { DiscordPresence, sanitizeActivity } = require('./discordPresence');
 const { sharedProxy, closeSharedProxy } = require('./publicProxy');
 const { lockDownPermissions } = require('./permissions');
 const { CloudflareTurn } = require('./cloudflareTurn');
+const { MediaLibrary } = require('./mediaLibrary');
+const { LinkCache, uniquePath: uniqueFilePath, WORK_DIR: DOWNLOAD_WORK_DIR } = require('./linkCache');
+const { DownloadSaver } = require('./downloadSaver');
 const { labelProtocolHandler } = require('./protocolName');
 const { displayVersion, readBuildNumber } = require('./appVersion');
 
@@ -69,7 +72,8 @@ const DEV_HOOKS = !app.isPackaged && process.env.NOXREEL_DEV_HOOKS === '1';
 const devPicks = DEV_HOOKS && process.env.NOXREEL_DEV_PICK ? process.env.NOXREEL_DEV_PICK.split('|').filter(Boolean) : [];
 const DEV_UPLINK_BPS = DEV_HOOKS ? Number(process.env.NOXREEL_DEV_UPLINK_BPS) || 0 : 0;
 //  - NOXREEL_DISCORD_PIPE：Discord 状态只连这一个管道（测试用的假 Discord），不去碰本机真的 Discord；
-//  - NOXREEL_DISCORD_CLIENT_ID：临时换一个 Discord 应用 ID。
+//  - NOXREEL_DISCORD_CLIENT_ID：临时换一个 Discord 应用 ID；
+//  - NOXREEL_DEV_DOWNLOAD_DIR：默认下载位置（「边下边播」另存的地方）换到这里，不碰真的「视频」文件夹。
 const DEV_DISCORD_PIPE = DEV_HOOKS ? process.env.NOXREEL_DISCORD_PIPE || null : null;
 // Discord 应用 ID：公开信息，不是密钥（Discord 上显示为「正在观看 NoxReel」的那个应用）。
 const DISCORD_CLIENT_ID = (DEV_HOOKS && process.env.NOXREEL_DISCORD_CLIENT_ID) || '1551684816993390722';
@@ -99,6 +103,98 @@ let playerPaths = settings.playerPaths(mainConfig);
 // 构造时不碰磁盘也不碰 safeStorage（它要等 app ready），第一次用到时才读。
 const cfTurn = new CloudflareTurn({ userDataDir: USER_DATA_DIR, safeStorage });
 let cache = new CacheManager({ rootDir: cacheChoice.root, extraRoots: cacheKnownRoots });
+// 缓存清理方式（见 fileStore.setPolicy / mediaLibrary.js）和「边下边播」的下载位置。
+// 下载位置默认在「视频」文件夹下；拿不到「视频」目录（极少数精简系统、测试里的假 Electron）就放用户数据目录下
+function defaultDownloadDir() {
+  // 开发期测试钩子：端到端测试别往真的「视频」文件夹里写东西
+  if (DEV_HOOKS && process.env.NOXREEL_DEV_DOWNLOAD_DIR) return path.resolve(process.env.NOXREEL_DEV_DOWNLOAD_DIR);
+  let base = null;
+  try {
+    base = app.getPath('videos');
+  } catch {
+    /* 退回用户数据目录 */
+  }
+  return path.join(base || USER_DATA_DIR, 'NoxReel');
+}
+const DEFAULT_DOWNLOAD_DIR = defaultDownloadDir();
+let cacheMode = settings.resolveCacheMode(mainConfig);
+let downloadDir = settings.resolveDownloadDir(mainConfig, DEFAULT_DOWNLOAD_DIR);
+
+/**
+ * 手动清理模式的缓存放哪儿：要跨重启留着，所以不能在运行目录里（下次启动按残留回收），
+ * 也不能在系统临时目录里（Windows 的磁盘清理、存储感知会删临时文件）。
+ * 用户自己指了缓存位置就放那下面的 kept（缓存根里只回收 run-* 目录，碰不到它）；
+ * 用的是默认的系统临时目录（包括开机时指定的盘不在、退回默认的情况），就放本机应用数据目录。
+ */
+function keptCacheDir() {
+  // 模块加载时就要用（store.setPolicy），那时 pathKey 还没定义，这里直接比
+  if (path.resolve(cache.rootDir).toLowerCase() !== path.resolve(DEFAULT_CACHE_ROOT).toLowerCase()) {
+    return path.join(cache.rootDir, 'kept');
+  }
+  return path.join(process.env.LOCALAPPDATA || USER_DATA_DIR, 'NoxReel', 'Cache');
+}
+
+// 收下来的片子登记在哪儿：复用、手动清理都查它。临时条目的目录交还当前的缓存管理器去删
+const mediaLibrary = new MediaLibrary({ dataDir: USER_DATA_DIR, removeOwned: (dir) => cache.removeOwned(dir) });
+// 用户在「选择下载位置」对话框里挑过的目录，理由同 approvedCacheDirs
+const approvedDownloadDirs = new Set();
+
+/** 在 dir 下开一个放半截文件的工作目录；finish 把下好的文件挪进 dir（不重名），abort 删掉工作目录。 */
+async function workDirIn(dir, id, onFinish = async () => {}) {
+  const work = path.join(dir, DOWNLOAD_WORK_DIR, id);
+  await fsp.mkdir(work, { recursive: true });
+  return {
+    workDir: work,
+    finish: async (file, meta) => {
+      const target = await uniqueFilePath(dir, path.basename(file));
+      await fsp.rename(file, target);
+      await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
+      await onFinish(target, meta);
+      return target;
+    },
+    abort: () => fsp.rm(work, { recursive: true, force: true }),
+  };
+}
+
+// 在线视频下到本机（见 linkCache.js），两种用途：
+//  - cache（播放列表里的「开始手动缓存」）：进缓存，跟着清理方式走 —— 自动模式放本次运行的临时缓存、
+//    关软件时清；手动模式放长期缓存文件夹。都登记进 mediaLibrary，之后同一个链接直接从本地播。
+//  - download（「边下边播」）：另存一份到下载文件夹，是用户自己的文件，不登记、缓存清理不碰。
+// 下载和直接下不了时的解析都经本机过滤代理；解析和成员切片时的自动解析共用同一个并发名额
+const linkCache = new LinkCache({
+  findYtDlp: () => linkMedia.findYtDlp(),
+  proxyInfo: () => requireProxyInfo(),
+  resolve: (url) =>
+    withLinkInspectSlot(async () => {
+      const proxy = await requireProxyInfo();
+      const info = await linkMedia.inspectLink(url, {
+        proxy: proxy.url,
+        browserFallback: (target) => browserMediaResolver.resolveInBrowser(target, { proxy }),
+      });
+      if (info.playback?.url) info.playback.url = await validate.publicHttpUrl(info.playback.url, '播放地址');
+      return info;
+    }),
+  alreadyDone: (url, purpose) => purpose === 'cache' && !!mediaLibrary.findLink(url),
+  placement: async (job) => {
+    if (job.purpose === 'download') return workDirIn(downloadDir, job.id);
+    if (cacheMode === 'manual') {
+      return workDirIn(keptCacheDir(), job.id, (target, meta) =>
+        mediaLibrary.addLink({ url: meta.url, title: meta.title, filePath: target, size: meta.size })
+      );
+    }
+    const owned = await cache.createOwnedDir('link');
+    return {
+      workDir: owned,
+      finish: async (file, meta) => {
+        mediaLibrary.addTempLink({ url: meta.url, title: meta.title, filePath: file, size: meta.size, ownedDir: owned });
+        return file;
+      },
+      abort: () => cache.removeOwned(owned),
+    };
+  },
+  childEnv: () => linkMedia.childEnv(),
+});
+linkCache.on('update', (view) => send('linkCache:update', view));
 const remuxOutputs = new Map();
 // 转封装／精简正在跑的条数。产物要等任务结束才登记进 remuxOutputs，中间这段时间那张表是空的 ——
 // 只看它，换缓存目录就会在 ffmpeg 正往里写的时候把 run 目录端走，转封装白做一场。
@@ -120,6 +216,8 @@ app.enableSandbox();
 app.commandLine.appendSwitch('disable-http-cache');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 store.configureCache(cache);
+store.configureLibrary(mediaLibrary);
+store.setPolicy({ mode: cacheMode, keptDir: keptCacheDir() });
 
 function normalizeDeepLink(raw) {
   if (typeof raw !== 'string' || raw.length > 256 * 1024 || !raw.toLowerCase().startsWith(`${DEEP_LINK_SCHEME}//`)) return null;
@@ -217,6 +315,8 @@ async function approveSource(filePath) {
 async function requireAllowedLocalPath(filePath) {
   const target = validate.absolutePath(filePath);
   if (cache.owns(target)) return target;
+  // 手动模式、复用的片在保存位置里：正开着的接收会话的文件是主进程自己建的 / 核对过的
+  if (store.isSessionFile(target)) return target;
   const realPath = await fsp.realpath(target);
   if (!approvedSources.has(pathKey(realPath))) throw new Error('文件未经用户选择，已拒绝访问');
   return realPath;
@@ -508,6 +608,7 @@ async function ensureCacheReady() {
     cacheChoice = { root: DEFAULT_CACHE_ROOT, source: 'default' };
     cache = new CacheManager({ rootDir: DEFAULT_CACHE_ROOT, extraRoots: cacheKnownRoots });
     store.configureCache(cache);
+    store.setPolicy({ mode: cacheMode, keptDir: keptCacheDir() });
     return cache.initialize();
   }
 }
@@ -524,6 +625,10 @@ app.whenReady().then(async () => {
     if (registered) labelProtocolHandler().catch(() => {});
   }
   await ensureCacheReady();
+  // 登记表（手动模式存的片、手动缓存的在线视频）。读不出来就当空的，不挡启动
+  await mediaLibrary.load().catch(() => {});
+  // 上次没缓存完就退出留下的工作目录
+  await linkCache.cleanupLeftovers([keptCacheDir(), downloadDir]);
   await cleanupLegacySidecars(LEGACY_DOWNLOAD_DIR);
   createWindow();
   app.on('activate', () => {
@@ -548,6 +653,8 @@ async function cleanup() {
     malwareScan.cancelAll();
     // 还在算哈希的任务也一起停掉，别在退出途中继续读整部片
     for (const controller of tasks.values()) controller.abort();
+    // 在线视频的手动缓存和下载：yt-dlp 杀掉，没下完的工作目录由它自己删
+    linkCache.cancelAll();
     // 转封装／精简的 ffmpeg 也要收，否则它会变成孤儿进程继续满速写盘，
     // 而且持着输出文件的句柄让 cleanupRun() 当次删不掉缓存目录。
     media.cancelAll();
@@ -996,7 +1103,10 @@ secureHandle('store:openSeed', async (payload) => {
   return state;
 });
 
-secureHandle('store:openLeech', async (manifest) => store.openLeech(validate.manifest(manifest)));
+// 本机有这部片收完的副本就复用：逐片核对要一阵子，进度推给界面（开始、每半秒、结束各一条）
+secureHandle('store:openLeech', async (manifest) =>
+  store.openLeech(validate.manifest(manifest), { onReuse: (progress) => send('store:reuse', progress) })
+);
 
 // 只校验不开会话：房主收下管理员的片之前先过一遍，别让坏清单进列表。
 secureHandle('store:validateManifest', async (manifest) => {
@@ -1025,7 +1135,7 @@ secureHandle('store:state', async (sessionId) => store.state(validate.sessionId(
 secureHandle('store:scanReceivedMedia', async (sessionId) => {
   const id = validate.sessionId(sessionId);
   const filePath = await store.scanTarget(id);
-  if (!cache.owns(filePath)) throw new Error('拒绝扫描不属于当前会话的文件');
+  if (!cache.owns(filePath) && !store.isSessionFile(filePath)) throw new Error('拒绝扫描不属于当前会话的文件');
   // 超时按文件大小放缩，几十 GB 的片子不该套用 10GB 时代的那个固定 15 分钟。
   return malwareScan.scanFile(filePath, { size: store.state(id).size, tag: id });
 });
@@ -1039,11 +1149,25 @@ secureHandle('store:cancelScan', async (sessionId) => {
   return malwareScan.cancel(validate.sessionId(sessionId));
 });
 
-secureHandle('store:close', async (sessionId) => {
+// options.discard：扫描发现威胁时，不管收没收完、在临时缓存还是保存位置，一律删掉
+secureHandle('store:close', async (sessionId, options) => {
   const id = validate.sessionId(sessionId);
+  const { discard = false } = options === undefined ? {} : validate.plainObject(options, '关闭参数');
+  if (typeof discard !== 'boolean') throw new TypeError('无效的关闭参数');
   // 扫描进程还攥着文件的话，删缓存会失败 —— 先停掉它、等它退出
   await malwareScan.cancel(id).catch(() => {});
-  return store.close(id);
+  if (discard) {
+    // 可信房间里没扫完就另存过的，事后扫出威胁：下载文件夹里那份一起删
+    const fileId = (() => {
+      try {
+        return store.state(id).fileId;
+      } catch {
+        return null;
+      }
+    })();
+    if (fileId) await downloadSaver.discard(`file:${fileId}`).catch(() => {});
+  }
+  return store.close(id, { discard });
 });
 
 secureHandle('store:reveal', async (filePath) => {
@@ -1216,14 +1340,192 @@ secureHandle('settings:setCacheRoot', async (payload) => {
   await fsp.rm(probe, { force: true });
 
   await cache.cleanupRun().catch(() => {});
+  // 旧运行目录连同里面收完的片一起清掉了，临时登记跟着作废
+  mediaLibrary.dropTemp();
   cacheKnownRoots = settings.knownRoots({ knownRoots: cacheKnownRoots }, target);
   await settings.write(USER_DATA_DIR, { cacheRoot: target, knownRoots: cacheKnownRoots });
   cacheChoice = { root: target, source: 'config' };
   cacheFallback = null;
   cache = new CacheManager({ rootDir: target, extraRoots: cacheKnownRoots });
   store.configureCache(cache);
+  // 长期缓存文件夹跟着缓存位置走；已经存下的片留在原处，登记表里照样找得到
+  store.setPolicy({ mode: cacheMode, keptDir: keptCacheDir() });
   await cache.initialize();
   return { cacheDir: cache.rootDir };
+});
+
+/* ------------------------------ 清理方式、下载位置、手动清理 ------------------------------ */
+
+const cachePolicyView = () => ({ mode: cacheMode, keptDir: keptCacheDir(), downloadDir, defaultDownloadDir: DEFAULT_DOWNLOAD_DIR });
+
+secureHandle('cache:policy', async () => cachePolicyView());
+
+/** 清理方式：auto（关软件时清）/ manual（从不自动清，放长期缓存文件夹）。只影响之后开始接收、缓存的片。 */
+secureHandle('cache:setMode', async (mode) => {
+  if (mode !== 'auto' && mode !== 'manual') throw new TypeError('无效的清理方式');
+  await settings.write(USER_DATA_DIR, { cacheMode: mode });
+  cacheMode = mode;
+  store.setPolicy({ mode: cacheMode, keptDir: keptCacheDir() });
+  return cachePolicyView();
+});
+
+secureHandle('dialog:pickDownloadDir', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: '选择下载位置',
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  if (r.canceled || !r.filePaths || !r.filePaths[0]) return null;
+  const picked = validate.absolutePath(r.filePaths[0], '下载位置');
+  approvedDownloadDirs.add(pathKey(picked));
+  return picked;
+});
+
+/** 换下载位置：只认对话框里挑过的（或默认的）；先试着写一下，指到只读目录、没插的盘上得当场知道。 */
+secureHandle('download:setDir', async (payload) => {
+  const { dir } = validate.plainObject(payload, '下载位置参数');
+  const target = validate.absolutePath(dir, '下载位置');
+  const key = pathKey(target);
+  if (!approvedDownloadDirs.has(key) && key !== pathKey(DEFAULT_DOWNLOAD_DIR)) throw new Error('下载位置未经用户选择，已拒绝');
+  await fsp.mkdir(target, { recursive: true });
+  const probe = path.join(target, `.noxreel-write-test-${process.pid}`);
+  await fsp.writeFile(probe, 'ok');
+  await fsp.rm(probe, { force: true });
+  await settings.write(USER_DATA_DIR, { downloadDir: target });
+  downloadDir = target;
+  return cachePolicyView();
+});
+
+/* ------------------------------ 边下边播：另存一份到下载文件夹 ------------------------------ */
+
+// 另存到下载文件夹（见 downloadSaver.js）：同盘硬链接、否则复制，不覆盖，这次运行里存过的不再存
+const downloadSaver = new DownloadSaver({ dir: () => downloadDir });
+
+/**
+ * P2P 收完的片另存一份。只收完整、校验过的接收会话（scanTarget 把关）；扫描要不要先过由界面决定
+ * （扫出威胁的不存）。
+ */
+secureHandle('download:saveSession', async (sessionId) => {
+  const id = validate.sessionId(sessionId);
+  const source = await store.scanTarget(id);
+  const { fileId } = store.state(id);
+  return downloadSaver.save(`file:${fileId}`, source);
+});
+
+/**
+ * 在线视频另存一份：缓存里已经有的直接放一份过去，没有的在后台另下一份
+ * （进度走 linkCache:update，purpose=download）。
+ */
+secureHandle('download:saveLink', async (payload) => {
+  const { url, title = '' } = validate.plainObject(payload, '下载参数');
+  const safeUrl = await validate.publicHttpUrl(url, '视频链接');
+  if (typeof title !== 'string') throw new TypeError('无效的标题');
+  const key = `link:${safeUrl}`;
+  const done = (saved) => ({ url: safeUrl, purpose: 'download', title, state: 'done', ...saved });
+  const existing = await downloadSaver.existing(key);
+  if (existing) return done({ path: existing, fresh: false });
+  const cached = mediaLibrary.findLink(safeUrl);
+  if (cached) {
+    try {
+      return done(await downloadSaver.save(key, cached.path));
+    } catch {
+      /* 缓存那份拿不到：照常另下一份 */
+    }
+  }
+  return linkCache.start({ url: safeUrl, title: title.slice(0, 300), purpose: 'download' });
+});
+
+linkCache.on('update', (view) => {
+  if (view.purpose === 'download' && view.state === 'done') downloadSaver.remember(`link:${view.url}`, view.path);
+});
+
+/* ------------------------------ 在线视频的手动缓存 ------------------------------ */
+
+/** 所有下载任务（手动缓存和边下边播，在下、排队、下完、失败）加上登记表里早就缓存好的链接。 */
+secureHandle('linkCache:list', async () => {
+  const views = linkCache.status();
+  const seen = new Set(views.filter((v) => v.purpose === 'cache').map((v) => v.url));
+  for (const entry of await mediaLibrary.list()) {
+    if (entry.kind !== 'link' || seen.has(entry.url)) continue;
+    views.push({
+      url: entry.url,
+      purpose: 'cache',
+      title: entry.name,
+      state: 'done',
+      downloaded: entry.size,
+      total: entry.size,
+      path: '',
+      error: '',
+    });
+  }
+  return views;
+});
+
+secureHandle('linkCache:start', async (payload) => {
+  const { url, title = '' } = validate.plainObject(payload, '缓存参数');
+  const safeUrl = await validate.publicHttpUrl(url, '视频链接');
+  if (typeof title !== 'string') throw new TypeError('无效的标题');
+  return linkCache.start({ url: safeUrl, title: title.slice(0, 300), purpose: 'cache' });
+});
+
+secureHandle('linkCache:cancel', async (payload) => {
+  const { url, purpose = 'cache' } = validate.plainObject(payload, '取消参数');
+  if (purpose !== 'cache' && purpose !== 'download') throw new TypeError('无效的下载用途');
+  return linkCache.cancel(validate.string(url, '视频链接', { max: 16_384 }), purpose);
+});
+
+/**
+ * 缓存好的本地文件：交给播放器之前由主进程核准（approvedSources）。文件没了、大小不对就摘掉登记。
+ * @returns {Promise<{path: string, title: string}|null>}
+ */
+secureHandle('linkCache:localPath', async (url) => {
+  const key = validate.string(url, '视频链接', { max: 16_384 });
+  const entry = mediaLibrary.findLink(key);
+  if (!entry) return null;
+  try {
+    const stat = await fsp.stat(entry.path);
+    if (!stat.isFile() || stat.size !== entry.size) throw new Error('变了');
+  } catch {
+    await mediaLibrary.forgetPath(entry.path).catch(() => {});
+    return null;
+  }
+  // 扩展名不在能播的格式里（yt-dlp 偶尔下出冷门格式）：不核准，界面照旧在线播
+  let realPath;
+  try {
+    realPath = await approveSource(entry.path);
+  } catch {
+    return null;
+  }
+  mediaLibrary.touch(entry.id).catch(() => {});
+  return { path: realPath, title: entry.name };
+});
+
+/** 手动清理列的清单：登记过的片子（临时的、保存位置里的、手动缓存的在线视频），标出哪些正在用。 */
+secureHandle('cache:listFiles', async () => {
+  const entries = await mediaLibrary.list();
+  return entries.map((e) => ({ ...e, inUse: store.isSessionFile(e.path) }));
+});
+
+/** 删勾选的那几条。正在用的不删；删不掉的（被别的程序占着）报回去。 */
+secureHandle('cache:deleteFiles', async (ids) => {
+  if (!Array.isArray(ids) || ids.length > 5000) throw new TypeError('无效的删除列表');
+  const entries = await mediaLibrary.list();
+  const byId = new Map(entries.map((e) => [e.id, e]));
+  const result = { removed: 0, skipped: 0, failed: 0 };
+  for (const raw of ids) {
+    const entry = typeof raw === 'string' ? byId.get(raw) : null;
+    if (!entry) continue;
+    if (store.isSessionFile(entry.path)) {
+      result.skipped++;
+      continue;
+    }
+    try {
+      await mediaLibrary.remove(entry.id);
+      result.removed++;
+    } catch {
+      result.failed++;
+    }
+  }
+  return result;
 });
 
 secureHandle('clipboard:writeText', async (text) => {

@@ -112,10 +112,29 @@ function playerPaths(config = {}) {
   return out;
 }
 
+/**
+ * 缓存清理方式：auto（默认，关软件时清）/ manual（从不自动清，放在长期保留的缓存文件夹里）。
+ * 放主进程侧的理由同缓存根目录：接收文件写到哪儿是主进程在开会话那一刻决定的。
+ */
+function resolveCacheMode(config = {}) {
+  return config.cacheMode === 'manual' ? 'manual' : 'auto';
+}
+
+/**
+ * 下载位置：打开「边下边播」后，看过的片子另存一份到这里（用户自己的文件，缓存清理不碰）。
+ * 配置里不是绝对路径就用默认的。
+ */
+function resolveDownloadDir(config = {}, defaultDir) {
+  const value = String(config.downloadDir || '').trim();
+  return value && path.isAbsolute(value) ? path.resolve(value) : defaultDir;
+}
+
 module.exports = {
   read,
   write,
   resolveCacheRoot,
+  resolveCacheMode,
+  resolveDownloadDir,
   knownRoots,
   filePath,
   resolvePlayer,

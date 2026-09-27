@@ -97,6 +97,40 @@ export function clampName(raw) {
   return sliceCodePoints(text, MAX_NAME).trim();
 }
 
+/**
+ * 房间里重名时临时编号：同名的按 id 排序，排第一的保持原名，其余依次显示成「小明 #2」「小明 #3」。
+ * 只影响显示，不改任何人存着的昵称；看到同一批人的成员算出来的编号一样。
+ * 编号后的名字要是正好和别人的真名撞上（真有人叫「小明 #2」），就往后跳一个号。
+ * @param {Array<{id: string, name: string}>} members
+ * @returns {Map<string, string>} id → 显示名
+ */
+export function numberDuplicateNames(members) {
+  const out = new Map();
+  const groups = new Map();
+  for (const { id, name } of members) {
+    if (out.has(id)) continue;
+    out.set(id, name);
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(id);
+  }
+  const taken = new Set(groups.keys());
+  for (const [name, ids] of groups) {
+    if (ids.length < 2) continue;
+    ids.sort();
+    let n = 1;
+    for (const id of ids.slice(1)) {
+      let label;
+      do {
+        n++;
+        label = `${name} #${n}`;
+      } while (taken.has(label));
+      taken.add(label);
+      out.set(id, label);
+    }
+  }
+  return out;
+}
+
 /** 12 位随机十六进制 id。一律走 crypto.getRandomValues，不许退回不安全的伪随机数。 */
 export function newMessageId() {
   const buf = new Uint8Array(6);

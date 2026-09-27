@@ -320,15 +320,62 @@ const EN = new Map(Object.entries({
     'Not found. It is a separate executable from ffmpeg. Without it NoxReel cannot read the duration or per-track bitrates, so the stall forecast and the lossless slim-down both stop working.',
   '重试': 'Retry',
   '复制诊断信息': 'Copy diagnostics',
-  '房间进行中不能改名，退出后可改。': 'Your display name cannot change during a screening; leave the room first.',
+  '改名': 'Rename',
+  '改昵称': 'Change display name',
+  '昵称不能为空': 'Display name cannot be empty',
+  '只保存在这台电脑上。房间里有人同名时，名字后面会临时加上编号。': 'Saved on this computer only. If someone in the room has the same name, a number is added after it for now.',
   '缓存位置': 'Cache location',
   '换个位置': 'Change location',
   '清理残留': 'Clean up leftovers',
   '正在统计…': 'Measuring…',
   '（未知）': '(unknown)',
   '放映进行中不能换位置，退出房间后可改。': 'The location cannot change during a screening; leave the room first.',
-  '接收到的片子放在这里，退房或关闭软件时自动删除。':
-    'Received videos live here and are deleted when you leave the room or close the app.',
+  '自动清理模式下，接收到的片子放在这里，关软件时清掉。':
+    'In automatic cleanup mode, received videos live here and are cleared when NoxReel closes.',
+  // 缓存清理方式、长期缓存文件夹、手动清理
+  '缓存清理': 'Cache cleanup',
+  '自动：关软件时清掉': 'Automatic: cleared when NoxReel closes',
+  '手动：从不自动清，放进长期缓存文件夹': 'Manual: never cleared automatically, kept in the long-term cache folder',
+  '自动：收到的片先放在上面的缓存位置，换片、退房都不删，这次运行里再放同一部直接用，关软件时清掉；磁盘不够时先删最久没用的。':
+    'Automatic: received videos stay in the cache location above. Switching videos or leaving the room does not delete them, the same video is reused during this session, and they are cleared when NoxReel closes. When the disk runs low, the least recently used ones go first.',
+  '手动：收到的片放进长期缓存文件夹，从不自动删，以后再放同一部直接用；磁盘满了会停下来提示你来这里清理。':
+    'Manual: received videos are kept in the long-term cache folder and never deleted automatically; the same video is reused later. When the disk is full, NoxReel stops and asks you to clean up here.',
+  '只影响之后开始接收的片。': 'Applies only to videos received from now on.',
+  '长期缓存文件夹': 'Long-term cache folder',
+  '手动清理模式收的片、手动缓存的在线视频放在这里。它跟着上面的缓存位置走；缓存位置是默认的系统临时目录时，放在本机应用数据目录里，免得被系统的磁盘清理删掉。':
+    'Videos received in manual cleanup mode and online videos you cache yourself are kept here. It follows the cache location above; when that is the default system temp directory, it lives in the local app data directory instead so system disk cleanup does not delete it.',
+  '管理缓存文件': 'Manage cached files',
+  '删除所选': 'Delete selected',
+  '长期缓存': 'Long-term cache',
+  '临时缓存': 'Temporary cache',
+  '正在用': 'In use',
+  '还没有缓存文件': 'No cached files yet',
+  '只列出本软件存下的片子，删的也只是这些；正在用的删不了。':
+    'Only videos NoxReel saved are listed, and only those get deleted; files in use cannot be deleted.',
+  '缓存改成手动清理：之后收的片放进长期缓存文件夹，不再自动删':
+    'Cache cleanup set to manual: videos received from now on go to the long-term cache folder and are never deleted automatically',
+  '缓存改成自动清理：之后收的片关软件时清掉': 'Cache cleanup set to automatic: videos received from now on are cleared when NoxReel closes',
+  '手动清理模式不会自动删缓存：去「设置 → 管理缓存文件」里腾点地方':
+    'Manual cleanup mode never deletes caches automatically: free up space in Settings → Manage cached files',
+  // 在线视频的手动缓存
+  '开始手动缓存': 'Start caching',
+  '取消缓存': 'Cancel caching',
+  '已缓存 · 从本地播': 'Cached · Plays from disk',
+  '缓存排队中': 'Queued for caching',
+  '缓存失败': 'Caching failed',
+  '没找到 yt-dlp，下载不了网页视频': 'yt-dlp was not found, so web videos cannot be downloaded',
+  // 边下边播：看的片另存一份到下载位置
+  '边下边播': 'Download while watching',
+  '边看边另存一份到下载位置': 'Save a copy of what you watch to the download folder',
+  '开着时，你放到的每一部都另存一份：P2P 的片收完并通过扫描后存（可信房间没扫出威胁就存），在线视频在后台另下一份，缓存过的直接复制。':
+    'When on, every video you watch is saved as a copy: P2P videos are saved once fully received and scanned (in trusted rooms, as long as no threat is found); online videos are downloaded in the background, or copied if already cached.',
+  '存下来的是你自己的文件，缓存清理不会碰它；这个开关也不改变什么时候开始播。':
+    'Saved copies are your own files, and cache cleanup never touches them; this switch does not change when playback starts.',
+  '下载位置': 'Download folder',
+  '已存到下载位置': 'Saved to download folder',
+  '下载排队中': 'Queued for download',
+  '下载失败': 'Download failed',
+  '取消下载': 'Cancel download',
   '换到空间大的盘上，才收得下大文件。': 'Point it at a drive with room, so large files fit.',
   '清理只认本软件自己建的目录，同目录下你自己的文件一个都不会动。':
     'Cleanup only touches directories NoxReel created itself; your own files in the same folder are never touched.',
@@ -1019,6 +1066,9 @@ const EN_PATTERNS = [
   [/^(.*)\n\n如果对方没有部署信令服务器，让他改用「极简模式」生成邀请码 —— 那个不需要服务器。$/, '$1\n\nIf the other person has no signaling server, ask them to use Manual mode, which requires no server.'],
   [/^房间使用(.+)，你的本机设置是(.+)。请先在设置中切换为相同模式，再重新粘贴邀请码。$/, 'The room uses $1, while your local setting is $2. Select the same mode in Settings, then paste the invite code again.'],
   [/^(.+) 加入了房间$/, '$1 joined the room'],
+  // 改昵称：「你改名为」要排在通用的「X 改名为 Y」前面，否则「你」会被当成一个人名
+  [/^你改名为 (.+)$/, 'You are now $1'],
+  [/^(.+) 改名为 (.+)$/, '$1 is now $2'],
   [/^(.+) 离开了房间$/, '$1 left the room'],
   // 未读条数和限速倒计时是动态的，单复数得跟着变
   [/^↓ (\d+) 条新消息$/, (_all, n) => `↓ ${n} new message${n === '1' ? '' : 's'}`],
@@ -1155,6 +1205,31 @@ const EN_PATTERNS = [
   [/^清不掉：(.+)$/, 'Could not clean up: $1'],
   [/^缓存目录已改到 (.+)$/, 'Cache directory moved to $1'],
   [/^清掉了 (\d+) 处残留缓存$/, 'Cleaned up $1 leftover cache director(ies)'],
+  // 缓存清理方式、下载位置、手动清理、复用收完的片
+  [/^改不了：(.+)$/, 'Could not change it: $1'],
+  [/^下载位置已改到 (.+)$/, 'Download folder changed to $1'],
+  [/^共 (\d+) 个，(.+)$/, '$1 file(s), $2 in total'],
+  [/^删掉了 (\d+) 个缓存文件$/, 'Deleted $1 cached file(s)'],
+  [/^(\d+) 个正在用，没删$/, '$1 in use, not deleted'],
+  [/^(\d+) 个删不掉（可能被别的程序占着）$/, '$1 could not be deleted (another program may be using them)'],
+  [/^删不掉：(.+)$/, 'Could not delete: $1'],
+  [/^本机已有《(.+)》，正在核对…$/, 'Already have “$1” on this computer, checking it…'],
+  [/^本机已有的《(.+)》核对通过，不用再传$/, '“$1” on this computer checks out; no need to transfer it again'],
+  [/^本机的《(.+)》有 (\d+)\/(\d+) 片对得上，其余照常接收$/, '$2/$3 chunks of “$1” on this computer match; receiving the rest as usual'],
+  [/^本机的《(.+)》和这一部对不上，重新接收$/, '“$1” on this computer does not match this video; receiving it again'],
+  // 在线视频的手动缓存
+  [/^缓存中 (.+)$/, 'Caching $1'],
+  [/^下载中 (.+)$/, 'Downloading $1'],
+  [/^《(.+)》已存到下载位置$/, '“$1” saved to the download folder'],
+  [/^《(.+)》下载失败：(.+)$/, 'Could not download “$1”: $2'],
+  [/^《(.+)》存不到下载位置：(.+)$/, 'Could not save “$1” to the download folder: $2'],
+  [/^存不到下载位置：(.+)$/, 'Could not save to the download folder: $1'],
+  [/^已取消下载《(.+)》$/, 'Canceled downloading “$1”'],
+  [/^《(.+)》缓存好了，之后从本地播$/, '“$1” is cached and will play from disk from now on'],
+  [/^《(.+)》缓存失败：(.+)$/, 'Could not cache “$1”: $2'],
+  [/^开始缓存《(.+)》$/, 'Started caching “$1”'],
+  [/^已取消缓存《(.+)》$/, 'Canceled caching “$1”'],
+  [/^缓存不了：(.+)$/, 'Could not cache it: $1'],
   [
     /^你配置的 (.+) 这次用不了（(.+)），已临时用回系统临时目录。$/,
     'The directory you configured ($1) is unavailable this time ($2); the system temp directory is being used instead.',

@@ -20,7 +20,7 @@ const path = require('node:path');
 const nodeCrypto = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 
-const { fakeDocument, rowsOf } = require('./helpers/androidDom.js');
+const { fakeDocument, rowsOf, textOf } = require('./helpers/androidDom.js');
 
 const ASSETS = path.join(__dirname, '..', 'android', 'app', 'src', 'main', 'assets');
 const JS = path.join(ASSETS, 'js');
@@ -298,7 +298,8 @@ async function bootPhone(t, { securityMode = 'trusted', role = 'guest', name = '
   // 弹幕层的尺寸：真机上由布局给，这里手动摆一个横屏大小
   $('danmaku').clientWidth = 800;
   $('danmaku').clientHeight = 400;
-  $('name').value = name;
+  // name 传 null：不动大厅里的输入框，看它自己从本机存的昵称里取了什么
+  if (name !== null) $('name').value = name;
   $('url').value = 'ws://127.0.0.1:9';
   $('room').value = 'room';
   $('join').click();
@@ -1005,7 +1006,7 @@ test('安卓端：点「N 人在线」打开成员面板，每个人标着用什
 
   const rows = rowsOf(phone.$('members-body')).map((r) => r.text);
   assert.deepEqual(rows, [
-    '手机上的我（你）Android游客',
+    '手机上的我（你）Android游客改名', // 自己那一行带「改名」按钮
     '房主电脑房主', // 房主排最前；测试里的房主连接没走 HELLO，没报平台 → 笼统的「电脑」
     '阿花Windows游客',
     '老版本电脑游客',
@@ -1024,6 +1025,85 @@ test('安卓端：点「N 人在线」打开成员面板，每个人标着用什
   await flush();
   assert.equal(rowsOf(phone.$('members-body')).length, 4);
   assert.equal(phone.$('peers').textContent, '3 人在线');
+});
+
+/* ------------------------------ 昵称 ------------------------------ */
+
+test('安卓端：昵称存在手机上，下次打开大厅里就是它', async (t) => {
+  const phone = await bootPhone(t, { name: null, storage: { 'sw.name': '老王的手机' } });
+  assert.equal(phone.swarm.name, '老王的手机');
+  assert.equal(phone.store.get('sw.name'), '老王的手机');
+});
+
+test('安卓端：第一次用随机一个名字，进房时存下来，之后就固定了', async (t) => {
+  const phone = await bootPhone(t, { name: null });
+  assert.match(phone.swarm.name, /^观众\d+$/);
+  assert.equal(phone.store.get('sw.name'), phone.swarm.name);
+});
+
+test('安卓端：成员面板里「改名」：存下来、告诉连着的人，面板和自己说过的话都换成新名字', async (t) => {
+  const phone = await bootPhone(t, { name: '小明' });
+  const a = phone.join('peer-a', '阿花', 'windows');
+  await flush();
+  phone.type('改名前说的');
+  phone.$('chat-send').click();
+  await flush();
+
+  phone.$('peers').click();
+  const selfRow = () => phone.$('members-body').children[0];
+  selfRow().children.find((c) => c?.className === 'mb-rename').click();
+  const edit = selfRow();
+  assert.equal(edit.className, 'mb-row mb-edit');
+  const [input, save] = edit.children;
+  assert.equal(input.value, '小明');
+
+  // 编辑中成员表重画（每个 pong 都可能触发）：输入框不能被换掉，打了一半的字和焦点会丢
+  phone.join('peer-b', '阿强');
+  await flush();
+  assert.equal(selfRow(), edit, '正在打字时别把输入框换掉');
+
+  input.value = '   ';
+  save.click();
+  assert.equal(selfRow(), edit, '空名字不收，还停在编辑');
+  assert.equal(phone.swarm.name, '小明');
+
+  input.value = '大明';
+  save.click();
+  await flush();
+  assert.equal(phone.swarm.name, '大明', '之后新建的连接 HELLO 用新名字');
+  assert.equal(phone.sync.name, '大明', '之后的 SYNC / STALL 署新名字');
+  assert.equal(phone.store.get('sw.name'), '大明', '存在手机上');
+  assert.deepEqual(phone.host.sent.filter((m) => m.t === 'name').map((m) => m.name), ['大明']);
+  assert.deepEqual(a.sent.filter((m) => m.t === 'name').map((m) => m.name), ['大明']);
+  assert.match(textOf(selfRow()), /^大明（你）Android/);
+  assert.ok(phone.chatTexts().some((x) => x.startsWith('大明改名前说的')), '自己之前说的那条也显示新名字');
+});
+
+test('安卓端：房间里重名的临时编号，成员面板和聊天用同一套；别人改名聊天里说一声', async (t) => {
+  const phone = await bootPhone(t, { name: '小明' });
+  await startLink(phone); // 收到播放列表才算进了房，聊天里的系统消息从这时起显示
+  const twin = phone.join('peer-twin', '小明');
+  await flush();
+  phone.chat({ text: '我也叫小明', peer: twin });
+  await flush();
+
+  const rows = () => rowsOf(phone.$('members-body')).map((r) => r.text);
+  const selfShown = rows()[0].split('（你）')[0];
+  const twinShown = rows()[2].replace(/电脑游客$/, '');
+  assert.deepEqual(new Set([selfShown, twinShown]), new Set(['小明', '小明 #2']), '两个小明一个带编号');
+  assert.ok(phone.chatTexts().includes(`${twinShown}我也叫小明`), '聊天里的名字和成员面板一致');
+  assert.equal(phone.store.get('sw.name'), '小明', '编号只是显示，存着的昵称不变');
+
+  // 他改名了：重名没了，谁都不再带编号；他说过的话显示新名字；聊天里说一声
+  phone.sendFrom(twin, { t: 'name', name: '小明二号' });
+  await flush();
+  assert.equal(rows()[0].split('（你）')[0], '小明');
+  assert.equal(rows()[2], '小明二号电脑游客');
+  assert.ok(phone.chatTexts().includes('小明二号我也叫小明'));
+  assert.ok(phone.chatTexts().includes('小明 改名为 小明二号'));
+  const { translate } = phone.h.i18n;
+  assert.equal(translate('小明 改名为 小明二号', 'en'), '小明 is now 小明二号');
+  assert.equal(translate('你改名为 大明', 'en'), 'You are now 大明');
 });
 
 test('安卓端：往上翻着看旧消息时，新消息不会把人拽回底下', async (t) => {

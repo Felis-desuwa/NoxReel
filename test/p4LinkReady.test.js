@@ -28,7 +28,14 @@ function fnSource(name) {
 }
 
 function sandbox(fns, globals) {
-  const ctx = { ...globals };
+  const ctx = {
+    // 在线视频的手动缓存：这些测试里没有缓存任务
+    linkCacheOf: () => null,
+    linkDownloadOf: () => null,
+    linkCacheBusy: () => false,
+    linkCachePct: () => '0%',
+    ...globals,
+  };
   vm.createContext(ctx);
   vm.runInContext(fns.map(fnSource).join('\n\n'), ctx, { filename: 'app.js（节选）' });
   return ctx;
@@ -117,7 +124,7 @@ const LINK_FNS = [
   'refreshNowLink',
 ];
 
-async function linkRoom({ peerId = 'victim-peer', inspect, isHost = false, paused = true } = {}) {
+async function linkRoom({ peerId = 'victim-peer', inspect, isHost = false, paused = true, extraFns = [], extraGlobals = {}, sw = {} } = {}) {
   const { isItemReady, currentItem } = await load('playlist.js');
   const clock = { now: Date.now() };
   class FakeDate extends Date {
@@ -159,9 +166,12 @@ async function linkRoom({ peerId = 'victim-peer', inspect, isHost = false, pause
       status: () => ({ stalled: false, paused, intendedPaused: paused, position: 0, duration: 0, waitingFor: [] }),
       canIControl: () => true,
     },
+    settings: {},
+    linkCaches: new Map(),
+    linkDownloads: new Map(),
   };
   const noop = () => {};
-  const ctx = sandbox(LINK_FNS, {
+  const ctx = sandbox([...LINK_FNS, ...extraFns], {
     S,
     URL,
     updatePresence: () => {}, // Discord 状态显示：这里不关心
@@ -202,8 +212,10 @@ async function linkRoom({ peerId = 'victim-peer', inspect, isHost = false, pause
           },
         },
         player: { osd: noop },
+        ...sw,
       },
     },
+    ...extraGlobals,
   });
   return { ctx, S, dom, inspected, launched, logs, banners, clock };
 }
@@ -733,4 +745,127 @@ test('playlist.js 里每条拒绝原因都翻得出英文', async () => {
     if (!/[一-鿿]/.test(zh)) continue;
     assert.ok(!/[一-鿿]/.test(translate(zh, 'en')), `漏翻：${zh}`);
   }
+});
+
+/* ======================= 在线视频的手动缓存 ======================= */
+
+const CACHE_FNS = ['linkCacheOf', 'linkDownloadOf', 'linkCachePct', 'useCachedLink', 'onLinkCacheUpdate', 'linkTransferView', 'localMenu'];
+
+async function cacheRoom({ localPath = { path: 'D:\saved\片子.mp4', title: '缓存的片子' }, ...opts } = {}) {
+  const asked = [];
+  const room = await linkRoom({
+    ...opts,
+    extraFns: CACHE_FNS,
+    extraGlobals: {
+      linkCacheBusy: (c) => c?.state === 'queued' || c?.state === 'downloading',
+      pct: (r) => `${Math.round(r * 100)}%`,
+      fmtBytes: (n) => `${n} B`,
+    },
+    sw: {
+      linkCache: {
+        localPath: async (url) => {
+          asked.push(url);
+          return localPath;
+        },
+      },
+    },
+  });
+  return { ...room, asked };
+}
+
+const cacheView = (state, over = {}) => ({ url: 'https://good.example/v', title: '片子', state, downloaded: 50, total: 200, error: '', ...over });
+
+test('缓存好了的在线视频：直接从本地播，不去网站解析、也不用再问网站', async () => {
+  const { ctx, S, inspected, launched, asked } = await cacheRoom();
+  const item = linkItem();
+  S.current = item;
+  S.linkCaches.set(ctx.linkKey(item.url), cacheView('done'));
+  assert.equal(ctx.siteApproved(item), false, '网站没允许过');
+  await ctx.activateLinkItem(item, 1);
+  assert.deepEqual(inspected, [], '不去解析');
+  assert.deepEqual(asked, ['https://good.example/v']);
+  assert.deepEqual(launched, ['D:\saved\片子.mp4'], '交给播放器的是本地文件');
+  assert.equal(S.linkInfo.extractor, 'cache');
+  assert.equal(ctx.localReadyNow(), true, '缓存好了就算准备好（网站不用再问）');
+  assert.equal(ctx.linkTransferView(item).text, '已缓存 · 从本地播');
+});
+
+test('正在缓存的那一部照常在线看（缓存在后台接着下），缓存好了也不中途换源；缓存失败了照样在线看', async () => {
+  const { ctx, S, inspected, launched } = await cacheRoom();
+  const item = linkItem();
+  S.approvedSites.add('https://good.example');
+  S.current = item;
+  S.linkCaches.set(ctx.linkKey(item.url), cacheView('downloading'));
+  await ctx.activateLinkItem(item, 1);
+  assert.deepEqual(inspected, ['https://good.example/v'], '照常在线解析');
+  assert.deepEqual(launched, ['https://good.example/v']);
+  assert.equal(ctx.linkTransferView(item).text, '缓存中 25%');
+
+  ctx.onLinkCacheUpdate(cacheView('done'));
+  await flush();
+  assert.deepEqual(launched, ['https://good.example/v'], '正在放的不中途换成本地文件，下次轮到时才从本地播');
+  assert.equal(ctx.linkTransferView(item).text, '已缓存 · 从本地播');
+
+  const other = await cacheRoom();
+  other.S.approvedSites.add('https://good.example');
+  other.S.current = item;
+  other.S.linkCaches.set(other.ctx.linkKey(item.url), cacheView('failed', { error: 'HTTP 403' }));
+  await other.ctx.activateLinkItem(item, 1);
+  assert.deepEqual(other.launched, ['https://good.example/v']);
+  assert.equal(other.ctx.linkTransferView(item).text, '缓存失败');
+});
+
+test('边下边播的下载和手动缓存分开记：进度各显示各的，下载的结果不当成缓存', async () => {
+  const { ctx, S, logs } = await cacheRoom();
+  const item = linkItem();
+  const download = (state, over) => ({ ...cacheView(state, over), purpose: 'download' });
+  ctx.onLinkCacheUpdate(download('queued'));
+  assert.equal(S.linkCaches.size, 0, '下载不进缓存表（不会被当成「已缓存 · 从本地播」）');
+  assert.equal(ctx.linkTransferView(item).text, '下载排队中');
+  ctx.onLinkCacheUpdate(download('downloading'));
+  assert.equal(ctx.linkTransferView(item).text, '下载中 25%');
+  ctx.onLinkCacheUpdate(download('done'));
+  assert.equal(ctx.linkTransferView(item).text, '已存到下载位置');
+  assert.deepEqual(Array.from(logs.at(-1)), ['《片子》已存到下载位置', 'good']);
+  // 缓存在下的时候先说缓存（有进度条），缓存好了排在「已存到下载位置」前面
+  S.linkCaches.set(ctx.linkKey(item.url), cacheView('downloading'));
+  assert.equal(ctx.linkTransferView(item).text, '缓存中 25%');
+  S.linkCaches.set(ctx.linkKey(item.url), cacheView('done'));
+  assert.equal(ctx.linkTransferView(item).text, '已缓存 · 从本地播');
+  S.linkCaches.clear();
+  ctx.onLinkCacheUpdate(download('failed', { error: '网断了' }));
+  assert.equal(ctx.linkTransferView(item).text, '下载失败');
+  assert.deepEqual(Array.from(logs.at(-1)), ['《片子》下载失败：网断了', 'bad']);
+});
+
+test('缓存登记着但文件没了（被手动删了）：退回在线看', async () => {
+  const { ctx, S, inspected, launched } = await cacheRoom({ localPath: null });
+  const item = linkItem();
+  S.approvedSites.add('https://good.example');
+  S.current = item;
+  S.linkCaches.set(ctx.linkKey(item.url), cacheView('done'));
+  await ctx.activateLinkItem(item, 1);
+  assert.equal(S.linkCaches.size, 0, '登记作废');
+  assert.deepEqual(inspected, ['https://good.example/v']);
+  assert.deepEqual(launched, ['https://good.example/v']);
+});
+
+test('「…」菜单：只有在线视频有「开始手动缓存」，在缓存的变成「取消缓存」，缓存好了的不再出现', async () => {
+  const { ctx, S } = await cacheRoom();
+  const item = linkItem();
+  // 沙箱里建的数组跨了 realm，深比较前在这边重建一份
+  const keys = () => Array.from(ctx.localMenu(item), (m) => m.key);
+  assert.deepEqual(keys(), ['start-cache', 'copy-link']);
+  S.linkCaches.set(ctx.linkKey(item.url), cacheView('queued'));
+  assert.deepEqual(keys(), ['cancel-cache', 'copy-link']);
+  S.linkCaches.set(ctx.linkKey(item.url), cacheView('done'));
+  assert.deepEqual(keys(), ['copy-link']);
+  S.linkCaches.set(ctx.linkKey(item.url), cacheView('failed'));
+  assert.deepEqual(keys(), ['start-cache', 'copy-link'], '失败了可以再来一次');
+  // 边下边播的下载在下：可以单独取消，不影响手动缓存那一项
+  S.linkDownloads.set(ctx.linkKey(item.url), { ...cacheView('downloading'), purpose: 'download' });
+  assert.deepEqual(keys(), ['start-cache', 'cancel-download', 'copy-link']);
+  S.linkDownloads.clear();
+  const file = { id: 'f', kind: 'file', fileId: 'x', slot: 1, name: 'a.mkv', size: 1 };
+  assert.equal(ctx.localMenu(file).some((m) => m.key === 'start-cache'), false, '本地片子没有这一项');
 });

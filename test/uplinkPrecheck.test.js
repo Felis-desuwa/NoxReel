@@ -217,6 +217,8 @@ async function runTransferVerdict(p, { playhead = 0, size = 2e9, level = 'stall'
   const ctx = {
     S: { manifest: { size, sourceUplinkBps: 0 }, roomSecurityMode: 'trusted', sourceType: 'file', mpvRunning: true },
     $: () => node,
+    // 边下边播开着：这里测的是可信房间边收边播时的「会不会卡」预判
+    streamsWhileReceiving: () => true,
     servingCurrent: () => false,
     renderHostVerdict: () => {},
     currentFileCtx: () => ({ scheduler: { bytesPerSecond: 1e6 } }),

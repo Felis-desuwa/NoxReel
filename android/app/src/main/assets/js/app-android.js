@@ -26,7 +26,7 @@ import {
 import { RelayUsageMeter, cloudflareRelayPairs, onlyCloudflareRelays } from './turnUsage.js';
 import { MSG, PROTOCOL_VERSION, normalizePlatform } from './protocol.js';
 import { catalogOf, createPlaylist, currentItem, findItem, reorderIds, validateSnapshot } from './playlist.js';
-import { ChatGate, ChatSender, parseHistory, trustsRelay } from './chat.js';
+import { ChatGate, ChatSender, clampName, numberDuplicateNames, parseHistory, trustsRelay } from './chat.js';
 import { AREAS, DanmakuEngine, DEFAULT_SETTINGS as DANMAKU_BASE } from './danmaku.js';
 import { currentLocale, setLocale, SKIP_ATTR, startI18n, translate as t } from './i18n.js';
 
@@ -544,7 +544,9 @@ setInterval(() => meterTurnUsage(), TURN_METER_MS);
 /* ------------------------- 群管理 + 同步引擎 ------------------------- */
 function initSwarmAndSync() {
   if (S.swarm) return;
-  S.name = ($('name').value.trim() || '观众') .slice(0, 20);
+  // 大厅里填的昵称存下来，下次打开还是它
+  S.name = cleanMyName($('name').value) || '观众';
+  saveName(S.name);
   S.securityMode = normalizeSecurityMode($('security-mode').value);
   localStorage.setItem('sw.securityMode', S.securityMode);
   $('security-mode').disabled = true;
@@ -608,6 +610,14 @@ function initSwarmAndSync() {
   });
   S.swarm.on('sources', () => ensureCurrentSession());
   S.swarm.on('complete', () => log('全部下载完成', 'good'));
+  // 有人在房间里改了昵称：聊天里说一声，就绪 / 卡顿表和离场提示用的名字跟着换
+  S.swarm.on('peer-renamed', ({ peerId, name, oldName }) => {
+    S.sync?.noteRename(peerId, name);
+    if (S.chat.names.has(peerId)) S.chat.names.set(peerId, name);
+    chatSystem(`${oldName || peerId} 改名为 ${name}`);
+    renderPeers();
+    renderChat();
+  });
   S.swarm.on('peer-authenticated', (peer) => {
     log(`已和 ${peer.name} 完成${securityModeLabel(S.securityMode)}握手`, 'good');
     S.chat.names.set(peer.peerId, peer.name);
@@ -1098,6 +1108,8 @@ function startPlayerTicks() {
       const pb = snap.duration > 0 ? (snap.position / snap.duration) * size : 0;
       S.swarm.setPlaybackByte(slot, pb);
       S.prog = S.swarm.progress(slot);
+      // 「往后能放多久」跟着播放位置走：下载断了、画面还在往前放时，这个数要一拍拍变小
+      renderStatus(S.prog);
     }
 
     // 在线链接没有分片水位：完全同步的管理员缓冲时让全房等，其余只卡自己（和桌面端同一套）
@@ -1712,6 +1724,90 @@ const ROLE_LABEL = { host: '房主', admin: '管理员', guest: '游客' };
 /** 成员面板上的设备标记。系统名是专有名词，不翻译；老版本电脑端只报得出「电脑」。 */
 const PLATFORM_LABEL = { windows: 'Windows', mac: 'macOS', linux: 'Linux', android: 'Android', desktop: '电脑' };
 
+/* ------------------------------ 昵称 ------------------------------ */
+// 昵称存在这台手机上（和电脑端同一个键），下次打开还是它；进了房也能改，改了告诉连着的人。
+// 房间里有人同名时，显示名临时加编号（「小明 #2」），存着的昵称不变。
+const NAME_KEY = 'sw.name';
+const MY_NAME_MAX = 20; // 和大厅输入框的 maxlength 一致
+
+/** 清洗成能用的昵称：去控制字符、并空白，截到 MY_NAME_MAX 个字。 */
+function cleanMyName(raw) {
+  return Array.from(clampName(raw)).slice(0, MY_NAME_MAX).join('').trim();
+}
+
+function savedName() {
+  try {
+    return cleanMyName(localStorage.getItem(NAME_KEY) || '');
+  } catch {
+    return '';
+  }
+}
+
+function saveName(name) {
+  try {
+    localStorage.setItem(NAME_KEY, name);
+  } catch {
+    /* 存不进去就只在这一次生效 */
+  }
+}
+
+/**
+ * 改自己的昵称：存下来，进了房的话经 NAME 消息告诉连着的人，Swarm、同步引擎里的名字一起换。
+ * @returns {boolean} 名字能用（清洗后非空）
+ */
+function applyMyName(raw) {
+  const name = cleanMyName(raw);
+  if (!name) return false;
+  saveName(name);
+  $('name').value = name;
+  if (name === S.name) return true;
+  S.name = name;
+  S.swarm?.setName(name);
+  S.sync?.setName(name);
+  // 连上房间就算（收到播放列表之前 S.entered 还是假的，聊天和成员面板照样在）
+  if (S.swarm) {
+    log(`你改名为 ${name}`, 'good');
+    renderPeers();
+    renderChat();
+  }
+  return true;
+}
+
+/** 房间里每个人的显示名（重名临时编号）。和电脑端同一套：自己 + 握过手的直连成员。 */
+function roomDisplayNames() {
+  const members = [{ id: S.peerId, name: S.name || '' }];
+  for (const p of S.swarm?.peers.values() || []) {
+    if (p.authenticated) members.push({ id: p.peerId, name: p.name || '' });
+  }
+  return numberDuplicateNames(members);
+}
+
+// 成员面板里自己那一行正在改名：编辑行的节点留着复用，成员表每次重画（每个 pong 都可能触发）
+// 都换一个新输入框的话，正在打的字和焦点就丢了
+let renameRowNode = null;
+
+function startRename() {
+  const input = el('input', { className: 'mb-input', attrs: { maxlength: MY_NAME_MAX, 'aria-label': '你的昵称' } });
+  input.value = S.name;
+  const save = el('button', { className: 'primary', text: '保存' });
+  const cancel = el('button', { text: '取消' });
+  save.addEventListener('click', () => {
+    if (!applyMyName(input.value)) {
+      log('昵称不能为空', 'warn');
+      return;
+    }
+    renameRowNode = null;
+    renderMembers();
+  });
+  cancel.addEventListener('click', () => {
+    renameRowNode = null;
+    renderMembers();
+  });
+  renameRowNode = el('div', { className: 'mb-row mb-edit' }, [input, save, cancel]);
+  renderMembers();
+  input.focus?.();
+}
+
 /** 连上了、握过手的人。和「N 人在线」数的是同一拨。 */
 function connectedPeers() {
   return S.swarm
@@ -1732,19 +1828,27 @@ function renderMembers() {
   };
   const row = (name, platform, role, self) => {
     const key = normalizePlatform(platform);
+    let rename = null;
+    if (self) {
+      rename = el('button', { className: 'mb-rename', text: '改名' });
+      rename.addEventListener('click', () => startRename());
+    }
     return el('div', { className: 'mb-row' }, [
       el('span', { className: 'mb-name', raw: true, text: name }),
       self ? el('span', { className: 'mb-role', text: '（你）' }) : null,
       el('span', { className: `mb-os ${key}`, text: PLATFORM_LABEL[key] }),
       el('span', { className: 'mb-role', text: ROLE_LABEL[role] }),
+      rename,
     ]);
   };
+  // 显示名：重名的临时带编号（只是显示，谁存着的昵称都不变）
+  const names = roomDisplayNames();
   const others = connectedPeers()
     .map((p) => ({ p, role: roleOf(p.peerId) }))
     .sort((a, b) => (a.role === 'host' ? -1 : b.role === 'host' ? 1 : 0));
   body.replaceChildren(
-    row(S.name || '', 'android', S.sync?.myRole() || 'guest', true),
-    ...others.map(({ p, role }) => row(p.name || '', p.platform, role, false))
+    renameRowNode || row(names.get(S.peerId) || S.name || '', 'android', S.sync?.myRole() || 'guest', true),
+    ...others.map(({ p, role }) => row(names.get(p.peerId) || p.name || '', p.platform, role, false))
   );
 }
 
@@ -2056,9 +2160,89 @@ function setSheet(id) {
     renderChatUnread();
     scrollChatToBottom();
   }
+  // 开着抽屉时控件不收；关上之后重新计时
+  pokeUi();
 }
 
 const toggleSheet = (id) => setSheet(openSheet === id ? '' : id);
+
+/* ---------------------------- 控件自动收起 ---------------------------- */
+// 播放中这么久没碰屏幕，顶栏和底栏就收起来，系统状态栏、导航栏也一起藏（沉浸全屏），只剩画面和弹幕。
+// 点画面空白处在「收起 / 亮出」之间切换。暂停、开着抽屉、弹着对话框时不自动收：这时候人多半要点东西。
+// 「等待缓冲」和「同步到房主」那一条不跟着藏，免得人不知道画面为什么停了。
+const UI_HIDE_MS = 4000;
+// 点在这些东西上算「在用控件」，只重新计时，不切换收起
+const UI_CONTROL_IDS = new Set(['topbar', 'botbar', 'drift', 'waiting', ...SHEETS.map((s) => s.sheet)]);
+const UI_DIALOG_IDS = ['confirm-ask', 'invite-ask', 'site-ask'];
+let uiHidden = false;
+let uiHideTimer = null;
+let uiLastPaused = null;
+
+const dialogOpen = () => UI_DIALOG_IDS.some((id) => $(id).classList.contains('on'));
+
+/** 现在能不能自动收：在房间里、播放器起来了、正在播、没开抽屉、没弹对话框、没在拖进度条。 */
+function uiCanAutoHide() {
+  return S.entered && !!S.playerTimer && !openSheet && !dialogOpen() && !seeking && !!S.sync && !S.sync.effectivePaused;
+}
+
+function setUiHidden(hidden) {
+  if (hidden === uiHidden) return;
+  uiHidden = hidden;
+  $('stage').classList.toggle('ui-hidden', hidden);
+  window.sw.setImmersive(hidden);
+}
+
+function cancelUiHide() {
+  clearTimeout(uiHideTimer);
+  uiHideTimer = null;
+}
+
+/** 控件亮着、又满足条件时，UI_HIDE_MS 之后收起。 */
+function scheduleUiHide() {
+  cancelUiHide();
+  if (uiHidden || !uiCanAutoHide()) return;
+  uiHideTimer = setTimeout(() => {
+    uiHideTimer = null;
+    if (uiCanAutoHide()) setUiHidden(true);
+  }, UI_HIDE_MS);
+}
+
+/** 有人碰了控件或状态变了：先亮出来，再重新计时。 */
+function pokeUi() {
+  setUiHidden(false);
+  scheduleUiHide();
+}
+
+/** 每条播放器快照都走一遍：刚暂停就亮出来（好让人点播放）；在播又没计时就开始计时。 */
+function syncUiAutoHide(paused) {
+  if (paused !== uiLastPaused) {
+    uiLastPaused = paused;
+    if (paused) {
+      cancelUiHide();
+      setUiHidden(false);
+      return;
+    }
+  }
+  if (!uiCanAutoHide()) return cancelUiHide();
+  if (!uiHidden && !uiHideTimer) scheduleUiHide();
+}
+
+/** 点击落在控件、抽屉、对话框里没有（沿父节点往上找）。 */
+function onUiControl(node) {
+  for (let n = node, depth = 0; n && depth < 32; n = n.parentElement, depth++) {
+    if (UI_CONTROL_IDS.has(n.id) || UI_DIALOG_IDS.includes(n.id)) return true;
+  }
+  return false;
+}
+
+/** 画面上的一次点击。控件收起时点哪儿都是「叫回来」（收起的控件不吃触摸，点击落到页面上）。 */
+function onStageTap(target) {
+  if (!S.entered) return;
+  if (onUiControl(target)) return pokeUi();
+  if (uiHidden) return pokeUi();
+  cancelUiHide();
+  setUiHidden(true);
+}
 
 /* ------------------------------ 聊天 ------------------------------ */
 
@@ -2092,18 +2276,27 @@ function renderChatUnread() {
   badge.classList.toggle('on', chatUnread > 0);
 }
 
-/** 一行聊天。按 key 复用节点：「发送中」改成「已送达」时只换那一小段文字。 */
-function chatRow(entry) {
+/**
+ * 一行聊天。按 key 复用节点：「发送中」改成「已送达」时只换那一小段文字。
+ * 发言人还在房里的，名字按成员面板同一套显示名（重名编号、改过名的用新名字）；走了的用当时的名字。
+ */
+function chatRow(entry, names = null) {
+  const shownName = (entry.from && names?.get(entry.from)) || entry.name;
   const cached = chatRows.get(entry.key);
   if (cached) {
     if (cached.stateNode) {
       const label = entry.state ? t(stateLabel(entry.state)) : '';
       if (cached.stateNode.textContent !== label) cached.stateNode.textContent = label;
     }
+    if (cached.nameNode && cached.nameNode.textContent !== shownName) {
+      cached.nameNode.textContent = shownName;
+      cached.nameNode.setAttribute('title', shownName);
+    }
     return cached.node;
   }
   let node;
   let stateNode = null;
+  let nameNode = null;
   if (entry.kind === 'system') {
     // 系统事件整句交给 t()，昵称和片名靠词条里的正则捕获原样带过去，所以这一行不打跳过标记
     node = el('div', { className: 'chat-system', text: entry.text });
@@ -2111,13 +2304,14 @@ function chatRow(entry) {
     node = el('div', { className: 'chat-divider', text: entry.text });
   } else {
     stateNode = el('span', { className: 'chat-state', text: entry.state ? stateLabel(entry.state) : '' });
+    nameNode = el('span', { className: 'chat-name', raw: true, text: shownName, title: shownName });
     node = el('div', { className: `chat-msg${entry.self ? ' self' : ''}` }, [
-      el('span', { className: 'chat-name', raw: true, text: entry.name, title: entry.name }),
+      nameNode,
       el('span', { className: 'chat-text', raw: true, text: entry.text }),
       stateNode,
     ]);
   }
-  chatRows.set(entry.key, { node, stateNode });
+  chatRows.set(entry.key, { node, stateNode, nameNode });
   return node;
 }
 
@@ -2134,7 +2328,8 @@ function renderChat() {
   } else {
     const keys = new Set(entries.map((e) => e.key));
     for (const key of [...chatRows.keys()]) if (!keys.has(key)) chatRows.delete(key);
-    body.replaceChildren(...entries.map(chatRow));
+    const names = roomDisplayNames();
+    body.replaceChildren(...entries.map((e) => chatRow(e, names)));
   }
   const notice = $('chat-notice');
   if (notice) {
@@ -2194,7 +2389,7 @@ function sendChat(rawInput) {
   const { id, text, ts } = res.message;
   // 自己的 id 先记一笔：房主把它转回来时认得出是回声，不会显示两遍
   S.chat.gate.remember(id);
-  pushChatEntry({ key: id, kind: 'msg', name: S.name, text, self: true, state: 'sending' });
+  pushChatEntry({ key: id, kind: 'msg', from: S.peerId, name: S.name, text, self: true, state: 'sending' });
   showDanmaku({ id, text, self: true });
   const wire = { t: MSG.CHAT, id, text, ts };
   for (const p of chatPeers()) p.send(wire);
@@ -2215,7 +2410,7 @@ function onChatMessage(msg, peer) {
     return;
   }
   const m = res.message;
-  pushChatEntry({ key: m.id, kind: 'msg', name: m.name, text: m.text, self: false });
+  pushChatEntry({ key: m.id, kind: 'msg', from: m.origin, name: m.name, text: m.text, self: false });
   showDanmaku({ id: m.id, text: m.text, self: false });
   // 手机不是房主，不做转发中枢
 }
@@ -2242,6 +2437,7 @@ function onChatHistory(msg, peer) {
     .map((it) => ({
       key: it.id,
       kind: 'msg',
+      from: it.origin,
       name: it.name,
       text: it.text,
       self: it.origin === S.peerId,
@@ -2450,24 +2646,52 @@ function renderStatus(p) {
     $('buf').firstElementChild.style.width = '0%';
     return;
   }
-  const pct = Math.round((p.contiguousRatio || 0) * 100);
-  const rate = fmtBytes(p.downRate || 0) + '/s';
-  $('status').textContent = `可播 ${pct}% · 已有 ${p.haveCount || 0}/${p.chunkCount || 0} 片 · ↓${rate}`;
+  // 百分比是整部收了多少；「往后能放」按当前播放位置往后连续收到的那段算（runBytes）。
+  // 以前显示的是从片头起连续的比例（contiguousRatio），中途加入时片头之后整段是空的，
+  // 播得好好的也一直写「可播 0%」。
+  const pct = p.complete ? 100 : Math.floor((p.ratio || 0) * 100);
   $('buf').firstElementChild.style.width = pct + '%';
+  if (p.complete) {
+    $('status').textContent = '已收完';
+    return;
+  }
+  const rate = fmtBytes(p.downRate || 0) + '/s';
+  const size = S.manifest?.size || 0;
+  const duration = S.sync?.duration > 0 ? S.sync.duration : S.manifest?.durationSec || 0;
+  if (!(size > 0) || !(duration > 0)) {
+    // 时长未知（房主没装 ffmpeg）换算不出秒数，只说收了多少
+    $('status').textContent = `已收 ${pct}% · ↓${rate}`;
+    return;
+  }
+  const toEnd = (p.runEndBytes || 0) >= size;
+  const ahead = toEnd ? '能一直放到片尾' : `往后能放 ${fmtTime(((p.runBytes || 0) / size) * duration)}`;
+  $('status').textContent = `已收 ${pct}% · ${ahead} · ↓${rate}`;
 }
+
+// 上一次用的显示名（重名编号）。有人进出、改名让它变了，聊天也要按新的重画一遍
+let lastDisplayNames = '';
 
 function renderPeers() {
   const n = connectedPeers().length;
   $('peers').textContent = n ? `${n} 人在线` : '等待连接…';
   renderMembers();
+  const key = [...roomDisplayNames()].join('\n');
+  if (key !== lastDisplayNames) {
+    lastDisplayNames = key;
+    renderChat();
+  }
 }
 
 let seeking = false;
-$('seek').addEventListener('input', () => { seeking = true; });
+$('seek').addEventListener('input', () => {
+  seeking = true;
+  cancelUiHide(); // 拖着进度条时别收起来
+});
 $('seek').addEventListener('change', () => {
   const dur = S.sync?.duration || 0;
   if (dur > 0) S.sync.userSeek((Number($('seek').value) / 1000) * dur);
   seeking = false;
+  pokeUi();
 });
 
 /** 换片后播放器还没起来：时间和进度条按房间位置显示，别留着上一部的值。 */
@@ -2484,6 +2708,7 @@ function renderPlayback(snap) {
   if (!seeking && dur > 0) $('seek').value = Math.round((snap.position / dur) * 1000);
   const paused = S.sync ? S.sync.effectivePaused : snap.paused;
   $('pp').textContent = paused ? '▶' : '⏸';
+  syncUiAutoHide(paused);
 }
 
 function renderWaiting() {
@@ -2616,6 +2841,10 @@ $('btn-chat').addEventListener('click', () => toggleSheet('chat-sheet'));
 $('btn-danmaku').addEventListener('click', () => toggleSheet('danmaku-sheet'));
 for (const id of ['playlist-close', 'chat-close', 'danmaku-close', 'members-close']) $(id).addEventListener('click', () => setSheet(''));
 $('peers').addEventListener('click', () => toggleSheet('members-sheet'));
+// 点画面：收起 ↔ 亮出（捕获阶段，先于按钮自己的处理，只管计时和显隐，不拦事件）
+document.addEventListener('click', (e) => onStageTap(e.target), true);
+// 整页重载（退房、换语言）之前可能正藏着系统栏：一加载就还原
+window.sw.setImmersive(false);
 
 $('chat-send').addEventListener('click', submitChat);
 $('chat-input').addEventListener('keydown', (e) => {
@@ -2811,8 +3040,8 @@ $('dm-area').addEventListener('change', () =>
 );
 renderDanmakuControls();
 
-// 默认昵称
-$('name').value = '观众' + Math.floor(Math.random() * 90 + 10);
+// 昵称：上次存下的；第一次用就随机一个（进房时存下来，之后就固定了）
+$('name').value = savedName() || '观众' + Math.floor(Math.random() * 90 + 10);
 $('security-mode').value = S.securityMode;
 $('security-mode').addEventListener('change', () => {
   S.securityMode = normalizeSecurityMode($('security-mode').value);

@@ -1681,14 +1681,16 @@ select:disabled {
 .peer-role {
   display: flex;
 }
-.role-toggle {
+.role-toggle,
+.peer-rename {
   font-size: 11px;
   padding: 3px 9px;
   background: var(--bg);
   color: var(--muted);
   border: 1px solid var(--line);
 }
-.role-toggle:hover {
+.role-toggle:hover,
+.peer-rename:hover {
   color: var(--text);
   border-color: var(--accent-dim);
 }
@@ -1898,6 +1900,47 @@ select:disabled {
 }
 .cmd-row code {
   overflow-wrap: anywhere;
+}
+/* 设置 → 管理缓存文件：一条一行，勾选后删 */
+.cache-files {
+  max-height: 180px;
+  overflow-y: auto;
+  margin: 6px 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.cache-files:empty {
+  display: none;
+}
+/* 选择器要压过 .field label（设置里的 label 默认是一整块、字号 12、灰色） */
+.cache-files label.cache-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 5px 8px;
+  font-size: 12px;
+  color: var(--text);
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+.cache-files label.cache-file:last-child {
+  border-bottom: none;
+}
+.cache-file-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cache-file-meta {
+  flex: none;
+  color: var(--muted);
+  font-size: 11px;
+}
+.cache-file-meta.busy {
+  color: var(--accent);
 }
 .ghost.tiny {
   padding: 2px 8px;

@@ -52,6 +52,10 @@
                  color:#fff; text-shadow:0 1px 2px #000c; will-change:transform; }
   #danmaku .dm.self { -webkit-text-stroke:1px var(--accent); }
   #topbar, #botbar { z-index:2; }
+  /* 播放中一会儿没碰屏幕：顶栏、底栏淡出（系统状态栏、导航栏一起藏），点画面空白处再叫回来。
+     「等待缓冲」和「同步到房主」那一条不在 .bar 里，照常显示 */
+  #stage .bar { transition:opacity .25s; }
+  #stage.ui-hidden .bar { opacity:0; pointer-events:none; }
   /* 在线链接和房主差开了：顶栏下面一条，带「同步到房主」按钮 */
   #drift { position:absolute; top:64px; left:50%; transform:translateX(-50%); z-index:2; display:flex; flex-wrap:wrap;
            align-items:center; justify-content:center; gap:4px 8px; background:#000b; border:1px solid var(--warn);
@@ -96,6 +100,9 @@
   .mb-os { flex:0 0 auto; font-size:11px; padding:0 6px; border-radius:4px; background:#ffffff12; color:var(--dim); }
   .mb-os.android { color:var(--good); }
   .mb-role { flex:0 0 auto; font-size:11px; color:var(--dim); }
+  .mb-rename { flex:0 0 auto; padding:3px 10px; font-size:12px; background:#ffffff14; }
+  .mb-edit input { flex:1; min-width:0; }
+  .mb-edit button { flex:0 0 auto; padding:6px 12px; font-size:13px; }
 
   /* -------- 聊天 -------- */
   #chat-body { display:flex; flex-direction:column; gap:6px; }

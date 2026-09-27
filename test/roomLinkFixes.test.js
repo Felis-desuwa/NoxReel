@@ -30,7 +30,13 @@ function fnSource(name) {
 }
 
 function sandbox(fns, globals) {
-  const ctx = { ...globals };
+  const ctx = {
+    // 在线视频的手动缓存：这些测试里没有缓存任务
+    linkCacheOf: () => null,
+    linkCacheBusy: () => false,
+    linkCachePct: () => '0%',
+    ...globals,
+  };
   vm.createContext(ctx);
   vm.runInContext(fns.map(fnSource).join('\n\n'), ctx, { filename: 'app.js（节选）' });
   return ctx;

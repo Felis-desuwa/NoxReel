@@ -745,6 +745,16 @@ test('边下边播时收完了，控制条给一键切换，OSD 上每一部只�
   assert.equal(box.calls.filter((c) => c[0] === 'osd').length, 2);
 });
 
+test('在线链接只用 mpv：选了 PotPlayer 也不冒「已收完 · 切换到 PotPlayer」', async () => {
+  const box = playerBox({ choice: 'pot', sourceType: 'link' });
+  await box.ctx.launchPlayer();
+  assert.equal(box.S.playerKind, 'mpv', '在线链接照旧交给 mpv');
+  box.ctx.updatePlayerSwitchHint();
+  assert.equal(box.$('btn-switch-player').hidden, true, '点了也换不过去，不该出现');
+  assert.deepEqual(box.calls.filter((c) => c[0] === 'osd'), []);
+  assert.equal(box.ctx.externalPlaybackReady(), false);
+});
+
 test('已经在用外部播放器时不再劝人切换', async () => {
   const box = playerBox({ choice: 'pot' });
   await box.ctx.launchPlayer();

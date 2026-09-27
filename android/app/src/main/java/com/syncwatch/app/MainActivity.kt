@@ -21,6 +21,9 @@ import android.webkit.WebView
 import android.util.Log
 import org.json.JSONObject
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
 import com.google.android.exoplayer2.ui.StyledPlayerView
@@ -70,7 +73,12 @@ class MainActivity : AppCompatActivity() {
         player.attachView(playerView)
         // Cloudflare TURN 的结果从后台线程回来：切回主线程，按请求 id 交给页面（见 native-shim 的 nativeCall）。
         // 两个参数都经 JSONObject.quote 变成 JS 字符串字面量，不拼接任何未转义的内容。
-        bridge = NativeBridge(store, player, CloudflareTurn(applicationContext.filesDir)) { id, json ->
+        bridge = NativeBridge(
+            store,
+            player,
+            CloudflareTurn(applicationContext.filesDir),
+            immersive = { on -> main.post { if (!isFinishing && !isDestroyed) setImmersive(on) } },
+        ) { id, json ->
             main.post {
                 if (webGone || !::web.isInitialized) return@post
                 web.evaluateJavascript(
@@ -179,6 +187,20 @@ class MainActivity : AppCompatActivity() {
         pendingInviteLink = null
         lastInviteAt = SystemClock.uptimeMillis()
         web.evaluateJavascript("window.noxreelOpenInvite?.(${JSONObject.quote(link)})", null)
+    }
+
+    /**
+     * 沉浸全屏：页面收起控件时把系统状态栏、导航栏也藏起来，亮出控件时还原。
+     * 藏起来之后从屏幕边缘滑一下，系统栏会临时出来一会儿（BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE）。
+     */
+    private fun setImmersive(on: Boolean) {
+        val bars = WindowCompat.getInsetsController(window, window.decorView)
+        if (on) {
+            bars.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            bars.hide(WindowInsetsCompat.Type.systemBars())
+        } else {
+            bars.show(WindowInsetsCompat.Type.systemBars())
+        }
     }
 
     override fun onBackPressed() {

@@ -47,11 +47,34 @@ contextBridge.exposeInMainWorld('sw', {
     usage: () => ipcRenderer.invoke('cache:usage'),
     purge: () => ipcRenderer.invoke('cache:purge'),
     setRoot: (dir) => ipcRenderer.invoke('settings:setCacheRoot', { dir }),
+    // 清理方式（auto 关软件时清 / manual 从不自动清、放长期缓存文件夹），连同下载位置一起返回
+    policy: () => ipcRenderer.invoke('cache:policy'),
+    setMode: (mode) => ipcRenderer.invoke('cache:setMode', mode),
+    // 手动清理：列出登记过的片子，删勾选的
+    listFiles: () => ipcRenderer.invoke('cache:listFiles'),
+    deleteFiles: (ids) => ipcRenderer.invoke('cache:deleteFiles', ids),
+  },
+  // 边下边播：看的片另存一份到下载文件夹（和缓存是两回事，缓存清理不碰它）
+  download: {
+    setDir: (dir) => ipcRenderer.invoke('download:setDir', { dir }),
+    // P2P 收完的片（接收会话）
+    saveSession: (sessionId) => ipcRenderer.invoke('download:saveSession', sessionId),
+    // 在线视频：缓存里有就放一份过去，没有就在后台另下（进度走 linkCache.onUpdate，purpose=download）
+    saveLink: (url, title) => ipcRenderer.invoke('download:saveLink', { url, title }),
+  },
+  // 在线视频下到本机：手动缓存（purpose=cache，之后同一个链接直接从本地播）和边下边播的下载
+  linkCache: {
+    list: () => ipcRenderer.invoke('linkCache:list'),
+    start: (url, title) => ipcRenderer.invoke('linkCache:start', { url, title }),
+    cancel: (url, purpose = 'cache') => ipcRenderer.invoke('linkCache:cancel', { url, purpose }),
+    localPath: (url) => ipcRenderer.invoke('linkCache:localPath', url),
+    onUpdate: on('linkCache:update'),
   },
   dialog: {
     pickVideo: () => ipcRenderer.invoke('dialog:pickVideo'),
     pickVideos: () => ipcRenderer.invoke('dialog:pickVideos'),
     pickCacheDir: () => ipcRenderer.invoke('dialog:pickCacheDir'),
+    pickDownloadDir: () => ipcRenderer.invoke('dialog:pickDownloadDir'),
     // 这里**不**暴露「按路径批准片源」：页面传一个字符串就能批准本机任意视频（连同旁边的字幕）
     // 去做种，approvedSources 这道白名单就形同虚设了。拖进来的文件只走下面的 pathForFile(File)。
     pickSubtitles: () => ipcRenderer.invoke('dialog:pickSubtitles'),
@@ -85,13 +108,17 @@ contextBridge.exposeInMainWorld('sw', {
     onHashProgress: on('store:hashProgress'),
     openSeed: (manifest, filePath) => ipcRenderer.invoke('store:openSeed', { manifest, filePath }),
     openLeech: (manifest) => ipcRenderer.invoke('store:openLeech', manifest),
+    // 本机有收完的副本时，打开会话前要逐片核对：开始 / 进度 / 结束
+    onReuse: on('store:reuse'),
     validateManifest: (manifest) => ipcRenderer.invoke('store:validateManifest', manifest),
     readChunk: (sessionId, index) => ipcRenderer.invoke('store:readChunk', { sessionId, index }),
     writeChunk: (sessionId, index, data) => ipcRenderer.invoke('store:writeChunk', { sessionId, index, data }),
     state: (sessionId) => ipcRenderer.invoke('store:state', sessionId),
     scanReceivedMedia: (sessionId) => ipcRenderer.invoke('store:scanReceivedMedia', sessionId),
     cancelScan: (sessionId) => ipcRenderer.invoke('store:cancelScan', sessionId),
-    close: (sessionId) => ipcRenderer.invoke('store:close', sessionId),
+    // discard：扫描发现威胁时一律删掉（平时关会话，收完的片按清理方式留着复用）
+    close: (sessionId, options) =>
+      options === undefined ? ipcRenderer.invoke('store:close', sessionId) : ipcRenderer.invoke('store:close', sessionId, options),
     reveal: (filePath) => ipcRenderer.invoke('store:reveal', filePath),
   },
 

@@ -1,0 +1,360 @@
+'use strict';
+
+/**
+ * 用 yt-dlp 把在线视频下到本机。两种用途，同一套下载：
+ *  - cache（手动缓存）：播放列表里点「开始手动缓存」。下进缓存，跟着缓存清理方式走
+ *    （自动模式放本次运行的临时缓存、关软件时清；手动模式放长期缓存文件夹），
+ *    之后同一个链接直接从本地播。
+ *  - download（边下边播）：设置里打开「边下边播」后，看的在线视频在后台另下一份到下载文件夹。
+ *    那是用户自己的文件，缓存清理不碰。
+ * 下到哪儿、下完怎么登记由调用方给的 placement 决定，这里只管下载本身：
+ *
+ *  - 可以同时下好几部：最多 maxParallel 个一起下，其余排队。
+ *  - 每个网络请求都经本机过滤代理（和解析、播放同一道关），私网地址一律连不上。
+ *  - 优先选音画合一的格式：不用 ffmpeg 合并，没装 ffmpeg 也能下。
+ *  - 直接下网页地址失败（yt-dlp 认不出的网站），就先解析（含隔离浏览器兜底）拿到媒体地址，
+ *    带着它要求的请求头再下一次。
+ *  - 下在 placement 给的工作目录里，下完才由 finish 挪到位、登记；取消、失败由 abort 收拾，
+ *    不会留下半截文件。yt-dlp 报回来的路径必须在工作目录里。
+ */
+
+const fsp = require('fs/promises');
+const path = require('path');
+const crypto = require('crypto');
+const readline = require('readline');
+const { EventEmitter } = require('events');
+const { spawn } = require('child_process');
+
+const MAX_PARALLEL = 3;
+// 长期缓存文件夹、下载文件夹里放半截文件的子目录名（启动时按这个名字清残留）
+const WORK_DIR = '.noxreel-downloading';
+// 最后那个 /b 不能省：直链的 mp4 yt-dlp 报不出编码（vcodec/acodec 是未知），
+// 前面几项「必须有音轨和视频轨」一个都选不中，整个下载直接报「Requested format is not available」
+const FORMAT =
+  'best[protocol^=http][vcodec!=none][acodec!=none]/best[protocol^=m3u8][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/b';
+const PURPOSES = ['cache', 'download'];
+const PROGRESS_TAG = 'NRPROG';
+const FILE_TAG = 'NRFILE';
+const YOUTUBE_HOST_RE = /(^|\.)(?:youtube\.com|youtube-nocookie\.com|youtu\.be)$/i;
+// 进度最多每这么久报一次：yt-dlp 每秒能吐几十行进度，全转给界面没有意义
+const PROGRESS_EVERY_MS = 500;
+// 记着的任务（含下完、失败的）上限：再多就把最早结束的忘掉
+const MAX_JOBS = 200;
+
+/** 文件名里不能有的字符换掉，再截短。 */
+function safeTitle(title) {
+  const cleaned = String(title || '')
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+  return cleaned || 'video';
+}
+
+/** 不重名的文件名：「片名.mp4」已经有了就用「片名 (2).mp4」。 */
+async function uniquePath(dir, name) {
+  const ext = path.extname(name);
+  const base = name.slice(0, name.length - ext.length);
+  for (let n = 1; n < 1000; n++) {
+    const candidate = path.join(dir, n === 1 ? name : `${base} (${n})${ext}`);
+    try {
+      await fsp.access(candidate);
+    } catch {
+      return candidate;
+    }
+  }
+  throw new Error('同名文件太多了');
+}
+
+/** 路径是不是在 dir 里面（yt-dlp 报回来的文件路径不能跑到工作目录外面去）。 */
+function inside(dir, target) {
+  const rel = path.relative(dir, target);
+  return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+const jobKey = (purpose, url) => `${purpose}\n${url}`;
+
+/**
+ * 下好的成品在哪儿。优先用 yt-dlp 报回来的路径；那个路径在工作目录里却找不到文件 ——
+ * Windows 上 yt-dlp 往管道里打印时按控制台代码页编码，中文片名会被弄乱（实测「样片二」变成乱码）——
+ * 就在工作目录里找唯一的成品。报回来的路径跑出了工作目录则一律不认，也不替它兜底。
+ */
+async function finalFile(workDir, reported) {
+  if (reported) {
+    const resolved = path.resolve(reported);
+    if (!inside(workDir, resolved)) return null;
+    try {
+      if ((await fsp.stat(resolved)).isFile()) return resolved;
+    } catch {
+      /* 路径被编码弄乱了：下面按目录找 */
+    }
+  }
+  const entries = await fsp.readdir(workDir, { withFileTypes: true }).catch(() => []);
+  const done = entries.filter((e) => e.isFile() && !/\.(part|ytdl|tmp)$/i.test(e.name) && !/\.part-Frag\d+$/i.test(e.name));
+  return done.length === 1 ? path.join(workDir, done[0].name) : null;
+}
+
+class LinkCache extends EventEmitter {
+  /**
+   * @param {object} deps
+   * @param {() => string|null} deps.findYtDlp
+   * @param {() => Promise<{url: string}>} deps.proxyInfo  本机过滤代理（起不来就抛，不许绕过去直连）
+   * @param {(url: string) => Promise<object>} deps.resolve  解析网页（linkMedia.inspectLink + 隔离浏览器兜底）
+   * @param {(job: object) => Promise<{workDir: string, finish: Function, abort: Function}>} deps.placement
+   *   下到哪儿：workDir 是放半截文件的目录；finish(file, meta) 挪到位并登记，返回最终路径；abort() 收拾残局
+   * @param {(url: string, purpose: string) => boolean} [deps.alreadyDone]  已经有了就不再下（手动缓存查登记表）
+   * @param {() => object} [deps.childEnv]  子进程环境（去掉 no_proxy）
+   */
+  constructor({
+    findYtDlp,
+    proxyInfo,
+    resolve,
+    placement,
+    alreadyDone = () => false,
+    childEnv = () => process.env,
+    spawnImpl = spawn,
+    maxParallel = MAX_PARALLEL,
+  }) {
+    super();
+    this.findYtDlp = findYtDlp;
+    this.proxyInfo = proxyInfo;
+    this.resolve = resolve;
+    this.placement = placement;
+    this.alreadyDone = alreadyDone;
+    this.childEnv = childEnv;
+    this.spawnImpl = spawnImpl;
+    this.maxParallel = maxParallel;
+    this.jobs = new Map(); // jobKey -> job
+    this.running = 0;
+  }
+
+  /** 上次没下完就退出留下的半截文件（只认我们自己那个子目录名）。启动时清一次。 */
+  async cleanupLeftovers(dirs) {
+    for (const dir of dirs) {
+      if (dir) await fsp.rm(path.join(dir, WORK_DIR), { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  view(job) {
+    return {
+      url: job.url,
+      purpose: job.purpose,
+      title: job.title,
+      state: job.state,
+      downloaded: job.downloaded,
+      total: job.total,
+      path: job.finalPath || '',
+      error: job.error || '',
+    };
+  }
+
+  status() {
+    return [...this.jobs.values()].map((job) => this.view(job));
+  }
+
+  _emit(job) {
+    this.emit('update', this.view(job));
+  }
+
+  /** 开始一个下载。同一个链接同一种用途在下 / 在排队的直接返回它；已经有了的不再下。 */
+  start({ url, title = '', purpose = 'cache' }) {
+    if (!PURPOSES.includes(purpose)) throw new TypeError('无效的下载用途');
+    const key = jobKey(purpose, url);
+    const current = this.jobs.get(key);
+    if (current && (current.state === 'queued' || current.state === 'downloading')) return this.view(current);
+    if (this.alreadyDone(url, purpose)) {
+      return this.view({ url, purpose, title, state: 'done', downloaded: 0, total: 0, error: '' });
+    }
+    const job = {
+      id: crypto.randomBytes(6).toString('hex'),
+      url,
+      purpose,
+      title: String(title || '').slice(0, 300),
+      state: 'queued',
+      downloaded: 0,
+      total: 0,
+      error: '',
+      finalPath: '',
+      child: null,
+      lastEmit: 0,
+    };
+    this.jobs.delete(key);
+    this.jobs.set(key, job);
+    this._trim();
+    this._emit(job);
+    this._pump();
+    return this.view(job);
+  }
+
+  /** 取消（在下的杀掉 yt-dlp，半截文件随后删掉；在排队的直接出队）。 */
+  cancel(url, purpose = 'cache') {
+    const job = this.jobs.get(jobKey(purpose, url));
+    if (!job || (job.state !== 'queued' && job.state !== 'downloading')) return false;
+    const wasQueued = job.state === 'queued';
+    job.state = 'canceled';
+    job.child?.kill();
+    if (wasQueued) this._emit(job);
+    return true;
+  }
+
+  cancelAll() {
+    for (const job of this.jobs.values()) this.cancel(job.url, job.purpose);
+  }
+
+  _trim() {
+    if (this.jobs.size <= MAX_JOBS) return;
+    for (const [key, job] of this.jobs) {
+      if (this.jobs.size <= MAX_JOBS) break;
+      if (job.state !== 'queued' && job.state !== 'downloading') this.jobs.delete(key);
+    }
+  }
+
+  _pump() {
+    while (this.running < this.maxParallel) {
+      const next = [...this.jobs.values()].find((job) => job.state === 'queued');
+      if (!next) return;
+      this.running++;
+      next.state = 'downloading';
+      this._emit(next);
+      this._run(next)
+        .then(() => {
+          next.state = 'done';
+        })
+        .catch((error) => {
+          if (next.state !== 'canceled') {
+            next.state = 'failed';
+            next.error = String(error?.message || error).slice(0, 500);
+          }
+        })
+        .finally(() => {
+          this.running--;
+          this._emit(next);
+          this._pump();
+        });
+    }
+  }
+
+  async _run(job) {
+    const ytDlp = this.findYtDlp();
+    if (!ytDlp) throw new Error('没找到 yt-dlp，下载不了网页视频');
+    const proxy = await this.proxyInfo();
+    const place = await this.placement(job);
+    job.workDir = place.workDir;
+    let finished = false;
+    try {
+      let file;
+      try {
+        file = await this._download(ytDlp, job, job.url, [], proxy);
+      } catch (first) {
+        if (job.state === 'canceled') throw first;
+        // 网页直接下不了（yt-dlp 认不出的网站）：先解析拿到媒体地址，再带着请求头下一次
+        const info = await this.resolve(job.url).catch(() => null);
+        if (job.state === 'canceled' || !info?.playback?.url) throw first;
+        if (!job.title && info.title) job.title = String(info.title).slice(0, 300);
+        const headers = Object.entries(info.playback.headers || {}).flatMap(([k, v]) => ['--add-header', `${k}:${v}`]);
+        file = await this._download(ytDlp, job, info.playback.url, headers, proxy);
+      }
+      if (job.state === 'canceled') throw new Error('已取消');
+      const stat = await fsp.stat(file);
+      job.downloaded = stat.size;
+      job.total = stat.size;
+      job.finalPath = await place.finish(file, { url: job.url, title: job.title, size: stat.size });
+      finished = true;
+    } finally {
+      if (!finished) await Promise.resolve(place.abort()).catch(() => {});
+    }
+  }
+
+  _args(job, url, extra, proxy) {
+    let host = '';
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      /* 解析不了的地址 yt-dlp 自己会报错 */
+    }
+    // 标题已知就用它当文件名（直链兜底时 yt-dlp 拿到的「标题」往往只是个 video）；模板里的 % 要写成 %%
+    const name = job.title ? `${safeTitle(job.title).replace(/%/g, '%%')}.%(ext)s` : '%(title).120B.%(ext)s';
+    return [
+      '--ignore-config',
+      '--no-playlist',
+      '--no-cache-dir',
+      '--no-warnings',
+      '--newline',
+      // 打印出来的路径按 UTF-8 编码（不写的话 Windows 上按控制台代码页，中文片名会乱）
+      '--encoding',
+      'utf-8',
+      '--no-mtime',
+      '--socket-timeout',
+      '20',
+      // 本机过滤代理：每个请求、每一跳跳转都在连接那一刻按解析出的 IP 判定，私网一律拒绝
+      '--proxy',
+      proxy.url,
+      '--format',
+      FORMAT,
+      '--output',
+      path.join(job.workDir, name),
+      '--progress-template',
+      `download:${PROGRESS_TAG} %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s`,
+      '--print',
+      `after_move:${FILE_TAG} %(filepath)s`,
+      ...(YOUTUBE_HOST_RE.test(host) ? ['--extractor-args', 'youtube:player_client=android_vr'] : []),
+      ...extra,
+      '--',
+      url,
+    ];
+  }
+
+  _download(ytDlp, job, url, extra, proxy) {
+    return new Promise((resolve, reject) => {
+      let child;
+      try {
+        child = this.spawnImpl(ytDlp, this._args(job, url, extra, proxy), {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true,
+          env: { ...this.childEnv(), PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+        });
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      job.child = child;
+      let file = null;
+      let stderr = '';
+      readline.createInterface({ input: child.stdout }).on('line', (line) => {
+        if (line.startsWith(`${PROGRESS_TAG} `)) {
+          const [done, total, estimate] = line.slice(PROGRESS_TAG.length + 1).split(' ').map(Number);
+          if (Number.isFinite(done)) job.downloaded = done;
+          const whole = Number.isFinite(total) && total > 0 ? total : Number.isFinite(estimate) && estimate > 0 ? estimate : 0;
+          if (whole) job.total = Math.round(whole);
+          const now = Date.now();
+          if (now - job.lastEmit >= PROGRESS_EVERY_MS) {
+            job.lastEmit = now;
+            this._emit(job);
+          }
+        } else if (line.startsWith(`${FILE_TAG} `)) {
+          file = line.slice(FILE_TAG.length + 1).trim();
+        }
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk.toString('utf8');
+        if (stderr.length > 16_384) stderr = stderr.slice(-8_192);
+      });
+      child.on('error', (error) => {
+        job.child = null;
+        reject(error);
+      });
+      child.on('close', (code) => {
+        job.child = null;
+        if (job.state === 'canceled') return reject(new Error('已取消'));
+        const failed = () => {
+          const detail = stderr.trim().split(/\r?\n/).slice(-2).join(' ');
+          reject(new Error(`下载失败${detail ? `：${detail}` : ''}`));
+        };
+        if (code !== 0) return failed();
+        finalFile(job.workDir, file).then((found) => (found ? resolve(found) : failed()), failed);
+      });
+    });
+  }
+}
+
+module.exports = { LinkCache, safeTitle, uniquePath, WORK_DIR, FORMAT, MAX_PARALLEL, PURPOSES };

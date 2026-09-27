@@ -74,7 +74,7 @@ test('设置里拦下「开了 TURN 却没填用户名或密码」', () => {
   const save = APP.slice(APP.indexOf("okText: '保存',"), APP.indexOf("localStorage.setItem('sw.name', S.name);"));
   assert.match(
     save,
-    /if \(\$\('set-turn-on'\)\.checked && \(!\$\('set-turn-user'\)\.value\.trim\(\) \|\| !\$\('set-turn-pass'\)\.value\.trim\(\)\)\) \{[\s\S]*?return false;/
+    /if \((?:turnTouched && )?\$\('set-turn-on'\)\.checked && \(!\$\('set-turn-user'\)\.value\.trim\(\) \|\| !\$\('set-turn-pass'\)\.value\.trim\(\)\)\) \{[\s\S]*?return false;/
   );
 });
 

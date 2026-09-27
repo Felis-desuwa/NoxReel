@@ -104,6 +104,30 @@ function configureCache(manager) {
   cacheManager = manager;
 }
 
+/**
+ * 缓存清理方式和长期缓存文件夹（见 mediaLibrary.js）：
+ *  - auto（默认）：收的片放本次运行的临时缓存，关会话（换片、退房、移出列表）不删，
+ *    收完的登记成临时条目留着复用，关软件时整个运行目录一起清掉；磁盘不够时先删最久没用的。
+ *  - manual：收的片直接写进长期保留的缓存文件夹（keptDir，不在运行目录里、也不在系统临时目录里），
+ *    收完的登记下来跨重启复用，从不自动删；磁盘不够就报出来，由用户自己去清理。
+ * 两种模式下，没收完的片在关会话时都删掉（没有断点续传，留着也用不上）。
+ */
+let library = null;
+let policy = { mode: 'auto', keptDir: null };
+
+function configureLibrary(lib) {
+  library = lib;
+}
+
+function setPolicy({ mode, keptDir }) {
+  policy = {
+    mode: mode === 'manual' ? 'manual' : 'auto',
+    keptDir: typeof keptDir === 'string' && path.isAbsolute(keptDir) ? path.resolve(keptDir) : null,
+  };
+}
+
+const pathKey = (p) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
+
 async function canonicalFileKey(filePath, stat) {
   const realPath = await fsp.realpath(filePath).catch(() => path.resolve(filePath));
   const normalized = process.platform === 'win32' ? realPath.toLowerCase() : realPath;
@@ -228,6 +252,10 @@ class Session {
     // 预分配之后还没真正占到盘上的字节（稀疏文件是整个文件），减去已写入的就是这场接收还要吃掉的空间
     this.unallocatedAtOpen = 0;
     this.writtenBytes = 0;
+    // 文件在长期缓存文件夹里（手动模式新收的，或者复用了登记过的持久副本），关会话时不随临时缓存走
+    this.persistent = false;
+    // 这个文件是这次会话新建的：没收完就删；复用来的不是（里面对得上的分片下次还用得上）
+    this.createdFresh = false;
   }
 
   /** 这场接收还要从磁盘上吃掉多少字节。整块预分配的文件已经占好了，是 0。 */
@@ -532,22 +560,45 @@ function assertManifestShape(manifest) {
   if (!ok) throw new TypeError('无效的媒体清单');
 }
 
-async function openLeech(manifest) {
+/**
+ * 开一个接收会话。先看本机有没有这部片收完的副本（登记表里，按 fileId 认）：有就逐片核对，
+ * 对得上的片直接算已收；一片都对不上才新建文件。
+ * @param {object} manifest
+ * @param {{onReuse?: (e: object) => void}} [opts] onReuse：核对进度（大片子要核对一阵子，界面得说一声）
+ */
+async function openLeech(manifest, { onReuse = null } = {}) {
   if (!cacheManager) throw new Error('缓存目录尚未初始化');
   assertManifestShape(manifest);
+  const reused = await tryReuse(manifest, onReuse);
+  if (reused) return reused.state();
+
   const id = nextId('leech');
+  const manual = policy.mode === 'manual' && !!policy.keptDir;
   let ownedDir = null;
+  let filePath = null;
+  let created = false;
   let session = null;
   let counted = false;
   try {
-    ownedDir = await cacheManager.createOwnedDir('media');
-    const filePath = path.join(ownedDir, safeName(manifest.name));
-    // 先查余量再按分片数分配位图：放不下的清单连这点内存都不该花
-    await ensureFreeSpace(ownedDir, manifest.size, reservedDiskBytes);
+    if (manual) {
+      await fsp.mkdir(policy.keptDir, { recursive: true });
+      // 手动模式从不自动删东西：放不下就直接报，让用户自己去清理
+      await ensureFreeSpace(policy.keptDir, manifest.size, reservedDiskBytes);
+      filePath = await uniquePath(policy.keptDir, safeName(manifest.name));
+    } else {
+      ownedDir = await cacheManager.createOwnedDir('media');
+      filePath = path.join(ownedDir, safeName(manifest.name));
+      // 先查余量再按分片数分配位图：放不下的清单连这点内存都不该花
+      await ensureFreeSpaceWithEviction(ownedDir, manifest.size);
+    }
     openingBytes += manifest.size;
     counted = true;
     session = new Session({ id, manifest, filePath, mode: 'leech', ownedDir });
-    session.fh = await fsp.open(filePath, 'w+');
+    session.persistent = manual;
+    // 长期缓存文件夹可能是用户自己指的：只新建、绝不覆盖已有的同名文件（uniquePath 挑好了名字，wx 再兜一次并发）
+    session.fh = await fsp.open(filePath, manual ? 'wx+' : 'w+');
+    created = true;
+    session.createdFresh = true;
     await markSparse(filePath);
     await session.fh.truncate(manifest.size);
     session.unallocatedAtOpen = await unallocatedBytes(session.fh, manifest.size);
@@ -556,10 +607,125 @@ async function openLeech(manifest) {
   } catch (error) {
     await session?.fh?.close().catch(() => {});
     if (ownedDir) await cacheManager.removeOwned(ownedDir).catch(() => {});
+    else if (created && filePath) await fsp.unlink(filePath).catch(() => {});
     throw error;
   } finally {
     if (counted) openingBytes -= manifest.size;
   }
+}
+
+/** 自动模式：放不下时先删临时缓存里最久没用的收完的片，删一部查一次，直到放得下或没得删。 */
+async function ensureFreeSpaceWithEviction(dir, bytesNeeded) {
+  for (;;) {
+    try {
+      return await ensureFreeSpace(dir, bytesNeeded, reservedDiskBytes);
+    } catch (error) {
+      if (!library || !/磁盘空间不够/.test(String(error.message)) || !(await library.evictOldestTemp())) throw error;
+    }
+  }
+}
+
+/** 不重名的文件名：「片名.mkv」已经有了就用「片名 (2).mkv」。 */
+async function uniquePath(dir, name) {
+  const ext = path.extname(name);
+  const base = name.slice(0, name.length - ext.length);
+  for (let n = 1; n < 1000; n++) {
+    const candidate = path.join(dir, n === 1 ? name : `${base} (${n})${ext}`);
+    try {
+      await fsp.access(candidate);
+    } catch {
+      return candidate;
+    }
+  }
+  throw new Error('同名文件太多了');
+}
+
+/**
+ * 本机有这部片收完的副本（临时缓存或长期缓存文件夹里）就接过来：逐片核对哈希，对得上的算已收。
+ * 一片都对不上（被改过、被换掉了）就不用它。
+ * @returns {Promise<Session|null>}
+ */
+async function tryReuse(manifest, onReuse) {
+  if (!library) return null;
+  const found = library.findFile(manifest.fileId);
+  if (!found) return null;
+  const { entry, persistent } = found;
+  // 同一个文件已经有会话在用（不会发生：渲染进程一部片只开一个会话），不去抢
+  if ([...sessions.values()].some((s) => !s.closed && pathKey(s.filePath) === pathKey(entry.path))) return null;
+  let fh = null;
+  try {
+    const stat = await fsp.stat(entry.path);
+    if (!stat.isFile() || stat.size !== manifest.size) throw new Error('大小对不上');
+    fh = await fsp.open(entry.path, 'r+');
+  } catch {
+    await fh?.close().catch(() => {});
+    // 文件没了、被换成别的了：登记作废（持久的只摘登记，不碰那个位置上现在的东西）
+    if (persistent) await library.forgetPath(entry.path).catch(() => {});
+    else if (library.takeTemp(entry.id)?.ownedDir) await cacheManager.removeOwned(entry.ownedDir).catch(() => {});
+    return null;
+  }
+  // 临时条目交给会话：用着的时候磁盘不够的清理不会把它删掉；会话关的时候再登记回去
+  if (!persistent) library.takeTemp(entry.id);
+  const session = new Session({
+    id: nextId('leech'),
+    manifest,
+    filePath: entry.path,
+    mode: 'leech',
+    ownedDir: persistent ? null : entry.ownedDir,
+  });
+  session.persistent = persistent;
+  session.fh = fh;
+  const matched = await verifyExisting(session, onReuse).catch(() => 0);
+  if (!matched) {
+    await fh.close().catch(() => {});
+    if (persistent) await library.forgetPath(entry.path).catch(() => {});
+    else if (entry.ownedDir) await cacheManager.removeOwned(entry.ownedDir).catch(() => {});
+    return null;
+  }
+  sessions.set(session.id, session);
+  if (persistent) library.touch(entry.id).catch(() => {});
+  return session;
+}
+
+/**
+ * 逐片读、逐片算 SHA-256，和清单对。哈希走 WebCrypto（线程池里算），几十 GB 的片子核对期间
+ * 主进程照样能响应别的请求。第 0 片还要过一遍容器头检查 —— 和收片时 writeChunk 同一道关。
+ * @returns {Promise<number>} 对上的片数
+ */
+async function verifyExisting(session, onReuse) {
+  const { manifest } = session;
+  const total = manifest.chunkCount;
+  const buf = Buffer.allocUnsafe(manifest.chunkSize);
+  const report = (stage, extra = {}) => {
+    try {
+      onReuse?.({ stage, fileId: manifest.fileId, name: manifest.name, total, ...extra });
+    } catch {
+      /* 报进度失败不影响核对 */
+    }
+  };
+  report('start', { done: 0 });
+  let lastReport = Date.now();
+  for (let i = 0; i < total; i++) {
+    if (session.closing) break;
+    if (Date.now() - lastReport >= 500) {
+      lastReport = Date.now();
+      report('progress', { done: i });
+    }
+    const len = chunkLengthAt(i, manifest.size);
+    const { bytesRead } = await session.fh.read(buf, 0, len, i * manifest.chunkSize);
+    if (bytesRead !== len) continue;
+    const chunk = buf.subarray(0, len);
+    const digest = Buffer.from(await crypto.webcrypto.subtle.digest('SHA-256', chunk)).toString('hex');
+    if (digest !== manifest.hashes[i]) continue;
+    if (i === 0 && !validateMediaHeader(manifest.name, chunk).ok) continue;
+    session.have[i] = 1;
+    session.haveCount++;
+  }
+  session._advanceContiguous();
+  // 复用的文件早就整个在盘上了，不会再吃新的空间
+  session.unallocatedAtOpen = 0;
+  report('done', { done: total, matched: session.haveCount });
+  return session.haveCount;
 }
 
 function safeName(name) {
@@ -628,13 +794,35 @@ function hasOpenSessions() {
   return sessions.size > 0;
 }
 
+/**
+ * 这个路径是不是某个开着的接收会话的文件。手动模式和复用的文件在长期缓存文件夹里，
+ * 不归临时缓存（cache.owns）管 —— 播放、扫描、打开所在位置要靠这一条放行。
+ */
+function isSessionFile(filePath) {
+  if (typeof filePath !== 'string' || !path.isAbsolute(filePath)) return false;
+  const key = pathKey(filePath);
+  for (const session of sessions.values()) {
+    if (session.mode === 'leech' && !session.closed && pathKey(session.filePath) === key) return true;
+  }
+  return false;
+}
+
 function state(sessionId) {
   return get(sessionId).state();
 }
 
-async function close(sessionId) {
+/**
+ * 关会话。文件怎么处理看清理方式（见 setPolicy 上面的说明）：
+ *  - 收完的：自动模式登记成临时条目留着复用（关软件时随运行目录清掉），手动模式登记进长期缓存；
+ *  - 没收完的、新建的：删掉；复用来的持久副本不删（对得上的分片下次还用得上）；
+ *  - discard（扫描发现威胁）：不管收没收完、在哪儿，一律删掉、摘登记。
+ * @param {string} sessionId
+ * @param {{discard?: boolean}} [opts]
+ */
+async function close(sessionId, { discard = false } = {}) {
   const session = sessions.get(sessionId);
   if (!session || session.closed) return;
+  if (discard) session.discard = true;
   if (session.closePromise) return session.closePromise;
 
   session.closing = true;
@@ -651,9 +839,31 @@ async function close(sessionId) {
     await session.fh?.close().catch(() => {});
     chunkCache.deleteSession(sessionId);
     sessions.delete(sessionId);
-    if (session.ownedDir && cacheManager) await cacheManager.removeOwned(session.ownedDir).catch(() => {});
+    await settleFile(session);
   })();
   return session.closePromise;
+}
+
+/** 会话关了以后它的文件去哪儿。 */
+async function settleFile(session) {
+  if (session.mode !== 'leech') {
+    // 做种的是用户自己的文件，不碰；接手的转封装副本在软件自己的目录里，照旧删掉
+    if (session.ownedDir && cacheManager) await cacheManager.removeOwned(session.ownedDir).catch(() => {});
+    return;
+  }
+  const keep = session.complete && !session.discard;
+  if (session.persistent) {
+    if (keep) {
+      await library?.addFile({ manifest: session.manifest, filePath: session.filePath }).catch(() => {});
+    } else if (session.discard || session.createdFresh) {
+      await fsp.unlink(session.filePath).catch(() => {});
+      await library?.forgetPath(session.filePath).catch(() => {});
+    }
+    return;
+  }
+  if (!session.ownedDir || !cacheManager) return;
+  if (keep && library) library.addTempFile({ manifest: session.manifest, filePath: session.filePath, ownedDir: session.ownedDir });
+  else await cacheManager.removeOwned(session.ownedDir).catch(() => {});
 }
 
 async function closeAll() {
@@ -678,6 +888,8 @@ function resetForTests() {
   inFlightReads.clear();
   sparseSkippedVolumes.clear();
   pendingMemoryBytes = 0;
+  library = null;
+  policy = { mode: 'auto', keptDir: null };
 }
 
 module.exports = {
@@ -688,12 +900,15 @@ module.exports = {
   FLUSH_DELAY_MS,
   configureCache,
   buildManifest,
+  configureLibrary,
+  setPolicy,
   openSeed,
   openLeech,
   readChunk,
   writeChunk,
   state,
   hasOpenSessions,
+  isSessionFile,
   scanTarget,
   close,
   closeAll,

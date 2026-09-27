@@ -99,6 +99,13 @@ window.sw.leaveRoom = () => {
   } catch (e) {}
 };
 
+// 沉浸全屏：控件收起时把系统状态栏、导航栏也藏起来。旧版原生层没有这个方法，就什么都不做。
+window.sw.setImmersive = (on) => {
+  try {
+    Native.setImmersive?.(!!on);
+  } catch (e) {}
+};
+
 // 安装包版本号（build.gradle 的 versionName）。拿不到就是空串。
 window.sw.appVersion = () => {
   try {

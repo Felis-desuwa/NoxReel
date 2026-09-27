@@ -20,7 +20,11 @@ function fnSource(name) {
 }
 
 function sandbox(sources, globals) {
-  const ctx = { console, Promise, ...globals };
+  const ctx = { console, Promise, 
+    // 边下边播开着：这些老测试测的就是可信房间边收边播的那一套
+    streamsWhileReceiving: () => ctx.S?.roomSecurityMode === 'trusted',
+    ...globals,
+  };
   vm.createContext(ctx);
   vm.runInContext(sources.join('\n\n'), ctx, { filename: 'app.js（节选）' });
   return ctx;
@@ -278,6 +282,31 @@ test('进度条的绿色画的是「从播放位置起不用等的一段」，�
   // 图例带数值
   assert.match(src, /legendItem\('play', position > 0 \? `播放到 \$\{fmtTime\(position\)\}` : '还没开始'\)/);
   assert.match(src, /`不用等还能放 \$\{fmtTime\(runBytes \/ bitrate\)\}`/);
+});
+
+test('在线链接的进度条整条画满、起点归零：从本地片子换过来不会伸出边框', () => {
+  const nodes = new Map();
+  const $ = (id) => {
+    if (!nodes.has(id)) nodes.set(id, { id, style: {} });
+    return nodes.get(id);
+  };
+  // 上一部本地片子留下的：绿色段从 37.5% 处起
+  $('buf-safe').style.left = '37.50%';
+  $('buf-safe').style.width = '20.00%';
+  const ctx = sandbox([fnSource('renderProgress')], {
+    $,
+    S: { sourceType: 'link', sync: null, swarm: { peers: new Map() } },
+    linkFollowMode: () => 'full',
+    isRoomHost: () => true,
+    replace: () => {},
+    stat: () => null,
+    kv: () => null,
+    connectionModeLabel: () => '',
+  });
+  ctx.renderProgress({});
+  assert.equal($('buf-safe').style.left, '0%', '起点还停在 37.5% 的话，再画 100% 宽就伸出边框');
+  assert.equal($('buf-safe').style.width, '100%');
+  assert.equal($('buf-have').style.width, '100%');
 });
 
 /* ------------------------------ 翻译 ------------------------------ */

@@ -92,9 +92,19 @@ class FakeElement {
 
 function fakeDocument() {
   const byId = new Map();
+  const listeners = new Map();
   return {
     documentElement: { lang: '' },
-    body: {},
+    body: new FakeElement('body', 'body'),
+    /** 文档级的监听（点画面收起控件用的就是它）。捕获/冒泡不区分，按注册顺序调。 */
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    },
+    /** 测试用：假装在 target 上点了一下，文档级监听收到的 event.target 就是它。 */
+    dispatch(type, event = {}) {
+      for (const fn of listeners.get(type) || []) fn({ type, ...event });
+    },
     getElementById(id) {
       if (!byId.has(id)) byId.set(id, new FakeElement('div', id));
       return byId.get(id);

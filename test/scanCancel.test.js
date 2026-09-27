@@ -341,7 +341,9 @@ test('store:close 先等扫描退出，再关会话删缓存', () => {
   const body = handlerBody('store:close');
   assert.match(body, /const id = validate\.sessionId\(sessionId\)/);
   const cancelAt = body.search(/await malwareScan\.cancel\(id\)/);
-  const closeAt = body.indexOf('store.close(id)');
+  // 带着 discard 往下传（发现威胁时一律删），所以只认 `store.close(id` 这个开头
+  const closeAt = body.indexOf('store.close(id');
+  assert.ok(body.includes('store.close(id, { discard })'), 'discard 要原样交给 store.close');
   assert.ok(cancelAt >= 0, 'store:close 必须 await malwareScan.cancel(id) —— 不 await 就等于没等');
   assert.ok(closeAt >= 0, 'store:close 必须调用 store.close(id)');
   // 顺序反了，MpCmdRun 还攥着文件句柄，删缓存会失败

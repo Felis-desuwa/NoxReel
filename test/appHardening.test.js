@@ -1094,6 +1094,7 @@ test('聊天每来一条不全量重画：合并到一次', () => {
       VIEW_LIMIT: 300,
       setTimeout: timers.setTimeout,
       ensureChatPanel: () => ({ render: () => renders++ }),
+      roomDisplayNames: () => new Map(), // 重名编号：这里不关心
     },
   });
   for (let i = 0; i < 500; i++) ctx.pushChatEntry({ key: `m${i}`, kind: 'msg', text: 'x' });
@@ -1101,6 +1102,187 @@ test('聊天每来一条不全量重画：合并到一次', () => {
   timers.runAll();
   assert.equal(renders, 1);
   assert.equal(S.chat.entries.length, 300, '列表本身有上限');
+});
+
+test('聊天里的名字按发言人 id 换成成员表同一套显示名（重名编号、改过的新名字），走了的人用当时的名字', () => {
+  const timers = fakeTimers();
+  let rendered = null;
+  const S = {
+    chat: {
+      entries: [
+        { key: 'a', kind: 'msg', from: 'p1', name: '小明', text: '一' },
+        { key: 'b', kind: 'msg', from: 'gone', name: '走了的人', text: '二' },
+        { key: 'c', kind: 'system', text: '小明 加入了房间' },
+      ],
+      notice: '',
+    },
+  };
+  const ctx = sandbox({
+    fns: ['renderChat'],
+    decls: ['CHAT_RENDER_MS', 'chatRenderTimer'],
+    globals: {
+      S,
+      roomEntered: true,
+      setTimeout: timers.setTimeout,
+      ensureChatPanel: () => ({ render: ({ entries }) => (rendered = entries) }),
+      roomDisplayNames: () => new Map([['p1', '小明 #2']]),
+    },
+  });
+  ctx.renderChat();
+  timers.runAll();
+  assert.deepEqual(
+    rendered.map((e) => e.name ?? null),
+    ['小明 #2', '走了的人', null]
+  );
+  assert.equal(S.chat.entries[0].name, '小明', '存着的原名不动：换的只是这一次画出来的');
+});
+
+test('applyMyName：清洗后存到本机、告诉 Swarm 和同步引擎；空的不要，没变不广播', async () => {
+  const { clampName } = await load('src/renderer/lib/chat.js');
+  const saved = new Map();
+  const calls = [];
+  const S = {
+    name: '观众-166',
+    swarm: { setName: (n) => calls.push(['swarm', n]) },
+    sync: { setName: (n) => calls.push(['sync', n]) },
+  };
+  const ctx = sandbox({
+    fns: ['applyMyName'],
+    globals: {
+      S,
+      clampName,
+      roomEntered: true,
+      localStorage: { setItem: (k, v) => saved.set(k, v) },
+      log: (m) => calls.push(['log', m]),
+      renderPeersSoon: () => calls.push(['peers']),
+      renderChat: () => calls.push(['chat']),
+    },
+  });
+  assert.equal(ctx.applyMyName('   '), false, '清洗后为空的不要');
+  assert.equal(S.name, '观众-166');
+  assert.equal(ctx.applyMyName('  老王\u0000 '), true);
+  assert.equal(S.name, '老王');
+  assert.equal(saved.get('sw.name'), '老王', '存在这台电脑上，下次打开还是它');
+  assert.deepEqual(calls, [['swarm', '老王'], ['sync', '老王'], ['log', '你改名为 老王'], ['peers'], ['chat']]);
+  calls.length = 0;
+  assert.equal(ctx.applyMyName('老王'), true);
+  assert.deepEqual(calls, [], '没变不广播、不重画');
+});
+
+test('边下边播：只存本人放到的片；P2P 收完且扫描过关才存（可信房间没扫出威胁就行），在线视频交给下载', async () => {
+  const saved = [];
+  const links = [];
+  const logs = [];
+  const S = {
+    roomSecurityMode: 'safe',
+    settings: { downloadWhileWatching: false },
+    sessions: new Map(),
+    linkDownloads: new Map(),
+    downloadWanted: new Set(),
+    downloadSaving: new Set(),
+  };
+  const sw = {
+    download: {
+      saveSession: async (id) => {
+        saved.push(id);
+        return { path: `D:/下载/${id}.mkv`, fresh: true };
+      },
+      saveLink: async (url, title) => {
+        links.push([url, title]);
+        return { url, purpose: 'download', title, state: 'queued', downloaded: 0, total: 0 };
+      },
+    },
+  };
+  const updates = [];
+  const ctx = sandbox({
+    fns: ['downloadAllowed', 'wantDownload', 'saveLinkDownload', 'maybeSaveDownload', 'linkDownloadOf'],
+    decls: ['linkCacheBusy'],
+    globals: {
+      S,
+      window: { sw },
+      SCAN_RESUMABLE: ['scan-timeout', 'scan-stopped'],
+      linkKey: (url) => url,
+      log: (text, tone) => logs.push([text, tone]),
+      onLinkCacheUpdate: (view) => {
+        updates.push(view);
+        S.linkDownloads.set(view.url, view);
+      },
+    },
+  });
+  const session = { fileId: 'f1', sessionId: 's1', isSeeder: false, manifest: { name: '片子.mkv' }, safety: { status: 'scanning' } };
+  S.sessions.set('f1', session);
+  const fileItem = { kind: 'file', fileId: 'f1' };
+
+  ctx.wantDownload(fileItem);
+  await flush();
+  assert.equal(S.downloadWanted.size, 0, '开关关着（默认）什么都不记');
+
+  S.settings.downloadWhileWatching = true;
+  ctx.wantDownload(fileItem);
+  await flush();
+  assert.deepEqual(saved, [], '还在扫描：先不存');
+  session.safety.status = 'unscanned';
+  await ctx.maybeSaveDownload(session);
+  assert.deepEqual(saved, [], '安全模式要扫过才存');
+  session.safety.status = 'clean';
+  await ctx.maybeSaveDownload(session);
+  assert.deepEqual(saved, ['s1']);
+  assert.deepEqual(logs.at(-1), ['《片子.mkv》已存到下载位置', 'good']);
+  await ctx.maybeSaveDownload(session);
+  assert.deepEqual(saved, ['s1'], '存过就不再存');
+
+  // 可信房间：没扫出威胁就存；没轮到本人放的片不存
+  S.roomSecurityMode = 'trusted';
+  const other = { fileId: 'f2', sessionId: 's2', isSeeder: false, manifest: { name: '别的.mkv' }, safety: { status: 'unscanned' } };
+  S.sessions.set('f2', other);
+  await ctx.maybeSaveDownload(other);
+  assert.deepEqual(saved, ['s1'], '列表里没轮到的不存');
+  ctx.wantDownload({ kind: 'file', fileId: 'f2' });
+  await flush();
+  assert.deepEqual(saved, ['s1', 's2']);
+  for (const status of ['blocked', 'scanning', 'trusted-streaming']) assert.equal(ctx.downloadAllowed(status), false, status);
+  for (const status of ['clean', 'unscanned', 'scan-timeout', 'scan-stopped']) assert.equal(ctx.downloadAllowed(status), true, status);
+
+  // 片源自己（房主放自己的片）不存
+  S.sessions.set('f3', { fileId: 'f3', sessionId: 's3', isSeeder: true, manifest: { name: 'x' }, safety: { status: 'clean' } });
+  ctx.wantDownload({ kind: 'file', fileId: 'f3' });
+  await flush();
+  assert.deepEqual(saved, ['s1', 's2']);
+
+  // 在线视频：交给主进程下载；在下的、下完的不重复要
+  const link = { kind: 'link', url: 'https://video.example.org/v', title: '在线' };
+  ctx.wantDownload(link);
+  await flush();
+  ctx.wantDownload(link);
+  await flush();
+  assert.deepEqual(links, [['https://video.example.org/v', '在线']]);
+  assert.equal(updates[0].purpose, 'download');
+
+  const app = read('src/renderer/app.js');
+  assert.match(app, /downloadWhileWatching: localStorage\.getItem\('sw\.downloadWhileWatching'\) === '1',/, '默认关，存在本机');
+  assert.match(app, /localStorage\.setItem\('sw\.downloadWhileWatching', S\.settings\.downloadWhileWatching \? '1' : '0'\);/);
+  assert.match(app, /id: 'set-download'/);
+  assert.match(app, /\n  wantDownload\(item\);\n  if \(item\.kind === 'link'\) await activateLinkItem/, '换到这一部时记下要存');
+  assert.match(app, /safety\.status = outcome\.status;\n  maybeSaveDownload\(session\);/, '扫描结果出来时存');
+  assert.doesNotMatch(app, /S\.settings\.progressive|streamsWhileReceiving/, '边下边播不再改变起播时机');
+});
+
+test('新装时 TURN 勾着但没填地址（默认状态）：没动 TURN 那几栏就不拦别的设置的保存', () => {
+  const app = read('src/renderer/app.js');
+  assert.match(app, /turnEnabled: localStorage\.getItem\('sw\.turnEnabled'\) !== '0',/, '前提：TURN 默认勾着');
+  assert.match(app, /const turnTouched =\n\s+\$\('set-turn-on'\)\.checked !== S\.settings\.turnEnabled \|\|\n\s+turnRaw !== \(S\.settings\.turnUrl \|\| ''\)/);
+  assert.match(app, /if \(turnTouched && \$\('set-turn-on'\)\.checked && !turnRaw\) \{/, '缺地址只在动过时才拦');
+  assert.match(app, /if \(turnTouched && \$\('set-turn-on'\)\.checked && \(!\$\('set-turn-user'\)/, '缺凭据同理');
+});
+
+test('设置里的昵称进房后也能改：不再锁住，保存走 applyMyName', () => {
+  const app = read('src/renderer/app.js');
+  assert.doesNotMatch(app, /nameLocked/);
+  assert.doesNotMatch(app, /房间进行中不能改名/);
+  assert.match(app, /applyMyName\(\$\('set-name'\)\.value\);/);
+  // 成员表自己那一行有「改名」，点了开弹窗
+  assert.match(app, /make\('button', \{ className: 'peer-rename', text: '改名' \}\)/);
+  assert.match(app, /if \(e\.target\.closest\('\.peer-rename'\)\) return openRenameModal\(\);/);
 });
 
 test('Discord 状态：变化再频繁也按最短间隔发，关掉立刻生效', async () => {

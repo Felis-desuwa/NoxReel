@@ -15,6 +15,7 @@ import {
   BITFIELD_CHUNKS_PER_PART,
 } from './protocol.js';
 import { Scheduler } from './scheduler.js';
+import { clampName } from './chat.js';
 
 /**
  * 群管理：一堆 Peer + 若干个文件槽位 + 收发分片。
@@ -92,6 +93,8 @@ const BITFIELD_PER_SEC = 8;
 const SERVE_BUDGET_SLACK = 64;
 // 成员表刷新合并到这么久一次：位图、往返时延都是对方能随时推过来的，每条都整张重算一遍太贵
 const PEERS_COALESCE_MS = 200;
+// 同一个人两次改名至少隔这么久，间隔内再来的不理：成员表和聊天里的「改名为」不会被人刷屏
+const RENAME_MIN_MS = 2000;
 const VERSION_REJECTED_MAX = 256;
 // 同一条连接上同一份清单，每 MANIFEST_SERVE_WINDOW_MS 最多发这么多次。
 // 诚实的人要一次，慢链路上超时重要也就再来一两次
@@ -727,6 +730,21 @@ export class Swarm extends Emitter {
   }
 
   /**
+   * 改自己的昵称：之后新建的连接在 HELLO 里就用新名字，已经连着的人发一条 NAME 告诉他们。
+   * 老版本不认 NAME，那边照旧显示旧名字，不影响别的。
+   * @returns {boolean} 真的改了（清洗后非空、和原来不一样）
+   */
+  setName(raw) {
+    const name = clampName(raw);
+    if (!name || name === this.name) return false;
+    this.name = name;
+    for (const peer of this.peers.values()) {
+      if (peer.authenticated) peer.send({ t: MSG.NAME, name });
+    }
+    return true;
+  }
+
+  /**
    * 对方推过来的东西（位图、往返时延）引起的成员表刷新，合并到 PEERS_COALESCE_MS 一次。
    * peerList() 要把每个人的位图整张数一遍，上层还要重画成员表；逐条刷的话，
    * 一个人连着灌位图就能把渲染进程拖住。本机自己引起的变化（进出、换片）照旧立刻刷新。
@@ -750,6 +768,19 @@ export class Swarm extends Emitter {
       case MSG.HELLO:
         this._onHello(peer, msg);
         break;
+
+      case MSG.NAME: {
+        // 对方改了昵称。名字是对方自己说的，照 HELLO 一样清洗；改得太勤的不理
+        const name = clampName(msg.name);
+        const now = Date.now();
+        if (!name || name === peer.name || now - (peer.renamedAt || 0) < RENAME_MIN_MS) break;
+        const oldName = peer.name;
+        peer.name = name;
+        peer.renamedAt = now;
+        this.emit('peer-renamed', { peerId: peer.peerId, name, oldName });
+        this._peersChanged();
+        break;
+      }
 
       case MSG.PART: {
         // 大消息在认证之后才拼；拼好的内层消息仍然算这条连接发的。

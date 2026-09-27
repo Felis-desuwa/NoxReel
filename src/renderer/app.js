@@ -23,7 +23,7 @@ import {
 import { SCAN_RESUMABLE, decideScanOutcome, needsScan, pickScanTarget, shouldPreempt } from './lib/scanPolicy.js';
 import { PlayerGate } from './lib/playerGate.js';
 import { hasAnyMissing } from './lib/transferSources.js';
-import { ChatGate, ChatHistory, ChatSender, parseHistory, trustsRelay } from './lib/chat.js';
+import { ChatGate, ChatHistory, ChatSender, clampName, numberDuplicateNames, parseHistory, trustsRelay } from './lib/chat.js';
 import { DanmakuEngine } from './lib/danmaku.js';
 import { $, make, rawText, replace } from './ui/dom.js';
 import { createPlaylistPanel } from './ui/playlistPanel.js';
@@ -238,7 +238,18 @@ const S = {
     relayOnly: localStorage.getItem('sw.relayOnly') === '1',
     // 在线链接怎么跟房主：'full' 完全同步（默认），'manual' 手动同步。每个成员自己选，只存在本机
     linkSync: localStorage.getItem('sw.linkSync') === 'manual' ? 'manual' : 'full',
+    // 边下边播：放到的每一部另存一份到下载位置（和缓存是两回事）。默认关，只存在本机
+    downloadWhileWatching: localStorage.getItem('sw.downloadWhileWatching') === '1',
   },
+  // 缓存清理方式和下载位置 { mode: 'auto'|'manual', keptDir, downloadDir }，主进程说了算（见 cache:policy）
+  cachePolicy: null,
+  // 在线视频的手动缓存：linkKey(url) -> { url, purpose: 'cache', title, state: queued|downloading|done|failed|canceled, downloaded, total, error }
+  linkCaches: new Map(),
+  // 边下边播的在线视频下载，结构同上（purpose: 'download'）
+  linkDownloads: new Map(),
+  // 边下边播要另存、还没存上的 P2P 片（fileId）；收完并扫描过关时存（见 maybeSaveDownload）
+  downloadWanted: new Set(),
+  downloadSaving: new Set(),
   // Cloudflare 的临时 TURN 账号 { urls, username, credential, expiresAt }，主进程生成，这里只缓存。
   // API Token 永远不到渲染进程来。
   cfTurn: null,
@@ -722,6 +733,11 @@ async function boot() {
   // 而探测的结论只是「哪些外部程序缺了」，全当成缺件继续走，用户至少进得去。
   try {
     S.env = await window.sw.env.status();
+    // 缓存清理方式和下载位置：手动模式下磁盘满了不自动删，得先知道是哪种
+    S.cachePolicy = (await Promise.resolve(window.sw.cache?.policy?.()).catch(() => null)) || null;
+    // 在线视频的手动缓存和边下边播的下载：哪些下好了、哪些还在下（播放列表的行和菜单要用）
+    const views = (await Promise.resolve(window.sw.linkCache?.list?.()).catch(() => null)) || [];
+    for (const view of views) (view.purpose === 'download' ? S.linkDownloads : S.linkCaches).set(linkKey(view.url), view);
     // 开发期端到端测试钩子（主进程只在未打包且显式打开时才报 devHooks）
     if (S.env.devHooks === true) window.__noxreel = { S, submitPlaylistOp };
   } catch (error) {
@@ -2021,6 +2037,7 @@ async function switchCurrent(item) {
     log(playing, 'good');
     S.chat?.note(playing);
   }
+  wantDownload(item);
   if (item.kind === 'link') await activateLinkItem(item, seq);
   else onFileItemCurrent(item);
 }
@@ -2181,7 +2198,9 @@ async function openLeechFor(item) {
           // 先腾地方：已播放区里最久没放的那部的缓存（队列里还要的不动），腾完再试。
           // 但要先算「全清掉够不够」—— 不够就一部也不删，删了照样收不下，白丢已播放的缓存。
           const free = parseFreeBytes(message);
-          const victim = stillWanted() ? evictionVictim(manifest.size, free, freeBefore) : null;
+          // 手动清理模式从不自动删东西：放不下就停下来，让用户自己去清
+          const manualCache = S.cachePolicy?.mode === 'manual';
+          const victim = stillWanted() && !manualCache ? evictionVictim(manifest.size, free, freeBefore) : null;
           freeBefore = free;
           if (victim) {
             log(`磁盘空间不够，先清掉已播放的《${victim.manifest.name}》的缓存`, 'warn');
@@ -2193,7 +2212,9 @@ async function openLeechFor(item) {
             continue;
           }
           S.diskFull.add(fileId);
-          if (stillWanted() && evictableSessions().length) {
+          if (manualCache) {
+            log('手动清理模式不会自动删缓存：去「设置 → 管理缓存文件」里腾点地方', 'warn');
+          } else if (stillWanted() && evictableSessions().length) {
             log('清掉已播放的缓存也放不下这一部，缓存先都留着', 'warn');
           }
           log(`没法接收《${item.name}》：${diskFull[0]}`, 'bad');
@@ -3892,6 +3913,19 @@ function linkFallback(item, seq) {
 
 /** 当前项是链接：每个人在自己的电脑上解析，房主把自己解析到的地址也发一份做兜底。 */
 async function activateLinkItem(item, seq) {
+  const cache = linkCacheOf(item);
+  if (!S.skippedLinks.has(item.id) && cache?.state === 'done') {
+    // 手动缓存好了：直接从本地播
+    const local = await window.sw.linkCache.localPath(item.url).catch(() => null);
+    if (S.currentSeq !== seq) return;
+    if (local) {
+      await useCachedLink(item, local, seq);
+      return;
+    }
+    // 文件没了（手动删了、被挪走了）：登记已经摘掉，退回在线看
+    S.linkCaches.delete(linkKey(item.url));
+    renderPlaylistSoon();
+  }
   // 跳过了的就让播放器闲着；别人加的、没允许过的网站，等本人点头（不弹窗，见 approveLinkSite）
   if (S.skippedLinks.has(item.id) || !siteApproved(item)) {
     if (S.currentSeq !== seq) return;
@@ -4276,6 +4310,13 @@ function initSwarmAndSync() {
   });
   // 每个 pong、每次握手都会发 peers：照单全收的话对端刷 pong 就能让整张成员表每秒重建上千次
   S.swarm.on('peers', renderPeersSoon);
+  // 有人在房间里改了昵称：聊天里说一声，就绪 / 卡顿表里的名字跟着换，成员表和聊天按新名字重画
+  S.swarm.on('peer-renamed', ({ peerId, name, oldName }) => {
+    S.sync?.noteRename(peerId, name);
+    chatSystem(`${oldName || peerId} 改名为 ${name}`);
+    renderPeersSoon();
+    renderChat();
+  });
   S.swarm.on('identity-mismatch', ({ expected }) => {
     log(`已断开身份校验失败的成员：${expected}`, 'bad');
   });
@@ -4512,7 +4553,11 @@ function renderChat() {
   if (!roomEntered || chatRenderTimer) return;
   chatRenderTimer = setTimeout(() => {
     chatRenderTimer = null;
-    if (roomEntered) ensureChatPanel().render({ entries: S.chat.entries, notice: S.chat.notice });
+    if (!roomEntered) return;
+    // 发言人还在房里的，按成员表同一套显示名（重名编号、改过名的用新名字）；走了的就用当时的名字
+    const names = roomDisplayNames();
+    const entries = S.chat.entries.map((e) => (e.from && names.has(e.from) ? { ...e, name: names.get(e.from) } : e));
+    ensureChatPanel().render({ entries, notice: S.chat.notice });
   }, CHAT_RENDER_MS);
 }
 
@@ -4571,7 +4616,7 @@ function sendChat(rawInput, { fromPlayer = false } = {}) {
   S.chat.gate.remember(id);
   const host = isRoomHost();
   // 房主本人就是转发中枢，没有「等谁转回来」这回事，直接算已送达
-  pushChatEntry({ key: id, kind: 'msg', name: S.name, text, self: true, state: host ? 'sent' : 'sending' });
+  pushChatEntry({ key: id, kind: 'msg', from: S.peerId, name: S.name, text, self: true, state: host ? 'sent' : 'sending' });
   showDanmaku({ id, text, self: true });
   if (host) S.chat.history.add({ id, text, origin: S.peerId, name: S.name, ts });
   const wire = host ? { t: MSG.CHAT, id, text, ts, origin: S.peerId, originName: S.name } : { t: MSG.CHAT, id, text, ts };
@@ -4593,7 +4638,7 @@ function onChatMessage(msg, peer) {
     return;
   }
   const m = res.message;
-  pushChatEntry({ key: m.id, kind: 'msg', name: m.name, text: m.text, self: false });
+  pushChatEntry({ key: m.id, kind: 'msg', from: m.origin, name: m.name, text: m.text, self: false });
   showDanmaku({ id: m.id, text: m.text, self: false });
   if (!isRoomHost()) return;
   // 房主是转发中枢：留进历史，再转给所有人 —— 包括发送者本人。
@@ -4622,6 +4667,7 @@ function onChatHistory(msg, peer) {
   const old = items.map((it) => ({
     key: it.id,
     kind: 'msg',
+    from: it.origin,
     name: it.name,
     text: it.text,
     self: it.origin === S.peerId,
@@ -4799,7 +4845,148 @@ function fileTransferView(item) {
 }
 
 function linkTransferView(item) {
+  const cache = linkCacheOf(item);
+  const download = linkDownloadOf(item);
+  const busyView = (job, label) => {
+    if (job.state === 'queued') return { text: `${label}排队中`, tone: '' };
+    const ratio = job.total > 0 ? Math.min(1, job.downloaded / job.total) : 0;
+    return { text: `${label}中 ${linkCachePct(job)}`, tone: '', ratio };
+  };
+  // 在下的先说（有进度条），然后是下好了的，最后才是失败
+  if (linkCacheBusy(cache)) return busyView(cache, '缓存');
+  if (linkCacheBusy(download)) return busyView(download, '下载');
+  if (cache?.state === 'done') return { text: '已缓存 · 从本地播', tone: 'good' };
+  if (download?.state === 'done') return { text: '已存到下载位置', tone: 'good' };
+  if (cache?.state === 'failed') return { text: '缓存失败', tone: 'bad' };
+  if (download?.state === 'failed') return { text: '下载失败', tone: 'bad' };
   return { text: S.current?.id === item.id && S.linkInfo ? '各自从原网站播放' : '在线视频', tone: '' };
+}
+
+/* ---------------------------- 在线视频的手动缓存 ---------------------------- */
+// 列表里的在线视频可以「开始手动缓存」：主进程用 yt-dlp 下到缓存里（见 linkCache.js，跟着缓存清理方式走），
+// 下好了之后同一个链接直接从本地播。可以同时缓存好几部。正在放的那一部不中途换源，下次轮到时才从本地播。
+// 边下边播的下载走同一个下载器（purpose=download），进度也从这里报上来，但放在 S.linkDownloads 里。
+
+function linkCacheOf(item) {
+  return item?.kind === 'link' ? S.linkCaches.get(linkKey(item.url)) || null : null;
+}
+
+function linkDownloadOf(item) {
+  return item?.kind === 'link' ? S.linkDownloads.get(linkKey(item.url)) || null : null;
+}
+
+const linkCacheBusy = (cache) => cache?.state === 'queued' || cache?.state === 'downloading';
+
+function linkCachePct(cache) {
+  return cache?.total > 0 ? pct(Math.min(1, cache.downloaded / cache.total)) : fmtBytes(cache?.downloaded || 0);
+}
+
+/** 主进程报来一次缓存 / 下载进度或结果。缓存好的这一部下次轮到时从本地播（正在放的不中途换源）。 */
+function onLinkCacheUpdate(view) {
+  if (!view || typeof view.url !== 'string') return;
+  const download = view.purpose === 'download';
+  const table = download ? S.linkDownloads : S.linkCaches;
+  const key = linkKey(view.url);
+  const before = table.get(key);
+  table.set(key, view);
+  if (before?.state !== view.state) {
+    const title = view.title || siteHost(view.url);
+    if (download) {
+      if (view.state === 'done') log(`《${title}》已存到下载位置`, 'good');
+      else if (view.state === 'failed') log(`《${title}》下载失败：${view.error || '原因不明'}`, 'bad');
+    } else if (view.state === 'done') log(`《${title}》缓存好了，之后从本地播`, 'good');
+    else if (view.state === 'failed') log(`《${title}》缓存失败：${view.error || '原因不明'}`, 'bad');
+  }
+  renderPlaylistSoon();
+}
+
+window.sw.linkCache?.onUpdate?.(onLinkCacheUpdate);
+
+async function startLinkCache(item) {
+  try {
+    const view = await window.sw.linkCache.start(item.url, item.title || '');
+    onLinkCacheUpdate(view);
+    if (view.state !== 'done') log(`开始缓存《${item.title || siteHost(item.url)}》`, 'good');
+  } catch (error) {
+    log(`缓存不了：${error.message || error}`, 'bad');
+  }
+}
+
+/* ---------------------------- 边下边播：看的片另存一份 ---------------------------- */
+// 设置里打开「边下边播」后，放到的每一部都另存一份到下载位置（见主进程 download:*）。
+// 和缓存是两回事：存下来的是用户自己的文件，缓存清理不碰；也不改变什么时候开始播。
+// 只存本人放到的片（列表里没轮到的不存）：
+//  - P2P 的片收完、扫描过关才存 —— 安全模式要扫过，可信房间只要没扫出威胁（它本来就不等扫描就播）；
+//  - 在线视频缓存过的直接放一份过去，没缓存的在后台另下一份，和在线播放同时进行。
+
+/** 这个扫描状态下能不能另存。扫出威胁的缓存当场就删了，不会走到这里。 */
+function downloadAllowed(status) {
+  if (status === 'clean') return true;
+  return S.roomSecurityMode === 'trusted' && (status === 'unscanned' || SCAN_RESUMABLE.includes(status));
+}
+
+/** 这一部轮到本机放了：记下要另存，能存就存。 */
+function wantDownload(item) {
+  if (!S.settings.downloadWhileWatching || !item) return;
+  if (item.kind === 'link') {
+    saveLinkDownload(item);
+    return;
+  }
+  if (!item.fileId) return;
+  S.downloadWanted.add(item.fileId);
+  maybeSaveDownload(S.sessions.get(item.fileId));
+}
+
+async function saveLinkDownload(item) {
+  const current = linkDownloadOf(item);
+  if (linkCacheBusy(current) || current?.state === 'done') return;
+  try {
+    onLinkCacheUpdate(await window.sw.download.saveLink(item.url, item.title || ''));
+  } catch (error) {
+    log(`存不到下载位置：${error.message || error}`, 'bad');
+  }
+}
+
+/** P2P 的片：要另存的、收完了、扫描状态允许，就交给主进程放一份到下载位置（同盘硬链接，否则复制）。 */
+async function maybeSaveDownload(session) {
+  if (!session || session.isSeeder || !S.settings.downloadWhileWatching) return;
+  const { fileId } = session;
+  if (!S.downloadWanted.has(fileId) || S.downloadSaving.has(fileId)) return;
+  if (!downloadAllowed(session.safety?.status)) return;
+  S.downloadSaving.add(fileId);
+  try {
+    const r = await window.sw.download.saveSession(session.sessionId);
+    if (r?.fresh) log(`《${session.manifest.name}》已存到下载位置`, 'good');
+  } catch (error) {
+    log(`《${session.manifest.name}》存不到下载位置：${error.message || error}`, 'bad');
+  } finally {
+    // 存上了或者存不了都不再自动重试（每个进度事件都重试一遍只会刷屏）；重新放这一部时再试
+    S.downloadWanted.delete(fileId);
+    S.downloadSaving.delete(fileId);
+  }
+}
+
+/** 缓存好的这一部：直接交给播放器，不再去网站解析（缓存是本人点的，网站也不用再问）。 */
+async function useCachedLink(item, local, seq) {
+  S.linkInfo = {
+    url: item.url,
+    title: item.title || local.title,
+    duration: item.durationSec || 0,
+    extractor: 'cache',
+    playback: null,
+    resolvedAt: Date.now(),
+    local: true,
+  };
+  S.filePath = local.path;
+  if (isRoomHost()) {
+    // 房主放的是本地缓存，没有能分给成员的播放地址；照样发一条，好让大家知道这一部开始了
+    S.nowLink = { seq, playback: null, resolvedAt: Date.now() };
+    for (const p of S.swarm.peers.values()) {
+      if (p.authenticated) p.send({ t: MSG.NOW_LINK, ...S.nowLink });
+    }
+  }
+  updateLocalReady();
+  await onLinkSessionReady();
 }
 
 /** 别人加的链接：没允许过的网站在行内问一句，跳过的给个改主意的机会。 */
@@ -4840,7 +5027,13 @@ function localMenu(item) {
   const menu = [];
   const sess = item.kind === 'file' ? S.sessions.get(item.fileId) : null;
   if (sess?.filePath) menu.push({ key: 'reveal', label: sess.isSeeder ? '打开源文件位置' : '打开临时缓存位置' });
-  if (item.kind === 'link') menu.push({ key: 'copy-link', label: '复制链接' });
+  if (item.kind === 'link') {
+    const cache = linkCacheOf(item);
+    if (linkCacheBusy(cache)) menu.push({ key: 'cancel-cache', label: '取消缓存' });
+    else if (cache?.state !== 'done') menu.push({ key: 'start-cache', label: '开始手动缓存' });
+    if (linkCacheBusy(linkDownloadOf(item))) menu.push({ key: 'cancel-download', label: '取消下载' });
+    menu.push({ key: 'copy-link', label: '复制链接' });
+  }
   return menu;
 }
 
@@ -4935,6 +5128,19 @@ async function onPlaylistAction(key, id) {
       if (item.kind !== 'link') return;
       await window.sw.clipboard.writeText(item.url);
       log('链接已复制', 'good');
+      return;
+    case 'start-cache':
+      if (item.kind === 'link') await startLinkCache(item);
+      return;
+    case 'cancel-cache':
+      if (item.kind !== 'link') return;
+      await window.sw.linkCache.cancel(item.url, 'cache').catch(() => {});
+      log(`已取消缓存《${item.title || siteHost(item.url)}》`, 'warn');
+      return;
+    case 'cancel-download':
+      if (item.kind !== 'link') return;
+      await window.sw.linkCache.cancel(item.url, 'download').catch(() => {});
+      log(`已取消下载《${item.title || siteHost(item.url)}》`, 'warn');
       return;
     default:
   }
@@ -5047,7 +5253,8 @@ function localReadyNow() {
   if (item.kind === 'link') {
     return isItemReady(item, {
       skipped: S.skippedLinks.has(item.id),
-      consented: siteApproved(item),
+      // 缓存好了的从本地播，不用再问网站
+      consented: siteApproved(item) || linkCacheOf(item)?.state === 'done',
       resolved: !!S.linkInfo,
     });
   }
@@ -5408,6 +5615,7 @@ async function applyScanResult(session, result, before) {
     return;
   }
   safety.status = outcome.status;
+  maybeSaveDownload(session);
   const name = session.manifest.name;
   if (currentSession() !== session) {
     // 不是正在放的那部：记一笔，轮到它时直接用这个结果
@@ -5486,7 +5694,8 @@ async function destroyBlockedSession(session, message = '') {
   if (message) log(`已阻止接收文件：${message}`, 'bad');
   announceGone(session.slot);
   if (session.slot !== null) S.swarm?.removeFile(session.slot);
-  await trackClosing(window.sw.store.close(session.sessionId).catch(() => {}));
+  // discard：发现威胁的文件不留着复用，不管在临时缓存还是长期缓存文件夹都删掉
+  await trackClosing(window.sw.store.close(session.sessionId, { discard: true }).catch(() => {}));
   scheduleTransferUpdate();
 }
 
@@ -5675,7 +5884,9 @@ function desiredPlayerKind() {
 
 /** 当前这一部是不是「完整的一个文件」—— 外部播放器只接手这种。 */
 function externalPlaybackReady() {
-  if (S.sourceType === 'link') return true; // 链接不经过接收缓存，没有正在增长这回事
+  // 在线链接只交给 mpv（见 desiredPlayerKind）。这里说「好了」的话，控制条会冒出
+  // 「已收完 · 切换到 PotPlayer」，点了也换不过去
+  if (S.sourceType === 'link') return false;
   if (S.isSeeder) return true; // 片源手里本来就是整部片
   return !!currentFileCtx()?.complete;
 }
@@ -6559,6 +6770,8 @@ function renderProgress(p) {
 
   if (S.sourceType === 'link') {
     $('buf-have').style.width = '100%';
+    // 起点也要归零：从本地片子换过来时它还停在上一部的播放位置，起点加上 100% 宽就伸出边框了
+    $('buf-safe').style.left = '0%';
     $('buf-safe').style.width = '100%';
     const snap = S.sync?.lastTick;
     const playRatio = snap && S.sync.duration ? Math.min(1, (snap.position || 0) / S.sync.duration) : 0;
@@ -6785,6 +6998,65 @@ const PLATFORM_LABEL = { windows: 'Windows', mac: 'macOS', linux: 'Linux', andro
 
 /** 本机在 HELLO 里报的平台。主进程的 env 还没到时只能笼统报「电脑」。 */
 const myPlatform = () => platformOfOs(S.env?.platform);
+
+/**
+ * 房间里每个人的显示名：重名的临时编号（「小明 #2」），只影响显示，不改谁存着的昵称。
+ * 算的是自己 + 握过手的直连成员，成员表列的就是这一拨；聊天按发言人的 id 查同一张表，
+ * 所以聊天里的「小明 #2」和成员表里的是同一个人。
+ */
+function roomDisplayNames() {
+  const members = [{ id: S.peerId, name: S.name || '' }];
+  for (const p of S.swarm?.peers.values() || []) {
+    if (p.authenticated) members.push({ id: p.peerId, name: p.name || '' });
+  }
+  return numberDuplicateNames(members);
+}
+
+/**
+ * 改自己的昵称：存在这台电脑上（下次打开还是它），进了房的话告诉连着的人。
+ * @returns {boolean} 名字能用（清洗后非空）
+ */
+function applyMyName(raw) {
+  const name = clampName(raw);
+  if (!name) return false;
+  const changed = name !== S.name;
+  S.name = name;
+  try {
+    localStorage.setItem('sw.name', name);
+  } catch {
+    /* 存不进去就只在这一次生效 */
+  }
+  if (!changed) return true;
+  S.swarm?.setName(name);
+  S.sync?.setName(name);
+  if (roomEntered) {
+    log(`你改名为 ${name}`, 'good');
+    renderPeersSoon();
+    renderChat();
+  }
+  return true;
+}
+
+/** 成员表里自己那一行的「改名」。 */
+function openRenameModal() {
+  const input = make('input', { attrs: { type: 'text', maxlength: 40 }, props: { value: S.name } });
+  const error = make('div', { className: 'field-error hidden', text: '昵称不能为空' });
+  openModal({
+    title: '改昵称',
+    body: [
+      field('你的昵称', input),
+      error,
+      hint('只保存在这台电脑上。房间里有人同名时，名字后面会临时加上编号。'),
+    ],
+    okText: '保存',
+    onOk: () => {
+      if (applyMyName(input.value)) return true;
+      error.classList.remove('hidden');
+      return false;
+    },
+  });
+  setTimeout(() => input.focus?.(), 0);
+}
 
 /** 成员名后面那个设备标记。平台是对端自己报的，只拿来显示；标记单独一个元素，不拼进昵称。 */
 function platformChip(platform) {
@@ -7112,7 +7384,7 @@ function myRates(list = S.swarm?.peerList() || []) {
 }
 
 /** 成员表里「你」这一行：等不等得起，你自己也是其中一个。 */
-function selfPeerRow(waiting) {
+function selfPeerRow(waiting, names = roomDisplayNames()) {
   const role = S.sync?.myRole() || (S.role === 'host' ? 'host' : 'guest');
   const p = S.swarm?.progress();
   const serving = servingCurrent();
@@ -7132,7 +7404,8 @@ function selfPeerRow(waiting) {
   return make('div', { className: 'peer self', attrs: { role: 'row' } }, [
     make('div', { className: 'peer-who', attrs: { role: 'cell' } }, [
       avatarOf(S.peerId, S.name),
-      make('span', { raw: true, className: 'peer-name', text: S.name || '' }),
+      // 显示名：和别人重名时临时带编号（只是显示，存着的昵称不变）
+      make('span', { raw: true, className: 'peer-name', text: names.get(S.peerId) || S.name || '' }),
       platformChip(S.swarm?.platform || myPlatform()),
       make('span', { className: 'peer-platform', text: '（你）' }),
     ]),
@@ -7143,7 +7416,7 @@ function selfPeerRow(waiting) {
       make('div', { className: tone ? `peer-forecast ${tone}` : 'peer-forecast', text: state }),
     ]),
     make('div', { className: speed === '供片中' || speed === '—' ? 'peer-speed idle' : 'peer-speed', attrs: { role: 'cell' }, text: speed }),
-    make('div', { className: 'peer-act', attrs: { role: 'cell' } }),
+    make('div', { className: 'peer-act', attrs: { role: 'cell' } }, [make('button', { className: 'peer-rename', text: '改名' })]),
   ]);
 }
 
@@ -7171,6 +7444,13 @@ function renderPeers(list) {
   const iAmHost = S.sync?.myRole() === 'host';
   const waiting = notReadyIds();
   const bitrate = S.sourceType === 'link' ? 0 : mediaBitrate();
+  const names = roomDisplayNames();
+  // 有人进出、改名，重名编号可能跟着变：聊天里的名字要和成员表对得上
+  const nameKey = [...names].join('\n');
+  if (nameKey !== lastDisplayNames) {
+    lastDisplayNames = nameKey;
+    renderChat();
+  }
   replace('peer-list', [
     make('div', { className: 'peer-head', attrs: { role: 'row' } }, [
       make('span', { text: '成员' }),
@@ -7179,7 +7459,7 @@ function renderPeers(list) {
       make('span', { text: '实时速率' }),
       make('span'),
     ]),
-    selfPeerRow(waiting),
+    selfPeerRow(waiting, names),
     ...list.map((peer) => {
       const stalled = S.sync?.stalledPeers.has(peer.peerId);
       const candidateRole = S.sync?.roleOf(peer.peerId) || 'guest';
@@ -7233,7 +7513,7 @@ function renderPeers(list) {
       return make('div', { className: 'peer', attrs: { role: 'row' } }, [
         make('div', { className: 'peer-who', attrs: { role: 'cell' } }, [
           avatarOf(peer.peerId, peer.name),
-          make('span', { raw: true, className: `peer-name ${stalled ? 'stalled' : ''}`, text: peer.name }),
+          make('span', { raw: true, className: `peer-name ${stalled ? 'stalled' : ''}`, text: names.get(peer.peerId) || peer.name }),
           // 每个人用什么设备加入的（Windows / Android …）。昵称是用户输入，标记单独一个元素，别拼进去
           platformChip(peer.platform),
         ]),
@@ -7253,6 +7533,8 @@ function renderPeers(list) {
 // 对端刷 pong 或者房主刷就绪消息，就能让界面卡死。进房那一刻的第一次仍然直接画（enterRoom）。
 const PEERS_RENDER_MS = 150;
 let peersRenderTimer = null;
+// 上一次成员表用的显示名（重名编号）。变了才让聊天重画一遍
+let lastDisplayNames = '';
 
 function renderPeersSoon() {
   if (peersRenderTimer) return;
@@ -7264,6 +7546,8 @@ function renderPeersSoon() {
 
 // 房主点「设为管理员/游客」—— 事件委托，省得每次重画都重新接线。
 $('peer-list').addEventListener('click', (e) => {
+  // 自己那一行的「改名」
+  if (e.target.closest('.peer-rename')) return openRenameModal();
   const btn = e.target.closest('.role-toggle');
   if (!btn || S.sync?.myRole() !== 'host') return;
   S.sync.setRole(btn.dataset.peer, btn.dataset.next);
@@ -7683,6 +7967,18 @@ function handlePlayerExit({ code }) {
 
 window.sw.player.onError((payload) => handlePlayerError(payload || {}));
 
+// 本机有这部片收完的副本（这次运行里收过、或者手动模式存在长期缓存文件夹里）：打开接收会话前逐片核对，
+// 对得上的片就不用再传。大片子要核对一阵子，日志里说一声
+window.sw.store.onReuse?.((e) => {
+  if (!e || typeof e.name !== 'string') return;
+  if (e.stage === 'start') log(`本机已有《${e.name}》，正在核对…`);
+  else if (e.stage === 'done') {
+    if (e.matched === e.total) log(`本机已有的《${e.name}》核对通过，不用再传`, 'good');
+    else if (e.matched > 0) log(`本机的《${e.name}》有 ${e.matched}/${e.total} 片对得上，其余照常接收`, 'warn');
+    else log(`本机的《${e.name}》和这一部对不上，重新接收`, 'warn');
+  }
+});
+
 /* ------------------------------- 控件 ------------------------------- */
 
 $('btn-playpause').onclick = () => {
@@ -7864,6 +8160,154 @@ $('buffer').onclick = (e) => {
  * 而且缓存占了多少、能不能清，以前界面上一个字都没有 —— `env:status` 早就把
  * cacheDir 返回了，渲染层从来没读过它。
  */
+/**
+ * 设置里的「边下边播」「下载位置」两栏：看的片另存一份（见主进程 download:*）。
+ * 开关随「保存」生效；下载位置和「换个位置」一样改完立刻生效。
+ */
+function downloadFields() {
+  const errorLine = make('div', { className: 'field-error hidden' });
+  const dirPath = make('code', { text: S.cachePolicy?.downloadDir || '（未知）' });
+  const dirButton = make('button', { className: 'ghost tiny', text: '换个位置' });
+  dirButton.onclick = async () => {
+    errorLine.classList.add('hidden');
+    const dir = await window.sw.dialog.pickDownloadDir();
+    if (!dir) return;
+    try {
+      S.cachePolicy = await window.sw.download.setDir(dir);
+      dirPath.textContent = S.cachePolicy.downloadDir;
+      log(`下载位置已改到 ${S.cachePolicy.downloadDir}`, 'good');
+    } catch (error) {
+      errorLine.textContent = t(`换不了：${error.message || error}`);
+      errorLine.classList.remove('hidden');
+    }
+  };
+  return [
+    field(
+      '边下边播',
+      make('label', { className: 'check' }, [
+        make('input', { id: 'set-download', attrs: { type: 'checkbox' }, props: { checked: !!S.settings.downloadWhileWatching } }),
+        make('span', { text: '边看边另存一份到下载位置' }),
+      ]),
+      hint(
+        '开着时，你放到的每一部都另存一份：P2P 的片收完并通过扫描后存（可信房间没扫出威胁就存），在线视频在后台另下一份，缓存过的直接复制。',
+        '存下来的是你自己的文件，缓存清理不会碰它；这个开关也不改变什么时候开始播。'
+      )
+    ),
+    field('下载位置', make('div', { className: 'cmd-row' }, [dirPath, dirButton]), errorLine),
+  ];
+}
+
+/**
+ * 设置里的「缓存清理」「长期缓存文件夹」「管理缓存文件」三栏（见主进程 fileStore.setPolicy / mediaLibrary.js）。
+ * 都是改完立刻生效，和「换个位置」一样；文件列表直接嵌在设置里 —— 设置本身是弹窗，
+ * 弹窗里再开弹窗要排队到设置关了才出来。
+ */
+function cachePolicyFields() {
+  const policy = S.cachePolicy || { mode: 'auto', keptDir: '' };
+  const errorLine = make('div', { className: 'field-error hidden' });
+  const showError = (text) => {
+    errorLine.textContent = t(text);
+    errorLine.classList.remove('hidden');
+  };
+
+  const modeSelect = make('select', { id: 'set-cache-mode' }, [
+    make('option', { attrs: { value: 'auto' }, text: '自动：关软件时清掉' }),
+    make('option', { attrs: { value: 'manual' }, text: '手动：从不自动清，放进长期缓存文件夹' }),
+  ]);
+  modeSelect.value = policy.mode;
+  modeSelect.onchange = async () => {
+    errorLine.classList.add('hidden');
+    try {
+      S.cachePolicy = await window.sw.cache.setMode(modeSelect.value);
+      keptPath.textContent = S.cachePolicy.keptDir || t('（未知）');
+      log(
+        S.cachePolicy.mode === 'manual'
+          ? '缓存改成手动清理：之后收的片放进长期缓存文件夹，不再自动删'
+          : '缓存改成自动清理：之后收的片关软件时清掉',
+        'good'
+      );
+    } catch (error) {
+      modeSelect.value = S.cachePolicy?.mode || 'auto';
+      showError(`改不了：${error.message || error}`);
+    }
+  };
+
+  const keptPath = make('code', { id: 'set-kept-dir', text: policy.keptDir || '（未知）' });
+
+  // 手动清理：登记过的片子一条一行，勾选后删
+  const summary = make('span', { text: '正在统计…' });
+  const deleteButton = make('button', { className: 'ghost tiny', text: '删除所选', props: { disabled: true } });
+  const listBox = make('div', { className: 'cache-files' });
+  const checked = () => [...listBox.querySelectorAll('input[type="checkbox"]')].filter((box) => box.checked);
+  const fileRow = (file) => {
+    const box = make('input', { attrs: { type: 'checkbox', 'data-id': file.id }, props: { disabled: !!file.inUse } });
+    box.onchange = () => {
+      deleteButton.disabled = checked().length === 0;
+    };
+    return make('label', { className: 'cache-file' }, [
+      box,
+      make('span', { raw: true, className: 'cache-file-name', text: file.name, attrs: { title: file.path } }),
+      make('span', { className: 'cache-file-meta', text: file.kind === 'link' ? '在线视频' : 'P2P' }),
+      make('span', { className: 'cache-file-meta', text: file.persistent ? '长期缓存' : '临时缓存' }),
+      make('span', { className: 'cache-file-meta', text: fmtBytes(file.size) }),
+      file.inUse ? make('span', { className: 'cache-file-meta busy', text: '正在用' }) : null,
+    ]);
+  };
+  const refreshList = async () => {
+    let files;
+    try {
+      files = await window.sw.cache.listFiles();
+    } catch (error) {
+      summary.textContent = t(`统计不出来：${error.message || error}`);
+      return;
+    }
+    const total = files.reduce((sum, file) => sum + (file.size || 0), 0);
+    summary.textContent = files.length ? t(`共 ${files.length} 个，${fmtBytes(total)}`) : t('还没有缓存文件');
+    replace(listBox, ...files.map(fileRow));
+    deleteButton.disabled = true;
+  };
+  deleteButton.onclick = async () => {
+    const ids = checked().map((box) => box.getAttribute('data-id'));
+    if (!ids.length) return;
+    errorLine.classList.add('hidden');
+    deleteButton.disabled = true;
+    try {
+      const r = await window.sw.cache.deleteFiles(ids);
+      log(`删掉了 ${r.removed} 个缓存文件`, 'good');
+      if (r.skipped) log(`${r.skipped} 个正在用，没删`, 'warn');
+      if (r.failed) showError(`${r.failed} 个删不掉（可能被别的程序占着）`);
+    } catch (error) {
+      showError(`删不掉：${error.message || error}`);
+    }
+    refreshList();
+  };
+  refreshList();
+
+  return [
+    field(
+      '缓存清理',
+      modeSelect,
+      hint(
+        '自动：收到的片先放在上面的缓存位置，换片、退房都不删，这次运行里再放同一部直接用，关软件时清掉；磁盘不够时先删最久没用的。',
+        '手动：收到的片放进长期缓存文件夹，从不自动删，以后再放同一部直接用；磁盘满了会停下来提示你来这里清理。',
+        '只影响之后开始接收的片。'
+      )
+    ),
+    field(
+      '长期缓存文件夹',
+      keptPath,
+      hint('手动清理模式收的片、手动缓存的在线视频放在这里。它跟着上面的缓存位置走；缓存位置是默认的系统临时目录时，放在本机应用数据目录里，免得被系统的磁盘清理删掉。')
+    ),
+    field(
+      '管理缓存文件',
+      make('div', { className: 'cmd-row' }, [summary, deleteButton]),
+      listBox,
+      errorLine,
+      hint('只列出本软件存下的片子，删的也只是这些；正在用的删不了。')
+    ),
+  ];
+}
+
 function cacheField() {
   const pathLine = make('code', { text: S.env?.cacheDir || '（未知）' });
   const usageLine = make('span', { text: '正在统计…' });
@@ -7898,6 +8342,13 @@ function cacheField() {
       S.env.cacheDir = r.cacheDir;
       log(`缓存目录已改到 ${r.cacheDir}`, 'good');
       refresh();
+      // 长期缓存文件夹跟着缓存位置走
+      const policy = await Promise.resolve(window.sw.cache.policy?.()).catch(() => null);
+      if (policy) {
+        S.cachePolicy = policy;
+        const kept = $('set-kept-dir');
+        if (kept) kept.textContent = policy.keptDir;
+      }
     } catch (error) {
       errorLine.textContent = t(`换不了：${error.message || error}`);
       errorLine.classList.remove('hidden');
@@ -7921,7 +8372,7 @@ function cacheField() {
     usageLine,
     errorLine,
     hint(
-      locked ? '放映进行中不能换位置，退出房间后可改。' : '接收到的片子放在这里，退房或关闭软件时自动删除。',
+      locked ? '放映进行中不能换位置，退出房间后可改。' : '自动清理模式下，接收到的片子放在这里，关软件时清掉。',
       '换到空间大的盘上，才收得下大文件。',
       // 让用户指定任意目录，最大的顾虑就是「会不会把我原来的东西删了」
       '清理只认本软件自己建的目录，同目录下你自己的文件一个都不会动。',
@@ -8115,7 +8566,6 @@ $('btn-settings').onclick = () => {
     body: () => {
       const modeLocked = roomEntered || !!S.swarm;
       const languageLocked = roomEntered || S.role !== null;
-      const nameLocked = roomEntered || !!S.swarm;
       // 设置页开着时顺手把 Cloudflare TURN 的状态和本月用量刷一遍
       refreshCfTurnState();
       return [
@@ -8148,13 +8598,10 @@ $('btn-settings').onclick = () => {
           make('input', {
             id: 'set-name',
             attrs: { type: 'text', maxlength: 40 },
-            props: { value: S.name, disabled: nameLocked },
+            props: { value: S.name },
           }),
-          // S.name 在 initSwarmAndSync 时就被拷进 Swarm 和 SyncEngine 了，HELLO 也早发完。
-          // 房间里改名只会改本地这一份，对别人一个字都不生效 —— 与其让人以为改成了，
-          // 不如像语言和安全模式那样明确锁住。真要支持改名得加一条协议消息，
-          // 还要同步 swarm 的三张表和 syncEngine 里各处名字副本，是另一件事。
-          nameLocked ? hint('房间进行中不能改名，退出后可改。') : []
+          // 房间里也能改：applyMyName 会经 NAME 消息告诉连着的人，并同步 Swarm、SyncEngine 里的名字
+          hint('只保存在这台电脑上。房间里有人同名时，名字后面会临时加上编号。')
         ),
         field(
           '房间安全模式',
@@ -8251,7 +8698,9 @@ $('btn-settings').onclick = () => {
         ),
         ...turnSettingsFields(),
         make('div', { id: 'set-turn-err', className: 'field-error hidden' }),
+        ...downloadFields(),
         cacheField(),
+        ...cachePolicyFields(),
         field(
           '遇到问题时',
           copyDiagnosticsButton(),
@@ -8271,6 +8720,13 @@ $('btn-settings').onclick = () => {
       const turnCheck = normalizeTurnInput(turnRaw);
       const errorBox = $('set-turn-err');
       const turnSource = $('set-turn-source-cf').checked ? 'cloudflare' : 'manual';
+      // 这次没动过 TURN 那几栏：「勾着但没填地址」是新装时的默认状态（等于没配），
+      // 为此拦下别的设置（昵称、边下边播……）的保存就说不过去了。动过才查缺地址、缺凭据
+      const turnTouched =
+        $('set-turn-on').checked !== S.settings.turnEnabled ||
+        turnRaw !== (S.settings.turnUrl || '') ||
+        $('set-turn-user').value.trim() !== (S.settings.turnUser || '') ||
+        $('set-turn-pass').value.trim() !== (S.settings.turnPass || '');
       // 手动那套字段只在来源是「自己填」时才生效，也只在那时才查
       if (turnSource === 'manual') {
         if (turnCheck.invalid.length) {
@@ -8284,13 +8740,13 @@ $('btn-settings').onclick = () => {
           errorBox.classList.remove('hidden');
           return false;
         }
-        if ($('set-turn-on').checked && !turnRaw) {
+        if (turnTouched && $('set-turn-on').checked && !turnRaw) {
           errorBox.textContent = t('勾了启用 TURN 中继，但地址是空的 —— 这样等于没配。填一个地址，或者把勾去掉。');
           errorBox.classList.remove('hidden');
           return false;
         }
         // 缺用户名或密码的中继，浏览器会连整个连接对象一起拒掉（邀请、加入全都失败），得当场拦下
-        if ($('set-turn-on').checked && (!$('set-turn-user').value.trim() || !$('set-turn-pass').value.trim())) {
+        if (turnTouched && $('set-turn-on').checked && (!$('set-turn-user').value.trim() || !$('set-turn-pass').value.trim())) {
           errorBox.textContent = t('TURN 中继要填用户名和密码（中继服务器靠它们认人）。没有的话把「启用 TURN 中继」的勾去掉。');
           errorBox.classList.remove('hidden');
           return false;
@@ -8324,7 +8780,8 @@ $('btn-settings').onclick = () => {
       if (!languageLocked) {
         S.settings.language = setLocale(nextLanguage);
       }
-      if (!roomEntered && !S.swarm) S.name = $('set-name').value.trim().slice(0, 40) || S.name;
+      // 昵称清空了就保留原来的；房间里改的会告诉连着的人（见 applyMyName）
+      applyMyName($('set-name').value);
       if (!roomEntered && !S.swarm) {
         S.settings.securityMode = normalizeSecurityMode($('set-security-mode').value);
         if (S.role === 'host') S.roomSecurityMode = S.settings.securityMode;
@@ -8333,6 +8790,11 @@ $('btn-settings').onclick = () => {
       S.settings.relays = relayLines.join('\n');
       saveCapacitySetting($('set-capacity').value);
       S.settings.stun = $('set-stun').value.trim();
+      const downloadWasOn = S.settings.downloadWhileWatching;
+      S.settings.downloadWhileWatching = $('set-download').checked;
+      localStorage.setItem('sw.downloadWhileWatching', S.settings.downloadWhileWatching ? '1' : '0');
+      // 放到一半才打开的：正在放的这一部也算「看了」，一样存
+      if (!downloadWasOn && S.settings.downloadWhileWatching && roomEntered) wantDownload(S.current);
       S.settings.turnEnabled = $('set-turn-on').checked;
       S.settings.turnUrl = $('set-turn-url').value.trim();
       S.settings.turnUser = $('set-turn-user').value.trim();

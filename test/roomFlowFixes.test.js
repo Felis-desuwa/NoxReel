@@ -268,6 +268,9 @@ async function makeRoom({ fns, stubs = {}, sync } = {}) {
     cancelPrepJob: noop,
     manifestCandidates: () => [],
     activateLinkItem: async () => {},
+    // 边下边播（另存一份到下载位置）：这些测试不关心
+    wantDownload: noop,
+    maybeSaveDownload: noop,
     ...stubs,
   };
   vm.createContext(ctx);

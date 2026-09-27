@@ -48,6 +48,8 @@ export const MSG = {
   NOW_LINK: 'now-link',
   CHAT: 'chat',
   CHAT_HISTORY: 'chat-history',
+  // 进房之后改昵称：{ name }，只发给连着的人。老版本不认，照旧显示旧名字
+  NAME: 'name',
   PART: 'part',
   PING: 'ping',
   PONG: 'pong',

@@ -429,6 +429,27 @@ export class SyncEngine extends Emitter {
     return this.clock;
   }
 
+  /* ------------------------------ 昵称 ------------------------------ */
+
+  /** 自己改了昵称：之后发出去的 SYNC / STALL / READY 都带新名字。 */
+  setName(name) {
+    const clean = clampName(name).trim();
+    if (!clean) return;
+    if (this.shared.by === this.peerId) this.shared.byName = clean;
+    this.name = clean;
+  }
+
+  /** 别人改了昵称：就绪表、卡顿表里记着的名字跟着换，「等待缓冲：xxx」不再显示旧名字。 */
+  noteRename(peerId, name) {
+    const clean = clampName(name).trim();
+    if (!clean) return;
+    const ready = this.readyPeers.get(peerId);
+    if (ready) ready.name = clean;
+    const stalled = this.stalledPeers.get(peerId);
+    if (stalled) stalled.name = clean;
+    if (this.shared.by === peerId) this.shared.byName = clean;
+  }
+
   /* ------------------------------ 权限 ------------------------------ */
 
   /** 某个 peer 的角色：房主 / 管理员 / 游客。未显式分配的都是游客。 */

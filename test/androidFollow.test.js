@@ -136,6 +136,9 @@ function fakeNative({ openLeech } = {}) {
     log(msg) {
       logs.push(msg);
     },
+    setImmersive(on) {
+      calls.push(['setImmersive', on]);
+    },
   };
   return native;
 }
@@ -506,7 +509,7 @@ test('安卓端：换到还没有会话的片时，状态栏、缓冲条和时�
   await phone.deliverManifest(a);
   await until(() => phone.nativeCalls('playerLoad').length === 1, '上一部起播');
   await phone.advance(1500);
-  assert.match(phone.$('status').textContent, /^可播 100% /);
+  assert.equal(phone.$('status').textContent, '已收完');
   assert.equal(phone.$('buf').firstElementChild.style.width, '100%');
   assert.notEqual(phone.$('time').textContent, '0:00 / 0:00');
 
@@ -515,7 +518,7 @@ test('安卓端：换到还没有会话的片时，状态栏、缓冲条和时�
   phone.send(playlistMsg({ rev: 2, seq: 2, queue: [itemB], history: [itemA] }));
   await flush();
   assert.equal(phone.$('buf').firstElementChild.style.width, '0%', '缓冲条要清零');
-  assert.match(phone.$('status').textContent, /^可播 0% · 已有 0\/12 片/);
+  assert.match(phone.$('status').textContent, /^已收 0% · /);
   assert.equal(phone.$('time').textContent, '0:00 / 1:00:00', '时间要按新片显示');
   assert.equal(Number(phone.$('seek').value), 0, '进度条要回到开头');
 
@@ -574,7 +577,7 @@ test('安卓端：管理员手机存储不够开不了会话时退出卡顿，�
   await phone.advance(31_000, 500);
   assert.equal(phone.nativeCalls('openLeech').length, 3);
   assert.equal(phone.swarm.files.get(1)?.manifest.fileId, a.fileId);
-  assert.match(phone.$('status').textContent, /^可播 0% /);
+  assert.match(phone.$('status').textContent, /^已收 0% · /);
   assert.deepEqual(phone.outboundStalls(), [true, false, true], '开出会话后缓冲不足照常报卡顿');
   assert.equal(phone.manifestGets(a.fileId), 1);
 });
@@ -787,6 +790,121 @@ test('安卓端：跳进空洞的第一条 tick 就报卡顿，不是等下一�
   );
   assert.equal(phone.sync.localStalled, true, '跳进空洞要当拍就报卡顿，晚一拍全房就多抖一下');
   assert.deepEqual(phone.outboundStalls().slice(before), [true]);
+});
+
+/* ============ 状态行：整部收了多少 + 从当前位置往后能放多久 ============ */
+
+test('安卓端：状态行按「已收 X% · 往后能放 M:SS」说，中途加入不再一直写「可播 0%」', async (t) => {
+  // 60MB / 60 秒 = 1MB/s
+  const phone = await bootPhone(t, { securityMode: 'trusted' });
+  const a = makeManifest('RW1', { chunkCount: 60, durationSec: 60 });
+  phone.native.mediaDuration = 60;
+  // 片头 8MB + [20MB, 55MB)。房间在 25 秒（25MB）处，往后连续到 55MB：能放 30 秒左右
+  // （起播门槛要 (15+2) 秒 × 1.5 ≈ 25.5MB，少了手机不起播）
+  phone.native.stateFor = () => partialState(phone.h.protocol, a, [[0, 8], [20, 55]]);
+  phone.send(playlistMsg({ rev: 1, seq: 1, queue: [fileItem(a, 1)] }));
+  phone.hostSync({ paused: true, position: 25, seq: 1 });
+  phone.send({ t: 'bitfield', s: 1, full: true });
+  await flush();
+  await phone.deliverManifest(a);
+  await until(() => phone.nativeCalls('playerLoad').length === 1, '中途加入应当起播');
+  await phone.advance(1500);
+  // 43 片 / 60 片 = 71%（从片头起连续的只有 8 片，旧写法是「可播 13%」，中途加入的大片子更是一直 0%）
+  assert.match(phone.$('status').textContent, /^已收 71% · 往后能放 0:(29|30|31) · ↓/);
+  assert.equal(phone.$('buf').firstElementChild.style.width, '71%', '进度条按整部收了多少画');
+
+  // 房主拖到 57 秒：那里一片都没有
+  phone.hostSync({ paused: true, position: 57, seq: 1 });
+  await flush();
+  await phone.advance(500);
+  assert.match(phone.$('status').textContent, /^已收 71% · 往后能放 0:00 · ↓/, '播放器每一拍都刷新，不等下一片到');
+
+  // 拖到 30 秒、往后一直有数据到片尾的情形
+  phone.native.stateFor = null;
+  const b = makeManifest('RW2', { chunkCount: 60, durationSec: 60 });
+  phone.native.stateFor = () => partialState(phone.h.protocol, b, [[0, 8], [20, 60]]);
+  phone.send(playlistMsg({ rev: 2, seq: 2, queue: [fileItem(b, 2)] }));
+  phone.hostSync({ paused: true, position: 30, seq: 2 });
+  phone.send({ t: 'bitfield', s: 2, full: true });
+  await flush();
+  await phone.deliverManifest(b);
+  await until(() => phone.nativeCalls('playerLoad').length === 2, '第二部起播');
+  await phone.advance(1500);
+  assert.match(phone.$('status').textContent, /^已收 80% · 能一直放到片尾 · ↓/);
+
+  const { translate } = await import(assetUrl('i18n.js'));
+  assert.equal(translate('已收 46% · 往后能放 0:15 · ↓1.0 MB/s', 'en'), 'Received 46% · 0:15 playable ahead · ↓1.0 MB/s');
+  assert.equal(translate('已收 46% · 往后能放 1:02:03 · ↓0 B/s', 'en'), 'Received 46% · 1:02:03 playable ahead · ↓0 B/s');
+  assert.equal(translate('已收 80% · 能一直放到片尾 · ↓2.0 MB/s', 'en'), 'Received 80% · playable to the end · ↓2.0 MB/s');
+  assert.equal(translate('已收 3% · ↓2.0 MB/s', 'en'), 'Received 3% · ↓2.0 MB/s');
+  assert.equal(translate('已收完', 'en'), 'Fully received');
+});
+
+/* ============ 控件自动收起 + 沉浸全屏 ============ */
+
+test('安卓端：播放中 4 秒没碰屏幕控件自动收起、系统栏一起藏；点一下叫回来；暂停和开着抽屉时不收', async (t) => {
+  const phone = await bootPhone(t, { securityMode: 'trusted' });
+  const a = makeManifest('UI1');
+  phone.native.mediaDuration = 1200;
+  phone.native.stateFor = () => fullState(phone.h.protocol, a);
+  phone.send(playlistMsg({ rev: 1, seq: 1, queue: [fileItem(a, 1)] }));
+  phone.hostSync({ paused: false, position: 0, seq: 1 });
+  phone.send({ t: 'bitfield', s: 1, full: true });
+  await flush();
+  await phone.deliverManifest(a);
+  await until(() => phone.nativeCalls('playerLoad').length === 1, '起播');
+  const doc = globalThis.document;
+  const tap = (target) => doc.dispatch('click', { target });
+  const hidden = () => phone.$('stage').classList.contains('ui-hidden');
+  const immersive = () => phone.nativeCalls('setImmersive').map((c) => c[1]);
+  assert.deepEqual(immersive(), [false], '页面一加载先把系统栏还原（重载前可能正藏着）');
+
+  await phone.advance(1000);
+  assert.equal(hidden(), false, '刚开始播还亮着');
+  await phone.advance(4500);
+  assert.equal(hidden(), true, '播放中 4 秒没碰屏幕就收起');
+  assert.deepEqual(immersive(), [false, true], '系统状态栏、导航栏一起藏');
+
+  // 收起时点哪儿都是叫回来（收起的控件不吃触摸，点击落在页面上）
+  tap(doc.body);
+  assert.equal(hidden(), false);
+  assert.deepEqual(immersive(), [false, true, false]);
+  // 亮着时点画面空白处：立刻收起
+  tap(doc.body);
+  assert.equal(hidden(), true);
+
+  // 点在控件上只算「碰了一下」：亮出来、重新计时，不会被当成点空白处收起来
+  const pp = phone.$('pp');
+  pp.parentElement = phone.$('botbar');
+  tap(pp);
+  assert.equal(hidden(), false);
+  await phone.advance(3000);
+  tap(pp);
+  await phone.advance(3000);
+  assert.equal(hidden(), false, '点了控件要重新计时');
+  await phone.advance(1500);
+  assert.equal(hidden(), true);
+
+  // 开着抽屉不收，关上后重新计时
+  tap(doc.body);
+  phone.$('btn-playlist').click();
+  await phone.advance(6000);
+  assert.equal(hidden(), false, '开着抽屉时不收');
+  phone.$('playlist-close').click();
+  await phone.advance(4500);
+  assert.equal(hidden(), true, '抽屉关上后照常收');
+
+  // 一暂停就亮出来（好让人点播放），暂停着不自动收
+  phone.hostSync({ paused: true, position: 30, seq: 1 });
+  await phone.advance(500);
+  assert.equal(hidden(), false, '一暂停就亮出来');
+  await phone.advance(6000);
+  assert.equal(hidden(), false, '暂停着不自动收');
+  // 自己点空白处还是能收
+  tap(doc.body);
+  assert.equal(hidden(), true);
+  await phone.advance(1000);
+  assert.equal(hidden(), true, '暂停着手动收起的，不会每一拍又被亮出来');
 });
 
 /* ------------------------------ 翻译 ------------------------------ */

@@ -61,6 +61,7 @@ const EN = new Map(Object.entries({
   '你拒绝了房主发送的视频链接': 'You declined the video link sent by the host',
   'Android 拒绝或无法打开这个播放地址': 'Android rejected or could not open this stream URL',
   '视频直链 · 从原网站播放 · 房间同步中': 'Direct stream · Playing from the source site · Room sync active',
+  '已收完': 'Fully received',
   '游客不能拖动进度': 'Guests cannot seek',
   '你是游客，不能拖动进度': 'Guests cannot seek',
   '等待连接…': 'Waiting for connection…',
@@ -69,6 +70,9 @@ const EN = new Map(Object.entries({
   '游客': 'Guest',
   // 成员面板：系统名（Windows、Android …）是专有名词不翻译，老版本电脑端只报得出「电脑」
   '成员': 'Members',
+  '改名': 'Rename',
+  '保存': 'Save',
+  '昵称不能为空': 'Display name cannot be empty',
   '（你）': ' (you)',
   '电脑': 'Desktop',
   '邀请码异常过长': 'The invite code is unexpectedly long',
@@ -294,6 +298,9 @@ const PATTERNS = [
   ],
   [/^观众(\d+)$/, 'Viewer $1'],
   [/^(.+) 加入了房间$/, '$1 joined the room'],
+  // 改昵称：「你改名为」要排在通用的「X 改名为 Y」前面，否则「你」会被当成一个人名
+  [/^你改名为 (.+)$/, 'You are now $1'],
+  [/^(.+) 改名为 (.+)$/, '$1 is now $2'],
   [
     /^(.+) 的信令连接断了，但直连还在，传输继续$/,
     '$1 lost the signaling connection, but the direct connection is still up and the transfer continues',
@@ -365,7 +372,10 @@ const PATTERNS = [
     /^发得太快了（(\d+) 秒后再试）$/,
     (_all, n) => `Too many messages — try again in ${n} second${n === '1' ? '' : 's'}`,
   ],
-  [/^可播 (\d+)% · 已有 (\d+)\/(\d+) 片 · ↓(.+)$/, 'Playable $1% · $2/$3 chunks · ↓$4'],
+  // 状态行：整部收了多少 + 从当前位置往后还能放多久
+  [/^已收 (\d+)% · 往后能放 (\d+(?::\d+)+) · ↓(.+)$/, 'Received $1% · $2 playable ahead · ↓$3'],
+  [/^已收 (\d+)% · 能一直放到片尾 · ↓(.+)$/, 'Received $1% · playable to the end · ↓$2'],
+  [/^已收 (\d+)% · ↓(.+)$/, 'Received $1% · ↓$2'],
   [/^(\d+) 人在线$/, '$1 online'],
   [/^⏳ 等待缓冲：(.*)$/, '⏳ Waiting for buffer: $1'],
   // 在线链接和房主差多少秒
