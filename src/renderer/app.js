@@ -3296,6 +3296,8 @@ async function joinViaServer(payload) {
     // 重连成功后没人再校验，用户可能被静默拖进一个他已经放弃的房间。
     S.signaling?.close();
     S.signaling = null;
+    // 房间已经关了：服务器是好的，别再叫人去折腾部署
+    if (e.code === 'ROOM_CLOSED') return prepStop('房间已关闭', e.message);
     return prepFail(
       e.code === 'REGION_BLOCKED'
         ? e.message
@@ -3538,6 +3540,23 @@ function directLinkUp(peer) {
   return ice !== 'disconnected' && ice !== 'failed' && ice !== 'closed';
 }
 
+/**
+ * 房间里不经这条信令进来的人（一对一邀请、先前的房间链接）。信令服务器只数经它进房的人，
+ * 房主不报的话房间会超员 —— 房间链接那边用 occupied 把直连算进去了，这里是同一件事。
+ * 握过手、还没关的都算：ICE 抖一下时名额照样占着，不然服务器会趁这几秒多放一个人进来。
+ */
+function outsideSeats(sig = S.signaling) {
+  let n = 0;
+  for (const p of S.swarm?.peers.values() || []) if (p.authenticated && !p.closed && p.via !== sig) n += 1;
+  return n;
+}
+
+function syncOutsideSeats() {
+  const sig = S.signaling;
+  if (S.role !== 'host' || S.hostId !== S.peerId || S.signalTransport !== 'ws' || !sig?.setOutside) return;
+  sig.setOutside(outsideSeats(sig));
+}
+
 // 信令那头推来的日志按种类限流：出了毛病的服务器能每秒推上万条，每一条都要让日志面板重排一次
 const SIG_LOG_WINDOW_MS = 10_000;
 const SIG_LOG_MAX = 20;
@@ -3576,7 +3595,8 @@ async function connectSignaling(url, roomId, relay = null) {
         // 房主拿它收回一直没和我连上的名额：持链接的人光发 hello 不建连，就能把房间占满
         ...(relay.isHost ? { isLinked: peerLinked } : {}),
       })
-    : new WsSignaling({ url, roomId, peerId: S.peerId, name: S.name, maxMembers });
+    : // 成员也带上房间人数和房主：服务器重启过的话，重连时拿它们做建房提示（见 WsSignaling）
+      new WsSignaling({ url, roomId, peerId: S.peerId, name: S.name, maxMembers: S.roomCapacity, hostId: S.hostId });
   S.signalTransport = relay ? 'relay' : 'ws';
   // 这里就赋值是为了让事件处理器能拿到它；但连接失败时必须置回 null，
   // 否则 inviteViaServer 的 if (!S.signaling) 守卫会短路跳过重连，
@@ -3690,16 +3710,40 @@ async function connectSignaling(url, roomId, relay = null) {
     if (peerId === S.hostId) hostReallyGone();
     S.swarm.removePeer(peerId);
   });
-  sig.on('joined', ({ maxMembers }) => {
+  let joinedBefore = false;
+  sig.on('joined', ({ hostId, maxMembers } = {}) => {
     if (!live()) return;
-    if (maxMembers) S.roomCapacity = clampCapacity(maxMembers);
+    const again = joinedBefore;
+    joinedBefore = true;
+    // 服务器认的房主和本机认的对不上：旧版信令服务器重启后，房间由先重连上的人重建，他成了服务器眼里的房主。
+    // 首次加入对不上的由 connect() 之后的检查拒掉；重连时说清楚后果，人数也别跟着这个房间改
+    if (hostId && S.hostId && hostId !== S.hostId) {
+      if (again) {
+        sigLog(
+          'host-mismatch',
+          S.hostId === S.peerId
+            ? '信令服务器重启后没认出你是房主（它可能还是旧版本）：新人拿邀请码进不来，你也改不了人数；已经在房里的人不受影响。升级信令服务器后重新开房即可恢复'
+            : '信令服务器重启后认错了房主（它可能还是旧版本）：新人暂时进不来；已经在房里的人不受影响',
+          'bad'
+        );
+      }
+      return;
+    }
+    if (again && S.role === 'host' && S.hostId === S.peerId && maxMembers !== S.roomCapacity) {
+      // 房主重新进房：断着的时候改过人数（或者房间被重建过），以本机的设置为准推回去
+      sig.setMaxMembers(S.roomCapacity);
+    } else if (maxMembers) {
+      S.roomCapacity = clampCapacity(maxMembers);
+    }
     renderCapacityStatus();
   });
   sig.on('room-config', ({ maxMembers }) => {
     if (!live()) return;
+    const before = S.roomCapacity;
     S.roomCapacity = clampCapacity(maxMembers);
     renderCapacityStatus();
-    sigLog('config', `房间人数上限已设为 ${S.roomCapacity}`, 'good');
+    // 房主只是报了一下不经服务器进来的人数时，旧版服务器也会把没变的上限广播一遍：没变就不刷日志
+    if (S.roomCapacity !== before) sigLog('config', `房间人数上限已设为 ${S.roomCapacity}`, 'good');
   });
   // 房主换了房间链接：观众手上那条（Discord 状态里的「加入放映」）跟着换
   sig.on('rekey', ({ secret }) => {
@@ -3729,6 +3773,14 @@ async function connectSignaling(url, roomId, relay = null) {
   });
 
   const joined = await sig.connect();
+  if (!relay && S.hostId && S.hostId !== S.peerId && joined?.hostId === S.peerId) {
+    // 服务器上已经没有这个房间了（人走光被删，或者服务器重启过），它按「第一个进来的人」把我记成了
+    // 新房间的房主。不是冒名，是房间关了：照样不进，但把原因说对
+    sig.close();
+    const err = new Error('这个房间已经关闭（房主可能已离开），请让房主重新发邀请');
+    err.code = 'ROOM_CLOSED';
+    throw err;
+  }
   if (!joined?.hostId || (S.hostId && joined.hostId !== S.hostId)) {
     sig.close();
     throw new Error('房主身份与邀请码不一致，已拒绝加入');
@@ -3795,6 +3847,14 @@ function hostReallyGone() {
 function scheduleReconnect(peer, sig, { retry = false } = {}) {
   if (!sig || !S.swarm || (peer.closed && !retry)) return;
   const peerId = peer.peerId;
+  // 信令服务器早先宣布过他离开（那时直连还开着，没摘），现在直连也断了：他不在信令里，
+  // 重协商的消息投不到，退避多少次都是空等 —— 直接按离开处理。他回来的话服务器会重新广播 peer-join。
+  // 房主强退、崩溃、正常退出都是这个顺序：先断信令，数据通道后关
+  if (sig.hasLeft?.(peerId)) {
+    cancelRecovery(peerId);
+    if (peerId === S.hostId) hostReallyGone();
+    return;
+  }
   const st = RECOVERY.get(peerId) || { attempts: 0, timer: null, watch: null };
   if (st.timer) return; // 已经排上了
   clearTimeout(st.watch);
@@ -3805,6 +3865,9 @@ function scheduleReconnect(peer, sig, { retry = false } = {}) {
     log(`和 ${peer.name} 的直连试了 ${st.attempts} 次都没恢复。${advice.text}`, 'bad');
     // 退避用尽才承认失联：在这之前列表横幅只说「正在重连」，别把 ICE 抖一下说成房主走了
     if (peerId === S.hostId) hostReallyGone();
+    // 最后一轮新建的连接还停在半路（对面一直没应答）：摘掉，别让它一直占着名额和一条 RTCPeerConnection
+    const stuck = S.swarm.peers.get(peerId);
+    if (stuck && stuck.ctrl?.readyState !== 'open') S.swarm.removePeer(peerId);
     return;
   }
 
@@ -3902,6 +3965,8 @@ async function reconnectPeer(peerId, name, sig) {
 /* ------------------------------ peer 接线 ------------------------------ */
 
 function wirePeer(peer, sig) {
+  // 经哪条信令建的连接（一对一邀请的没有）：信令服务器判满时只数经它进房的人，见 outsideSeats
+  peer.via = sig || null;
   if (sig) peer.on('icecandidate', (c) => sig.signal(peer.peerId, { kind: 'ice', candidate: c }));
 
   let graceTimer = null;
@@ -4548,6 +4613,10 @@ function initSwarmAndSync() {
         // 极简模式没有信令、也没有重连的路子：直连断了就是这一场结束了
         S.hostGone = true;
         log('房主已离开，这个房间结束了', 'warn');
+      } else if (S.signaling?.hasLeft?.(peerId)) {
+        // 信令服务器早就宣布他离开了，数据通道现在也关了（强退、崩溃、正常退出都是先断信令）：
+        // 不是链路抖动，没有什么可重连的
+        hostReallyGone();
       } else {
         // 信令模式下 peer-gone 还可能来自 ICE failed 或房主发来的重协商 —— 那时正在重连，
         // 人没走。真的离开由信令的 peer-leave 或重连退避用尽来认定（见 hostReallyGone）。
@@ -4566,6 +4635,9 @@ function initSwarmAndSync() {
     renderPlaylistSoon();
   });
   S.swarm.on('ctrl', ({ msg, peer }) => onRoomCtrl(msg, peer));
+  // 房主用信令服务器时，经一对一邀请、房间链接进来的人服务器看不到：有人进出就把这个数报上去
+  S.swarm.on('peer-authenticated', () => syncOutsideSeats());
+  S.swarm.on('peer-gone', () => syncOutsideSeats());
 
   S.sync.on('stall-change', ({ who: peerId, name, stalled, self }) => {
     // 名字按成员表同一套显示名：两个「小明」时得分得清是哪一个在卡
@@ -7102,6 +7174,11 @@ async function inviteViaServer() {
       // 房间号只在这台服务器上有效。设置里的地址房间进行中也能改，编码时不能再去读它
       S.roomSignalUrl = url;
     }
+    // 复用手上那条信令时也得改回来：中间点过「一对一」的话 S.mode 还停在 'manual'，诊断会写成
+    // 「极简（零服务器）」，「邀请下一位」还会按极简模式现生成一次性链接盖掉这个多人可用的邀请码
+    S.mode = 'server';
+    // 先前经一对一邀请、房间链接进来的人，服务器看不到：报上去，让它判满时算上
+    syncOutsideSeats();
 
     const code = await encodeCode({
       k: 'room',

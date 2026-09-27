@@ -382,19 +382,33 @@ export async function decodeCode(code) {
   }
 }
 
+// 服务器随 joined 发给房主以外的人的房主凭据摘要（SHA-256 的 base64url）
+const HOST_KEY_RE = /^[A-Za-z0-9_-]{43}$/;
+// 服务器还挂着自己上一条（半开的）连接、报「peerId 已被占用」时，按这个固定的短间隔重试，最多这么多次。
+// 旧版服务器要等心跳（最长约一分钟）才清掉那条死连接，退避一路涨到 30 秒的话，清掉之后还要白等半分钟
+const DUP_RETRY_MS = 5000;
+const DUP_RETRY_MAX = 18;
+// 「信令宣布离开」的人最多记这么多个：出了毛病的服务器能推任意多条 peer-leave
+const LEFT_MAX = 64;
+
 /**
  * WebSocket 信令客户端。
  * 服务器只做房间内的消息转发，看不到也存不下视频内容。
  */
 export class WsSignaling extends Emitter {
-  constructor({ url, roomId, peerId, name, maxMembers = 0 }) {
+  constructor({ url, roomId, peerId, name, maxMembers = 0, hostId = null }) {
     super();
     this.url = url;
     this.roomId = roomId;
     this.peerId = peerId;
     this.name = name;
+    // 房主：房间人数上限。成员：邀请码里（之后跟着 room-config）的人数，重连时交给服务器当建房提示
     this.maxMembers = Number(maxMembers) || 0;
+    // 本机认的房主（加入者取自邀请码，房主就是自己）。服务器重启过的话房间由先重连上的人重建，
+    // 成员重连时拿它做建房提示，服务器才不会把重建房间的人当成房主
+    this.hostId = typeof hostId === 'string' && hostId ? hostId : null;
     this.ws = null;
+    // 进了房间（收到 joined）才算连上：join 被接受之前发的信令服务器不认
     this.connected = false;
     this._retry = 0;
     this._joinedOnce = false; // 曾经真的进过房吗。只有进过才值得自动重连
@@ -403,6 +417,14 @@ export class WsSignaling extends Emitter {
     // 不然 HOST_ID_RESERVED 会把掉线重连的房主本人也挡在门外，之后再也收不到 peer-join。
     // 只放在这个实例里：不交给调用方、不进邀请码、不广播。
     this._hostToken = null;
+    // 房主凭据的摘要（服务器发给房主以外的人）。房间被重建时随建房提示交上去，服务器拿它核对
+    // 回来认领的是不是真房主。同样只放在这个实例里
+    this._hostKey = null;
+    // 不经这台服务器进房的人数（房主用：一对一邀请、房间链接进来的），服务器判满时要算上
+    this.outside = 0;
+    // 信令服务器宣布离开、之后没再出现的人（见 hasLeft）
+    this._left = new Set();
+    this._dupStreak = 0;
   }
 
   connect() {
@@ -415,10 +437,11 @@ export class WsSignaling extends Emitter {
       }
 
       this.ws.onopen = () => {
-        this.connected = true;
         // 退避计数不能在这里清零。WS 握手成功不代表加入成功 —— 「连得上但 join 被拒」
         // （房间满、peerId 被占、地区拦截）每一轮都会把退避重置回 1 秒，
         // 指数退避形同虚设，变成每秒一次的重连风暴。真正加入成功才算数，见 joined 分支。
+        // 建房提示只在重连时带：首次加入时房间不在，就是房间已经关了，不该替房主把它建起来
+        const hint = this._joinedOnce && this.hostId && this.hostId !== this.peerId;
         this._send({
           t: 'join',
           roomId: this.roomId,
@@ -426,6 +449,8 @@ export class WsSignaling extends Emitter {
           name: this.name,
           maxMembers: this.maxMembers,
           ...(this._hostToken ? { hostToken: this._hostToken } : {}),
+          ...(hint ? { hostHint: this.hostId, ...(this._hostKey ? { hostKey: this._hostKey } : {}) } : {}),
+          ...(this.outside > 0 ? { outside: this.outside } : {}),
         });
       };
 
@@ -441,10 +466,18 @@ export class WsSignaling extends Emitter {
 
         if (msg.t === 'joined') {
           this._retry = 0; // 真正进房了，退避才该归零
+          this._dupStreak = 0;
           this._joinedOnce = true;
+          this.connected = true;
           // 每次进房都以服务器这次的答复为准：房间被重建、自己不再是房主时它就没有这一项
-          const { hostToken, ...joined } = msg;
+          const { hostToken, hostKey, ...joined } = msg;
           this._hostToken = typeof hostToken === 'string' && hostToken ? hostToken : null;
+          // 服务器认的房主和本机认的一致，才记它给的摘要和人数（下次重建房间时的提示）
+          if (this.hostId && joined.hostId === this.hostId && this.hostId !== this.peerId) {
+            if (typeof hostKey === 'string' && HOST_KEY_RE.test(hostKey)) this._hostKey = hostKey;
+            this._noteCapacity(joined.maxMembers);
+          }
+          for (const p of Array.isArray(joined.peers) ? joined.peers : []) this._left.delete(p?.peerId);
           if (!settled) {
             settled = true;
             resolve(joined);
@@ -455,6 +488,7 @@ export class WsSignaling extends Emitter {
         if (msg.t === 'error') {
           const err = new Error(msg.message || '信令服务器拒绝了连接');
           err.code = msg.code;
+          if (msg.code === 'DUP_PEER') this._dupStreak += 1;
           if (!settled) {
             settled = true;
             reject(err);
@@ -462,6 +496,21 @@ export class WsSignaling extends Emitter {
           this.emit('error', err);
           return;
         }
+        if (msg.t === 'peer-join' && typeof msg.peerId === 'string') {
+          this._left.delete(msg.peerId);
+          const { hostKey, ...join } = msg;
+          // 房主回来认领重建的房间时摘要会换成他那张凭据的，跟着更新
+          if (msg.peerId === this.hostId && typeof hostKey === 'string' && HOST_KEY_RE.test(hostKey)) this._hostKey = hostKey;
+          this.emit('peer-join', join);
+          return;
+        }
+        if (msg.t === 'peer-leave' && typeof msg.peerId === 'string') {
+          this._left.delete(msg.peerId);
+          this._left.add(msg.peerId);
+          while (this._left.size > LEFT_MAX) this._left.delete(this._left.values().next().value);
+        }
+        if (msg.t === 'signal' && typeof msg.from === 'string') this._left.delete(msg.from);
+        if (msg.t === 'room-config') this._noteCapacity(msg.maxMembers);
         this.emit(msg.t, msg);
       };
 
@@ -492,11 +541,18 @@ export class WsSignaling extends Emitter {
 
   /** 信令断了不该拆掉已经建好的 P2P 连接 —— 那些是直连，不经过服务器。 */
   _scheduleReconnect() {
-    const delay = Math.min(30000, 1000 * 2 ** this._retry++);
+    // 刚被 DUP_PEER 拒过：是自己上一条连接还挂在服务器上，等它被清掉就好，不必越等越久
+    const dup = this._dupStreak > 0 && this._dupStreak <= DUP_RETRY_MAX;
+    const delay = dup ? DUP_RETRY_MS : Math.min(30000, 1000 * 2 ** this._retry++);
     this.emit('reconnecting', { in: delay });
     setTimeout(() => {
       if (!this._closedByUs) this.connect().catch(() => {});
     }, delay);
+  }
+
+  _noteCapacity(value) {
+    const n = Number(value);
+    if (Number.isSafeInteger(n) && n > 0) this.maxMembers = n;
   }
 
   _send(obj) {
@@ -504,12 +560,34 @@ export class WsSignaling extends Emitter {
   }
 
   signal(to, payload) {
-    this._send({ t: 'signal', to, from: this.peerId, payload });
+    if (this.connected) this._send({ t: 'signal', to, from: this.peerId, payload });
   }
 
   setMaxMembers(maxMembers) {
     this.maxMembers = Number(maxMembers) || this.maxMembers;
-    this._send({ t: 'room-config', maxMembers: this.maxMembers });
+    // 断着的时候改的由调用方在重新进房后补发（见 app 的 joined 处理）
+    if (this.connected) this._send({ t: 'room-config', maxMembers: this.maxMembers });
+  }
+
+  /**
+   * 房主报「不经这台服务器进房的人数」（一对一邀请、房间链接进来的）：服务器只数经它进房的人，
+   * 不报的话房间会超员。只在变了时发；断着的时候记下，重新进房时随 join 带上。
+   */
+  setOutside(count) {
+    const n = Math.max(0, Math.floor(Number(count) || 0));
+    if (n === this.outside) return;
+    this.outside = n;
+    if (this.connected && this.maxMembers > 0) {
+      this._send({ t: 'room-config', maxMembers: this.maxMembers, outside: n });
+    }
+  }
+
+  /**
+   * 信令服务器宣布这个人离开了，之后也没再出现（没有 peer-join、没发过信令）。
+   * 服务器是看着他的连接断掉才广播的，他不在房间里，发给他的重协商消息都会被丢掉。
+   */
+  hasLeft(peerId) {
+    return this._left.has(peerId);
   }
 
   close() {

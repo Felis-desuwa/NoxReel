@@ -1413,12 +1413,21 @@ function cancelRecovery(peerId, { keepCount = false } = {}) {
 function scheduleReconnect(peer, sig, { retry = false } = {}) {
   if (!sig || !S.swarm || (peer.closed && !retry)) return;
   const peerId = peer.peerId;
+  // 信令服务器早先宣布过他离开（那时直连还开着），现在直连也断了：他不在信令里，重协商的消息投不到，
+  // 退避只是空等（和电脑端一样；房间链接的信令没有 hasLeft，不走这条）
+  if (sig.hasLeft?.(peerId)) {
+    cancelRecovery(peerId);
+    return;
+  }
   const st = RECOVERY.get(peerId) || { attempts: 0, timer: null, watch: null };
   if (st.timer) return;
   clearTimeout(st.watch);
   st.watch = null;
   if (st.attempts >= RECONNECT_BACKOFF_MS.length) {
     log('和 ' + peer.name + ' 的直连试了 ' + st.attempts + ' 次都没恢复。双方都在严格 NAT 后面时需要 TURN 中继兜底。', 'bad');
+    // 最后一轮新建的连接还停在半路（对面一直没应答）：摘掉，别让它一直占着名额和一条 RTCPeerConnection（和电脑端一样）
+    const stuck = S.swarm.peers.get(peerId);
+    if (stuck && stuck.ctrl?.readyState !== 'open') S.swarm.removePeer(peerId);
     return;
   }
   const wait = RECONNECT_BACKOFF_MS[st.attempts];

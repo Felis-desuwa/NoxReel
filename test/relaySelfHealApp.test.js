@@ -487,6 +487,7 @@ function inviteBox({ rekeyResult, admitted = 0 } = {}) {
       turnFetchNeeded: () => false,
       inviteBlocked: () => false,
       connectSignaling: async () => ({ hostId: 'host1' }),
+      syncOutsideSeats: () => {},
     },
   });
   return { ctx, S, calls, el, relay };

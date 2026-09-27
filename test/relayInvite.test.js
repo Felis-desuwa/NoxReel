@@ -331,6 +331,7 @@ function inviteRace() {
     newRoomSecret: () => 'SECRET',
     randomRoomId: () => 'ROOM1',
     inviteMediaInfo: () => null,
+    syncOutsideSeats: () => {},
     encodeCode: async (p) => {
       calls.push(['encode', p.k]);
       return 'NR3-Xcode';

@@ -288,6 +288,7 @@ PORT=8080 BLOCKED_COUNTRIES=CN ALLOW_UNKNOWN=0 MAXMIND_DB=./GeoLite2-Country.mmd
 - Set a count or rate limit to `0` to disable it (`MSG_RATE=0` turns off message rate limiting); sizes and durations cannot be `0` and fall back to their defaults. The defaults leave ample room for several devices of one household behind the same NAT and for a 16-person room exchanging SDP/ICE all at once.
 - Behind nginx, Caddy, or a CDN, always set `TRUST_PROXY=1` and make the proxy **append** to `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`). Otherwise every client appears to come from the proxy itself and shares one per-IP limit.
 - When raising `MAX_CONNECTIONS`, raise the process file descriptor limit as well (`ulimit -n` on Linux is often 1024 by default).
+- After the server restarts (a deploy or a crash), rooms come back with their original host and capacity, and a member who switches networks no longer waits a minute to reconnect. This needs both the server and the clients to be up to date: after an older server restarts, the room is rebuilt by whoever reconnects first, new people can’t join with the invite, and the host has to open a new room.
 
 ## Contributing
 

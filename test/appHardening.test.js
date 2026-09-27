@@ -1006,6 +1006,7 @@ function serverHost() {
       updatePresence: () => {},
       newRoomSecret: () => 'SECRET',
       inviteViaManual: async () => {},
+      syncOutsideSeats: () => {},
     },
   });
   return { ctx, S, encoded, connects };

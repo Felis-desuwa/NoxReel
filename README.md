@@ -288,6 +288,7 @@ PORT=8080 BLOCKED_COUNTRIES=CN ALLOW_UNKNOWN=0 MAXMIND_DB=./GeoLite2-Country.mmd
 - 数量和速率类的上限填 `0` 表示不限（`MSG_RATE=0` 即不限速）；大小和时长类填 `0` 无效，按默认值处理。默认值按「一家人在同一个 NAT 后面开几台设备」「16 人房间一口气交换 SDP/ICE」留足了余量。
 - 放在 nginx、Caddy 或 CDN 后面时务必设 `TRUST_PROXY=1`，并让反代**追加**写 `X-Forwarded-For`（nginx：`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`）。否则所有人都会被当成来自反代自己，共用一份每 IP 上限。
 - 调大 `MAX_CONNECTIONS` 时，记得同时调高进程的文件句柄上限（Linux 上的 `ulimit -n` 默认常是 1024）。
+- 服务器重启（部署、崩溃）后房间会按原来的房主和人数上限恢复，成员换网络重连也不用再等一分钟。这要求服务器和客户端都是新版本：旧版服务器重启后，房间会由最先重连上的人重建，新人拿邀请码进不来，只能重新开房。
 
 ## 参与项目
 

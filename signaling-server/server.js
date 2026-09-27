@@ -367,12 +367,27 @@ function acquireConnSlot(key, socket) {
 
 /* ------------------------------- 房间管理 ------------------------------- */
 
-/** @type {Map<string, {members:Map<string, {ws:WebSocket, name:string}>, hostId:string, hostToken:string, maxMembers:number}>} */
+/**
+ * @type {Map<string, {members:Map<string, {ws:WebSocket, name:string}>, hostId:string, hostToken:string|null,
+ *   hostKey:string|null, maxMembers:number, outside:number}>}
+ */
 const rooms = new Map();
 // 和客户端 randomPeerId / randomRoomId 的字母表对齐（chat-safe base64 用了 '-' 和 '.'）。
 // 只限上界和字符集：要防的是「超长标识符被存进房间表并按人数广播出去」这种
 // 内存放大，以及奇怪字符混进日志。下界没有意义，短 id 是合法的。
 const ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+// 房主续期凭据：服务器发的是 24 字节随机数的 base64url（32 位）。认领重建的房间时要沿用房主手上那张，
+// 只收这个形状的，别让人塞一个一位数的「凭据」进来
+const TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/;
+// 凭据的摘要：SHA-256 的 base64url（43 位）
+const KEY_RE = /^[A-Za-z0-9_-]{43}$/;
+
+// 同一个 peerId 的新连接到来时，先 ping 一下占着这个身份的旧连接，这么久没回 pong 就当它已经死了
+// （TCP 半开：客户端换了网络、先于服务器发现断线），由新连接顶替。不探的话要等心跳清掉它（最长两个
+// 心跳周期），本人重连一直撞 DUP_PEER，别人为恢复直连发来的 offer 也全投进那条死连接
+const PROBE_MS = Math.min(3000, HEARTBEAT_MS);
+// 同一条旧连接同时最多替几个新连接探活。正常重连只有一个，多出来的直接按 DUP_PEER 拒
+const PROBE_WAITERS = 4;
 
 function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -381,10 +396,11 @@ function isPlainObject(v) {
 /**
  * 房间容量。
  *
- * 0 的语义是「我没有意见，用默认值」—— 非房主的客户端 join 时发的正是 maxMembers: 0。
+ * 0 的语义是「我没有意见，用默认值」—— 老版本的非房主客户端 join 时发的正是 maxMembers: 0。
  * 原来 Math.max(2, …) 把它压成 2，于是只要房间碰巧是由游客先建起来的
  * （房主还没连上、或断线后房间被重建），容量就被永久钉死在 2 人，
  * 后面所有人都会撞上 ROOM_FULL，而房主根本不知道发生了什么。
+ * 新版本的成员 join 时带的是邀请码里（之后跟着 room-config 更新）的人数，重建时照它来。
  */
 function normalizeCapacity(value) {
   const n = Number.parseInt(value, 10);
@@ -392,36 +408,78 @@ function normalizeCapacity(value) {
   return Math.max(2, Math.min(MAX_ROOM_SIZE, n));
 }
 
+/** 不经这台服务器进房的人数（一对一邀请、房间链接进来的）：非负整数，不超过房间人数硬上限。 */
+function seatCount(value) {
+  if (!Number.isFinite(value)) return null;
+  return Math.max(0, Math.min(MAX_ROOM_SIZE, Math.floor(value)));
+}
+
+function newHostToken() {
+  return crypto.randomBytes(24).toString('base64url');
+}
+
+/** 续期凭据的摘要。随 joined 发给房主以外的人，房间被重建时由他们交回来核对房主 —— 摘要推不回凭据。 */
+function hostKeyOf(token) {
+  return crypto.createHash('sha256').update(token).digest('base64url');
+}
+
 /**
- * 房间是内存态的，空了即删，所以 hostId 只能认「第一个加入的人」——
- * 房主断线后房间被重建时，这个答案就是错的。服务端没有能绑定房主身份的凭据，
- * 真正的锚点在客户端：加入者拿邀请码里的 hostId 和 joined.hostId 比对，
- * 对不上就拒绝进房（见 app.js 的「房主身份与邀请码不一致」）。
- * 这里再加一道 HOST_ID_RESERVED，房间存续期间不许别人顶替房主的 peerId。
+ * 房间是内存态的，空了即删，服务器重启更是全丢。peerId 又是公开的（joined.peers 会发给全房），
+ * 光凭它分不清「房主本人断线重连」和「别人顶着房主的 id 来接管」。所以：
  *
- * 但 peerId 是公开的（joined.peers 会发给全房），光凭它分不清「房主本人断线重连」
- * 和「别人顶着房主的 id 来接管」。所以建房时再发一张只有房主拿得到的续期凭据
- * hostToken：只随房主自己的 joined 回去，不广播、不进邀请码。房主重连时带上它，
- * 对得上才放行，对不上仍是 HOST_ID_RESERVED。
+ * - 建房时发一张只有房主拿得到的续期凭据 hostToken：只随房主自己的 joined 回去，不广播、不进邀请码。
+ *   房主重连时带上它，对得上才放行，对不上是 HOST_ID_RESERVED —— 房间存续期间不许别人顶替房主。
+ *   凭据的 SHA-256 摘要 hostKey 随 joined 发给其他成员（摘要推不回凭据）。
+ *
+ * - 房间不在了（服务器重启、全员信令同时掉线），抢着重连的老成员谁先到谁建房。原来建房的人就被记成
+ *   房主：真房主回来拿不回身份（改人数 NOT_HOST）、容量掉回默认值、新人拿邀请码比对房主对不上一律
+ *   被拒，房间实际上对新人关死了。现在老成员重连时带上建房提示（hint：他认的房主 id、凭据摘要，
+ *   join 里的 maxMembers 是他知道的人数）。建房的人不是提示里的房主时，房间登记的是提示里的房主：
+ *   给他留着席位，凭据先空着，等他本人拿旧凭据回来认领 —— 核对的是提示里的摘要；老成员不知道摘要
+ *   （之前连的是旧版服务器）就先到先得，和没有提示时服务器重启后的处境一样。
+ *   首次加入不带提示：那时房间不在就是真的关了，不该替房主把它建起来（客户端会报「房间已经关闭」）。
  */
-function roomOf(id, creatorId, requestedCapacity) {
+function roomOf(id, creatorId, requestedCapacity, hint = null) {
   if (!rooms.has(id)) {
+    const forHost = hint && hint.hostId !== creatorId;
+    const hostToken = forHost ? null : newHostToken();
     rooms.set(id, {
       members: new Map(),
-      hostId: creatorId,
-      hostToken: crypto.randomBytes(24).toString('base64url'),
+      hostId: forHost ? hint.hostId : creatorId,
+      hostToken,
+      hostKey: forHost ? hint.hostKey : hostKeyOf(hostToken),
       maxMembers: normalizeCapacity(requestedCapacity),
+      outside: 0,
     });
   }
   return rooms.get(id);
 }
 
 /** 恒定时间比较，不让逐字节的比较耗时泄露凭据前缀。 */
+function sameSecret(a, b) {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
 function hostTokenMatches(room, token) {
-  if (typeof token !== 'string' || !token) return false;
-  const expected = Buffer.from(room.hostToken);
-  const given = Buffer.from(token);
-  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+  if (typeof token !== 'string' || !token || !room.hostToken) return false;
+  return sameSecret(token, room.hostToken);
+}
+
+/** 顶着房主 id 来的这条连接拿得出房主的凭据吗。房间刚被老成员重建、房主还没回来认领时核对摘要。 */
+function hostCredentialOk(room, token) {
+  if (room.hostToken) return hostTokenMatches(room, token);
+  if (!room.hostKey) return true; // 重建的人也不知道摘要：先到先得
+  return typeof token === 'string' && TOKEN_RE.test(token) && sameSecret(hostKeyOf(token), room.hostKey);
+}
+
+/** 告诉房里剩下的人某人走了；房间空了就删。 */
+function announceLeave(room, roomId, peerId) {
+  for (const { ws: other } of room.members.values()) {
+    sendJson(other, { t: 'peer-leave', peerId });
+  }
+  if (room.members.size === 0 && rooms.get(roomId) === room) rooms.delete(roomId);
 }
 
 function leave(ws) {
@@ -432,11 +490,34 @@ function leave(ws) {
   if (!room || room.members.get(ws.peerId)?.ws !== ws) return;
 
   room.members.delete(ws.peerId);
-  for (const { ws: other } of room.members.values()) {
-    sendJson(other, { t: 'peer-leave', peerId: ws.peerId });
-  }
-  if (room.members.size === 0) rooms.delete(ws.roomId);
+  announceLeave(room, ws.roomId, ws.peerId);
   console.log(`[room] ${ws.peerId} 离开 ${ws.roomId}（剩 ${room.members.size} 人）`);
+}
+
+/**
+ * 探一下占着某个身份的旧连接还活着没有：ping 一次，PROBE_MS 内回了 pong 就是活的。
+ * 同一条旧连接同时只 ping 一次，几个新连接排在同一次探测上。
+ */
+function probe(holder, done) {
+  if (holder.readyState !== holder.OPEN) return done(false);
+  let p = holder.probe;
+  if (!p) {
+    p = holder.probe = { waiters: [], timer: setTimeout(() => settleProbe(holder, false), PROBE_MS) };
+    try {
+      holder.ping();
+    } catch {} // 发不出去就等超时
+  } else if (p.waiters.length >= PROBE_WAITERS) {
+    return done(true);
+  }
+  p.waiters.push(done);
+}
+
+function settleProbe(holder, alive) {
+  const p = holder.probe;
+  if (!p) return;
+  holder.probe = null;
+  clearTimeout(p.timer);
+  for (const done of p.waiters) guarded('probe', () => done(alive));
 }
 
 // 一条连接允许积压多少待发字节。ws 的 maxPayload 只限单条消息大小，不限条数，
@@ -469,6 +550,12 @@ function fail(ws, code, message) {
   }, 50);
 }
 
+/** admit 里的拒绝：断开这条连接，并告诉调用方没进成。 */
+function refuse(ws, code, message) {
+  fail(ws, code, message);
+  return false;
+}
+
 function report(ws, code, message) {
   sendJson(ws, { t: 'error', code, message });
 }
@@ -476,7 +563,8 @@ function report(ws, code, message) {
 /* ------------------------------- 消息处理 ------------------------------- */
 
 function handleJoin(ws, msg, verdict) {
-  if (ws.roomId) return fail(ws, 'ALREADY_JOINED', '这个连接已经在房间里了');
+  // joinPending：join 已经收下、正在替它探旧连接的死活（见 probeThenAdmit），这条连接不能再 join 一次
+  if (ws.roomId || ws.joinPending) return fail(ws, 'ALREADY_JOINED', '这个连接已经在房间里了');
   // 每次 join 都会向全房广播 peer-join，房里每个人随即新建一条 RTCPeerConnection 发 offer ——
   // 反复进进出出就能把一个房间拖垮。按来源 IP 限次数，被拒的尝试也算。
   if (!joinLimiter.take(ws.ipKey)) return fail(ws, 'JOIN_RATE_LIMITED', '加入房间太频繁，请稍后再试');
@@ -496,37 +584,84 @@ function handleJoin(ws, msg, verdict) {
   if (msg.maxMembers != null && !Number.isFinite(msg.maxMembers)) {
     return fail(ws, 'BAD_JOIN', 'maxMembers 必须是数字');
   }
-  // 续期凭据不是字符串就当没带：冒名者照样撞 HOST_ID_RESERVED
-  const hostToken = typeof msg.hostToken === 'string' ? msg.hostToken : null;
+  const req = {
+    roomId,
+    peerId,
+    name: (msg.name || peerId).slice(0, 40),
+    maxMembers: msg.maxMembers,
+    // 续期凭据不是字符串就当没带：冒名者照样撞 HOST_ID_RESERVED
+    hostToken: typeof msg.hostToken === 'string' ? msg.hostToken : null,
+    // 建房提示（见 roomOf）：类型不对就当没带，和续期凭据一样
+    hint:
+      typeof msg.hostHint === 'string' && ID_RE.test(msg.hostHint)
+        ? { hostId: msg.hostHint, hostKey: typeof msg.hostKey === 'string' && KEY_RE.test(msg.hostKey) ? msg.hostKey : null }
+        : null,
+    // 只有房主报的算数（见 admit）
+    outside: seatCount(msg.outside),
+  };
+  admit(ws, req, verdict);
+}
 
+/**
+ * 把这条连接放进房间。成了返回 true，被拒返回 false；要先探一下旧连接死活时返回 undefined，
+ * 探完再回到这里（probed = true）。
+ *
+ * 判断顺序：房主身份 → 同一身份的旧连接 → 满员。续期和顶替排在满员前面：房主或成员凭自己的
+ * 身份回来，占的就是自己原来那个位子，不该因为房间满了被挡在外面。
+ */
+function admit(ws, req, verdict, probed = false) {
+  const { roomId, peerId } = req;
   if (!rooms.has(roomId)) {
-    if (MAX_ROOMS && rooms.size >= MAX_ROOMS) return fail(ws, 'SERVER_FULL', '服务器的房间数已满，请稍后再试');
-    if (!roomLimiter.take(ws.ipKey)) return fail(ws, 'ROOM_RATE_LIMITED', '创建房间太频繁，请稍后再试');
+    if (MAX_ROOMS && rooms.size >= MAX_ROOMS) return refuse(ws, 'SERVER_FULL', '服务器的房间数已满，请稍后再试');
+    if (!roomLimiter.take(ws.ipKey)) return refuse(ws, 'ROOM_RATE_LIMITED', '创建房间太频繁，请稍后再试');
   }
-  const room = roomOf(roomId, peerId, msg.maxMembers);
+  const room = roomOf(roomId, peerId, req.maxMembers, req.hint);
   const claimsHost = peerId === room.hostId;
-  // 房主掉线期间替他留着一个名额：否则他重连的那几秒里补进来一个人，
-  // 房主就会一直撞 ROOM_FULL，直到有人主动离开。
-  const hostSeat = claimsHost || room.members.has(room.hostId) ? 0 : 1;
-  if (room.members.size + hostSeat >= room.maxMembers) {
-    return fail(ws, 'ROOM_FULL', `房间已满（上限 ${room.maxMembers} 人）`);
-  }
-  if (room.members.has(peerId)) return fail(ws, 'DUP_PEER', 'peerId 已被占用');
   // 房主的 peerId 会随 joined.peers 广播给全房，而客户端把「peerId === hostId」
   // 当成房主身份的唯一凭据。房主的信令连接一掉线，房内任何人都能顶着他的
   // peerId 重新 join，接管全场控制权。房间还在、位置空着，也不能让别人补位 ——
   // 只有拿得出续期凭据的房主本人能回来。
-  if (claimsHost && room.members.size > 0 && !hostTokenMatches(room, hostToken)) {
-    return fail(ws, 'HOST_ID_RESERVED', '这个身份是房主的，房间存续期间不能被顶替');
+  if (claimsHost && room.members.size > 0 && !hostCredentialOk(room, req.hostToken)) {
+    return refuse(ws, 'HOST_ID_RESERVED', '这个身份是房主的，房间存续期间不能被顶替');
   }
+  const holder = room.members.get(peerId);
+  if (holder) {
+    if (probed) return refuse(ws, 'DUP_PEER', 'peerId 已被占用');
+    return probeThenAdmit(ws, room, holder.ws, req, verdict);
+  }
+  // 房主掉线期间替他留着一个名额：否则他重连的那几秒里补进来一个人，
+  // 房主就会一直撞 ROOM_FULL，直到有人主动离开。
+  // 经一对一邀请、房间链接进来的人不经过这台服务器，由房主报上来的人数（outside）一并算上
+  const hostSeat = claimsHost || room.members.has(room.hostId) ? 0 : 1;
+  if (room.members.size + hostSeat + room.outside >= room.maxMembers) {
+    return refuse(ws, 'ROOM_FULL', `房间已满（上限 ${room.maxMembers} 人）`);
+  }
+
+  let capacityChanged = false;
+  if (claimsHost && !room.hostToken) {
+    // 房主回来认领老成员重建的房间：凭据沿用他手上那张（老成员手里的摘要就还对得上，服务器再重启一次
+    // 照样能认领），人数按他的设置 —— 但不能比房里已有的人还少
+    room.hostToken = TOKEN_RE.test(req.hostToken || '') ? req.hostToken : newHostToken();
+    room.hostKey = hostKeyOf(room.hostToken);
+    if (req.maxMembers > 0) {
+      const next = Math.max(normalizeCapacity(req.maxMembers), room.members.size + 1);
+      capacityChanged = next !== room.maxMembers;
+      room.maxMembers = next;
+    }
+    console.log(`[room] 房主 ${peerId} 认领了重建的房间 ${roomId}`);
+  }
+  if (claimsHost && req.outside != null) room.outside = req.outside;
 
   clearTimeout(ws.joinTimer);
   ws.roomId = roomId;
   ws.peerId = peerId;
-  ws.name = (msg.name || peerId).slice(0, 40);
+  ws.name = req.name;
 
   // 先把现有成员告诉新人，再通知老成员 —— 顺序反了新人会漏掉自己
   const existing = [...room.members.entries()].map(([id, v]) => ({ peerId: id, name: v.name }));
+  if (capacityChanged) {
+    for (const { ws: member } of room.members.values()) sendJson(member, { t: 'room-config', maxMembers: room.maxMembers });
+  }
   room.members.set(peerId, { ws, name: ws.name });
 
   sendJson(ws, {
@@ -537,14 +672,46 @@ function handleJoin(ws, msg, verdict) {
     country: verdict.country,
     hostId: room.hostId,
     maxMembers: room.maxMembers,
-    // 续期凭据只回给房主本人；别人拿到它就能在房主掉线时冒名重连
-    ...(peerId === room.hostId ? { hostToken: room.hostToken } : {}),
+    // 续期凭据只回给房主本人；别人拿到它就能在房主掉线时冒名重连。别人拿到的是它的摘要
+    ...(claimsHost ? { hostToken: room.hostToken } : room.hostKey ? { hostKey: room.hostKey } : {}),
   });
+  // 房主回来时摘要也跟着 peer-join 发一份：房主认领重建的房间之后，老成员手里才有对得上的摘要
+  const announce = { t: 'peer-join', peerId, name: ws.name, ...(claimsHost && room.hostKey ? { hostKey: room.hostKey } : {}) };
   for (const [id, v] of room.members) {
-    if (id !== peerId) sendJson(v.ws, { t: 'peer-join', peerId, name: ws.name });
+    if (id !== peerId) sendJson(v.ws, announce);
   }
 
   console.log(`[room] ${peerId}(${ws.name}) 加入 ${roomId}（${room.members.size}/${room.maxMembers} 人）`);
+  return true;
+}
+
+/**
+ * 同一个 peerId 已经在房里了：先探旧连接。活着就是真的重复（DUP_PEER）；没回应就悄悄摘掉它
+ * （同一个人马上就回来，不广播 peer-leave），新连接接着走一遍 admit。
+ */
+function probeThenAdmit(ws, room, holder, req, verdict) {
+  ws.joinPending = true;
+  clearTimeout(ws.joinTimer); // join 已经到了，「连上不 join」的超时不再适用；探测自己有时限
+  probe(holder, (alive) =>
+    guarded(
+      'probe join',
+      () => {
+        ws.joinPending = false;
+        if (ws.closing || ws.readyState !== ws.OPEN) return; // 等的这会儿新连接自己断了：旧连接交给心跳
+        if (alive) return fail(ws, 'DUP_PEER', 'peerId 已被占用');
+        const { roomId, peerId } = req;
+        const evicted = rooms.get(roomId) === room && room.members.get(peerId)?.ws === holder;
+        if (evicted) {
+          room.members.delete(peerId);
+          holder.terminate(); // 随后的 close 事件里 leave() 认得出它已经不是表里那一条，不会再广播
+          console.log(`[room] ${peerId} 的旧连接没有回应，由新连接顶替`);
+        }
+        // 顶替没成（比如房主凭据对不上）：旧连接已经摘了，照常告诉房里的人他走了
+        if (admit(ws, req, verdict, true) === false && evicted) announceLeave(room, roomId, peerId);
+      },
+      () => fail(ws, 'INTERNAL_ERROR', '服务器处理这条消息时出错')
+    )
+  );
 }
 
 function handleRoomConfig(ws, msg) {
@@ -552,19 +719,26 @@ function handleRoomConfig(ws, msg) {
   const room = rooms.get(ws.roomId);
   if (!room || room.hostId !== ws.peerId) return report(ws, 'NOT_HOST', '只有房主能修改房间人数');
   if (!Number.isFinite(msg.maxMembers)) return report(ws, 'BAD_CONFIG', 'maxMembers 必须是数字');
+  if (msg.outside != null && !Number.isFinite(msg.outside)) return report(ws, 'BAD_CONFIG', 'outside 必须是数字');
   const next = normalizeCapacity(msg.maxMembers);
   if (next < room.members.size) {
     return report(ws, 'CAPACITY_TOO_SMALL', `当前已有 ${room.members.size} 人，人数上限不能设得更小`);
   }
+  const changed = next !== room.maxMembers;
   room.maxMembers = next;
-  for (const { ws: member } of room.members.values()) {
-    sendJson(member, { t: 'room-config', maxMembers: next });
+  if (msg.outside != null) room.outside = seatCount(msg.outside);
+  // 只是报一下「不经服务器进来的人数」、上限没变的，不用广播：别让全房的日志跟着刷一行
+  if (changed || msg.outside == null) {
+    for (const { ws: member } of room.members.values()) {
+      sendJson(member, { t: 'room-config', maxMembers: next });
+    }
+    console.log(`[room] ${ws.roomId} 人数上限改为 ${next}`);
   }
-  console.log(`[room] ${ws.roomId} 人数上限改为 ${next}`);
 }
 
 function handleSignal(ws, msg, bytes) {
-  if (!ws.roomId) return fail(ws, 'NOT_JOINED', '还没加入房间');
+  // 正在等旧连接的探测结果：join 还没落定，这时发来的信令没有地方送，丢掉就是，不断开
+  if (!ws.roomId) return ws.joinPending ? undefined : fail(ws, 'NOT_JOINED', '还没加入房间');
   // SDP 连同全部候选也就几 KB；再大就是拿服务器当免费中转，不转发
   if (bytes > MAX_SIGNAL_BYTES) {
     return report(ws, 'SIGNAL_TOO_LARGE', `信令消息太大（上限 ${MAX_SIGNAL_BYTES} 字节）`);
@@ -688,11 +862,15 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () =>
     guarded('ws close', () => {
       clearTimeout(ws.joinTimer);
+      settleProbe(ws, false); // 正在被探活的旧连接自己断了：等着顶替它的新连接不必再等
       leave(ws);
     })
   );
   ws.isAlive = true;
-  ws.on('pong', () => (ws.isAlive = true));
+  ws.on('pong', () => {
+    ws.isAlive = true;
+    settleProbe(ws, true);
+  });
 
   guarded(
     'ws connection',

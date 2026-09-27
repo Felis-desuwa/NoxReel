@@ -181,6 +181,12 @@ const EN = new Map(Object.entries({
   '建立点对点连接': 'Establish P2P connection',
   '已进入房间，正在和其他成员打洞…': 'Joined the room. Establishing direct connections with other members…',
   '房主身份与邀请码不一致，已拒绝加入': 'The host identity does not match the invite code. Join request rejected.',
+  '这个房间已经关闭（房主可能已离开），请让房主重新发邀请':
+    'This room has closed (the host may have left). Ask the host for a new invite.',
+  '信令服务器重启后没认出你是房主（它可能还是旧版本）：新人拿邀请码进不来，你也改不了人数；已经在房里的人不受影响。升级信令服务器后重新开房即可恢复':
+    'After restarting, the signaling server no longer recognises you as the host (it may be an old version): new people can’t join with the invite and you can’t change the capacity. People already in the room are unaffected. Update the signaling server and open a new room to fix this.',
+  '信令服务器重启后认错了房主（它可能还是旧版本）：新人暂时进不来；已经在房里的人不受影响':
+    'After restarting, the signaling server has the wrong host on record (it may be an old version): new people can’t join for now. People already in the room are unaffected.',
   '未知站点': 'Unknown site',
   '你的缓冲不够，先暂停你自己（不影响他人）': 'Your buffer is low, so only your playback is paused',
   '缓冲不足，暂停你自己…': 'Buffer low—pausing your playback…',
