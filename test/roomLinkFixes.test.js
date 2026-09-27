@@ -116,6 +116,10 @@ const LINK_FNS = [
   'linkAsking',
   'askLinkConsent',
   'linkResolveFailed',
+  // 播放器放不了在线链接（打不开、半路断了）时的提示和「重试」
+  'linkPlayFailed',
+  'retryCurrentLink',
+  'retryLinkNow',
   'tryLinkFallback',
   'useLinkInfo',
   'onNowLink',
@@ -338,12 +342,12 @@ test('房主后发来的兜底地址（NOW_LINK）同样要过网站授权', asy
   assert.equal(S.fallbackConsent?.origin, 'https://tracker.evil');
   assert.equal(ctx.linkNotice(item)?.site, 'tracker.evil');
 
-  // 房主撤回地址：询问作废，行里只剩「跳过」（本机解析失败又没兜底，见 linkResolveFailed）
+  // 房主撤回地址：询问作废，行里只剩「重试」和「跳过」（本机解析失败又没兜底，见 linkResolveFailed）
   ctx.onNowLink({ seq: 4, playback: null }, host);
   await flush();
   assert.equal(S.fallbackConsent, null);
-  assert.equal(ctx.linkNotice(item)?.text, '本机无法解析这个链接');
-  assert.deepEqual(Array.from(ctx.linkNotice(item).actions, (a) => a.key), ['skip-link']);
+  assert.equal(ctx.linkNotice(item)?.text, '本机没能解析这个链接');
+  assert.deepEqual(Array.from(ctx.linkNotice(item).actions, (a) => a.key), ['retry-link', 'skip-link']);
 
   // 换成允许过的网站上的地址：直接用
   ctx.onNowLink({ seq: 4, playback: { url: 'https://www.youtube.com/direct.mp4' } }, host);
@@ -503,7 +507,7 @@ test('询问作废或改用已允许的网站：行内当场收起「允许」�
   // 房主撤回地址
   ctx.onNowLink({ seq: 8, playback: null }, host);
   await flush();
-  assert.deepEqual(watch.row.actions, ['skip-link'], '撤回后行里不该还挂着「允许」');
+  assert.deepEqual(watch.row.actions, ['retry-link', 'skip-link'], '撤回后行里不该还挂着「允许」');
 
   ctx.onNowLink({ seq: 8, playback: { url: 'https://tracker.evil/a' } }, host);
   await flush();

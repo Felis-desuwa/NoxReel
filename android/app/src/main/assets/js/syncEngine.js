@@ -59,6 +59,10 @@ import { MSG } from './protocol.js';
  *    播放/暂停不动他的进度；差开了只报差多少秒，由用户点「同步到房主」（落地没对上会自动补跳一次）。
  *    他是管理员时按暂停/播放报房间的位置而不是自己的，免得把全房拽到他落后的地方。
  * 房主是参照，没有选择，按完全同步走。
+ * 本机播放器打不开链接（tick 带 loadFailed：403、签名过期、解析失败，mpv 留在 idle）时不算「在等数据」，
+ * 否则控制者会把全房一直挂在「等待缓冲」；播放器没了（playerGone）同理放掉本机的卡顿。
+ * 在线链接没有分片水位线兜底，断流时 mpv 同样报 eof：片长已知且离片尾还远、或者片长未知时不认「放完了」，
+ * 改报 stream-cut（由上层提示本人重新连接），不然控制者网络一抖，全房就跳到下一部。
  */
 
 const STALL_THRESHOLD_SECONDS = 5; // 身前不足 5 秒的连续数据 → 喊停
@@ -95,6 +99,9 @@ const DRIFT_LEAD_PROBE_MS = 20_000;
 // 手动同步点了「同步到房主」之后这么久之内，落地还没对上就自动再补跳一次（用刚学到的提前量）——
 // 第一次跳还不知道这个网站跳转要花多久，一次点不到位。只补一次，之后还差就照常提示。
 const DRIFT_CHASE_MS = 30_000;
+// 在线链接报 eof 时，位置离片长还差这么多秒以上就不算放完了（断流、签名过期、分片连续失败）。
+// 片尾最后几秒断的，推进到下一部也无妨；留余量是因为网站给的片长和实际能放到的位置常差一两秒。
+const STREAM_EOF_SLACK_SECONDS = 10;
 const MAX_NAME = 40;
 const MAX_STASH = 64;
 // 别人的 Lamport 最多比基准（_anchor）领先这么多。合法指令一次只加 1，一场放映远到不了；
@@ -209,6 +216,8 @@ export class SyncEngine extends Emitter {
     this.followMode = 'full';
     this._seekLead = 0;
     this._resetDrift();
+    // 在线链接的播放器停在一个不是片尾的 eof 上（断流），已经报过 stream-cut。离开 eof 才清掉
+    this._streamCut = false;
   }
 
   get applying() {
@@ -253,6 +262,7 @@ export class SyncEngine extends Emitter {
     this._dataEndStall = false;
     this._replayAt = 0;
     this._lastSeekCmd = null;
+    this._streamCut = false;
     // 跳转提前量是按这一部的网站学的，换一部从头学。跟随方式不动，由上层按新的当前项重新设
     this._seekLead = 0;
     this._resetDrift();
@@ -397,10 +407,14 @@ export class SyncEngine extends Emitter {
     this._clock = { base: pos, at: this.now(), running: this._clockRunning() };
   }
 
-  /** 本机播放器此刻的位置（秒），按最后一条 tick 外推；播放器没起来时返回 null。 */
+  /**
+   * 本机播放器此刻的位置（秒），按最后一条 tick 外推；播放器没起来时返回 null。
+   * 打不开（loadFailed）、在线链接断在半路（_streamCut）的播放器报的位置不是房间的进度 ——
+   * 控制者这时在界面上按暂停，拿它广播会把全房拽回片头或断流的地方，所以同样当作没有。
+   */
   playerPositionNow() {
     const t = this.lastTick;
-    if (!t) return null;
+    if (!t || t.loadFailed === true || this._streamCut) return null;
     const base = t.position || 0;
     if (!this._advancing(t)) return base;
     return base + Math.max(0, this.now() - t.at) / 1000;
@@ -620,9 +634,21 @@ export class SyncEngine extends Emitter {
     if (this.streaming) this._evaluateStreamStall(snap);
     else this._evaluateStall(snap, { contiguousBytes, runBytes, complete });
 
+    // 播放器打不开这个片子（留在 idle，位置属性没了、报 0）：之后的位置跳变、暂停变化都不是用户的操作，
+    // 照常比对的话，控制者会把「跳到 0」广播给全房。
+    if (snap.loadFailed === true) return;
+
     // 放到头了。mpv 开着 keep-open，会自己停在最后一帧 —— 这不是用户按了暂停，
     // 不能广播出去把还差半秒的人也停住。只报一次，由上层决定要不要推进列表。
     if (snap.eof) {
+      if (this.streaming && !this._streamEndPlausible(snap)) {
+        // 在线链接断在半路：报给上层提示本人重新连接，不当成放完了（见类注释）
+        if (!this._streamCut && this.started) {
+          this._streamCut = true;
+          this.emit('stream-cut', { position: snap.position || 0, duration: this._streamDuration(snap) });
+        }
+        return;
+      }
       if (!this.eofReported && this.started) {
         this.eofReported = true;
         this.emit('eof', { position: snap.position });
@@ -630,6 +656,7 @@ export class SyncEngine extends Emitter {
       return;
     }
     this.eofReported = false;
+    this._streamCut = false;
 
     // cause === 'cmd'：播放器适配器明确说这是我们命令的效果（还没稳定下来），只当基线。
     if (this.applying || !this.started || snap.cause === 'cmd') return;
@@ -759,10 +786,23 @@ export class SyncEngine extends Emitter {
     // 「在等数据」不只是 paused-for-cache：跳转之后重新请求、重新起播那几秒（seeking，
     // 或者没暂停却 core-idle，比如刚打开链接）位置同样不动。房主跳到 5:00，网络流要好几秒才起播，
     // 这段不让房间等的话，房间时钟跑在房主前面，房主反倒要被自动对齐往前拽、跳过自己没看到的内容。
+    // 打不开（loadFailed）的播放器同样没暂停、core-idle，但它不是在等 —— 永远等不来，全房不能陪着挂着。
     const waiting =
-      snap.pausedForCache === true || (!snap.eof && (snap.seeking === true || (snap.idle === true && !snap.paused)));
+      snap.loadFailed !== true &&
+      (snap.pausedForCache === true || (!snap.eof && (snap.seeking === true || (snap.idle === true && !snap.paused))));
     const holdRoom = !this._manual() && this.canIControl() && waiting;
     if (holdRoom !== this.localStalled) this._setLocalStall(holdRoom, 0, snap.position || 0);
+  }
+
+  /** 在线链接的片长：播放器报的优先，其次是解析时拿到的。0 表示不知道。 */
+  _streamDuration(snap) {
+    return snap.duration > 0 ? snap.duration : this.duration > 0 ? this.duration : 0;
+  }
+
+  /** 在线链接报的 eof 像不像真放完了：片长已知、位置到了片尾附近才算。片长未知（直播之类）一律不信。 */
+  _streamEndPlausible(snap) {
+    const duration = this._streamDuration(snap);
+    return duration > 0 && (snap.position || 0) >= duration - STREAM_EOF_SLACK_SECONDS;
   }
 
   _playbackByte(snap) {
@@ -1259,6 +1299,17 @@ export class SyncEngine extends Emitter {
    */
   forgetPlayerState() {
     this.lastTick = null;
+    this._streamCut = false;
+  }
+
+  /**
+   * 播放器没了（用户关掉窗口、崩溃，或者上层撒手不管了）。除了忘掉它最后的状态，在线链接还要放掉
+   * 本机的卡顿：它只靠 tick 解除（在线链接没有下载进度那条路），播放器没了就再也没有 tick ——
+   * 控制者关掉一个正在缓冲或打不开的播放器，全房就会一直「等待 X 缓冲」。重新打开之后照常重新判定。
+   */
+  playerGone() {
+    this.forgetPlayerState();
+    if (this.streaming && this.localStalled) this._setLocalStall(false, 0, this.sharedPositionNow());
   }
 
   // 实际的 mpv 调用由 app.js 注入，引擎本身不直接碰 IPC
@@ -1334,8 +1385,9 @@ export class SyncEngine extends Emitter {
   checkDrift() {
     if (!this.streaming || !this.started) return;
     const t = this.lastTick;
-    // 正在跳转、缓冲、重新起播，或者放到头了：此刻的位置说明不了什么，维持上一次的判断
-    if (!t || t.seeking || t.pausedForCache || t.eof || (t.idle && !t.paused) || this.applying) return;
+    // 正在跳转、缓冲、重新起播，或者放到头了：此刻的位置说明不了什么，维持上一次的判断。
+    // 打不开的播放器也不去拽它（跳转发给一个 idle 的 mpv 什么都不会发生）
+    if (!t || t.seeking || t.pausedForCache || t.eof || t.loadFailed || (t.idle && !t.paused) || this.applying) return;
     // 自己按了暂停、只停自己（游客）：这是有意和房间分开，不算没对上
     if (this.intendedPaused !== this.shared.paused) {
       this._driftOver = 0;
@@ -1595,6 +1647,7 @@ export {
   DRIFT_FAIL_BACKOFF_MS,
   DRIFT_LEAD_MAX_SECONDS,
   DRIFT_CHASE_MS,
+  STREAM_EOF_SLACK_SECONDS,
   MAX_NAME,
   LAMPORT_WINDOW,
   LAMPORT_LEAD,

@@ -18,12 +18,14 @@ const os = require('os');
 const { EventEmitter } = require('events');
 const { randomBytes } = require('crypto');
 const { findBin } = require('./findBin');
-const { findYtDlp } = require('./linkMedia');
+const { findYtDlp, isYouTubeUrl } = require('./linkMedia');
 
 // 我们关心的属性。stream-pos 是字节位置 —— 这个比 time-pos 更适合跟连续水位线比，
 // 因为不用靠码率去猜时间和字节的换算。
 // paused-for-cache：在线链接缺数据时 mpv 自己停下来等（pause 仍是 no），同步引擎靠它区分
 // 「在缓冲」和「用户拖了进度条」，完全同步的控制者还据此让全房一起等。
+// idle-active：片子没载入成功（403、签名过期、ytdl_hook 解析失败……）时 mpv 带着 --idle=yes 留在空闲，
+// 不退出、不报 eof，core-idle 为真、pause 为假 —— 只看那几项像是「还在起播」，同步引擎会让全房一直等。
 const OBSERVED = [
   'time-pos',
   'pause',
@@ -33,7 +35,42 @@ const OBSERVED = [
   'eof-reached',
   'seeking',
   'paused-for-cache',
+  'idle-active',
 ];
+
+/**
+ * 看到 idle-active 为真、却还没见过 start-file 时，等这么久再认定是打不开：
+ * mpv 启动时等脚本加载的那一下也报空闲；而片子在我们连上管道之前就已经失败了，同样只剩这一个信号。
+ */
+const IDLE_CONFIRM_MS = 3000;
+
+/** 打不开的原因要从 mpv 的错误日志里看，只留最近几行、每行截短。 */
+const LOAD_ERROR_LOG_LINES = 8;
+const LOAD_ERROR_LOG_CHARS = 300;
+
+/**
+ * 从 mpv 的 end-file 和错误日志里认出打不开的原因。只给代号和 HTTP 状态码，
+ * 文字由渲染进程生成并翻译 —— 日志原文来自网站和第三方程序，不原样往界面上放。
+ * @returns {{reason: 'http'|'resolve'|'network'|'format'|'unknown', status: number|null}}
+ */
+function classifyLoadFailure({ fileError = '', logs = [] } = {}) {
+  const lines = (Array.isArray(logs) ? logs : []).map((l) => String(l || ''));
+  const text = lines.join('\n');
+  // ffmpeg：「HTTP error 403 Forbidden」；yt-dlp：「HTTP Error 403: Forbidden」
+  const http = /HTTP error (\d{3})/i.exec(text);
+  const status = http ? Number(http[1]) : null;
+  if (status >= 400 && status <= 599) return { reason: 'http', status };
+  if (lines.some((l) => /^ytdl_hook\b/i.test(l)) || /youtube-dl failed|yt-dlp failed/i.test(text)) {
+    return { reason: 'resolve', status: null };
+  }
+  if (/timed? ?out|timeout|connection (?:refused|reset)|failed to resolve|network is unreachable|no route to host/i.test(text)) {
+    return { reason: 'network', status: null };
+  }
+  if (/unrecognized file format|failed to recognize file format/i.test(`${fileError}\n${text}`)) {
+    return { reason: 'format', status: null };
+  }
+  return { reason: 'unknown', status: null };
+}
 
 /**
  * 在线链接缓冲时攒够这么多秒才接着放（mpv 默认 1 秒）。完全同步的控制者一缓冲全房就停，
@@ -220,6 +257,23 @@ function networkArgs({ isRemote, proxy }) {
 }
 
 /**
+ * YouTube 页面交给 ytdl_hook 时，用和 inspectLink、linkCache 同一个客户端（android_vr）去解析：
+ * 三处参数不一致的话，「解析成功」不代表播放器那一路也能解析。格式仍用 mpv 默认的
+ * bestvideo+bestaudio（桌面端自己合并音视频），不照搬解析时的音画合一格式。
+ */
+const YOUTUBE_EXTRACTOR_ARGS = 'youtube:player_client=android_vr';
+
+function youtubeArgs(source) {
+  let youtube = false;
+  try {
+    youtube = isYouTubeUrl(source);
+  } catch {
+    return [];
+  }
+  return youtube ? [`--ytdl-raw-options-append=extractor-args=${YOUTUBE_EXTRACTOR_ARGS}`] : [];
+}
+
+/**
  * 子进程的环境：去掉 no_proxy。ffmpeg 会读它，命中的主机直接绕过 --http-proxy ——
  * 用户环境里一句 no_proxy=* 就能让整道私网过滤失效。
  */
@@ -301,6 +355,7 @@ function buildLaunchArgs({
     ...(isRemote ? ['--load-scripts=no', '--ytdl=yes', '--script-opt=ytdl_hook-try_ytdl_first=yes'] : []),
     ...(isRemote ? [`--cache-pause-wait=${REMOTE_CACHE_PAUSE_WAIT}`] : []),
     ...(ytDlp ? [`--script-opt=ytdl_hook-ytdl_path=${ytDlp}`] : []),
+    ...(isRemote ? youtubeArgs(source) : []),
     ...(isRemote
       ? Object.entries(headers).map(([name, value]) => `--http-header-fields-append=${name}: ${value}`)
       : []),
@@ -366,6 +421,43 @@ class MpvController extends EventEmitter {
     this._danmaku = { inFlight: false, visible: false };
     // pause/seek 在途的条数。这两条是用户等着看结果的命令，不能让 30Hz 的弹幕帧排在前面。
     this._cmdHold = 0;
+    this.idleConfirmMs = IDLE_CONFIRM_MS;
+    this._resetLoadState();
+  }
+
+  /**
+   * 片子有没有载入成功（见 OBSERVED 里 idle-active 的注释）。打不开时快照带 loadFailed 和原因代号，
+   * 一直带到下一次开始载入（start-file）为止 —— 渲染进程靠它说明原因、让本机不再挡着全房。
+   */
+  _resetLoadState() {
+    this.loadError = null;
+    this._fileStarted = false;
+    this._errorLogs = [];
+    if (this._idleTimer) clearTimeout(this._idleTimer);
+    this._idleTimer = null;
+  }
+
+  _setLoadError(fileError = '') {
+    if (this._idleTimer) clearTimeout(this._idleTimer);
+    this._idleTimer = null;
+    if (this.loadError) return;
+    this.loadError = classifyLoadFailure({ fileError, logs: this._errorLogs });
+    this.emit('tick', this.snapshot());
+  }
+
+  /** idle-active 变了：载入过又回到空闲就是打不开；还没见过载入的，等一会儿再认（见 IDLE_CONFIRM_MS）。 */
+  _onIdleActive(active) {
+    if (this._idleTimer) clearTimeout(this._idleTimer);
+    this._idleTimer = null;
+    if (active !== true || this.loadError) return;
+    if (this._fileStarted) {
+      this._setLoadError();
+      return;
+    }
+    this._idleTimer = setTimeout(() => {
+      this._idleTimer = null;
+      if (this.running && this.props['idle-active'] === true && !this._fileStarted) this._setLoadError();
+    }, this.idleConfirmMs);
   }
 
   _ipcPath() {
@@ -411,6 +503,8 @@ class MpvController extends EventEmitter {
 
     this.proc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: false, env: childEnv() });
     this.running = true;
+    // 上一个进程打不开的状态不能带到这一个身上
+    this._resetLoadState();
     // 新进程身上没有任何覆盖层，缓存必须跟着清零，否则重开播放器后
     // setOverlay 会以为「文本没变」而不再发送，横幅再也不出现。
     this.forgetOverlays();
@@ -423,6 +517,8 @@ class MpvController extends EventEmitter {
     });
     this.proc.on('exit', (code) => {
       this.running = false;
+      if (this._idleTimer) clearTimeout(this._idleTimer);
+      this._idleTimer = null;
       this.forgetOverlays();
       this._resetDanmaku();
       this._failAllPending(new Error('mpv 已退出'));
@@ -438,6 +534,8 @@ class MpvController extends EventEmitter {
     for (let i = 0; i < OBSERVED.length; i++) {
       this.command(['observe_property', i + 1, OBSERVED[i]]).catch(() => {});
     }
+    // 打不开时的原因（HTTP 403、ytdl_hook 解析失败……）只在日志里，end-file 只说「载入失败」
+    this.command(['request_log_messages', 'error']).catch(() => {});
 
     this.emit('launched', { bin, filePath });
     return { bin, filePath };
@@ -525,9 +623,29 @@ class MpvController extends EventEmitter {
 
     if (msg.event === 'property-change') {
       this.props[msg.name] = msg.data;
+      if (msg.name === 'idle-active') this._onIdleActive(msg.data);
       this.emit('property', { name: msg.name, value: msg.data });
       this.emit('tick', this.snapshot());
       return;
+    }
+
+    // 载入成败（见 _resetLoadState）。错误日志先到、end-file 后到，同一条管道里顺序不会乱
+    if (msg.event === 'log-message') {
+      if (msg.level === 'error' || msg.level === 'fatal') {
+        const line = `${String(msg.prefix || '')}: ${String(msg.text || '').trim()}`.slice(0, LOAD_ERROR_LOG_CHARS);
+        this._errorLogs.push(line);
+        if (this._errorLogs.length > LOAD_ERROR_LOG_LINES) this._errorLogs.shift();
+      }
+      return;
+    }
+    if (msg.event === 'start-file') {
+      // 开始载入（重新载入、拖进来别的片子）：之前的失败作废
+      const had = !!this.loadError;
+      this._resetLoadState();
+      this._fileStarted = true;
+      if (had) this.emit('tick', this.snapshot());
+    } else if (msg.event === 'end-file' && msg.reason === 'error') {
+      this._setLoadError(typeof msg.file_error === 'string' ? msg.file_error : '');
     }
 
     // 播放器里按快捷键发的弹幕。脚本是我们自己的，但文本仍按聊天上限截断了才往外转：
@@ -567,6 +685,8 @@ class MpvController extends EventEmitter {
       eof: this.props['eof-reached'] === true,
       seeking: this.props['seeking'] === true,
       pausedForCache: this.props['paused-for-cache'] === true,
+      loadFailed: !!this.loadError,
+      loadError: this.loadError ? { ...this.loadError } : null,
     };
   }
 
@@ -720,6 +840,8 @@ class MpvController extends EventEmitter {
   }
 
   async quit() {
+    if (this._idleTimer) clearTimeout(this._idleTimer);
+    this._idleTimer = null;
     if (!this.running) return;
     try {
       await this.command(['quit']);
@@ -757,5 +879,9 @@ module.exports = {
   MAX_IPC_LINE,
   REMOTE_PROTOCOLS,
   networkArgs,
+  youtubeArgs,
+  YOUTUBE_EXTRACTOR_ARGS,
+  classifyLoadFailure,
+  IDLE_CONFIRM_MS,
   childEnv,
 };

@@ -146,6 +146,11 @@ const S = {
   links: new Map(),
   nowLink: null,
   linkFailedSeq: null,
+  // 当前这部链接解析成功了，本机播放器却放不了：{seq, kind: 'load'（打不开）| 'cut'（半路断了）, ...}。
+  // 本机不再挡着全房（见 syncEngine 的 loadFailed / stream-cut），行内和状态栏给「重试」
+  linkPlayFailed: null,
+  // 正在「重试」的那一部的 seq（见 retryCurrentLink）
+  linkRetrying: null,
   // 本房间里已经允许过的网站，同一个站点只问一次
   approvedSites: new Set(),
   // 本机自己提交过的链接（规范化后的地址）。只有这些不用再问 —— 快照里的 addedBy 是房主写的，不能拿来免问
@@ -4013,7 +4018,8 @@ function linkFallback(item, seq) {
     extractor: 'host-resolved',
     direct: true,
     playback,
-    resolvedAt: Date.now(),
+    // 记房主解析出它的时间，不是本机拿到它的时间：重开播放器时据此判断这条签名地址是不是放久了
+    resolvedAt: Number.isFinite(now.resolvedAt) ? now.resolvedAt : Date.now(),
   };
 }
 
@@ -4106,6 +4112,138 @@ function linkResolveFailed() {
   );
 }
 
+/** 当前这部链接解析成功了、本机播放器却放不了（打不开，或者半路断了）。跳过了的不算。 */
+function linkPlayFailed() {
+  const f = S.linkPlayFailed;
+  const item = S.current;
+  return !!f && f.seq === S.currentSeq && item?.kind === 'link' && !S.skippedLinks.has(item.id);
+}
+
+/** 播放器打不开在线视频的原因。主进程只给代号和 HTTP 状态码（日志原文来自网站），文字在这边生成、翻译。 */
+function linkLoadErrorText(error) {
+  const status = Number.isInteger(error?.status) ? error.status : 0;
+  switch (error?.reason) {
+    case 'http':
+      if (status === 401 || status === 403) return `网站拒绝了播放请求（HTTP ${status}），播放地址可能已经过期`;
+      return status ? `网站返回了错误（HTTP ${status}）` : '网站返回了错误';
+    case 'resolve':
+      return 'yt-dlp 没能从网页里解析出视频';
+    case 'network':
+      return '连不上视频网站（超时或网络中断）';
+    case 'format':
+      return '播放器认不出这个视频的格式';
+    default:
+      return '原因不明';
+  }
+}
+
+/**
+ * 在线链接的每条 tick：播放器打不开（loadFailed）就记下来、说明原因。同步引擎那边已经不再把它算作
+ * 「在等数据」，本机不会再挡着全房；这里负责让本人知道出了什么事，并给「重试」。
+ * 又放起来了（在播放器里往回拖、重新载入）就把之前的提示收掉。
+ */
+function noteLinkPlayback(snap) {
+  const failed = linkPlayFailed() ? S.linkPlayFailed : null;
+  if (snap.loadFailed) {
+    if (failed?.kind === 'load') return;
+    S.linkPlayFailed = { seq: S.currentSeq, kind: 'load', error: snap.loadError || null };
+    log(`播放器打不开这个在线视频：${linkLoadErrorText(snap.loadError)}`, 'bad');
+    renderPlaylistSoon();
+    return;
+  }
+  if (failed && !snap.eof) {
+    S.linkPlayFailed = null;
+    renderPlaylistSoon();
+  }
+}
+
+/**
+ * 同步引擎认定在线视频是半路断了、不是放完了（见 syncEngine 的 stream-cut）：不推进列表，
+ * 提示本人重新连接。片长未知时分不清是断了还是真放完了，两种都说。
+ */
+function onLinkStreamCut({ position = 0, duration = 0 } = {}) {
+  if (S.sourceType !== 'link' || !S.current || S.switchingMedia) return;
+  S.linkPlayFailed = { seq: S.currentSeq, kind: 'cut', position, duration };
+  log(
+    duration > 0
+      ? `在线视频在 ${fmtTime(position)} 断了（全片 ${fmtTime(duration)}），不是放完了：点「重试」重新连接`
+      : '在线视频停住了，但片长未知，分不清是放完了还是断流了：没放完就点「重试」重新连接',
+    'warn'
+  );
+  renderPlaylistSoon();
+  renderStatus();
+}
+
+/**
+ * 当前这部链接重新来一遍：本机解析失败（可能只是超时、限流）、播放器打不开、半路断了，
+ * 或者重开播放器时签名地址已经过期。旧播放器先退，解析结果不再沿用（签名地址可能正是出问题的那个），
+ * 重新走 activateLinkItem —— 从房间当前的位置起播。
+ * 本机早就解析失败、用的是房主给的地址时，房主手里有新鲜的就直接换上，不再先把本机解析重跑一遍。
+ */
+async function retryCurrentLink() {
+  const item = S.current;
+  if (item?.kind !== 'link' || S.switchingMedia || S.skippedLinks.has(item.id)) return;
+  const seq = S.currentSeq;
+  // 行内的按钮按节流重画，连点两下会重来两遍（两份解析、两次起播）
+  if (S.linkRetrying === seq) return;
+  S.linkRetrying = seq;
+  try {
+    await retryLinkNow(item, seq);
+  } finally {
+    if (S.linkRetrying === seq) S.linkRetrying = null;
+  }
+}
+
+async function retryLinkNow(item, seq) {
+  const hostResolved = S.linkInfo?.extractor === 'host-resolved';
+  S.linkPlayFailed = null;
+  S.linkFailedSeq = null;
+  S.links.delete(linkKey(item.url));
+  S.linkInfo = null;
+  S.filePath = null;
+  if (S.mpvRunning) {
+    retirePlayer();
+    $('btn-playpause').disabled = true;
+    // 旧播放器退掉之前别起新的；它在等数据时让全房等着的卡顿也一并放掉
+    S.sync?.playerGone?.();
+    await S.playerQuit;
+    if (S.currentSeq !== seq || S.current !== item) return;
+  }
+  $('btn-reopen')?.classList.add('hidden');
+  log(`重新连接《${item.title || siteHost(item.url)}》…`);
+  renderStatus();
+  renderPlaylistSoon();
+  updateLocalReady();
+  if (hostResolved && linkFallback(item, seq)) {
+    S.linkFailedSeq = seq;
+    await tryLinkFallback(item, seq);
+    return;
+  }
+  await activateLinkItem(item, seq);
+}
+
+/**
+ * 「重新打开播放器」。在线链接这几种情况不能照旧把原来的地址交给播放器：
+ *  - 上一次就没放起来（打不开、半路断了）：重新解析一遍（retryCurrentLink）；
+ *  - 隔离浏览器抓到的媒体地址放久了（签名多半过期）：本机重新解析；
+ *  - 房主给的地址放久了、房主那边已经有更新的：换成新的。没有更新的就还用手上这条试试，打不开会提示重试。
+ * 普通 yt-dlp 解析的那一路交给播放器的是网页地址，mpv 重开时自己会重新解析，照旧打开。
+ */
+function reopenPlayer() {
+  const item = S.current;
+  if (S.sourceType === 'link' && item?.kind === 'link' && !S.mpvRunning && !S.switchingMedia) {
+    if (linkPlayFailed()) return retryCurrentLink();
+    const info = S.linkInfo;
+    const stale = !!info && !info.local && Date.now() - (info.resolvedAt || 0) > LINK_INFO_TTL_MS;
+    if (stale && info.extractor === 'isolated-browser') return retryCurrentLink();
+    if (stale && info.extractor === 'host-resolved') {
+      const fresh = linkFallback(item, S.currentSeq);
+      if (fresh && fresh.url !== S.filePath) return retryCurrentLink();
+    }
+  }
+  return launchPlayer();
+}
+
 /**
  * 本机解析失败时改用房主给的临时播放地址。播放器会直接连这个地址，它常常和页面不在同一个网站 ——
  * 允许过页面所在的网站，不等于允许连房主填的任何网站。所以按地址自己的网站再问一次
@@ -4177,6 +4315,15 @@ function onNowLink(msg, peer) {
   // 解析时间只能往前不能往后：填个未来时间就能让过期的地址一直算新鲜。没填的按刚解析出来算（旧客户端）
   const resolvedAt = Number.isSafeInteger(msg.resolvedAt) ? Math.min(msg.resolvedAt, Date.now()) : Date.now();
   S.nowLink = { seq: msg.seq, playback, resolvedAt };
+  // 用着房主给的地址、播放器却打不开（多半是签名过期了），房主刚发来一条新的：直接换上。
+  // 在正常播放的不动（不中途换源），新地址留着给「重新打开播放器」用（见 reopenPlayer）
+  if (S.currentSeq === msg.seq && S.current?.kind === 'link' && S.linkInfo?.extractor === 'host-resolved' && linkPlayFailed()) {
+    const fresh = linkFallback(S.current, msg.seq);
+    if (fresh && fresh.url !== S.filePath) {
+      retryCurrentLink().catch((error) => log(error.message || String(error), 'bad'));
+      return;
+    }
+  }
   // 本机解析失败、正等着房主给地址的，现在补上（地址所在的网站没允许过的，先在行内问）
   if (S.linkFailedSeq !== msg.seq || S.currentSeq !== msg.seq || S.current?.kind !== 'link' || S.linkInfo) return;
   tryLinkFallback(S.current, msg.seq).catch((error) => log(error.message || String(error), 'bad'));
@@ -4232,6 +4379,8 @@ function initSwarmAndSync() {
     if (!S.sync.canIControl() || !S.current) return;
     submitPlaylistOp({ type: 'ended', seq: S.currentSeq });
   });
+  // 在线视频半路断了（引擎核对过位置和片长，不是放完了）：不推进列表，提示本人重新连接
+  S.sync.on('stream-cut', (e) => onLinkStreamCut(e));
 
   // 就绪变化：刷新等待名单；房主看看是不是该自动开播了
   S.sync.on('ready-change', () => {
@@ -5104,6 +5253,23 @@ function onLinkCacheUpdate(view) {
     else if (view.state === 'failed') log(`《${title}》缓存失败：${view.error || '原因不明'}`, 'bad');
   }
   renderPlaylistSoon();
+  if (!download && view.state === 'done' && before?.state !== 'done') playCachedCurrentNow(key);
+}
+
+/**
+ * 当前这一部本机还没放起来（解析失败、正等着本人允许网站或房主给的地址），手动缓存恰好下完了：
+ * 直接改从本地播，不用再「跳过 → 改为允许」绕一圈。从本地放不连网站，所以不必等允许。
+ * 已经在放的、还在解析的不动：正在放的不中途换源，解析那一路回来会照常起播。
+ */
+function playCachedCurrentNow(key) {
+  const cur = S.current;
+  if (cur?.kind !== 'link' || linkKey(cur.url) !== key || S.linkInfo || S.switchingMedia) return;
+  if (S.skippedLinks.has(cur.id)) return;
+  if (S.linkFailedSeq !== S.currentSeq && !linkAsking() && !fallbackAsking()) return;
+  S.linkConsent = null;
+  S.fallbackConsent = null;
+  log(`《${cur.title || siteHost(cur.url)}》缓存好了，改从本地播`, 'good');
+  activateLinkItem(cur, S.currentSeq).catch((error) => log(error.message || String(error), 'bad'));
 }
 
 window.sw.linkCache?.onUpdate?.(onLinkCacheUpdate);
@@ -5206,11 +5372,18 @@ async function useCachedLink(item, local, seq) {
   };
   S.filePath = local.path;
   if (isRoomHost()) {
-    // 房主放的是本地缓存，没有能分给成员的播放地址；照样发一条，好让大家知道这一部开始了
-    S.nowLink = { seq, playback: null, resolvedAt: Date.now() };
+    // 房主自己放本地缓存，用不上播放地址；成员却要靠它兜底 —— 安卓完全只认房主给的地址，
+    // 本机解析失败的电脑端也要用。提前解析过的（preResolveNextLink）直接发；没有就先发一条空的
+    // （好让大家知道这一部开始了），解析时间记 0，refreshNowLink 看到就会在后台解析一份补发过去。
+    // 缓存是本人点的，已经连过这个网站，再解析一次不用另问。
+    const pre = cachedLinkInfo(item.url);
+    S.nowLink = pre?.playback
+      ? { seq, playback: pre.playback, resolvedAt: pre.resolvedAt || Date.now() }
+      : { seq, playback: null, resolvedAt: 0 };
     for (const p of S.swarm.peers.values()) {
       if (p.authenticated) p.send({ t: MSG.NOW_LINK, ...S.nowLink });
     }
+    if (!S.nowLink.playback) refreshNowLink();
   }
   updateLocalReady();
   await onLinkSessionReady();
@@ -5233,9 +5406,28 @@ function linkNotice(item) {
       ],
     };
   }
-  // 本机解析失败、房主也没有能用的兜底地址：网站早就允许过了，这里只给「跳过」
+  // 本机解析失败、房主也没有能用的兜底地址：网站早就允许过了，不再问「允许」。
+  // 失败可能只是暂时的（超时、限流），先给「重试」，再给「跳过」
   if (S.current?.id === item.id && linkResolveFailed()) {
-    return { text: '本机无法解析这个链接', tone: 'bad', actions: [{ key: 'skip-link', label: '跳过' }] };
+    return {
+      text: '本机没能解析这个链接',
+      tone: 'bad',
+      actions: [
+        { key: 'retry-link', label: '重试' },
+        { key: 'skip-link', label: '跳过' },
+      ],
+    };
+  }
+  // 解析成功了，本机播放器却放不了（打不开、半路断了）
+  if (S.current?.id === item.id && linkPlayFailed()) {
+    return {
+      text: S.linkPlayFailed.kind === 'cut' ? '在线视频断了' : '播放器打不开这个链接',
+      tone: 'bad',
+      actions: [
+        { key: 'retry-link', label: '重试' },
+        { key: 'skip-link', label: '跳过' },
+      ],
+    };
   }
   if (siteApproved(item)) return null;
   return {
@@ -5345,6 +5537,10 @@ async function onPlaylistAction(key, id) {
       return;
     case 'skip-link':
       if (item.kind === 'link') skipLinkItem(item);
+      return;
+    case 'retry-link':
+      // 行菜单打开之后当前项可能已经换了：只重试正在放的这一部
+      if (item.kind === 'link' && S.current?.id === item.id) await retryCurrentLink();
       return;
     case 'reveal': {
       const sess = item.kind === 'file' ? S.sessions.get(item.fileId) : null;
@@ -6320,7 +6516,7 @@ function detachFromPlayer() {
   S.mpvRunning = false;
   lastMpvBanner = '';
   S.danmaku?.setActive(false);
-  S.sync?.forgetPlayerState?.();
+  S.sync?.playerGone?.();
   $('btn-reopen')?.classList.remove('hidden');
   refreshMediaUi();
 }
@@ -7905,7 +8101,12 @@ function linkWaitText() {
   if (item && fallbackAsking()) return `房主提供的播放地址来自 ${S.fallbackConsent.host}，需要你先允许`;
   // 网站名取自登记下来的那次询问，不按此刻的 url 现算：现算的话房主换了网址，横幅会跟着变成新网站
   if (item && linkAsking()) return `这一部要打开 ${S.linkConsent.host}，需要你先允许`;
-  if (linkResolveFailed()) return '这个视频链接在你的电脑上无法解析，可以先跳过这一部';
+  if (linkResolveFailed()) return '这个视频链接在你的电脑上没能解析出来，可以重试，也可以先跳过这一部';
+  if (linkPlayFailed()) {
+    return S.linkPlayFailed.kind === 'cut'
+      ? '在线视频断了，点「重试」重新连接，也可以先跳过这一部'
+      : '播放器打不开这个在线视频，可以重试，也可以先跳过这一部';
+  }
   return '正在解析并连接原始视频…';
 }
 
@@ -7919,8 +8120,10 @@ function renderStatus() {
   const skipped = cur?.kind === 'link' && S.skippedLinks.has(cur.id);
   const failed = linkResolveFailed();
   const asking = cur?.kind === 'link' && !S.linkInfo && (skipped || linkAsking() || fallbackAsking());
+  // 播放器开着也可能放不了（打不开、半路断了）：这时房间照走，横幅得说本机出了什么事
+  const playFailed = linkPlayFailed();
   // 房间在播不等于本机播放器起来了：还在等授权、或者解析失败的时候，横幅得说清在等什么
-  const linkWaiting = cur?.kind === 'link' && !S.mpvRunning && (asking || failed);
+  const linkWaiting = cur?.kind === 'link' && ((!S.mpvRunning && (asking || failed)) || playFailed);
 
   if (st.stalled) {
     banner.className = 'status-banner waiting';
@@ -7935,7 +8138,9 @@ function renderStatus() {
       : '播放中，所有人同步';
   } else {
     banner.className = 'status-banner';
-    banner.textContent = S.mpvRunning
+    banner.textContent = playFailed
+      ? linkWaitText()
+      : S.mpvRunning
       ? '已暂停'
       : !S.current
       ? canEditPlaylist()
@@ -7972,7 +8177,8 @@ function renderStatus() {
   $('btn-cancel-scan')?.classList.toggle('hidden', !scanning);
   $('btn-rescan')?.classList.toggle('hidden', !unfinished);
   $('btn-allow-link').classList.toggle('hidden', !asking);
-  $('btn-skip-link').classList.toggle('hidden', !(asking || failed) || skipped);
+  $('btn-retry-link').classList.toggle('hidden', !(failed || playFailed));
+  $('btn-skip-link').classList.toggle('hidden', !(asking || failed || playFailed) || skipped);
   $('btn-skip-current').classList.toggle('hidden', !(S.sync.canIControl() && currentUnavailable()));
 
   // 全屏看片时上面这块横幅整个看不见 —— mpv 是独立窗口。把同一句话推到 mpv 画面上。
@@ -8175,6 +8381,7 @@ function handlePlayerTick(snap) {
     runBytes: prog?.runBytes || 0,
     complete: S.sourceType === 'link' || !!ctx?.complete,
   });
+  if (S.sourceType === 'link') noteLinkPlayback(snap);
 
   renderProgress(S.swarm.progress());
   renderStatus();
@@ -8198,7 +8405,8 @@ function handlePlayerExit({ code }) {
   // 必须把上一条 tick 忘掉。留着的话，重开播放器后新 mpv 的第一条 tick
   // （position=0、paused=true）会被 syncEngine 当成「用户拖了进度条 / 按了暂停」，
   // 房主据此广播 SYNC(0)，整个房间被拉回片头并暂停。
-  S.sync?.forgetPlayerState?.();
+  // playerGone 顺带放掉在线链接的本机卡顿：播放器没了，不会再有 tick 来解开它
+  S.sync?.playerGone?.();
   $('btn-playpause').disabled = true;
   if (!S.switchingMedia && S.filePath) {
     $('btn-reopen')?.classList.remove('hidden');
@@ -8229,7 +8437,7 @@ $('btn-playpause').onclick = () => {
   renderStatus();
 };
 
-$('btn-reopen').onclick = () => launchPlayer();
+$('btn-reopen').onclick = () => reopenPlayer();
 
 // 「已收完 · 切换到 X」：可信房间边下边播那一段过去之后的一键切换
 $('btn-switch-player').onclick = () => {
@@ -8323,6 +8531,10 @@ $('btn-allow-link').onclick = () => {
 
 $('btn-skip-link').onclick = () => {
   if (S.current?.kind === 'link') skipLinkItem(S.current);
+};
+
+$('btn-retry-link').onclick = () => {
+  if (S.current?.kind === 'link') retryCurrentLink();
 };
 
 $('btn-skip-current').onclick = () => {

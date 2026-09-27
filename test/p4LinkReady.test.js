@@ -117,6 +117,10 @@ const LINK_FNS = [
   'linkAsking',
   'askLinkConsent',
   'linkResolveFailed',
+  // 播放器放不了在线链接（打不开、半路断了）时的提示和「重试」
+  'linkPlayFailed',
+  'retryCurrentLink',
+  'retryLinkNow',
   'tryLinkFallback',
   'useLinkInfo',
   'onNowLink',
@@ -366,20 +370,25 @@ async function failedRoom() {
   return { ...r, item };
 }
 
-test('本机解析失败、房主又没给兜底地址：状态栏说清楚，本人有「先跳过」的出口', async () => {
+test('本机解析失败、房主又没给兜底地址：状态栏说清楚，本人有「重试」和「先跳过」的出口', async () => {
   const { ctx, S, dom, item } = await failedRoom();
   assert.equal(S.linkFailedSeq, 4);
   assert.equal(ctx.linkResolveFailed(), true);
-  assert.equal(ctx.linkWaitText(), '这个视频链接在你的电脑上无法解析，可以先跳过这一部');
+  assert.equal(ctx.linkWaitText(), '这个视频链接在你的电脑上没能解析出来，可以重试，也可以先跳过这一部');
 
   const notice = ctx.linkNotice(item);
-  assert.equal(notice.text, '本机无法解析这个链接');
-  assert.deepEqual(Array.from(notice.actions, (a) => a.key), ['skip-link'], '网站早就允许过了，这里不该再问「允许」');
+  assert.equal(notice.text, '本机没能解析这个链接');
+  assert.deepEqual(
+    Array.from(notice.actions, (a) => a.key),
+    ['retry-link', 'skip-link'],
+    '网站早就允许过了，这里不该再问「允许」；失败可能只是暂时的，先给「重试」'
+  );
 
   ctx.renderStatus();
   assert.equal(dom.$('btn-skip-link').hidden, false, '状态栏要给出「这一部我先跳过」');
+  assert.equal(dom.$('btn-retry-link').hidden, false, '状态栏要给出「重试」');
   assert.equal(dom.$('btn-allow-link').hidden, true);
-  assert.equal(dom.$('status-banner').textContent, '这个视频链接在你的电脑上无法解析，可以先跳过这一部');
+  assert.equal(dom.$('status-banner').textContent, '这个视频链接在你的电脑上没能解析出来，可以重试，也可以先跳过这一部');
 
   // 卡住自动连播的正是「本人永远不就绪」；跳过之后就不挡别人了
   assert.equal(ctx.localReadyNow(), false);
@@ -717,10 +726,10 @@ test('新增文案都有英文：列表上限、解析失败、看清楚再点�
     ['列表最多 100 项', 'The playlist can hold at most 100 items'],
     ['列表没改成：列表最多 100 项', 'The playlist was not changed: The playlist can hold at most 100 items'],
     ['《film.mp4》没加进列表：列表最多 100 项', '“film.mp4” was not added to the playlist: The playlist can hold at most 100 items'],
-    ['本机无法解析这个链接', 'This link cannot be resolved on your computer'],
+    ['本机没能解析这个链接', 'This link could not be resolved on your computer'],
     [
-      '这个视频链接在你的电脑上无法解析，可以先跳过这一部',
-      'This video link cannot be resolved on your computer. You can skip this one for now.',
+      '这个视频链接在你的电脑上没能解析出来，可以重试，也可以先跳过这一部',
+      'This video link could not be resolved on your computer. You can retry or skip this one for now.',
     ],
     [
       '这一部的网址刚换成 evil.example，看清楚再点「允许」',
@@ -754,7 +763,16 @@ test('playlist.js 里每条拒绝原因都翻得出英文', async () => {
 
 /* ======================= 在线视频的手动缓存 ======================= */
 
-const CACHE_FNS = ['linkCacheOf', 'linkDownloadOf', 'linkCachePct', 'useCachedLink', 'onLinkCacheUpdate', 'linkTransferView', 'localMenu'];
+const CACHE_FNS = [
+  'linkCacheOf',
+  'linkDownloadOf',
+  'linkCachePct',
+  'useCachedLink',
+  'onLinkCacheUpdate',
+  'playCachedCurrentNow',
+  'linkTransferView',
+  'localMenu',
+];
 
 async function cacheRoom({ localPath = { path: 'D:\saved\片子.mp4', title: '缓存的片子' }, ...opts } = {}) {
   const asked = [];

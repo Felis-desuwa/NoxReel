@@ -653,9 +653,23 @@ const EN = new Map(Object.entries({
   // 链接授权（行内，不弹窗）
   '需要允许打开': 'Needs your permission to open',
   '房主给的播放地址需要允许打开': 'The host’s stream URL needs your permission to open',
-  '本机无法解析这个链接': 'This link cannot be resolved on your computer',
-  '这个视频链接在你的电脑上无法解析，可以先跳过这一部':
-    'This video link cannot be resolved on your computer. You can skip this one for now.',
+  '本机没能解析这个链接': 'This link could not be resolved on your computer',
+  '这个视频链接在你的电脑上没能解析出来，可以重试，也可以先跳过这一部':
+    'This video link could not be resolved on your computer. You can retry or skip this one for now.',
+  // 解析成功了，本机播放器却放不了（打不开、半路断了）
+  '播放器打不开这个链接': 'The player cannot open this link',
+  '在线视频断了': 'The online video was cut off',
+  '播放器打不开这个在线视频，可以重试，也可以先跳过这一部':
+    'The player cannot open this online video. You can retry or skip this one for now.',
+  '在线视频断了，点「重试」重新连接，也可以先跳过这一部':
+    'The online video was cut off. Select “Retry” to reconnect, or skip this one for now.',
+  '在线视频停住了，但片长未知，分不清是放完了还是断流了：没放完就点「重试」重新连接':
+    'The online video stopped, but its length is unknown, so it is unclear whether it finished or was cut off. If it did not finish, select “Retry” to reconnect.',
+  '网站返回了错误': 'The website returned an error',
+  'yt-dlp 没能从网页里解析出视频': 'yt-dlp could not extract a video from the page',
+  '连不上视频网站（超时或网络中断）': 'Could not reach the video website (timed out or the network dropped)',
+  '播放器认不出这个视频的格式': 'The player does not recognize this video format',
+  '原因不明': 'Unknown reason',
   '允许': 'Allow',
   '允许打开': 'Allow',
   '改为允许': 'Allow instead',
@@ -1109,6 +1123,16 @@ const EN_PATTERNS = [
   ],
   [/^这个视频链接在你的电脑上无法解析：(.*)$/, (_all, detail) => `This video link could not be parsed on your computer: ${translate(detail, 'en')}`],
   [/^本机解析失败，改用房主提供的临时播放地址：(.*)$/, (_all, detail) => `Local parsing failed; using the host's temporary stream URL: ${translate(detail, 'en')}`],
+  // 解析成功了，本机播放器却放不了；重试、缓存下完改从本地播
+  [/^播放器打不开这个在线视频：(.*)$/, (_all, detail) => `The player cannot open this online video: ${translate(detail, 'en')}`],
+  [/^网站拒绝了播放请求（HTTP (\d{3})），播放地址可能已经过期$/, 'The website refused playback (HTTP $1); the stream URL may have expired'],
+  [/^网站返回了错误（HTTP (\d{3})）$/, 'The website returned an error (HTTP $1)'],
+  [
+    /^在线视频在 (\S+) 断了（全片 (\S+)），不是放完了：点「重试」重新连接$/,
+    'The online video was cut off at $1 (full length $2); it did not finish. Select “Retry” to reconnect.',
+  ],
+  [/^重新连接《(.+)》…$/, 'Reconnecting “$1”…'],
+  [/^《(.+)》缓存好了，改从本地播$/, '“$1” is cached; playing it from disk now'],
   [/^已和 (.+) 完成(.+)握手$/, 'Completed $2 handshake with $1'],
   [/^(.+)的缓冲跟不上了，全员暂停等待$/, '$1 is buffering; pausing everyone'],
   [/^等待 (.+) 缓冲…$/, 'Waiting for $1 to buffer…'],
