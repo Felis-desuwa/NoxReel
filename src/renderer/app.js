@@ -53,6 +53,7 @@ import {
   bufferLead,
   forecastStall,
   hostPrecheck,
+  resumeLead,
   viewersSupported,
   worstWaitSeconds,
   RateMeter,
@@ -74,7 +75,7 @@ const randomInt = (min, max) => {
   return min + (value % (max - min + 1));
 };
 const HEAD_READY_BYTES = 8 * 1024 * 1024;
-// 起播点不在片头时（中途加入、「回头接着放」），起播点往后还要有这么多连续内容。
+// 可信房间的就绪门槛：起播点往后还要有这么多连续内容（从片头起播时起播点就是 0）。
 // 和同步引擎的恢复线取同一个数：起播那一刻就低于恢复线的话，第一帧还没画出来就该暂停了。
 const START_RUN_SECONDS = 15;
 // 解复用器的预读。实测 mpv 的 demuxer-cache-time 常年领先 time-pos 约 1.7 秒，
@@ -5989,26 +5990,73 @@ function localReadyNow() {
   const sess = S.sessions.get(item.fileId);
   const ctx = sess && sess.slot === item.slot ? S.swarm?.files.get(item.slot) : null;
   const prog = ctx ? S.swarm.progress(item.slot) : null;
-  const startByte = roomPlayheadByte();
+  // midJoin 单独给：码率未知时 startByte 恒为 0，只看它会让这道门槛静默失效。
+  const midJoin = midJoinNow();
+  // 房间还在片头时起播点就是文件头 0，从它起的连续数据就是从文件头起的那段。
+  // 不能用 roomPlayheadByte()：播放器一起来，第一条 tick 就带着 stream-pos（解复用器
+  // 已经读到的位置，暂停在 0 秒时也常有几 MB），拿它当起播点的话，同一个人对同一个起播点
+  // 的结论会随「播放器报没报过 tick」翻转 —— 先报就绪又撤回，自动连播开不开播看竞态。
+  const startByte = midJoin ? roomPlayheadByte() : 0;
   return isItemReady(item, {
     isSeeder: !!sess?.isSeeder,
     mode: S.roomSecurityMode,
     contiguousBytes: ctx?.contiguousBytes || 0,
-    // 起播点不在片头时（中途加入、或「回头接着放」），片头够了还不算准备好。
-    // midJoin 单独给：码率未知时 startByte 恒为 0，只看它会让这道门槛静默失效。
-    midJoin: midJoinNow(),
+    // 片头够了只说明播放器认得出格式，还得从起播点起够放 15 秒（中途加入、「回头接着放」
+    // 时起播点在片中，swarm 的 runBytes 已经按房间位置起算）
+    midJoin,
     startByte,
-    runBytes: prog?.runBytes || 0,
+    runBytes: midJoin ? prog?.runBytes || 0 : ctx?.contiguousBytes || 0,
     runNeeded: startRunNeeded(item.size || 0, startByte),
+    // 起播点在片中时，MKV 的索引（常在文件尾）也得先到
+    tailReady: midJoin ? tailIndexMissing(ctx) === 0 : true,
     complete: !!ctx?.complete,
     scanStatus: sess?.safety.status,
   });
 }
 
+/**
+ * 文件尾的索引（MKV 的 Cues 常写在文件尾）还差多少字节，0 = 到齐了或者用不着。
+ * 调度器按内容认出是 faststart MP4（索引在文件头）才不预留文件尾，这里用同一个判据：
+ * 认不出来就按「要」算。起播点在片中时缺了它，mpv 得从片头扫着建索引才定位得到起播点，
+ * 而 [片头, 起播点) 是空洞。
+ */
+function tailIndexMissing(ctx) {
+  const sch = ctx?.scheduler;
+  if (!sch || ctx.complete || !sch.needsTailIndex() || !(sch.tailReserveBytes > 0)) return 0;
+  const { size, chunkSize, chunkCount } = ctx.manifest;
+  let missing = 0;
+  for (let i = sch.byteToChunk(size - Math.min(sch.tailReserveBytes, size)); i < chunkCount; i++) {
+    if (!ctx.have[i]) missing += Math.min(chunkSize, size - i * chunkSize);
+  }
+  return missing;
+}
+
+/**
+ * 我没准备好的原因里，房主从我的位图上看不出来的那几种：收完了却卡在安全扫描上。
+ * 随就绪消息报过去，房主的就绪名单和成员表才说得清在等什么 —— 否则只看得到「已收完」，
+ * 不知道这个人本机的扫描器用不了（Defender 被第三方杀毒软件接管），每一部都得手动「仍然开始」。
+ */
+function localNotReadyWhy() {
+  const item = S.current;
+  if (item?.kind !== 'file' || S.roomSecurityMode === 'trusted' || localOptedOut(item)) return null;
+  const sess = S.sessions.get(item.fileId);
+  if (!sess || sess.isSeeder || sess.slot !== item.slot || !S.swarm?.files.get(item.slot)?.complete) return null;
+  const status = sess.safety.status;
+  if (status === 'scan-timeout') return sess.safety.unavailable ? 'scan-unavailable' : 'scan-incomplete';
+  if (status === 'scan-stopped') return 'scan-incomplete';
+  // 收完了还没出结论：正在扫，或者排在别的片后面等扫
+  if (status !== 'clean' && status !== 'blocked') return 'scanning';
+  return null;
+}
+
+/** 就绪消息里的原因，给人看的说法。 */
+const READY_WHY_LABEL = { scanning: '在做安全扫描', 'scan-unavailable': '扫描器不可用', 'scan-incomplete': '安全扫描没做完' };
+
 /** 就绪状态变了才会发出去（同步引擎里去重），所以进度事件里随手调也不贵。 */
 function updateLocalReady() {
   if (!S.sync) return;
-  S.sync.setLocalReady(localReadyNow());
+  const ready = localReadyNow();
+  S.sync.setLocalReady(ready, ready ? null : localNotReadyWhy());
   renderReady();
   maybeAutoStart();
 }
@@ -6021,12 +6069,14 @@ function readyWaiting() {
   if (!S.sync || !S.swarm || !S.current) return [];
   const snap = S.sync.readySnapshot();
   const ready = new Map(snap.peers.map((p) => [p.peerId, p.ready]));
+  const why = new Map(snap.peers.map((p) => [p.peerId, p.why]));
   const members = new Map();
   if (!isRoomHost()) for (const p of snap.peers) members.set(p.peerId, { peerId: p.peerId, name: p.name });
   for (const p of S.swarm.peers.values()) {
     if (p.authenticated) members.set(p.peerId, { peerId: p.peerId, name: p.name });
   }
-  const out = waitingFor([...members.values()], ready);
+  // 没准备好的原因（对方报了的话）：房主据此知道是在等下载，还是卡在他本机的安全扫描上
+  const out = waitingFor([...members.values()], ready).map((m) => ({ ...m, why: why.get(m.peerId) || null }));
   if (!snap.self) out.unshift({ peerId: S.peerId, name: '', self: true });
   return out;
 }
@@ -6075,6 +6125,8 @@ function renderReady() {
     waiting.slice(0, READY_NAMES_SHOWN).forEach((w, i) => {
       if (i) names.push(rawText(sep));
       names.push(w.self ? make('span', { text: '你' }) : rawText(shown.get(w.peerId) || peerName(w.name, w.peerId)));
+      // 卡在安全扫描上的人说一句原因（昵称原样，原因单独一个元素走翻译）
+      if (READY_WHY_LABEL[w.why]) names.push(make('span', { text: `（${READY_WHY_LABEL[w.why]}）` }));
     });
     if (waiting.length > READY_NAMES_SHOWN) names.push(rawText(`${sep}…`));
     replace('ready-text', make('span', { text: `等待 ${waiting.length} 人准备好：` }), ...names);
@@ -6209,11 +6261,15 @@ function maybeLaunchPlayer(p) {
     if (p.contiguousBytes < readyBytes || S.mediaSafety.status !== 'waiting-download') return;
     // 起播点不在片头（中途加入、或「回头接着放」）：片头够了只说明播放器认得出格式，
     // 它落脚的是起播点 —— 那里没有足够的连续数据，一起播就撞上连续区尽头。
+    // 从片头起播（房间还在 0 秒）时片头够了就先把播放器打开，停在第一帧等房间开播；
+    // 房间什么时候开播由就绪门槛（localReadyNow：还要从片头起够放 15 秒）决定。
     if (midJoinNow() && !p.complete) {
       const startByte = roomPlayheadByte();
       // 码率未知（片源没装 ffmpeg，清单里就没有时长）时换不出字节位置，
       // 判不了起播点附近有没有数据。这一部只能等收完再播。
       if (!(startByte > 0)) return warnMidJoinBlind();
+      // MKV 的索引常在文件尾：网状房间里几个上游并行时，起播点附近那段可能比尾片先到齐
+      if (tailIndexMissing(S.swarm.files.get(p.slot)) > 0) return;
       if ((p.runBytes || 0) < startRunNeeded(S.manifest?.size || 0, startByte)) return;
     }
     S.mediaSafety.status = 'trusted-streaming';
@@ -6310,6 +6366,8 @@ async function verifyReceivedMedia({ force = false, session = currentSession() }
   if (currentSession() === session) {
     setScanTicker(true);
     renderStatus();
+    // 重新扫描时，就绪消息里的原因从「扫描器不可用 / 没扫完」换回「在做安全扫描」
+    updateLocalReady();
   }
   renderPlaylistSoon();
   let result;
@@ -6346,6 +6404,9 @@ async function applyScanResult(session, result, before) {
   session.preempted = false;
   const outcome = decideScanOutcome(result, S.roomSecurityMode);
   safety.timeoutMs = result.timeoutMs || 0;
+  // 安全模式下「扫描器没跑起来」和「没扫完」记成同一个状态（都能重新扫描），
+  // 就绪消息却要分开报：前者多半是 Defender 被第三方杀毒软件接管，重扫几遍都一样
+  safety.unavailable = result.status === 'unavailable';
   if (outcome.destroy) {
     await blockScannedSession(session, result.message || '安全扫描未通过');
     return;
@@ -7716,21 +7777,27 @@ function renderTransferVerdict(p) {
   const parts = [];
 
   if (S.roomSecurityMode === 'trusted') {
-    if (!S.mpvRunning) {
-      const startByte = roomPlayheadByte();
-      if (midJoinNow() && !(startByte > 0)) {
+    // 还没起播：播放器没起来；或者从片头起播、播放器已经停在第一帧，房间还在等我够上就绪门槛
+    const awaitingStart = !S.mpvRunning || (!S.playlist?.started && S.sync?.localReady === false);
+    if (awaitingStart) {
+      // 和就绪门槛（localReadyNow）同一个起播点：房间还在片头时就是文件头 0
+      const midJoin = midJoinNow();
+      const startByte = midJoin ? roomPlayheadByte() : 0;
+      if (midJoin && !(startByte > 0)) {
         // 中途加入却算不出房间播到第几个字节（清单里没有时长）：这一部只能等收完，
         // 再报「距起播还差 0」就是在骗人。见 warnMidJoinBlind()。
         const remaining = Math.max(0, Math.round((1 - p.ratio) * S.manifest.size));
         parts.push(stat('片源没提供时长 · 完整接收后才播，还剩', fmtBytes(remaining)));
         if (rate > 0) parts.push(stat('预计还需', fmtTime(remaining / rate)));
       } else {
-        // 中途加入时片头早就够了，还差的是起播点附近那一段 —— 只报片头会一直显示「还差 0」。
+        // 片头 8MB 之外还要从起播点起够放 15 秒。中途加入时片头早就够了，还差的是起播点附近
+        // 那一段 —— 只报片头会一直显示「还差 0」；从片头起播时两段是同一段，取大的那个。
         const headLeft = Math.max(0, Math.min(HEAD_READY_BYTES, S.manifest.size) - p.contiguousBytes);
-        const runLeft =
-          startByte > 0 ? Math.max(0, startRunNeeded(S.manifest.size, startByte) - (p.runBytes || 0)) : 0;
-        const left = Math.max(headLeft, runLeft);
-        parts.push(stat(runLeft > headLeft ? '距起播还差（当前位置附近）' : '距起播还差', fmtBytes(left)));
+        const run = midJoin ? p.runBytes || 0 : p.contiguousBytes || 0;
+        const runLeft = Math.max(0, startRunNeeded(S.manifest.size, startByte) - run);
+        // 起播点在片中时文件尾的索引也在门槛里，缺着的话别报「还差 0」
+        const left = Math.max(headLeft, runLeft) + (midJoin ? tailIndexMissing(currentFileCtx()) : 0);
+        parts.push(stat(midJoin && runLeft > headLeft ? '距起播还差（当前位置附近）' : '距起播还差', fmtBytes(left)));
         if (rate > 0) parts.push(stat('预计还需', fmtTime(left / rate)));
       }
     }
@@ -7747,12 +7814,15 @@ function renderTransferVerdict(p) {
 
   // 安全模式收完才播，不存在中途卡顿，上面的「还剩 / 预计还需」就是全部要说的。
   if (need > 0 && rate > 0 && S.roomSecurityMode === 'trusted') {
+    // 播放位置往后还缺的各段：第一个空洞后面已经收齐的那段不算要等的（中途加入后往回拖时常见）
+    const holes = S.swarm.missingAhead(p.slot);
     const forecast = forecastStall({
       size: S.manifest.size,
       bitrate: need,
       rate,
       contiguous: p.runEndBytes,
       playhead: roomPlayheadByte(),
+      holes,
     });
     if (forecast.level === 'stall') {
       node.classList.add('bad');
@@ -7766,6 +7836,7 @@ function renderTransferVerdict(p) {
         rate,
         contiguous: p.runEndBytes,
         playhead: roomPlayheadByte(),
+        holes,
       });
       if (lead && lead.waitSec > 0 && Number.isFinite(lead.waitSec)) {
         parts.push(
@@ -8024,6 +8095,7 @@ function updatePeerForecasts(list) {
   const size = S.manifest?.size || 0;
   const bitrate = mediaBitrate();
   const playhead = roomPlayheadByte();
+  const trusted = S.roomSecurityMode === 'trusted';
   // 片源是加这部片的人，不一定是房主
   const sourceId = S.current?.kind === 'file' ? S.current.sourceId : '';
   const next = new Map();
@@ -8036,18 +8108,36 @@ function updatePeerForecasts(list) {
     meter.sample(now, info.remoteHeldBytes || 0);
     const rate = meter.rate;
     const held = info.remoteHeldBytes || 0;
+    // 按房间播放位置往后他还缺的各段逐段算：空洞后面他已经收齐的不算要等的
+    const shape = {
+      size,
+      bitrate,
+      rate,
+      contiguous: info.remoteRunEndBytes || 0,
+      playhead,
+      holes: info.remoteMissingAhead ?? undefined,
+    };
     let forecast;
     if (!size || S.sourceType === 'link') forecast = { level: 'unknown' };
     else if (sourceId && info.peerId === sourceId && !S.isSeeder) forecast = { level: 'source' };
-    else if ((info.remoteRunEndBytes || 0) >= size) forecast = { level: 'done' };
+    // 「已收完」只认整部都在手上。只看从播放位置到文件尾的话，中途加入、回头接着放的人
+    // [0, P) 还缺着也会被报成「已收完」—— 安全模式下他其实还没收完、更没扫描，根本放不了
+    else if (held >= size) forecast = { level: 'done' };
+    // 从播放位置往后都收齐了、[0, P) 还在补：可信房间里不会卡，但不能说成「已收完」
+    else if (trusted && (info.remoteRunEndBytes || 0) >= size) forecast = { level: 'ahead' };
     else if (rate === null) forecast = { level: 'measuring' };
-    else forecast = forecastStall({ size, bitrate, rate, contiguous: info.remoteRunEndBytes || 0, playhead });
+    // 安全模式收完才播，不存在中途卡顿，只算还要多久（见 forecastLabel）
+    else if (!trusted) forecast = { level: 'receiving' };
+    else forecast = forecastStall(shape);
     // 会卡的人才算「先等多久就不卡了」——不卡的人这个数恒为 0，算了也没东西可说。
-    const lead =
-      forecast.level === 'stall'
-        ? bufferLead({ size, bitrate, rate, contiguous: info.remoteRunEndBytes || 0, playhead })
+    const lead = forecast.level === 'stall' ? bufferLead(shape) : null;
+    // 他在全员暂停里还要多久才攒够（同步引擎的恢复线）。和上面那个不是一回事，
+    // 卡住的人预判等级不一定是 stall（比如余量很薄的人网络抖了一下）。
+    const resume =
+      trusted && rate !== null && forecast.level !== 'done' && forecast.level !== 'source'
+        ? resumeLead({ ...shape, resumeBytes: S.sync?.resumeThresholdBytes || 0 })
         : null;
-    next.set(info.peerId, { ...forecast, rate, held, lead });
+    next.set(info.peerId, { ...forecast, rate, held, lead, resume });
   }
   for (const id of intakeMeters.keys()) if (!next.has(id)) intakeMeters.delete(id);
   lastForecasts = next;
@@ -8059,9 +8149,12 @@ function forecastLabel(f) {
   if (!f) return '';
   if (f.level === 'source') return '片源';
   if (f.level === 'done') return '已收完，不会卡';
+  // 可信房间：播放位置往后都齐了，播放器不会卡；[0, P) 还在补，所以不说「已收完」
+  if (f.level === 'ahead') return '前方已收齐，不会卡';
   if (f.level === 'measuring') return '正在测速…';
   if (f.level === 'unknown') return mediaBitrate() > 0 ? '' : '码率未知，没法预判';
   if (S.roomSecurityMode !== 'trusted') {
+    // 按整部还缺多少算：从播放位置往后收齐了也得等 [0, P) 收完、扫描通过才放得了
     const remaining = Math.max(0, (S.manifest?.size || 0) - (f.held || 0));
     return f.rate > 0 ? `收完才播 · 预计还需 ${fmtTime(remaining / f.rate)}` : '收完才播';
   }
@@ -8074,27 +8167,32 @@ function forecastLabel(f) {
 }
 
 /**
- * 自己这一路的预缓冲估计。传输面板和 mpv 横幅共用这一个数，
- * 免得同一件事在两个地方给出不一样的说法。
+ * 自己这一路还要多久攒够恢复线（同步引擎据此解除卡顿）。横幅和 mpv 里的
+ * 「约 T 后继续」用它；「再缓冲多久可一路看完」是另一件事，见 renderTransferVerdict。
  */
-function myBufferLead() {
+function myResumeLead() {
   if (S.isSeeder || S.sourceType === 'link' || !S.manifest) return null;
   const p = S.swarm?.progress();
   if (!p || p.complete) return null;
-  const bitrate = mediaBitrate();
   const rate = p.downRate || 0;
-  if (!(bitrate > 0) || !(rate > 0)) return null;
-  return bufferLead({
+  if (!(rate > 0)) return null;
+  return resumeLead({
     size: S.manifest.size,
-    bitrate,
     rate,
     contiguous: p.runEndBytes,
-    playhead: roomPlayheadByte(),
+    // 和 runEndBytes 出自同一个播放位置（swarm 的 playbackByte）
+    playhead: p.playbackByte,
+    holes: S.swarm.missingAhead(p.slot),
+    resumeBytes: S.sync?.resumeThresholdBytes || 0,
   });
 }
 
 /**
- * 全员暂停还要等多久。
+ * 全员暂停还要等多久：卡住的人各自攒够恢复线（15 秒 × 码率）要多久。
+ *
+ * 不是「再缓冲多久可一路看完」—— 速度低于码率时那个数常常是十几分钟，引擎却在余量
+ * 过了恢复线就松口，十几秒后房间就走了（之后多半会再卡）。拿那个数当「约 T 后继续」，
+ * 恰好在最需要说准的时候说错。
  *
  * 取所有卡住的人里最久的那个 —— 房间要等最慢的那个攒够才恢复。任何一个人算不出来
  * 就整个返回 null：宁可不给数，也别给一个偏乐观的数让人白等。
@@ -8107,8 +8205,8 @@ function myBufferLead() {
 function stallWaitSeconds({ room = false } = {}) {
   if (!S.sync) return null;
   const leads = [];
-  if (S.sync.localStalled && (!room || S.sync.canIControl())) leads.push(myBufferLead());
-  for (const peerId of S.sync.stalledPeers.keys()) leads.push(lastForecasts.get(peerId)?.lead);
+  if (S.sync.localStalled && (!room || S.sync.canIControl())) leads.push(myResumeLead());
+  for (const peerId of S.sync.stalledPeers.keys()) leads.push(lastForecasts.get(peerId)?.resume);
   return worstWaitSeconds(leads);
 }
 
@@ -8300,6 +8398,8 @@ function renderPeers(list) {
 
   const iAmHost = S.sync?.myRole() === 'host';
   const waiting = notReadyIds();
+  // 没准备好的人报来的原因（卡在安全扫描上）。预判只看得到位图，这种人在它眼里就是「已收完」
+  const readyWhy = new Map(waiting ? S.sync.readySnapshot().peers.map((p) => [p.peerId, p.why]) : []);
   const bitrate = S.sourceType === 'link' ? 0 : mediaBitrate();
   const names = roomDisplayNames();
   // 有人进出、改名，重名编号可能跟着变：聊天里的名字要和成员表对得上
@@ -8344,8 +8444,9 @@ function renderPeers(list) {
         const forecastText = forecastLabel(forecast);
         // 安全模式下不存在「会卡」，不上红黄色，免得把「要等」看成「出故障」。
         const tone = S.roomSecurityMode === 'trusted' ? forecast?.level || '' : '';
+        const waitText = READY_WHY_LABEL[readyWhy.get(peer.peerId)] || forecastText;
         const main = waiting?.has(peer.peerId)
-          ? make('div', { className: 'peer-forecast wait', text: forecastText ? `未就绪 · ${forecastText}` : '未就绪' })
+          ? make('div', { className: 'peer-forecast wait', text: waitText ? `未就绪 · ${waitText}` : '未就绪' })
           : waiting
           ? make('div', { className: 'peer-forecast ok', text: '已就绪' })
           : forecastText

@@ -119,6 +119,7 @@ const EN = new Map(Object.entries({
   '未测': 'Not measured',
   '片源': 'Source',
   '已收完，不会卡': 'Fully received, will not stall',
+  '前方已收齐，不会卡': 'Everything ahead is received, will not stall',
   '正在测速…': 'Measuring speed…',
   '码率未知，没法预判': 'Bitrate unknown; cannot predict stalls',
   '收完才播': 'Plays after full receipt',
@@ -779,6 +780,10 @@ const EN = new Map(Object.entries({
   '状态': 'Status',
   '已就绪': 'Ready',
   '未就绪': 'Not ready',
+  // 没准备好的原因（成员随就绪消息报来，卡在安全扫描上）
+  '在做安全扫描': 'Running the security scan',
+  '扫描器不可用': 'Scanner unavailable',
+  '安全扫描没做完': 'Security scan unfinished',
   '上行': 'Upload',
   '即将开始': 'Starting soon',
   '还没开始': 'Not started',
@@ -1451,6 +1456,8 @@ const EN_PATTERNS = [
   [/^已收到 ([\d.]+)%（(\d+)\/(\d+) 片）$/, 'Received $1% ($2/$3 chunks)'],
   [/^已收 (\d+)%$/, 'Received $1%'],
   [/^未就绪 · (.+)$/, (_all, rest) => `Not ready · ${translate(rest, 'en')}`],
+  // 就绪等待名单里跟在昵称后面的原因（昵称本身是单独的元素，不翻）
+  [/^（(在做安全扫描|扫描器不可用|安全扫描没做完)）$/, (_all, why) => ` (${translate(why, 'en')})`],
   [/^持有 (\d+)% · 延迟 (.+)$/, 'Has $1% · Latency $2'],
   [/^延迟 (.+)$/, 'Latency $1'],
   [/^片子码率 (.+)$/, 'Video bitrate $1'],

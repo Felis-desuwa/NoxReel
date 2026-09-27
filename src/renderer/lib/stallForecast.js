@@ -20,11 +20,36 @@ export function bitrateOf(size, durationSec) {
 }
 
 /**
+ * 播放位置往后还缺的那几段，[起, 止) 绝对字节位置，按位置排好。
+ *
+ * 调用方给了 holes（swarm.missingRangesFrom 按位图算的）就用它；没给就退回旧的近似：
+ * 从连续区尽头 contiguous 到文件尾整段都当缺着。中途加入之后往回拖、或者先往后跳
+ * 再拖回来时，空洞后面往往已经收齐了一大段，整段当缺着会把等待时间高估好几倍。
+ */
+function gapsAhead({ size, contiguous, playhead, holes }) {
+  const head = Math.max(0, Math.min(size, playhead || 0));
+  if (!Array.isArray(holes)) {
+    const from = Math.max(head, Math.min(size, contiguous || 0));
+    return from < size ? [[from, size]] : [];
+  }
+  const out = [];
+  for (const hole of holes) {
+    const a = Math.max(head, Math.min(size, hole?.[0] || 0));
+    const b = Math.max(head, Math.min(size, hole?.[1] || 0));
+    if (b > a) out.push([a, b]);
+  }
+  return out;
+}
+
+/**
  * 预判一个成员边下边播会不会卡。
  *
- * 模型：连续水位线以 rate 往前推，播放头以 bitrate 往前推。播放头追上水位线的那一刻
- * 就是卡住的时刻；如果水位线先推到文件尾，就永远不会卡 —— 哪怕速度低于码率。
+ * 模型：下载按顺序把播放位置往后的空洞一段段补上（调度器就是播放位置优先、再顺序补齐），
+ * 以 rate 往前推；播放头以 bitrate 往前推。播放头在某个空洞里追上正在补的位置，
+ * 就是卡住的时刻；如果每个空洞都赶在播放头到达之前补完，就永远不会卡 —— 哪怕速度低于码率。
  * 这一点很重要：一个已经缓冲了大半部片子的人，速度掉到码率以下也不该被报「会卡」。
+ *
+ * 只有一个空洞（从连续区尽头到文件尾）时，就是「播放头追上水位线之前水位线能不能先推到文件尾」。
  *
  * 暂停中的房间按「现在恢复播放」算，这正是用户想知道的。
  *
@@ -36,28 +61,40 @@ export function bitrateOf(size, durationSec) {
  *   （swarm.runEndFrom(playhead)）。从片头起播时它就是旧的「从文件头起的水位线」；
  *   中途加入房间时两者相差整整一部片，传错那个会把晚到的人判成一直在卡。
  * @param {number} [o.playhead]  当前播放到的字节位置
+ * @param {Array<[number, number]>} [o.holes] 播放位置往后还缺的各段（见 gapsAhead）；
+ *   不给就把 [contiguous, size) 整段当缺着
  * @returns {{level: 'unknown'|'done'|'ok'|'thin'|'stall', margin?: number, stallInSec?: number, finishSec?: number}}
+ *   - done  播放位置往后都收齐了（[0, 播放位置) 可能还缺着：「已收完」要调用方另看）
  *   - ok    速度有余量
  *   - thin  不会卡但没余量：速度在码率的 1~1.2 倍之间，或者速度不够但缓冲撑得到收完
  *   - stall 按现在的速度会卡，stallInSec 是还能播多久
  */
-export function forecastStall({ size, bitrate, rate, contiguous, playhead = 0 }) {
+export function forecastStall({ size, bitrate, rate, contiguous, playhead = 0, holes }) {
   if (!(size > 0)) return { level: 'unknown' };
-  if (contiguous >= size) return { level: 'done' };
+  const head = Math.max(0, Math.min(size, playhead || 0));
+  const gaps = gapsAhead({ size, contiguous, playhead: head, holes });
+  if (!gaps.length) return { level: 'done' };
   if (!(bitrate > 0)) return { level: 'unknown' };
 
-  const lead = Math.max(0, contiguous - Math.max(0, playhead));
   const speed = rate > 0 ? rate : 0;
   const margin = speed / bitrate;
 
   if (margin >= SMOOTH_MARGIN) return { level: 'ok', margin };
   if (margin >= 1) return { level: 'thin', margin };
 
-  // 速度不够：看播放头追上水位线之前，水位线能不能先推到文件尾。
-  const catchUpSec = lead / (bitrate - speed);
-  const finishSec = speed > 0 ? (size - contiguous) / speed : Infinity;
-  if (catchUpSec >= finishSec) return { level: 'thin', margin, finishSec };
-  return { level: 'stall', margin, stallInSec: catchUpSec };
+  // 速度不够：逐个空洞看，补到这个空洞末尾之前播放头会不会先到。
+  // 空洞里下载比播放慢，差距越拉越大，所以只看每个空洞的末尾就够了。
+  let before = 0; // 这个空洞前面还缺的字节（下载得先补完它们）
+  for (const [a, b] of gaps) {
+    const lateSec = speed > 0 ? (before + (b - a)) / speed - (b - head) / bitrate : Infinity;
+    if (lateSec > 0) {
+      // 卡在这个空洞里：播放头先到空洞口（下载还没补到这儿），或者在洞里追上正在补的位置
+      const stallInSec = Math.max((a - head) / bitrate, (a - head - before) / (bitrate - speed));
+      return { level: 'stall', margin, stallInSec };
+    }
+    before += b - a;
+  }
+  return { level: 'thin', margin, finishSec: before / speed };
 }
 
 /**
@@ -80,24 +117,76 @@ export function forecastStall({ size, bitrate, rate, contiguous, playhead = 0 })
  *   用它而不是从文件头起的水位线，「把前方补到尾还要多久」才不会把 [0,播放位置)
  *   那段回填也算进等待时间 —— 那段补不补都不影响这一场看完。
  * @param {number} [o.playhead]  当前播放到的字节位置
+ * @param {Array<[number, number]>} [o.holes] 播放位置往后还缺的各段（同 forecastStall）
  * @returns {{waitSec: number, needBytes: number, bufferSec: number}|null}
  *   waitSec 还要等多久才能开播（0 = 现在开播就能一路播完；Infinity = 速度为 0，等不到）；
  *   needBytes 这段时间要再收的字节；bufferSec 开播那一刻手上有多少秒的可播内容。
  *   码率或大小未知时返回 null，由调用方显示「未知」而不是编一个数。
+ *
+ * 播放位置往后有好几个空洞时，「下完」和「播完」要在每个空洞的末尾各对齐一次，取等得最久的
+ * 那一处：先补完第一个空洞、后面已经收齐的那段直接播过去，比「剩下全部重下一遍」快得多。
  */
-export function bufferLead({ size, bitrate, rate, contiguous, playhead = 0 }) {
+export function bufferLead({ size, bitrate, rate, contiguous, playhead = 0, holes }) {
   if (!(size > 0) || !(bitrate > 0)) return null;
 
-  const have = Math.max(0, Math.min(size, contiguous || 0));
   const head = Math.max(0, Math.min(size, playhead || 0));
-  if (have >= size) return { waitSec: 0, needBytes: 0, bufferSec: (size - head) / bitrate };
+  const gaps = gapsAhead({ size, contiguous, playhead: head, holes });
+  if (!gaps.length) return { waitSec: 0, needBytes: 0, bufferSec: (size - head) / bitrate };
 
+  const missing = gaps.reduce((sum, [a, b]) => sum + (b - a), 0);
   const speed = rate > 0 ? rate : 0;
-  if (!speed) return { waitSec: Infinity, needBytes: size - have, bufferSec: Infinity };
+  if (!speed) return { waitSec: Infinity, needBytes: missing, bufferSec: Infinity };
 
-  const waitSec = Math.max(0, (size - have) / speed - (size - head) / bitrate);
+  let waitSec = 0;
+  let upTo = 0; // 补到这个空洞末尾一共要收的字节
+  for (const [a, b] of gaps) {
+    upTo += b - a;
+    waitSec = Math.max(waitSec, upTo / speed - (b - head) / bitrate);
+  }
   const needBytes = waitSec * speed;
-  return { waitSec, needBytes, bufferSec: (have + needBytes - head) / bitrate };
+  return { waitSec, needBytes, bufferSec: (runEndAfter(gaps, needBytes, size) - head) / bitrate };
+}
+
+/** 按顺序把空洞补掉 bytes 个字节之后，从播放位置起连续可播到哪。 */
+function runEndAfter(gaps, bytes, size) {
+  let left = bytes;
+  for (const [a, b] of gaps) {
+    if (left < b - a) return a + left;
+    left -= b - a;
+  }
+  return size;
+}
+
+/**
+ * 卡住的人还要多久才攒够、全员暂停自动解除。
+ *
+ * 和 bufferLead 不是一回事：bufferLead 是「先攒多久，之后一路看到尾不再卡」，
+ * 同步引擎却是从播放位置起的连续数据超过恢复线（15 秒 × 码率）就松口 —— 速度低于码率时，
+ * 前者常常是十几分钟，后者只要十几秒（之后多半会再卡，那是另一件事）。
+ * 横幅和播放器里的「约 T 后自动继续」说的是后者。
+ *
+ * 全员暂停时播放头不动，所以只是「把 [播放位置, 播放位置 + 恢复线) 里还缺的字节收完」。
+ *
+ * @param {object} o
+ * @param {number} o.size         文件总字节
+ * @param {number} o.rate         当前接收速度，字节/秒
+ * @param {number} o.contiguous   从播放位置起连续可播到的绝对字节位置（同上）
+ * @param {number} [o.playhead]   当前播放到的字节位置
+ * @param {Array<[number, number]>} [o.holes] 播放位置往后还缺的各段（同上）
+ * @param {number} o.resumeBytes  恢复线（同步引擎的 resumeThresholdBytes）
+ * @returns {{waitSec: number, needBytes: number}|null} 速度为 0 时 waitSec 为 Infinity；大小未知返回 null
+ */
+export function resumeLead({ size, rate, contiguous, playhead = 0, holes, resumeBytes }) {
+  if (!(size > 0) || !(resumeBytes > 0)) return null;
+  const head = Math.max(0, Math.min(size, playhead || 0));
+  const target = Math.min(size, head + resumeBytes);
+  let needBytes = 0;
+  for (const [a, b] of gapsAhead({ size, contiguous, playhead: head, holes })) {
+    if (a >= target) break;
+    needBytes += Math.min(b, target) - a;
+  }
+  if (!needBytes) return { waitSec: 0, needBytes: 0 };
+  return { waitSec: rate > 0 ? needBytes / rate : Infinity, needBytes };
 }
 
 /**

@@ -406,6 +406,63 @@ impl('房主 greet：ROLE → 列表 → SYNC → 卡顿 → 其他人的 READY 
   });
 });
 
+/* ------------------------------ 5b. 没准备好的原因 ------------------------------ */
+
+/**
+ * GG3-5：安全模式下扫描器不可用的成员每一部都「未就绪」，房主只看得到他收完了，
+ * 不知道在等什么。成员在 READY 里顺带报原因（只认几种），房主转发、补发给新人。
+ * 旧版不认这个字段，照旧只看 ready。
+ */
+impl('没准备好时可以带原因：原因变了也重发；准备好了不带；认不得的原因丢掉', async (dir) => {
+  const { eng, outbound, readies, clear } = await makeEngine(dir, { peerId: 'me', guests: ['me'], seq: 2 });
+  assert.equal(eng.setLocalReady(false, 'scanning'), true);
+  assert.deepEqual(outbound, [{ t: 'ready', seq: 2, ready: false, why: 'scanning', peerId: 'me', name: 'me', readySeq: 1 }]);
+  assert.deepEqual(readies, [{ who: 'me', name: 'me', ready: false, why: 'scanning', self: true }]);
+  clear();
+
+  assert.equal(eng.setLocalReady(false, 'scanning'), false, '没变化不该发');
+  assert.equal(eng.setLocalReady(false, 'scan-unavailable'), true, '还是没准备好，但原因变了');
+  assert.equal(outbound.at(-1).why, 'scan-unavailable');
+  assert.equal(eng.setLocalReady(false), true, '原因没了也算变化');
+  assert.equal('why' in outbound.at(-1), false);
+  assert.equal(eng.setLocalReady(true, 'scanning'), true);
+  assert.equal('why' in outbound.at(-1), false, '准备好了不带原因');
+  assert.equal(eng.setLocalReady(false, '<b>乱写</b>'), true);
+  assert.equal('why' in outbound.at(-1), false, '认不得的原因不发');
+});
+
+impl('房主收下原因、转发清洗过的那份，新人入房时补发；原因不合法的照旧按没准备好算', async (dir) => {
+  const h = await makeEngine(dir, { peerId: 'host', guests: ['gst', 'g2', 'nw'], seq: 1 });
+  h.eng.onCtrl(ready({ seq: 1, readySeq: 1, ready: false, why: 'scan-unavailable', name: '乙' }), P('gst'));
+  assert.deepEqual(h.eng.readyPeers.get('gst'), { name: '乙', ready: false, why: 'scan-unavailable' });
+  assert.equal(h.relay[0].msg.why, 'scan-unavailable');
+  assert.deepEqual(h.readies.at(-1), { who: 'gst', name: '乙', ready: false, why: 'scan-unavailable', self: false });
+  assert.deepEqual(h.eng.readySnapshot().peers, [{ peerId: 'gst', name: '乙', ready: false, why: 'scan-unavailable' }]);
+
+  // 塞进来的长串、准备好了还带原因：都不记、不转发
+  h.eng.onCtrl(ready({ seq: 1, readySeq: 1, ready: false, why: 'x'.repeat(5000), name: '丙' }), P('g2'));
+  assert.deepEqual(h.eng.readyPeers.get('g2'), { name: '丙', ready: false });
+  assert.equal('why' in h.relay[1].msg, false, '不能借房主的嘴给全场塞任意内容');
+  h.eng.onCtrl(ready({ seq: 1, readySeq: 2, ready: true, why: 'scanning', name: '丙' }), P('g2'));
+  assert.deepEqual(h.eng.readyPeers.get('g2'), { name: '丙', ready: true });
+
+  // 新人入房：补发的就绪带着原因
+  const peer = greetPeer('nw');
+  h.eng.greet(peer);
+  const gst = peer.sent.find((m) => m.t === 'ready' && m.origin === 'gst');
+  assert.equal(gst.why, 'scan-unavailable');
+  const n = await makeEngine(dir, { peerId: 'nw', hostId: 'host' });
+  n.eng.resetMedia({ seq: 1 });
+  for (const m of peer.sent) n.eng.onCtrl(m, P('host'));
+  assert.deepEqual(n.eng.readyPeers.get('gst'), { name: '乙', ready: false, why: 'scan-unavailable' });
+
+  // 本机没准备好的原因也在 greet 里
+  h.eng.setLocalReady(false, 'scanning');
+  const again = greetPeer('nw');
+  h.eng.greet(again);
+  assert.equal(again.sent.at(-1).why, 'scanning');
+});
+
 impl('新人先收到 READY 再收到列表：暂存，列表应用后全部生效（按原发送者分开存）', async (dir) => {
   const h = await makeEngine(dir, { peerId: 'host', guests: ['gst', 'g2'], seq: 3 });
   h.eng.onCtrl(ready({ seq: 3, readySeq: 1 }), P('gst'));

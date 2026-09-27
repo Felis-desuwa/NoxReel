@@ -468,9 +468,9 @@ async function statusRoom({ role, safe = false }) {
     $,
     worstWaitSeconds,
     fmtTime: (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`,
-    // 自己再缓冲 5 分钟；A 再缓冲 1 分半
-    myBufferLead: () => ({ waitSec: 300 }),
-    lastForecasts: new Map([['a1', { lead: { waitSec: 90 } }]]),
+    // 自己还要 5 分钟攒够恢复线；A 还要 1 分半
+    myResumeLead: () => ({ waitSec: 300 }),
+    lastForecasts: new Map([['a1', { resume: { waitSec: 90 } }]]),
     roomDisplayNames: () => new Map([['a1', 'A']]),
     pushMpvBanner: (text) => banners.push(text),
     linkResolveFailed: () => false,

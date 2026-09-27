@@ -199,8 +199,11 @@ test('会卡时给出「再缓冲多久可一路看完」，不会卡时不显�
 
 test('成员列表里每个会卡的人都跟一句「再缓冲多久可看完」', () => {
   const update = body('function updatePeerForecasts(', 'function forecastLabel(');
-  assert.match(update, /forecast\.level === 'stall'\s*\?\s*bufferLead\(\{/);
-  assert.match(update, /next\.set\(info\.peerId, \{ \.\.\.forecast, rate, held, lead \}\)/);
+  // 预判和预缓冲用同一份输入（含按位图算的各段空洞）
+  assert.match(update, /forecast = forecastStall\(shape\)/);
+  assert.match(update, /forecast\.level === 'stall' \? bufferLead\(shape\) : null/);
+  assert.match(update, /holes: info\.remoteMissingAhead/);
+  assert.match(update, /next\.set\(info\.peerId, \{ \.\.\.forecast, rate, held, lead, resume \}\)/);
   const label = body('function forecastLabel(', 'function renderHostVerdict(');
   assert.match(label, /Number\.isFinite\(wait\) \? `\$\{base\} · 再缓冲 \$\{fmtTime\(wait\)\} 可看完` : base/);
 });
@@ -211,13 +214,23 @@ test('成员列表里每个会卡的人都跟一句「再缓冲多久可看完�
  * 水位线」，所以这里把 renderTransferVerdict 真跑一遍，看它究竟拿了哪个数。
  * 中途加入时两者差着整整一部片：拿水位线会把「不影响看完」的 [0,P) 回填也算进等待时间。
  */
-async function runTransferVerdict(p, { playhead = 0, size = 2e9, level = 'stall' } = {}) {
+async function runTransferVerdict(
+  p,
+  { playhead = 0, size = 2e9, level = 'stall', holes = [[playhead + 200e6, size]], extraS = {}, runNeeded = 0 } = {}
+) {
   const vm = require('node:vm');
-  const calls = { forecast: [], lead: [] };
-  const parts = [];
+  const calls = { forecast: [], lead: [], parts: [] };
+  const parts = calls.parts;
   const node = { className: '', classList: { add: () => {}, remove: () => {} } };
   const ctx = {
-    S: { manifest: { size, sourceUplinkBps: 0 }, roomSecurityMode: 'trusted', sourceType: 'file', mpvRunning: true },
+    S: {
+      manifest: { size, sourceUplinkBps: 0 },
+      roomSecurityMode: 'trusted',
+      sourceType: 'file',
+      mpvRunning: true,
+      swarm: { missingAhead: () => holes },
+      ...extraS,
+    },
     $: () => node,
     // 边下边播开着：这里测的是可信房间边收边播时的「会不会卡」预判
     streamsWhileReceiving: () => true,
@@ -226,7 +239,8 @@ async function runTransferVerdict(p, { playhead = 0, size = 2e9, level = 'stall'
     currentFileCtx: () => ({ scheduler: { bytesPerSecond: 1e6 } }),
     midJoinNow: () => playhead > 0,
     roomPlayheadByte: () => playhead,
-    startRunNeeded: () => 0,
+    startRunNeeded: () => runNeeded,
+    tailIndexMissing: () => 0,
     HEAD_READY_BYTES: 8 * 1024 * 1024,
     stat: (label, value) => ({ label, value }),
     make: (tag, o) => ({ tag, ...o }),
@@ -268,10 +282,38 @@ test('预缓冲时间按播放头算，和会卡预判用同一套输入', async
   for (const args of [calls.forecast[0], calls.lead[0]]) {
     assert.equal(args.contiguous, p.runEndBytes, '传的是从文件头起的水位线，中途加入时差着整整一部片');
     assert.notEqual(args.contiguous, p.contiguousBytes);
+    assert.deepEqual(args.holes, [[playhead + 200e6, size]], '按位图算的各段空洞也要一起传');
     assert.equal(args.playhead, playhead);
     assert.equal(args.size, size);
     assert.equal(args.bitrate, 1e6);
     assert.equal(args.rate, p.downRate);
+  }
+});
+
+/**
+ * GG3-1：从片头起播时播放器在片头 8MB 够了就先打开、停在第一帧等房间开播，
+ * 但就绪要从片头起够放 15 秒。以前播放器一打开「距起播还差」就不见了，也从不算那 15 秒。
+ */
+test('从片头起播、播放器已经停在第一帧但还没就绪：照样报距起播还差多少（按从片头起够放 15 秒算）', async () => {
+  const MB = 1024 * 1024;
+  const p = { complete: false, ratio: 0.01, downRate: 1e6, contiguousBytes: 8 * MB, runEndBytes: 8 * MB, runBytes: 5 * MB };
+  const waiting = await runTransferVerdict(p, {
+    playhead: 0,
+    level: 'ok',
+    runNeeded: 17 * MB,
+    extraS: { playlist: { started: false }, sync: { localReady: false } },
+  });
+  const left = waiting.parts.find((x) => x.label === '距起播还差');
+  assert.ok(left, `没有「距起播还差」：${JSON.stringify(waiting.parts.map((x) => x.label))}`);
+  assert.equal(left.value, `${9 * MB} B`, '从片头起 17MB − 已有 8MB；不能按 stream-pos 起算的 runBytes');
+
+  // 就绪了、或者房间已经开播：不再报
+  for (const extraS of [
+    { playlist: { started: false }, sync: { localReady: true } },
+    { playlist: { started: true }, sync: { localReady: false } },
+  ]) {
+    const calls = await runTransferVerdict(p, { playhead: 0, level: 'ok', runNeeded: 17 * MB, extraS });
+    assert.equal(calls.parts.some((x) => x.label === '距起播还差'), false, JSON.stringify(extraS));
   }
 });
 

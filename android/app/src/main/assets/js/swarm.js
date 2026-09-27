@@ -145,6 +145,49 @@ export function runEndFrom(have, meta, byte) {
   return Math.min(i * chunkSize, size); // 末片比 chunkSize 小，按片数乘出来会超，封顶到文件大小
 }
 
+// 卡顿预判只拿它估时间，段数多了也没用；位图是对方给的，东一片西一片的能拆出几十万段
+const MAX_MISSING_RANGES = 256;
+
+/**
+ * 从 byte 往后还缺的各段，[起, 止) 绝对字节位置，按位置排好。
+ *
+ * 卡顿预判要的是「播放位置往后实际还缺多少、缺在哪」：只拿 runEndFrom 的话，第一个空洞后面
+ * 已经收齐的那一大段（中途加入后往回拖、先往后跳再拖回来）也会被当成要重下。
+ * 段数超过 maxRanges 时，最后一段直接延伸到文件尾 —— 宁可高估等待，也不低估。
+ *
+ * @param {Uint8Array} have 位图
+ * @param {{chunkSize:number, chunkCount:number, size:number}} meta 清单里的尺寸信息
+ * @param {number} byte 起算的字节位置
+ * @returns {Array<[number, number]>}
+ */
+export function missingRangesFrom(have, meta, byte, maxRanges = MAX_MISSING_RANGES) {
+  const size = meta?.size || 0;
+  const chunkSize = meta?.chunkSize || 0;
+  const chunkCount = meta?.chunkCount || 0;
+  if (!have || !size || !chunkSize || !chunkCount) return [];
+  const pos = Math.max(0, Math.min(size, byte || 0));
+  if (pos >= size) return [];
+  const out = [];
+  let start = -1;
+  for (let i = Math.floor(pos / chunkSize); i < chunkCount; i++) {
+    if (have[i]) {
+      if (start >= 0) {
+        out.push([Math.max(pos, start * chunkSize), Math.min(size, i * chunkSize)]);
+        start = -1;
+      }
+      continue;
+    }
+    if (start >= 0) continue;
+    if (out.length >= maxRanges - 1) {
+      out.push([Math.max(pos, i * chunkSize), size]);
+      return out;
+    }
+    start = i;
+  }
+  if (start >= 0) out.push([Math.max(pos, start * chunkSize), size]);
+  return out;
+}
+
 /** 清单的 fileId 必须等于全部分片哈希拼起来的 SHA-256 前 32 位，和主进程 buildManifest 的算法一致。 */
 export async function manifestDigestOk(manifest) {
   const data = new TextEncoder().encode(manifest.hashes.join(''));
@@ -473,6 +516,16 @@ export class Swarm extends Emitter {
     };
   }
 
+  /**
+   * 本机从播放位置往后还缺的各段（见 missingRangesFrom），给卡顿预判用。
+   * 要整张位图扫一遍，不放进 progress()：那个每收一片、每发一片都要算。
+   */
+  missingAhead(slot = this.playingSlot) {
+    const ctx = this.files.get(slot);
+    if (!ctx) return [];
+    return missingRangesFrom(ctx.have, ctx.manifest, ctx.playbackByte || 0);
+  }
+
   /** 手里有这部片（至少一片）的已认证成员。 */
   sourcesFor(slot) {
     const out = [];
@@ -726,6 +779,8 @@ export class Swarm extends Emitter {
       // 和 progress() 一样先封顶到文件大小：越界的播放位置会让 runEndFrom 直接返回 size，
       // 于是每个人都被判成「从这里一路能播到尾」，成员面板全体显示「已收完」。
       remoteRunEndBytes: remote ? runEndFrom(remote.have, meta, playbackByte) : 0,
+      // 同一个播放位置往后他还缺的各段：卡顿预判按空洞逐段算，空洞后面他已经收齐的不算要等的
+      remoteMissingAhead: remote ? missingRangesFrom(remote.have, meta, playbackByte) : null,
       inflight: peer.inflight.size,
       // 给过太多坏片、本机已经不再向他要片的人
       banned: this._rep.get(peer.peerId)?.banned === true,
@@ -1662,9 +1717,11 @@ export class Swarm extends Emitter {
    * 调度器看到的 peer：只含这个槽位的位图。scheduler.js 两端共用，不为多文件改它。
    *
    * 信誉在这里折算成调度器认得的几个标记：
-   *  - 拉黑的人不出现；冷却中的人，只要还有别的上游可用也不出现；
-   *  - 观察期（超时过、还没送来新的好片，或者冷却中却没别人可用）标 probation：
-   *    一次只欠一片，排在正常上游后面，关键窗口里别人有的片不给他；
+   *  - 拉黑的人不出现；冷却中的人，只要还有别的上游可用也不出现。「可用」是手里真有
+   *    本机还缺的片：位图是空的、或者只有我早就有了的片的人不算 —— 否则场上一个刚开始收的人，
+   *    就能让超时过一次的房主（往往是唯一有片的人）整段冷却期里一片都要不到；
+   *  - 观察期（超时过、还没送来新的好片，或者冷却中却没别人可用；预取的请求按设计被推迟）
+   *    标 probation：一次只欠一片，排在正常上游后面，关键窗口里别人有的片不给他；
    *  - 他送坏过的片：坏过一次的进 avoid（有别人能给就不找他），同一片坏过两次以上、
    *    还在退避期里的进 blocked（不向他要）。
    */
@@ -1678,7 +1735,10 @@ export class Swarm extends Emitter {
       if (rep?.banned) continue;
       candidates.push({ p, remote, rep, cooling: !!rep && now < rep.coolUntil });
     }
-    const anyFresh = candidates.some((c) => !c.cooling);
+    // 没人在冷却时用不着这个结论，也就不必去扫位图
+    const ctx = this.files.get(slot);
+    const anyFresh =
+      candidates.some((c) => c.cooling) && candidates.some((c) => !c.cooling && this._offersMissing(c.remote, ctx));
     const views = [];
     for (const { p, remote, rep, cooling } of candidates) {
       if (cooling && anyFresh) continue;
@@ -1691,7 +1751,7 @@ export class Swarm extends Emitter {
         rtt: p.rtt || 0,
       };
       if (rep) {
-        if (cooling || rep.timeouts > 0) view.probation = true;
+        if (cooling || rep.timeouts > 0 || rep.deferred) view.probation = true;
         for (const entry of rep.bad.values()) {
           if (entry.slot !== slot) continue;
           const key = now < entry.until ? 'blocked' : 'avoid';
@@ -1704,12 +1764,22 @@ export class Swarm extends Emitter {
     return views;
   }
 
+  /** 他手里有没有本机这一部还缺的片。 */
+  _offersMissing(remote, ctx) {
+    if (!ctx || ctx.complete) return false;
+    if (remote.full) return true;
+    const theirs = remote.have;
+    const mine = ctx.have;
+    for (let i = 0; i < theirs.length; i++) if (theirs[i] === 1 && mine[i] !== 1) return true;
+    return false;
+  }
+
   /* ---------------------------- 上游信誉 ---------------------------- */
 
   _repOf(peerId) {
     let rep = this._rep.get(peerId);
     if (rep) return rep;
-    rep = { timeouts: 0, coolUntil: 0, bad: new Map(), good: 0, banned: false, bannedBytes: 0 };
+    rep = { timeouts: 0, coolUntil: 0, deferred: false, bad: new Map(), good: 0, banned: false, bannedBytes: 0 };
     this._rep.set(peerId, rep);
     if (this._rep.size > REP_MAX) {
       // 满了先挤没被拉黑的里最老的；全是拉黑的才挤最老的
@@ -1737,12 +1807,28 @@ export class Swarm extends Emitter {
     rep.coolUntil = now + Math.min(TIMEOUT_COOLDOWN_MAX_MS, TIMEOUT_COOLDOWN_BASE_MS * 2 ** (rep.timeouts - 1));
   }
 
+  /**
+   * 预取的请求（不是正在放的那部）到期没来。发片方按「当前这部优先」会把这类请求一直排着，
+   * 等还在收当前这部的人收完 —— 这是按设计推迟，不是他慢，不记超时、不进冷却：记成超时的话，
+   * 冷却一路翻倍到两分钟，换片时新片反倒要不到。可推迟和故意扣着不发从这头分不出来，
+   * 所以照样进观察期（一次只欠一片），直到他送来一片好片。
+   */
+  _noteDeferred(peerId) {
+    this._repOf(peerId).deferred = true;
+  }
+
+  /** 这一片的请求按设计会被发片方推迟：要的不是正在放的那部（对方和我放的是同一部）。 */
+  _deferredByDesign(slot) {
+    return this.playingSlot !== null && slot !== this.playingSlot;
+  }
+
   /** 他送来的一片通过了校验。没出过事的人不建档。 */
   _noteGood(peerId) {
     const rep = this._rep.get(peerId);
     if (!rep) return;
     rep.timeouts = 0;
     rep.coolUntil = 0;
+    rep.deferred = false;
     if (rep.bad.size && ++rep.good >= BAD_CHUNK_FORGIVE) {
       rep.good = 0;
       rep.bad.delete(rep.bad.keys().next().value);
@@ -1866,7 +1952,8 @@ export class Swarm extends Emitter {
         peer.inflight.delete(key);
         // 告诉他别发了：他那边的队列里还排着这一条，不撤的话会越攒越多
         peer.send({ t: MSG.CANCEL, s: info.slot, index: info.index });
-        this._noteTimeout(info.peerId);
+        if (this._deferredByDesign(info.slot)) this._noteDeferred(info.peerId);
+        else this._noteTimeout(info.peerId);
       }
     }
   }

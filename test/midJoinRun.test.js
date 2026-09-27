@@ -491,6 +491,76 @@ impl('_peerInfo 的 remoteRunEndBytes 按房间位置算，remoteHeldBytes 仍�
   // 对方在房间位置处没有数据
   const poor = { ...peer, remote: new Map([[0, { have: bitmap([[0, 4]]), full: false }]]) };
   assert.equal(swarm._peerInfo(poor).remoteRunEndBytes, 100 * MB, '洞里返回房间位置本身 = 一个字节都供不了');
+
+  // 同一个房间位置往后他还缺的各段：[120MB, 文件尾)。片头那 4 片在房间位置之前，不算
+  assert.deepEqual(info.remoteMissingAhead, [[120 * MB, SIZE]]);
+  assert.deepEqual(swarm._peerInfo(poor).remoteMissingAhead, [[100 * MB, SIZE]]);
+});
+
+/* ------------------------------ 11b. 播放位置往后还缺的各段 ------------------------------ */
+
+impl('missingRangesFrom：从播放位置起逐段列出缺的区间，起点落在片中间时从播放位置算', async (dir) => {
+  const { missingRangesFrom } = await import(dir + 'swarm.js');
+  const have = bitmap([[0, 4], [10, 20], [30, 100]]);
+  assert.deepEqual(missingRangesFrom(have, META, 0), [
+    [4 * CHUNK, 10 * CHUNK],
+    [20 * CHUNK, 30 * CHUNK],
+  ]);
+  // 从 [10,20) 中间起算：前面那个洞不算
+  assert.deepEqual(missingRangesFrom(have, META, 12 * CHUNK), [[20 * CHUNK, 30 * CHUNK]]);
+  // 起点在洞里、而且在片中间：从起点算，不从这一片的开头算
+  assert.deepEqual(missingRangesFrom(have, META, 25 * CHUNK + 5), [[25 * CHUNK + 5, 30 * CHUNK]]);
+  // 全都有 / 越过文件尾 / 缺尺寸
+  assert.deepEqual(missingRangesFrom(bitmap([[0, 100]]), META, 0), []);
+  assert.deepEqual(missingRangesFrom(have, META, SIZE + 1), []);
+  assert.deepEqual(missingRangesFrom(have, {}, 0), []);
+  // 末片短：缺着的末段封顶到文件大小
+  const odd = { size: 10 * CHUNK - 100, chunkSize: CHUNK, chunkCount: 10 };
+  const oddHave = new Uint8Array(10).fill(1);
+  oddHave[9] = 0;
+  assert.deepEqual(missingRangesFrom(oddHave, odd, 0), [[9 * CHUNK, odd.size]]);
+});
+
+impl('missingRangesFrom：东一片西一片的位图拆不出无数段，超过上限后剩下的整段当缺着', async (dir) => {
+  const { missingRangesFrom } = await import(dir + 'swarm.js');
+  // 隔一片有一片：50 个洞
+  const have = new Uint8Array(100);
+  for (let i = 0; i < 100; i += 2) have[i] = 1;
+  const all = missingRangesFrom(have, META, 0);
+  assert.equal(all.length, 50);
+  const capped = missingRangesFrom(have, META, 0, 4);
+  assert.equal(capped.length, 4);
+  assert.deepEqual(capped.slice(0, 3), all.slice(0, 3));
+  assert.deepEqual(capped[3], [7 * CHUNK, SIZE], '宁可高估等待，也不低估');
+});
+
+/* ------------------------------ 12b. 从片头起播的就绪门槛 ------------------------------ */
+
+impl('isItemReady：从片头起播也要从片头起够 runNeeded，片头 8MB 只是必要条件', async (dir) => {
+  const P = await import(dir + 'playlist.js');
+  const item = { kind: 'file', size: SIZE };
+  const head = { mode: 'trusted', midJoin: false, startByte: 0, runNeeded: 17 * MB };
+  assert.equal(P.isItemReady(item, { ...head, contiguousBytes: 8 * MB, runBytes: 8 * MB }), false);
+  assert.equal(P.isItemReady(item, { ...head, contiguousBytes: 17 * MB, runBytes: 17 * MB }), true);
+  // 片头仍是硬条件
+  assert.equal(P.isItemReady(item, { ...head, contiguousBytes: 4 * MB, runBytes: 40 * MB }), false);
+  // 收完了就不看门槛
+  assert.equal(P.isItemReady(item, { ...head, contiguousBytes: SIZE, runBytes: 0, complete: true }), true);
+  // 从片头起播不等文件尾的索引（顺着读用不着）
+  assert.equal(P.isItemReady(item, { ...head, contiguousBytes: 17 * MB, runBytes: 17 * MB, tailReady: false }), true);
+});
+
+impl('isItemReady：起播点在片中时文件尾索引没到不算准备好，tailReady 缺省不挡', async (dir) => {
+  const P = await import(dir + 'playlist.js');
+  const item = { kind: 'file', size: SIZE };
+  const mid = { mode: 'trusted', contiguousBytes: 8 * MB, midJoin: true, startByte: 100 * MB, runBytes: 17 * MB, runNeeded: 17 * MB };
+  assert.equal(P.isItemReady(item, mid), true, '调用方没接上 tailReady 时和以前一样');
+  assert.equal(P.isItemReady(item, { ...mid, tailReady: true }), true);
+  assert.equal(P.isItemReady(item, { ...mid, tailReady: false }), false);
+  // 「回头接着放」（只给了 startByte）同样要等
+  const { midJoin: _m, ...resume } = mid;
+  assert.equal(P.isItemReady(item, { ...resume, tailReady: false }), false);
+  assert.equal(P.isItemReady(item, { ...mid, tailReady: false, complete: true }), true);
 });
 
 /* ------------------------------ 12. 起播门槛 ------------------------------ */

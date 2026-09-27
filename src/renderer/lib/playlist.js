@@ -415,13 +415,20 @@ export function transferOrder(state, ctx) {
  * 某个成员对当前项算不算准备好了。
  *  - 自己是片源：直接就绪。
  *  - 可信房间：两条同时成立 —— 连续片头够 min(8MB, 大小)（容器索引），
- *    并且从起播点起有足够的连续数据。
+ *    并且从起播点起的连续数据够 runNeeded（恢复线 15 秒 + 解复用预读）。
+ *    从片头起播也一样：起播点是 0，从它起的连续数据就是从文件头起的那段。
  *  - 安全模式：必须收完并且扫描通过。
  *  - 链接：允许了站点且解析成功；自己选择跳过也算，不挡别人。
  *
  * 起播点不在片头有两种情况：中途加入房间（从房间位置 P 起播），以及「回头接着放」
- * （从 resumeAt 起播）。后者是本来就有的缺陷 —— 只看片头会让全员就绪之后立刻全员卡死。
- * local.startByte 缺省（或为 0）时与旧版逐位等价，从片头起播的用例一个都不受影响。
+ * （从 resumeAt 起播）。这时还多一条：local.tailReady 为 false（MKV 这类索引常在文件尾、
+ * 文件尾那几片还没到）就不算准备好 —— 缺了索引，播放器得从片头扫着建索引才定位得到
+ * 起播点，而 [片头, 起播点) 是空洞。从片头起播是顺着读，用不着它。
+ *
+ * 同一个人、同一个起播点，结论不能随播放器报没报过进度翻转：调用方从片头起播时
+ * 必须传 startByte = 0、runBytes = 从文件头起的连续字节，不能拿播放器的 stream-pos
+ * （解复用器已经读到哪了，暂停在 0 秒时也常有几 MB）当起播点。
+ * runNeeded 缺省（调用方还没接上）时退回只看片头，不会把人卡死在就绪上。
  *
  * 「起播点在不在片头」要由 local.midJoin 说了算，不能只看 startByte：字节位置是
  * 「秒数 × 码率」算出来的，码率未知（房主没装 ffmpeg，清单里就没有时长）时它恒为 0，
@@ -435,10 +442,14 @@ export function isItemReady(item, local) {
   if (local.mode === 'trusted') {
     const head = Math.min(HEAD_READY_BYTES, item.size || HEAD_READY_BYTES);
     if ((local.contiguousBytes || 0) < head) return false;
-    if (!local.midJoin && !(local.startByte > 0)) return true;
-    // 中途加入，可是起播点换算不出字节位置（码率未知）：判不了起播点附近有没有数据，
-    // 只能等整部收完。
-    if (!(local.startByte > 0)) return local.complete === true;
+    // 收完了就没有空洞可撞，也不缺索引
+    if (local.complete === true) return true;
+    if (local.midJoin || local.startByte > 0) {
+      // 中途加入，可是起播点换算不出字节位置（码率未知）：判不了起播点附近有没有数据，
+      // 只能等整部收完。
+      if (!(local.startByte > 0)) return false;
+      if (local.tailReady === false) return false;
+    }
     // runNeeded 由调用方按「恢复阈值 × 码率 + 解复用预读」算好传进来，
     // 这里不碰码率，保持「纯函数不依赖外部信息」的约定。
     return (local.runBytes || 0) >= (local.runNeeded || 0);

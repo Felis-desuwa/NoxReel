@@ -200,3 +200,110 @@ test('和 forecastStall 的结论一致：报会卡才需要等，不卡就不�
     }
   }
 });
+
+/* ------------------- 播放位置往后有好几个空洞（A4-4） ------------------- */
+
+/**
+ * 中途加入之后往回拖（或者先往后跳、再拖回来）：空洞后面往往已经收齐了一大段。
+ * 以前 [连续区尽头, 文件尾) 整段都当缺着，要等多久、会不会卡都算得离谱。
+ * 例子：片子码率 b，播放头在 25%，[25%, 50%) 缺着，[50%, 100%) 早就收齐了，速度 0.8b。
+ * 整段当缺着：0.75/0.8 − 0.75 = 0.1875 个片长；按空洞算：0.25/0.8 − 0.25 = 0.0625 个片长。
+ */
+test('预缓冲时间按空洞逐段算：空洞后面已经收齐的不算要等的', async () => {
+  const { bufferLead } = await load();
+  const size = 1000 * MB;
+  const bitrate = MB; // 片长 1000 秒
+  const o = { size, bitrate, rate: 0.8 * MB, contiguous: 250 * MB, playhead: 250 * MB };
+  assert.equal(Math.round(bufferLead(o).waitSec), 188, '不给空洞时照旧按整段缺着算（0.1875 个片长）');
+  const lead = bufferLead({ ...o, holes: [[250 * MB, 500 * MB]] });
+  assert.equal(Math.round(lead.waitSec * 10) / 10, 62.5, '0.0625 个片长');
+  // 等的这 62.5 秒收了 50MB，开播时从播放头起连续 50MB
+  assert.equal(Math.round(lead.bufferSec), 50);
+});
+
+test('好几个空洞时取等得最久的那一处，而不是只看第一个或只看总量', async () => {
+  const { bufferLead, forecastStall } = await load();
+  const size = 1000 * MB;
+  const bitrate = MB;
+  const rate = 0.5 * MB;
+  // 洞 1：[100,110) 很小；洞 2：[600,1000) 很大、离得远
+  const holes = [
+    [100 * MB, 110 * MB],
+    [600 * MB, 1000 * MB],
+  ];
+  const o = { size, bitrate, rate, contiguous: 100 * MB, playhead: 0, holes };
+  // 洞 1 末尾：10/0.5 − 110 < 0；洞 2 末尾：410/0.5 − 1000 = −180 < 0 → 不用等
+  assert.equal(bufferLead(o).waitSec, 0);
+  const f = forecastStall(o);
+  assert.equal(f.level, 'thin', '速度低于码率，但每个洞都赶在播放头到之前补完');
+  assert.equal(Math.round(f.finishSec), 820);
+
+  // 洞 2 挪近：[300,1000) → 710/0.5 − 1000 = 420 秒
+  const near = { ...o, holes: [holes[0], [300 * MB, 1000 * MB]] };
+  assert.equal(Math.round(bufferLead(near).waitSec), 420);
+  const g = forecastStall(near);
+  assert.equal(g.level, 'stall');
+  // 卡在洞 2 里：前面还欠洞 1 的 10MB；之后播放头每秒追近 0.5MB：(300 − 10) / (1 − 0.5) = 580 秒
+  assert.equal(Math.round(g.stallInSec), 580);
+});
+
+test('按空洞算的会不会卡，和预缓冲时间的结论一致', async () => {
+  const { bufferLead, forecastStall } = await load();
+  const size = 2000 * MB;
+  const shapes = [
+    [[0, 2000]],
+    [[100, 200], [1500, 2000]],
+    [[10, 20], [30, 40], [1000, 1200]],
+    [[400, 2000]],
+  ];
+  for (const rate of [0, 0.2, 0.5, 0.9, 1, 1.5].map((x) => x * MB)) {
+    for (const shape of shapes) {
+      const holes = shape.map(([a, b]) => [a * MB, b * MB]);
+      const o = { size, bitrate: MB, rate, contiguous: holes[0][0], playhead: 0, holes };
+      const willStall = forecastStall(o).level === 'stall';
+      const { waitSec } = bufferLead(o);
+      assert.equal(waitSec > 0, willStall, `rate=${rate} holes=${JSON.stringify(shape)} 两者结论不一致`);
+    }
+  }
+});
+
+test('空洞列表是空的：播放位置往后都收齐了；播放头之前的空洞不算', async () => {
+  const { bufferLead, forecastStall } = await load();
+  const o = { size: 100 * MB, bitrate: MB, rate: 0, contiguous: 40 * MB, playhead: 20 * MB, holes: [] };
+  assert.equal(forecastStall(o).level, 'done');
+  assert.deepEqual(bufferLead(o), { waitSec: 0, needBytes: 0, bufferSec: 80 });
+  // [0, P) 在回填：不影响往后播
+  assert.equal(forecastStall({ ...o, holes: [[0, 10 * MB]] }).level, 'done');
+});
+
+/* ------------------- 全员暂停还要多久（GG3-3） ------------------- */
+
+/**
+ * 引擎在余量超过恢复线（15 秒 × 码率）时就解除全员暂停。以前「约 T 后自动继续」用的是
+ * 「再缓冲多久可一路看完」：4GiB、码率 1MB/s、速度 0.8MB/s、播放头 1GiB、余量 3MB 时显示约 12:44，
+ * 实际约 15 秒就继续了。
+ */
+test('恢复要等的时间 = 恢复线里还缺的字节 ÷ 速度，不是「一路看完」要等的时间', async () => {
+  const { resumeLead, bufferLead } = await load();
+  const o = { size: 4 * GB, bitrate: MB, rate: 0.8 * MB, contiguous: GB + 3 * MB, playhead: GB };
+  const resume = resumeLead({ ...o, resumeBytes: 15 * MB });
+  assert.equal(resume.waitSec, 15, '(15MB − 3MB) / 0.8MB/s');
+  assert.equal(resume.needBytes, 12 * MB);
+  assert.equal(Math.round(bufferLead(o).waitSec), 764, '另一个数：一路看完要等 12:44');
+});
+
+test('恢复时间也按空洞算；速度为 0 时等不到；已经够了就是 0', async () => {
+  const { resumeLead } = await load();
+  const base = { size: 1000 * MB, rate: MB, playhead: 100 * MB, resumeBytes: 15 * MB };
+  // [100,105) 缺、[105,112) 有、[112,120) 缺：恢复线 [100,115) 里缺 5 + 3 = 8MB
+  const holes = [
+    [100 * MB, 105 * MB],
+    [112 * MB, 120 * MB],
+  ];
+  assert.equal(resumeLead({ ...base, contiguous: 100 * MB, holes }).waitSec, 8);
+  assert.equal(resumeLead({ ...base, contiguous: 100 * MB, holes, rate: 0 }).waitSec, Infinity);
+  assert.equal(resumeLead({ ...base, contiguous: 130 * MB }).waitSec, 0);
+  // 靠近片尾：恢复线越过文件尾时只算到文件尾
+  assert.equal(resumeLead({ ...base, playhead: 995 * MB, contiguous: 995 * MB }).waitSec, 5);
+  assert.equal(resumeLead({ ...base, resumeBytes: 0, contiguous: 0 }), null);
+});

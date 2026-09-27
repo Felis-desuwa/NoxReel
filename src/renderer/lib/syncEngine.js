@@ -116,6 +116,10 @@ const LAMPORT_LEAD = LAMPORT_WINDOW / 2;
 const READY_BURST = 20;
 const READY_PER_SEC = 4;
 const READY_FLUSH_MS = 500;
+// 「没准备好」可以顺带说一句为什么，只认这几种 —— 都是房主从成员的位图上看不出来的：
+// 收完了却还不能放，卡在安全扫描上（正在扫、扫描器用不了、没扫完）。旧版不认这个字段，照旧只看 ready。
+const READY_WHY = ['scanning', 'scan-unavailable', 'scan-incomplete'];
+const readyWhyOf = (ready, why) => (ready === false && READY_WHY.includes(why) ? why : null);
 // 按发送者记的表的上限。房间最多 16 人，这些数留足了人来人往的余量；
 // 超出的只可能是房主转发时塞进来的假 origin。
 const MAX_READY_PEERS = 64;
@@ -173,10 +177,11 @@ export class SyncEngine extends Emitter {
     // 卡顿消息按发送者单调编号：自己发出去的，和每个发送者最后采信的
     this._stallSeqOut = 0;
     this._stallSeen = new Map();
-    // 就绪状态：自己的，和别人的（peerId -> {name, ready}）；编号规则同卡顿
+    // 就绪状态：自己的，和别人的（peerId -> {name, ready, why}）；编号规则同卡顿
     // null = 这一部还没报过。换片后的第一次一定要发，哪怕是「没准备好」——
     // 星型拓扑下管理员只能从房主转来的 READY 里知道房间里还有谁在等。
     this.localReady = null;
+    this.localReadyWhy = null; // 没准备好的原因（READY_WHY 之一），准备好了恒为 null
     this.readyPeers = new Map();
     this._readySeqOut = 0;
     this._readySeen = new Map();
@@ -275,6 +280,7 @@ export class SyncEngine extends Emitter {
     this.stalledPeers.clear();
     // 就绪是针对某一部的，换片后谁都得重新报。编号不清：它按发送者全局单调。
     this.localReady = null;
+    this.localReadyWhy = null;
     this.readyPeers.clear();
     this._readyDeferred.clear(); // 攒着的是上一部的
     this.intendedPaused = true;
@@ -1141,16 +1147,21 @@ export class SyncEngine extends Emitter {
     if (!this.readyPeers.has(id) && this.readyPeers.size >= MAX_READY_PEERS) return true;
     setCapped(this._readySeen, id, msg.readySeq, MAX_SEEN_IDS);
 
-    this.readyPeers.set(id, { name: from.name, ready: msg.ready });
+    // 没报原因（旧版，或者就是还在收）的条目不带这个字段
+    const why = readyWhyOf(msg.ready, msg.why);
+    this.readyPeers.set(id, { name: from.name, ready: msg.ready, ...(why ? { why } : {}) });
+    // 转发清洗过的原因：原样转出去的话，谁都能借房主的嘴给全场塞一段任意内容
+    const { why: _why, ...rest } = msg;
+    const clean = why ? { ...rest, why } : rest;
     if (!this._takeReadyToken(id)) {
       // 超速：状态已经记下，事件和转发攒着，合并到一起晚一点发
-      this._readyDeferred.set(id, { msg, from });
+      this._readyDeferred.set(id, { msg: clean, from });
       if (!this._readyTimer) this._readyTimer = setTimeout(() => this._flushReady(), READY_FLUSH_MS);
       return true;
     }
     this._readyDeferred.delete(id); // 这一条就是最新的，攒着的那条作废
-    this._relay(msg, from);
-    this.emit('ready-change', { who: id, name: from.name, ready: msg.ready, self: false });
+    this._relay(clean, from);
+    this.emit('ready-change', { who: id, name: from.name, ready: msg.ready, ...(why ? { why } : {}), self: false });
     return true;
   }
 
@@ -1176,7 +1187,13 @@ export class SyncEngine extends Emitter {
       // 期间换了片，或者人已经走了（peerGone 已经替他撤销过）
       if (msg.seq !== this.seq || !entry) continue;
       this._relay(msg, from);
-      this.emit('ready-change', { who: id, name: entry.name, ready: entry.ready, self: false });
+      this.emit('ready-change', {
+        who: id,
+        name: entry.name,
+        ready: entry.ready,
+        ...(entry.why ? { why: entry.why } : {}),
+        self: false,
+      });
     }
   }
 
@@ -1531,29 +1548,44 @@ export class SyncEngine extends Emitter {
 
   /**
    * 本机对当前项准备好了没有（由上层判断：文件到位、扫描通过、播放器能起来……）。
-   * 只在变化时广播，返回是否真的变了。游客也发：就绪不是控制指令。
+   * why 是没准备好的原因（READY_WHY 之一，别的一律不带）。
+   * 只在变化时广播（原因变了也算），返回是否真的变了。游客也发：就绪不是控制指令。
    */
-  setLocalReady(ready) {
+  setLocalReady(ready, why = null) {
     const next = !!ready;
-    if (next === this.localReady) return false;
+    const reason = readyWhyOf(next, why);
+    if (next === this.localReady && reason === this.localReadyWhy) return false;
     this.localReady = next;
+    this.localReadyWhy = reason;
     this.emit('outbound', {
       t: MSG.READY,
       seq: this.seq,
       ready: next,
+      ...(reason ? { why: reason } : {}),
       peerId: this.peerId,
       name: this.name,
       readySeq: ++this._readySeqOut,
     });
-    this.emit('ready-change', { who: this.peerId, name: this.name, ready: next, self: true });
+    this.emit('ready-change', {
+      who: this.peerId,
+      name: this.name,
+      ready: next,
+      ...(reason ? { why: reason } : {}),
+      self: true,
+    });
     return true;
   }
 
-  /** 供上层判断「是不是全员就绪」：自己的，加上已知的每个人的。 */
+  /** 供上层判断「是不是全员就绪」：自己的，加上已知的每个人的（没准备好的带上原因，有的话）。 */
   readySnapshot() {
     return {
       self: this.localReady === true,
-      peers: [...this.readyPeers].map(([peerId, v]) => ({ peerId, name: v.name, ready: v.ready })),
+      peers: [...this.readyPeers].map(([peerId, v]) => ({
+        peerId,
+        name: v.name,
+        ready: v.ready,
+        ...(v.why ? { why: v.why } : {}),
+      })),
     };
   }
 
@@ -1632,6 +1664,7 @@ export class SyncEngine extends Emitter {
           t: MSG.READY,
           seq: this.seq,
           ready: entry.ready,
+          ...(entry.why ? { why: entry.why } : {}),
           origin: id,
           originName: clampName(entry.name),
           readySeq: this._readySeen.get(id) ?? 0,
@@ -1643,6 +1676,7 @@ export class SyncEngine extends Emitter {
       t: MSG.READY,
       seq: this.seq,
       ready: this.localReady === true,
+      ...(this.localReady === false && this.localReadyWhy ? { why: this.localReadyWhy } : {}),
       peerId: this.peerId,
       name: this.name,
       readySeq: ++this._readySeqOut,

@@ -331,6 +331,27 @@ test('卡顿预判与不限文件大小的新文案都有英文', async () => {
   );
 });
 
+test('就绪门槛与卡顿预判的新文案都有英文：前方已收齐、没准备好的原因', async () => {
+  const { translate } = await import('../src/renderer/lib/i18n.js');
+  assert.equal(translate('前方已收齐，不会卡', 'en'), 'Everything ahead is received, will not stall');
+  assert.equal(translate('未就绪 · 前方已收齐，不会卡', 'en'), 'Not ready · Everything ahead is received, will not stall');
+  // 成员表：「未就绪 · 原因」；就绪等待名单：昵称后面跟「（原因）」
+  const app = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'app.js'), 'utf8');
+  const m = /^const READY_WHY_LABEL = (\{[^\n]*\});$/m.exec(app.replace(/\r\n/g, '\n'));
+  assert.ok(m, 'app.js 里没找到 READY_WHY_LABEL');
+  const labels = Object.values(Function(`return ${m[1]};`)());
+  assert.equal(labels.length, 3);
+  for (const label of labels) {
+    const en = translate(label, 'en');
+    assert.notEqual(en, label, `原因缺英文：${label}`);
+    assert.equal(translate(`未就绪 · ${label}`, 'en'), `Not ready · ${en}`);
+    assert.equal(translate(`（${label}）`, 'en'), ` (${en})`);
+  }
+  assert.equal(translate('（扫描器不可用）', 'en'), ' (Scanner unavailable)');
+  // 这条模板只认这几个原因，别把别处的全角括号也吞了
+  assert.equal(translate('（随便什么）', 'en'), '（随便什么）');
+});
+
 test('播放列表与协议版本的新文案两端都有英文，片名和昵称原样保留', async () => {
   const { translate } = await import('../src/renderer/lib/i18n.js');
   const android = await import('../android/app/src/main/assets/js/i18n.js');

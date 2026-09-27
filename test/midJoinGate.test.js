@@ -54,18 +54,30 @@ const FNS = [
   'announceMidJoin',
   'maybeLaunchPlayer',
   'localReadyNow',
+  'tailIndexMissing',
   'applySeek',
 ];
 
 /**
  * 沙箱。sync 传真的同步引擎（房间时钟要真走），swarm 用一份按位图算的小假实现 ——
  * runBytes 的算法本身在 midJoinRun.test.js 里对着真 swarm 验过了。
+ *
+ * container 是调度器按第 0 片认出来的容器：默认当成 faststart MP4（索引在文件头，
+ * 不用等文件尾），专测文件尾索引的用例传 'matroska'。
  */
-async function makeSandbox({ have, durationSec = DURATION, mode = 'trusted', roomPosition = 0, complete = false } = {}) {
+async function makeSandbox({
+  have,
+  durationSec = DURATION,
+  mode = 'trusted',
+  roomPosition = 0,
+  complete = false,
+  container = 'mp4-faststart',
+} = {}) {
   const { bitrateOf } = await load('stallForecast.js');
   const { isItemReady } = await load('playlist.js');
   const { runEndFrom } = await load('swarm.js');
   const { SyncEngine } = await load('syncEngine.js');
+  const { Scheduler } = await load('scheduler.js');
 
   const manifest = {
     fileId: 'a'.repeat(32),
@@ -81,6 +93,8 @@ async function makeSandbox({ have, durationSec = DURATION, mode = 'trusted', roo
     while (i < bits.length && bits[i]) i++;
     return Math.min(i * CHUNK, SIZE);
   };
+  const scheduler = new Scheduler({ manifest });
+  scheduler.headContainer = container;
 
   const eng = new SyncEngine({ peerId: 'me', name: 'me', isSeeder: false, hostId: 'host' });
   const clock = { t: 1000 };
@@ -149,7 +163,22 @@ async function makeSandbox({ have, durationSec = DURATION, mode = 'trusted', roo
     sync: eng,
     swarm: {
       playingSlot: 1,
-      files: new Map([[1, { slot: 1, contiguousBytes: contiguous(), complete }]]),
+      files: new Map([
+        [
+          1,
+          {
+            slot: 1,
+            // 用例中途会往位图里补片，水位线得跟着变
+            get contiguousBytes() {
+              return contiguous();
+            },
+            complete,
+            have: bits,
+            manifest,
+            scheduler,
+          },
+        ],
+      ]),
       progress,
       setPlaybackByte: (slot, byte) => {
         playbackByte.value = byte;
@@ -197,7 +226,7 @@ async function makeSandbox({ have, durationSec = DURATION, mode = 'trusted', roo
   };
   vm.createContext(ctx);
   vm.runInContext(FNS.map(fnSource).join('\n\n'), ctx, { filename: 'app.js（节选）' });
-  return { ctx, S, eng, clock, logs, launches, playerCalls, progress, playbackByte, item, manifest };
+  return { ctx, S, eng, clock, logs, launches, playerCalls, progress, playbackByte, item, manifest, bits };
 }
 
 /** 位图：给定若干 [起片, 止片) 区间置 1。 */
@@ -351,8 +380,82 @@ test('localReadyNow：清单里没有时长时，中途加入的人等收完才�
 });
 
 test('localReadyNow：房间还在片头时，没有时长也照旧只看片头', async () => {
+  // 码率未知时「够放 15 秒」换算不出来，起播点后的连续量按兜底值（4MB）算，片头 8MB 已经盖住它
   const { ctx } = await makeSandbox({ have: bitmap([[0, 4]]), durationSec: 0, roomPosition: 0 });
   assert.equal(ctx.localReadyNow(), true);
+});
+
+/* ------------------------ 从片头起播的就绪门槛（GG3-1） ------------------------ */
+
+/** mpv 起来之后的第一条 tick：还停在 0 秒，但解复用器已经读到 streamPos。 */
+function firstTick({ ctx, S, eng, clock, progress }, streamPos) {
+  const snap = { position: 0, paused: true, eof: false, streamPos, sampledAt: clock.t };
+  // 和 handlePlayerTick 同一个顺序：先把播放位置落到调度器上，再取进度喂给引擎
+  S.swarm.setPlaybackByte(1, streamPos);
+  const p = progress();
+  eng.onMpvTick(snap, { contiguousBytes: p.contiguousBytes, runBytes: p.runBytes, complete: false });
+  assert.equal(ctx.midJoinNow(), false, '还在 0 秒，不是中途加入');
+  assert.equal(ctx.roomPlayheadByte(), streamPos, '前提：房间播放位置换成了 stream-pos');
+}
+
+test('从片头起播也要从片头起够放 15 秒才算准备好（片头 8MB 只是必要条件）', async () => {
+  // 码率 1MB/s：够放 15 秒 + 解复用预读 2 秒 = 17MB
+  const head = await makeSandbox({ have: bitmap([[0, 4]]), roomPosition: 0 });
+  assert.equal(head.ctx.localReadyNow(), false, '8MB 不到 5 秒的画面，一开播就全员卡住');
+  // 播放器照样在片头够了时先打开，停在第一帧等房间开播
+  head.ctx.maybeLaunchPlayer(head.progress());
+  assert.equal(head.launches.length, 1);
+
+  const enough = await makeSandbox({ have: bitmap([[0, 9]]), roomPosition: 0 });
+  assert.equal(enough.progress().contiguousBytes, 18 * MB);
+  assert.equal(enough.ctx.localReadyNow(), true);
+});
+
+test('就绪结论不随播放器的第一条 tick 翻转（tick 带 streamPos、position 为 0）', async () => {
+  for (const [ranges, expected] of [
+    [[[0, 4]], false], // 片头够了、15 秒不够
+    [[[0, 9]], true], // 从片头起 18MB：从 stream-pos 3MB 起只剩 15MB，按 stream-pos 算就会翻成「没准备好」
+  ]) {
+    const box = await makeSandbox({ have: bitmap(ranges), roomPosition: 0 });
+    const before = box.ctx.localReadyNow();
+    assert.equal(before, expected);
+    firstTick(box, 3 * MB);
+    assert.equal(box.ctx.localReadyNow(), before, `位图 ${JSON.stringify(ranges)}：tick 前后结论不一样`);
+  }
+});
+
+/* --------------------- 起播点在片中时要等文件尾的索引（GG3-7） --------------------- */
+
+test('中途加入的 MKV：起播点附近够了、文件尾索引没到，不起播也不算准备好', async () => {
+  // 网状房间里几个上游并行：起播点附近 20MB 先到齐了，文件尾两片还在慢上游手里
+  const box = await makeSandbox({ have: bitmap([[0, 4], [50, 60]]), roomPosition: 100, container: 'matroska' });
+  box.S.swarm.setPlaybackByte(1, box.ctx.roomPlayheadByte());
+  assert.equal(box.progress().runBytes, 20 * MB);
+  box.ctx.maybeLaunchPlayer(box.progress());
+  assert.equal(box.launches.length, 0, '缺了 Cues，mpv 得从片头扫着建索引才定位得到起播点，而前面是空洞');
+  assert.equal(box.ctx.localReadyNow(), false);
+  assert.equal(box.ctx.tailIndexMissing(box.S.swarm.files.get(1)), 4 * MB, '传输面板的「距起播还差」要算上它');
+
+  // 文件尾 4MB（最后两片）到了
+  box.bits[148] = 1;
+  box.bits[149] = 1;
+  assert.equal(box.ctx.localReadyNow(), true);
+  box.ctx.maybeLaunchPlayer(box.progress());
+  assert.equal(box.launches.length, 1);
+});
+
+test('文件尾索引只卡起播点在片中的场次：从片头起播、确认索引在文件头的 MP4 都不等它', async () => {
+  // 从片头起播是顺着读，用不着 Cues
+  const head = await makeSandbox({ have: bitmap([[0, 9]]), roomPosition: 0, container: 'matroska' });
+  assert.equal(head.ctx.localReadyNow(), true);
+  // faststart MP4 的索引在文件头
+  const mp4 = await makeSandbox({ have: bitmap([[0, 4], [50, 60]]), roomPosition: 100 });
+  mp4.S.swarm.setPlaybackByte(1, mp4.ctx.roomPlayheadByte());
+  assert.equal(mp4.ctx.localReadyNow(), true);
+  // 认不出容器（第 0 片还没认过）按「要」算：和调度器预留文件尾是同一个判据
+  const unknown = await makeSandbox({ have: bitmap([[0, 4], [50, 60]]), roomPosition: 100, container: null });
+  unknown.S.swarm.setPlaybackByte(1, unknown.ctx.roomPlayheadByte());
+  assert.equal(unknown.ctx.localReadyNow(), false);
 });
 
 /* ----------------------------- 跳转（applySeek） ----------------------------- */

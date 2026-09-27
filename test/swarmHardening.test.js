@@ -371,6 +371,89 @@ impl('超时的上游进入冷却：只有他时照样要但一次只欠一片�
   assert.equal(swarm._peerViews(SLOT).find((v) => v.peerId === 'slow-ss').probation, undefined);
 });
 
+/**
+ * A4-1：「有别的上游可用」得是手里真有本机缺的片。以前只要场上有人「有一张位图」就算，
+ * 哪怕是空的 —— 房主（往往是唯一有片的人）超时一次，整段冷却期里本机一片都要不到。
+ */
+impl('冷却中的上游只让给手里真有我缺的片的人：位图是空的、只有我已有的片，都不算可用', async (dir) => {
+  const { Swarm, protocol } = await load(dir);
+  contentStore();
+  const swarm = new Swarm({ peerId: 'victim-v', name: 'V' });
+  const host = swarm.addPeer(fakePeer('host-hh'));
+  const m = makeManifest('fresh', 16);
+  const ctx = swarm.addFile({ slot: SLOT, manifest: m, sessionId: 's1', isSeeder: false });
+  swarm._onCtrl(host, { t: 'bitfield', s: SLOT, full: true });
+  swarm.setActive(SLOT);
+  host.sent.length = 0;
+  ageInflight(swarm, 'host-hh');
+  swarm._tick();
+  assert.equal(swarm._rep.get('host-hh').timeouts, 1);
+
+  // 场上另一个人刚开始收：位图全是 0
+  const empty = swarm.addPeer(fakePeer('empty-ee'));
+  swarm._onCtrl(empty, { t: 'bitfield', s: SLOT, bits: protocol.packBitfield(new Uint8Array(16)) });
+  host.sent.length = 0;
+  swarm._tick();
+  assert.ok(swarm._peerViews(SLOT).some((v) => v.peerId === 'host-hh' && v.probation === true), '房主仍按观察期可用');
+  assert.equal(swarm._peerViews(SLOT).some((v) => v.peerId === 'empty-ee'), true);
+
+  // 他手里只有我早就有了的片，同样不算
+  ctx.have[9] = 1;
+  const stale = new Uint8Array(16);
+  stale[9] = 1;
+  swarm._onCtrl(empty, { t: 'bitfield', s: SLOT, bits: protocol.packBitfield(stale) });
+  assert.ok(swarm._peerViews(SLOT).some((v) => v.peerId === 'host-hh'));
+
+  // 他真有一片我缺的：冷却中的房主先让开（原来的规则不变）
+  stale[10] = 1;
+  swarm._onCtrl(empty, { t: 'bitfield', s: SLOT, bits: protocol.packBitfield(stale) });
+  assert.equal(swarm._peerViews(SLOT).some((v) => v.peerId === 'host-hh'), false);
+});
+
+/**
+ * A4-1：发片方按「当前这部优先」会把后面几部的请求一直排着（pickServeIndex 返回 -1）。
+ * 预取下一部的请求因此到期，不是对方慢：不记超时、不进冷却（记成超时的话冷却一路翻倍到两分钟，
+ * 换片时新片反倒要不到）。但分不出他是推迟还是故意扣着，照样进观察期，一次只欠一片。
+ */
+impl('预取下一部的请求到期：不记超时、不冷却，只进观察期；送来好片后恢复', async (dir) => {
+  const { Swarm, protocol } = await load(dir);
+  contentStore();
+  const swarm = new Swarm({ peerId: 'victim-v', name: 'V' });
+  const host = swarm.addPeer(fakePeer('host-hh'));
+  const cur = makeManifest('cur', 8);
+  const next = makeManifest('next', 16);
+  swarm.addFile({ slot: 1, manifest: cur, sessionId: 's1', isSeeder: false });
+  swarm.addFile({ slot: 2, manifest: next, sessionId: 's2', isSeeder: false });
+  swarm._onCtrl(host, { t: 'bitfield', s: 2, full: true });
+  swarm.setPlaying(1);
+  swarm.setActive(2);
+  assert.deepEqual(reqIdx(host), [0, 1, 2, 3]);
+
+  host.sent.length = 0;
+  ageInflight(swarm, 'host-hh');
+  swarm._tick();
+  assert.deepEqual(cancelIdx(host).sort(), [0, 1, 2, 3], '到期的照样撤回重要');
+  const rep = swarm._rep.get('host-hh');
+  assert.equal(rep.timeouts, 0, '按设计推迟不算超时');
+  assert.equal(rep.coolUntil, 0, '不进冷却');
+  assert.deepEqual(reqIdx(host), [0], '观察期一次只欠一片');
+
+  // 换片之后他马上发来：观察期结束，窗口恢复
+  deliver(swarm, protocol, host, 0, { slot: 2 });
+  await flush();
+  assert.equal(rep.deferred, false);
+  assert.equal(swarm._peerViews(2).find((v) => v.peerId === 'host-hh').probation, undefined);
+
+  // 正在放的那部照旧按超时算
+  swarm.setPlaying(2);
+  host.sent.length = 0;
+  swarm._tick();
+  ageInflight(swarm, 'host-hh');
+  swarm._tick();
+  assert.equal(rep.timeouts, 1);
+  assert.ok(rep.coolUntil > 0);
+});
+
 impl('调度：观察期的上游排在后面，关键窗口里别人有的片不给他，只拿窗口外或只有他有的片', async (dir) => {
   const { scheduler } = await load(dir);
   const chunkSize = 2 * MB;

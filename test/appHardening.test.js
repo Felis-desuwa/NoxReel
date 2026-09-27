@@ -1524,7 +1524,7 @@ test('就绪等待名单只列前几位，人数照实说', () => {
   const $ = fakeDollar();
   const ctx = sandbox({
     fns: ['renderReady'],
-    decls: ['READY_NAMES_SHOWN', 'MAX_PEER_NAME', 'peerName'],
+    decls: ['READY_NAMES_SHOWN', 'READY_WHY_LABEL', 'MAX_PEER_NAME', 'peerName'],
     globals: {
       S,
       $,
@@ -1566,7 +1566,7 @@ test('就绪等待名单和成员表用同一套显示名：两个「小明」�
   ];
   const ctx = sandbox({
     fns: ['renderReady'],
-    decls: ['READY_NAMES_SHOWN', 'MAX_PEER_NAME', 'peerName'],
+    decls: ['READY_NAMES_SHOWN', 'READY_WHY_LABEL', 'MAX_PEER_NAME', 'peerName'],
     globals: {
       S,
       $: fakeDollar(),
@@ -1590,6 +1590,48 @@ test('就绪等待名单和成员表用同一套显示名：两个「小明」�
   ctx.renderReady();
   const names = nodes.filter((n) => n.raw && n.text !== '、').map((n) => n.text);
   assert.deepEqual(names, ['小明 #2', '小明', '花阿']);
+});
+
+/**
+ * GG3-5：安全模式下扫描器不可用的成员每一部都「未就绪」，房主以前只看得到名字（成员表还写着「已收完」），
+ * 不知道在等什么。成员随就绪消息报原因，名单里跟在名字后面说一句；昵称照旧原样，原因单独一个元素走翻译。
+ */
+test('就绪等待名单：卡在安全扫描上的人跟一句原因，没报原因的照旧只有名字', () => {
+  const nodes = [];
+  const S = {
+    sync: { canIControl: () => true, shared: { paused: true } },
+    current: { kind: 'file' },
+    playlist: { started: false },
+    switchingMedia: false,
+    role: 'host',
+  };
+  const waiting = [
+    { peerId: 'pa', name: '小明', why: 'scan-unavailable' },
+    { peerId: 'pb', name: '小红', why: null },
+    { peerId: 'pc', name: '阿花', why: 'bogus' },
+  ];
+  const ctx = sandbox({
+    fns: ['renderReady'],
+    decls: ['READY_NAMES_SHOWN', 'READY_WHY_LABEL', 'MAX_PEER_NAME', 'peerName'],
+    globals: {
+      S,
+      $: fakeDollar(),
+      roomEntered: true,
+      readyWaiting: () => waiting,
+      autoStartArmed: () => false,
+      connectedPeerCount: () => 3,
+      currentLocale: () => 'zh-CN',
+      updateStripTone: () => {},
+      make: (tag, o = {}) => ({ tag, ...o }),
+      rawText: (text) => ({ raw: true, text }),
+      replace: (target, ...kids) => nodes.push(...kids),
+      roomDisplayNames: () => new Map(),
+    },
+  });
+  ctx.renderReady();
+  const texts = nodes.slice(1).map((n) => n.text);
+  assert.deepEqual(texts, ['小明', '（扫描器不可用）', '、', '小红', '、', '阿花']);
+  assert.equal(nodes.find((n) => n.text === '（扫描器不可用）').raw, undefined, '原因要走翻译，不能当昵称原样放');
 });
 
 test('patch 重画时文字没变就不写 DOM', async () => {
