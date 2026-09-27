@@ -23,7 +23,7 @@ import {
 import { SCAN_RESUMABLE, decideScanOutcome, needsScan, pickScanTarget, shouldPreempt } from './lib/scanPolicy.js';
 import { PlayerGate } from './lib/playerGate.js';
 import { hasAnyMissing } from './lib/transferSources.js';
-import { ChatGate, ChatHistory, ChatSender, clampName, numberDuplicateNames, parseHistory, trustsRelay } from './lib/chat.js';
+import { BURST_TOKENS, ChatGate, ChatHistory, ChatSender, clampName, numberDuplicateNames, parseHistory, trustsRelay } from './lib/chat.js';
 import { DanmakuEngine } from './lib/danmaku.js';
 import { $, make, rawText, replace } from './ui/dom.js';
 import { createPlaylistPanel } from './ui/playlistPanel.js';
@@ -195,12 +195,15 @@ const S = {
   // 聊天。gate 管收端（先去重再扣令牌、只认房主转发来的 origin），sender 管发端
   // （房间输入框和播放器里的输入条共用一把令牌桶），history 只有房主用得上。
   // names 得自己留一份：peer-gone 时 swarm 的 peers 表已经清空，再也查不出「走的是谁」。
+  // leaving 是还没说出口的「X 离开了房间」（见 noteLeaveLater），acks 是自己发的消息等房主回执的定时器。
   chat: {
     entries: [],
     gate: new ChatGate(),
     sender: new ChatSender(),
     history: new ChatHistory(),
     names: new Map(),
+    leaving: new Map(),
+    acks: new Map(),
     historyShown: false,
     notice: '',
     /**
@@ -288,8 +291,9 @@ function storedCapacity() {
 }
 // 昵称的长度上限，和 swarm / 信令服务器截断的一样。邀请码、应答码、第三方信令服务器
 // 带来的昵称都没经过它们，一条几百 KB 的深链接能把一个「名字」撑满整页。
+// 清洗和握手、改名走同一个 clampName：只截断的话，双向覆盖字符、换行照样能进日志和成员表
 const MAX_PEER_NAME = 40;
-const peerName = (name, fallback = '') => String(name || fallback).slice(0, MAX_PEER_NAME);
+const peerName = (name, fallback = '') => clampName(name) || String(fallback ?? '').slice(0, MAX_PEER_NAME);
 
 function connectedPeerCount() {
   return (S.swarm?.peerList() || []).filter(
@@ -4240,7 +4244,8 @@ function initSwarmAndSync() {
   S.swarm.on('peer-authenticated', async (peer) => {
     log(`已和 ${peer.name} 完成${securityModeLabel(S.roomSecurityMode)}握手`, 'good');
     S.chat.names.set(peer.peerId, peer.name);
-    S.chat?.note(`${peer.name} 加入了房间`);
+    // 刚断开、「离开了」还没说出口就连回来的，进出两句都不说
+    if (!noteRejoin(peer.peerId, peer.name)) S.chat?.note(`${peer.name} 加入了房间`);
     S.sync?.greet(peer, {
       // 顺序是契约：角色表 → 播放列表（和链接的兜底地址）→ 同步状态
       beforeSync: () => {
@@ -4257,6 +4262,8 @@ function initSwarmAndSync() {
       S.hostLink = null;
       renderPlaylistSoon();
     }
+    // 房主（重新）连上了：自己还没等到回执的聊天补发给他
+    if (peer.peerId === S.hostId && !isRoomHost()) resendPendingChats(peer);
     refreshSources();
     scheduleTransferUpdate();
     if (S.role === 'guest' && !roomEntered) await enterRoom();
@@ -4267,7 +4274,8 @@ function initSwarmAndSync() {
     const gone = S.chat?.names.get(peerId);
     if (gone) {
       S.chat.names.delete(peerId);
-      S.chat.note(`${gone} 离开了房间`);
+      // 直连断了会自动重连：「离开了」先压几秒，这期间连回来就不说
+      noteLeaveLater(peerId, gone);
     }
     if (peerId === S.hostId && !isRoomHost() && roomEntered && !S.hostGone) {
       if (S.mode === 'manual') {
@@ -4293,8 +4301,9 @@ function initSwarmAndSync() {
   });
   S.swarm.on('ctrl', ({ msg, peer }) => onRoomCtrl(msg, peer));
 
-  S.sync.on('stall-change', ({ name, stalled, self }) => {
-    const who = self ? t('你') : name;
+  S.sync.on('stall-change', ({ who: peerId, name, stalled, self }) => {
+    // 名字按成员表同一套显示名：两个「小明」时得分得清是哪一个在卡
+    const who = self ? t('你') : roomDisplayNames().get(peerId) || name;
     // 游客的缓冲不足只暂停自己，别喊「全员暂停」误导人。
     const guestSelf = self && !S.sync.canIControl();
     if (stalled) {
@@ -4415,6 +4424,8 @@ function initSwarmAndSync() {
   // 有人在房间里改了昵称：聊天里说一声，就绪 / 卡顿表里的名字跟着换，成员表和聊天按新名字重画
   S.swarm.on('peer-renamed', ({ peerId, name, oldName }) => {
     S.sync?.noteRename(peerId, name);
+    // 离开时的「X 离开了房间」也得用新名字
+    if (S.chat.names.has(peerId)) S.chat.names.set(peerId, name);
     chatSystem(`${oldName || peerId} 改名为 ${name}`);
     renderPeersSoon();
     renderChat();
@@ -4663,15 +4674,49 @@ function renderChat() {
   }, CHAT_RENDER_MS);
 }
 
+/** @returns {boolean} 真的加进去了（同一个 key 已经在列表里就不加） */
 function pushChatEntry(entry) {
   const list = S.chat.entries;
   // 同一个 key 绝不能进两次：面板按 key 复用元素，重复的会当场抛错，而且这两条一直留在列表里，
   // 之后每一次重绘都再抛一次，聊天面板从此永久坏掉。去重表有 TTL，同 id 的消息隔久了会「复活」，
   // 网状模式下直连那份和房主补发的历史也可能撞上，所以这一层必须自己兜住。
-  if (entry.key && list.some((e) => e.key === entry.key)) return;
+  if (entry.key && list.some((e) => e.key === entry.key)) return false;
   list.push(entry);
   if (list.length > VIEW_LIMIT) list.splice(0, list.length - VIEW_LIMIT);
   renderChat();
+  return true;
+}
+
+// 直连断了到重连握手完成，通常就几秒（退避 1.5 秒起，再加上 ICE 收集和握手）
+const LEAVE_NOTE_DELAY_MS = 10_000;
+
+/**
+ * 有人断开了：「X 离开了房间」先压 LEAVE_NOTE_DELAY_MS 再说。直连断了会自动重连（见 scheduleReconnect），
+ * 立刻说的话网络一抖，聊天里就是一对「离开了」「加入了」，大家以为有人掉线又进来了。
+ * 这期间同一个人重新握手成功（noteRejoin）就撤掉；真走了，晚几秒照样说。
+ */
+function noteLeaveLater(peerId, name) {
+  clearTimeout(S.chat.leaving.get(peerId)?.timer);
+  const timer = setTimeout(() => {
+    if (S.chat.leaving.get(peerId)?.timer !== timer) return;
+    S.chat.leaving.delete(peerId);
+    S.chat.note(`${name} 离开了房间`);
+  }, LEAVE_NOTE_DELAY_MS);
+  S.chat.leaving.set(peerId, { name, timer });
+}
+
+/**
+ * 有人完成握手：他要是刚断开、「离开了」还没说出口，这就是连回来了 —— 进出都不说，
+ * 断开期间改了名的补一句改名。
+ * @returns {boolean} 是不是连回来的
+ */
+function noteRejoin(peerId, name) {
+  const away = S.chat.leaving.get(peerId);
+  if (!away) return false;
+  clearTimeout(away.timer);
+  S.chat.leaving.delete(peerId);
+  if (away.name !== name) S.chat.note(`${away.name} 改名为 ${name}`);
+  return true;
 }
 
 /**
@@ -4718,12 +4763,63 @@ function sendChat(rawInput, { fromPlayer = false } = {}) {
   S.chat.gate.remember(id);
   const host = isRoomHost();
   // 房主本人就是转发中枢，没有「等谁转回来」这回事，直接算已送达
-  pushChatEntry({ key: id, kind: 'msg', from: S.peerId, name: S.name, text, self: true, state: host ? 'sent' : 'sending' });
+  pushChatEntry({ key: id, kind: 'msg', from: S.peerId, name: S.name, text, ts, self: true, state: host ? 'sent' : 'sending' });
   showDanmaku({ id, text, self: true });
   if (host) S.chat.history.add({ id, text, origin: S.peerId, name: S.name, ts });
   const wire = host ? { t: MSG.CHAT, id, text, ts, origin: S.peerId, originName: S.name } : { t: MSG.CHAT, id, text, ts };
   for (const p of chatPeers()) p.send(wire);
+  if (!host) {
+    armChatAck(id);
+    // 房主不在：「发送中」后面是什么情况得说清楚，别让人对着一直不变的状态干等
+    if (S.hostId && !chatPeers().some((p) => p.peerId === S.hostId)) {
+      const away = S.hostGone ? '房主已离开，这条消息房主收不到了' : '和房主的连接断了，连回来后补发这条消息';
+      chatNotice(away);
+      if (fromPlayer) window.sw.player.osd(t(away), 2500);
+    }
+  }
   return true;
+}
+
+// 自己发的消息等房主回执（他转回来的那一份）最多等这么久，过了还没有就标「未送达」
+const CHAT_ACK_TIMEOUT_MS = 10_000;
+
+/** 自己发的一条开始等回执：到点还是「发送中」就改成「未送达」。 */
+function armChatAck(id) {
+  clearTimeout(S.chat.acks.get(id));
+  const timer = setTimeout(() => {
+    if (S.chat.acks.get(id) !== timer) return;
+    S.chat.acks.delete(id);
+    const entry = S.chat.entries.find((e) => e.key === id && e.self);
+    if (!entry || entry.state !== 'sending') return;
+    entry.state = 'failed';
+    renderChat();
+  }, CHAT_ACK_TIMEOUT_MS);
+  S.chat.acks.set(id, timer);
+}
+
+/**
+ * 和房主（重新）连上了：自己还没等到回执的（「发送中」「未送达」）补发给他，id 不变 ——
+ * 房主按 id 去重，收过的不会再显示一遍、只回一份回执；没收过的照常进历史、转给大家。
+ * 房主对每个人限速（突发 BURST_TOKENS 条），一口气补多了也是被丢，所以只补最近这几条，更早的算「未送达」。
+ */
+function resendPendingChats(host) {
+  const pending = S.chat.entries.filter(
+    (e) => e.kind === 'msg' && e.self && (e.state === 'sending' || e.state === 'failed')
+  );
+  if (!pending.length) return;
+  const resend = pending.slice(-BURST_TOKENS);
+  for (const entry of pending) {
+    if (resend.includes(entry)) continue;
+    clearTimeout(S.chat.acks.get(entry.key));
+    S.chat.acks.delete(entry.key);
+    entry.state = 'failed';
+  }
+  for (const entry of resend) {
+    entry.state = 'sending';
+    host.send({ t: MSG.CHAT, id: entry.key, text: entry.text, ts: entry.ts });
+    armChatAck(entry.key);
+  }
+  renderChat();
 }
 
 /** 收到别人的聊天。身份以连接为准；只有房主转发来的才采信 origin。 */
@@ -4737,22 +4833,30 @@ function onChatMessage(msg, peer) {
   if (!res.ok) {
     // 房主把我自己那条转回来了：这是送达回执，不是新消息
     if (res.reason === 'echo') markChatDelivered(res.id);
+    // 发言人补发了一条我收过的：他没等到回执（转回去的那一份多半丢在断掉的旧连接上），只给他再回一份
+    else if (res.reason === 'duplicate' && isRoomHost()) {
+      const item = S.chat.history.list().find((it) => it.id === res.id && it.origin === peer.peerId);
+      if (item) peer.send({ t: MSG.CHAT, id: item.id, text: item.text, ts: item.ts, origin: item.origin, originName: item.name });
+    }
     return;
   }
   const m = res.message;
-  pushChatEntry({ key: m.id, kind: 'msg', from: m.origin, name: m.name, text: m.text, self: false });
-  showDanmaku({ id: m.id, text: m.text, self: false });
+  // 列表里已经有了（补发来的旧消息，去重表早过期了）就不再上弹幕、不再进历史
+  const added = pushChatEntry({ key: m.id, kind: 'msg', from: m.origin, name: m.name, text: m.text, self: false });
+  if (added) showDanmaku({ id: m.id, text: m.text, self: false });
   if (!isRoomHost()) return;
   // 房主是转发中枢：留进历史，再转给所有人 —— 包括发送者本人。
   // 转回去的这一份就是送达回执（他那边按 id 认出是自己的回声，只把「发送中」改成「已送达」，不会显示两遍）；
   // 不转回去的话，两个人的房间里发送者会永远停在「发送中」。
-  S.chat.history.add(m);
+  if (added) S.chat.history.add(m);
   const wire = { t: MSG.CHAT, id: m.id, text: m.text, ts: m.ts, origin: m.origin, originName: m.name };
   for (const p of chatPeers()) p.send(wire);
 }
 
-/** 自己那条被房主转回来了：「发送中」改成「已送达」。 */
+/** 自己那条被房主转回来了：「发送中」「未送达」改成「已送达」。 */
 function markChatDelivered(id) {
+  clearTimeout(S.chat.acks.get(id));
+  S.chat.acks.delete(id);
   const entry = S.chat.entries.find((e) => e.key === id && e.self);
   if (!entry || entry.state === 'sent') return;
   entry.state = 'sent';
@@ -5465,10 +5569,13 @@ function renderReady() {
   } else {
     const sep = currentLocale() === 'en' ? ', ' : '、';
     const names = [];
+    // 名字按成员表同一套显示名（重名编号），两个「小明」时分得清是哪一个没准备好；
+    // 不在表里的（星型房间里经房主转来的别人）用他报的名字
+    const shown = roomDisplayNames();
     // 人数照实说，名字只列前几位：就绪名单来自对端的消息，列全了一行能撑满整个状态带
     waiting.slice(0, READY_NAMES_SHOWN).forEach((w, i) => {
       if (i) names.push(rawText(sep));
-      names.push(w.self ? make('span', { text: '你' }) : rawText(peerName(w.name, w.peerId)));
+      names.push(w.self ? make('span', { text: '你' }) : rawText(shown.get(w.peerId) || peerName(w.name, w.peerId)));
     });
     if (waiting.length > READY_NAMES_SHOWN) names.push(rawText(`${sep}…`));
     replace('ready-text', make('span', { text: `等待 ${waiting.length} 人准备好：` }), ...names);
@@ -7124,8 +7231,9 @@ const myPlatform = () => platformOfOs(S.env?.platform);
 
 /**
  * 房间里每个人的显示名：重名的临时编号（「小明 #2」），只影响显示，不改谁存着的昵称。
- * 算的是自己 + 握过手的直连成员，成员表列的就是这一拨；聊天按发言人的 id 查同一张表，
- * 所以聊天里的「小明 #2」和成员表里的是同一个人。
+ * 算的是自己 + 握过手的直连成员，成员表列的就是这一拨；聊天、就绪名单、卡顿提示都按 id 查同一张表，
+ * 所以那里的「小明 #2」和成员表里的是同一个人。星型房间里经房主转来的其他观众不是直连成员、不在表里，
+ * 这几处都退回他自己报的名字（不编号）。
  */
 function roomDisplayNames() {
   const members = [{ id: S.peerId, name: S.name || '' }];
@@ -7404,6 +7512,17 @@ function stallBannerText(waitingFor) {
   return wait
     ? `全员暂停中 —— 在等 ${who} 把缓冲攒够，约 ${fmtTime(wait)}`
     : `全员暂停中 —— 在等 ${who} 把缓冲攒够`;
+}
+
+/**
+ * 全员暂停在等谁。和 status().waitingFor 同一批人、同一个顺序，但名字按成员表同一套显示名（重名编号），
+ * 两个「小明」时分得清是哪一个在卡；不在表里的（星型房间里经房主转来的别人）用他报的名字。
+ */
+function stallWaitingNames() {
+  const shown = roomDisplayNames();
+  const out = [...S.sync.stalledPeers].map(([peerId, v]) => shown.get(peerId) || v.name);
+  if (S.sync.localStalled) out.unshift('你'); // 和 status() 一样，由 t() 统一翻译
+  return out;
 }
 
 // 上一次推给 mpv 的横幅。主进程那边也会去重，这里再挡一层是因为 renderStatus
@@ -7805,7 +7924,7 @@ function renderStatus() {
 
   if (st.stalled) {
     banner.className = 'status-banner waiting';
-    banner.textContent = stallBannerText(st.waitingFor);
+    banner.textContent = stallBannerText(stallWaitingNames());
   } else if (!st.paused && !linkWaiting) {
     // 在播但本机和房主没对上：用提醒的黄色，别亮「一切正常」的绿
     banner.className = driftShown() ? 'status-banner waiting' : 'status-banner playing';

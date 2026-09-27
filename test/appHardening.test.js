@@ -52,9 +52,15 @@ const TURN_GATE_OPEN = {
   signalPeerIce: () => ({ iceServers: [], iceTransportPolicy: 'all' }),
 };
 
+// peerName 用 chat.js 的 clampName 清洗昵称（和握手、改名同一套）：沙箱里给一份真的
+let clampName = null;
+test.before(async () => {
+  ({ clampName } = await load('src/renderer/lib/chat.js'));
+});
+
 function sandbox({ fns = [], decls = [], globals = {} }) {
   // myPlatform：HELLO 里报的本机系统（成员表上的设备标记），这些测试不关心
-  const ctx = { console, inviteGen: 0, myPlatform: () => 'windows', ...TURN_GATE_OPEN, ...globals };
+  const ctx = { console, inviteGen: 0, myPlatform: () => 'windows', clampName, ...TURN_GATE_OPEN, ...globals };
   vm.createContext(ctx);
   vm.runInContext([...decls.map(declSource), ...fns.map(fnSource)].join('\n\n'), ctx, { filename: 'app.js（节选）' });
   return ctx;
@@ -759,6 +765,9 @@ test('信令推来的日志按种类限流；超长昵称截断', async () => {
   assert.equal(r.logs.length, appConst('SIG_LOG_MAX'));
   await r.sig.emit('peer-join', { peerId: 'long', name: 'W'.repeat(100_000) });
   assert.equal(r.peers[0].name.length, 40);
+  // 不只是截断：双向覆盖字符、换行和首尾空白也和握手、改名一样清洗掉
+  await r.sig.emit('peer-join', { peerId: 'bidi', name: ' \u202E花阿\n\t ' });
+  assert.equal(r.peers[1].name, '花阿');
 });
 
 test('列表操作刷屏：游客的不进队，管理员每人排队有上限', async () => {
@@ -1512,6 +1521,7 @@ test('就绪等待名单只列前几位，人数照实说', () => {
       make: (tag, o = {}) => ({ tag, ...o }),
       rawText: (text) => ({ raw: true, text }),
       replace: (target, ...kids) => nodes.push(...kids),
+      roomDisplayNames: () => new Map(),
     },
   });
   ctx.renderReady();
@@ -1520,6 +1530,50 @@ test('就绪等待名单只列前几位，人数照实说', () => {
   assert.ok(names.every((n) => n.text.length <= 40));
   assert.equal(nodes[0].text, '等待 50 人准备好：');
   assert.equal(nodes[nodes.length - 1].text, '、…');
+});
+
+test('就绪等待名单和成员表用同一套显示名：两个「小明」分得清是哪一个没准备好', async () => {
+  const { numberDuplicateNames } = await load('src/renderer/lib/chat.js');
+  const nodes = [];
+  const S = {
+    sync: { canIControl: () => true, shared: { paused: true } },
+    current: { kind: 'file' },
+    playlist: { started: false },
+    switchingMedia: false,
+    role: 'guest',
+  };
+  // pz 是星型房间里经房主转来的别人：不是直连成员，不在显示名表里，退回他报的名字
+  const waiting = [
+    { peerId: 'pb', name: '小明' },
+    { peerId: 'pa', name: '小明' },
+    { peerId: 'pz', name: '\u202E花阿' },
+  ];
+  const ctx = sandbox({
+    fns: ['renderReady'],
+    decls: ['READY_NAMES_SHOWN', 'MAX_PEER_NAME', 'peerName'],
+    globals: {
+      S,
+      $: fakeDollar(),
+      roomEntered: true,
+      readyWaiting: () => waiting,
+      autoStartArmed: () => false,
+      connectedPeerCount: () => 2,
+      currentLocale: () => 'zh-CN',
+      updateStripTone: () => {},
+      make: (tag, o = {}) => ({ tag, ...o }),
+      rawText: (text) => ({ raw: true, text }),
+      replace: (target, ...kids) => nodes.push(...kids),
+      roomDisplayNames: () =>
+        numberDuplicateNames([
+          { id: 'me', name: '我' },
+          { id: 'pa', name: '小明' },
+          { id: 'pb', name: '小明' },
+        ]),
+    },
+  });
+  ctx.renderReady();
+  const names = nodes.filter((n) => n.raw && n.text !== '、').map((n) => n.text);
+  assert.deepEqual(names, ['小明 #2', '小明', '花阿']);
 });
 
 test('patch 重画时文字没变就不写 DOM', async () => {

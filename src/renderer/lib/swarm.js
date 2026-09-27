@@ -93,7 +93,8 @@ const BITFIELD_PER_SEC = 8;
 const SERVE_BUDGET_SLACK = 64;
 // 成员表刷新合并到这么久一次：位图、往返时延都是对方能随时推过来的，每条都整张重算一遍太贵
 const PEERS_COALESCE_MS = 200;
-// 同一个人两次改名至少隔这么久，间隔内再来的不理：成员表和聊天里的「改名为」不会被人刷屏
+// 同一个人两次改名至少隔这么久：成员表和聊天里的「改名为」不会被人刷屏。
+// 间隔内再来的先记下，到点只应用最后一次 —— 丢掉的话，改错字马上改回的那一次就再也传不过来
 const RENAME_MIN_MS = 2000;
 const VERSION_REJECTED_MAX = 256;
 // 同一条连接上同一份清单，每 MANIFEST_SERVE_WINDOW_MS 最多发这么多次。
@@ -545,6 +546,8 @@ export class Swarm extends Emitter {
 
     peer.on('open', () => {
       // 版本和模式协商是数据通道上的第一步；通过前不发清单、控制消息或媒体数据。
+      // 记下 HELLO 里报的名字：握手完成前改的名，setName 发不到这条连接上，认证时要补一条 NAME
+      peer.helloName = this.name;
       peer.hello(this.peerId, this.name, this.securityMode, this.platform);
       this.emit('peers', this.peerList());
     });
@@ -607,7 +610,9 @@ export class Swarm extends Emitter {
     }
 
     p.peerId = newId;
-    if (name) p.name = String(name).slice(0, 40);
+    // 名字是对方自己说的：和 NAME 改名、聊天署名走同一个 clampName（去双向覆盖字符、按码点截断）
+    const clean = clampName(name);
+    if (clean) p.name = clean;
     this.peers.set(newId, p);
 
     this.emit('peers', this.peerList());
@@ -630,6 +635,8 @@ export class Swarm extends Emitter {
     this._serving.delete(peerId);
     this._serveQueue.delete(peerId);
     this._peerState.delete(peerId);
+    clearTimeout(p.renameTimer);
+    p.renameTimer = null;
     // 正在给他发的当前这部作废。那几次发送可能永远落不了定（通道关掉后缓冲不会回落），
     // 份额要是等它们来扣，别人排着的后面几部就一直发不出去
     this._priorityServing.delete(p);
@@ -745,6 +752,34 @@ export class Swarm extends Emitter {
   }
 
   /**
+   * 对方改名（name 已清洗）。同一个人两次改名至少隔 RENAME_MIN_MS：间隔内再来的只记下最后一次，
+   * 到点再换 —— 「改名为」照样不会刷屏，改错字马上改回的那一次也不会悄悄丢掉、让两边看到的名字从此对不上。
+   * 间隔按本机收到的时间算，网络抖动把两条挤到一起也一样处理。
+   */
+  _onRename(peer, name) {
+    const wait = (peer.renamedAt || 0) + RENAME_MIN_MS - Date.now();
+    if (wait > 0) {
+      peer.pendingName = name;
+      if (!peer.renameTimer) {
+        peer.renameTimer = setTimeout(() => {
+          peer.renameTimer = null;
+          const next = peer.pendingName;
+          peer.pendingName = null;
+          // 这期间人走了（或者换了一条连接）就算了
+          if (next && this.peers.get(peer.peerId) === peer) this._onRename(peer, next);
+        }, wait);
+      }
+      return;
+    }
+    if (name === peer.name) return;
+    const oldName = peer.name;
+    peer.name = name;
+    peer.renamedAt = Date.now();
+    this.emit('peer-renamed', { peerId: peer.peerId, name, oldName });
+    this._peersChanged();
+  }
+
+  /**
    * 对方推过来的东西（位图、往返时延）引起的成员表刷新，合并到 PEERS_COALESCE_MS 一次。
    * peerList() 要把每个人的位图整张数一遍，上层还要重画成员表；逐条刷的话，
    * 一个人连着灌位图就能把渲染进程拖住。本机自己引起的变化（进出、换片）照旧立刻刷新。
@@ -770,15 +805,9 @@ export class Swarm extends Emitter {
         break;
 
       case MSG.NAME: {
-        // 对方改了昵称。名字是对方自己说的，照 HELLO 一样清洗；改得太勤的不理
+        // 对方改了昵称。名字是对方自己说的，照 HELLO 一样清洗；改得太勤的先记下、到点再换
         const name = clampName(msg.name);
-        const now = Date.now();
-        if (!name || name === peer.name || now - (peer.renamedAt || 0) < RENAME_MIN_MS) break;
-        const oldName = peer.name;
-        peer.name = name;
-        peer.renamedAt = now;
-        this.emit('peer-renamed', { peerId: peer.peerId, name, oldName });
-        this._peersChanged();
+        if (name) this._onRename(peer, name);
         break;
       }
 
@@ -852,7 +881,7 @@ export class Swarm extends Emitter {
       this.emit('version-mismatch', {
         peer,
         peerId: peer.peerId,
-        name: typeof msg.name === 'string' ? msg.name.slice(0, 40) : peer.name,
+        name: clampName(msg.name) || peer.name,
         localVersion: PROTOCOL_VERSION,
         remoteVersion: Number.isSafeInteger(msg.ver) ? msg.ver : 1,
       });
@@ -868,9 +897,11 @@ export class Swarm extends Emitter {
         return;
       }
       peer.allowIdentityRename = false;
-    } else if (msg.name) {
-      peer.name = String(msg.name).slice(0, 40);
     }
+    // 名字是对方自己说的：和 NAME 改名、聊天署名走同一个 clampName —— 去控制字符和双向覆盖字符、
+    // 并空白、按码点截到 40 字。只截断不清洗的话，'\u202E花阿' 在成员表里显示成「阿花」，
+    // 「小明 」和「小明」也不算重名、不编号。没带名字或清洗后为空，用信令 / 邀请码给的，再不行用 peerId
+    peer.name = clampName(msg.name) || clampName(peer.name) || peer.peerId;
 
     // 缺少 securityMode 按安全模式处理。可信房间绝不允许缺省值。
     const remoteMode = msg.securityMode === 'trusted' ? 'trusted' : 'safe';
@@ -886,6 +917,8 @@ export class Swarm extends Emitter {
 
     peer.platform = normalizePlatform(msg.platform);
     peer.authenticated = true;
+    // HELLO 发出去之后、对方认证之前改的名，setName 发不到这条连接（只发给已认证的）：现在补一条
+    if (peer.helloName !== undefined && peer.helloName !== this.name) peer.send({ t: MSG.NAME, name: this.name });
     this._sendIntro(peer);
     this.emit('peer-authenticated', peer);
     this.emit('peer-open', this._peerInfo(peer));
@@ -1855,7 +1888,10 @@ export class Swarm extends Emitter {
     this.stop();
     clearTimeout(this._peersTimer);
     this._peersTimer = null;
-    for (const p of [...this.peers.values()]) p.close();
+    for (const p of [...this.peers.values()]) {
+      clearTimeout(p.renameTimer);
+      p.close();
+    }
     this.peers.clear();
     for (const ctx of this.files.values()) {
       ctx.assembler.clear();

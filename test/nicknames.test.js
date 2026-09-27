@@ -5,6 +5,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
 const { pathToFileURL } = require('url');
+const { IMPLS } = require('./helpers/impls');
 
 const LIB = path.join(__dirname, '../src/renderer/lib');
 const load = (file) => import(pathToFileURL(path.join(LIB, file)).href);
@@ -104,35 +105,158 @@ test('setName：清洗后发给握过手的人，没握手的不发；和原来�
 
 /* ------------------------------ 改名：收 ------------------------------ */
 
-test('收到 NAME：清洗后换名字、发 peer-renamed；2 秒内再改不理；空的、一样的不理', async (t) => {
-  t.mock.timers.enable({ apis: ['Date'], now: 1_700_000_000_000 });
-  const { Swarm } = await load('swarm.js');
-  const swarm = new Swarm({ peerId: 'me', name: '我' });
-  const peer = swarm.addPeer(fakePeer('pa'));
-  peer.name = '阿花';
-  const events = [];
-  swarm.on('peer-renamed', (e) => events.push(e));
+for (const { name: implName, dir } of IMPLS) {
+  const loadImpl = (file) => import(pathToFileURL(path.join(__dirname, dir, file)).href);
 
-  swarm._onCtrl(peer, { t: 'name', name: ' 花花‮ ' });
-  assert.equal(peer.name, '花花');
-  assert.deepEqual(events, [{ peerId: 'pa', name: '花花', oldName: '阿花' }]);
-  assert.equal(swarm.peerList().find((p) => p.peerId === 'pa').name, '花花');
+  test(`${implName}：收到 NAME：清洗后换名字、发 peer-renamed；2 秒内再改先记下、到点只换最后一次；空的、一样的不理`, async (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1_700_000_000_000 });
+    const { Swarm } = await loadImpl('swarm.js');
+    const swarm = new Swarm({ peerId: 'me', name: '我' });
+    const peer = swarm.addPeer(fakePeer('pa'));
+    peer.name = '阿花';
+    const events = [];
+    swarm.on('peer-renamed', (e) => events.push(e));
 
-  swarm._onCtrl(peer, { t: 'name', name: '又改了' });
-  assert.equal(peer.name, '花花', '2 秒内连着改的不理：成员表和聊天不会被刷屏');
-  t.mock.timers.tick(2000);
-  swarm._onCtrl(peer, { t: 'name', name: '又改了' });
-  assert.equal(peer.name, '又改了');
+    swarm._onCtrl(peer, { t: 'name', name: ' 花花\u202E ' });
+    assert.equal(peer.name, '花花');
+    assert.deepEqual(events, [{ peerId: 'pa', name: '花花', oldName: '阿花' }]);
+    assert.equal(swarm.peerList().find((p) => p.peerId === 'pa').name, '花花');
 
-  t.mock.timers.tick(5000);
-  for (const bad of ['', '   ', null, 42, { name: 'x' }, '又改了']) swarm._onCtrl(peer, { t: 'name', name: bad });
-  assert.equal(peer.name, '又改了');
-  assert.equal(events.length, 2);
+    // 改错字马上又改：间隔内先不换（成员表和聊天不会被刷屏），但也不能悄悄丢掉
+    t.mock.timers.tick(500);
+    swarm._onCtrl(peer, { t: 'name', name: '又改了' });
+    swarm._onCtrl(peer, { t: 'name', name: '改错了再改' });
+    assert.equal(peer.name, '花花', '2 秒内连着改的先不换');
+    assert.equal(events.length, 1);
+    t.mock.timers.tick(1499);
+    assert.equal(peer.name, '花花');
+    t.mock.timers.tick(1);
+    assert.equal(peer.name, '改错了再改', '到点只换最后一次，两边看到的名字最终一致');
+    assert.deepEqual(events[1], { peerId: 'pa', name: '改错了再改', oldName: '花花' });
+    assert.equal(events.length, 2, '中间那次不单独报');
 
-  t.mock.timers.tick(5000);
-  swarm._onCtrl(peer, { t: 'name', name: 'x'.repeat(100_000) });
-  assert.equal(peer.name.length, 40, '几十 KB 的名字截到 40 字');
-});
+    // 间隔内改回原名：到点一看没变，什么都不报
+    swarm._onCtrl(peer, { t: 'name', name: '临时' });
+    swarm._onCtrl(peer, { t: 'name', name: '改错了再改' });
+    t.mock.timers.tick(5000);
+    assert.equal(peer.name, '改错了再改');
+    assert.equal(events.length, 2);
+
+    for (const bad of ['', '   ', null, 42, { name: 'x' }, '改错了再改']) swarm._onCtrl(peer, { t: 'name', name: bad });
+    t.mock.timers.tick(5000);
+    assert.equal(peer.name, '改错了再改');
+    assert.equal(events.length, 2);
+
+    swarm._onCtrl(peer, { t: 'name', name: 'x'.repeat(100_000) });
+    assert.equal(peer.name.length, 40, '几十 KB 的名字截到 40 字');
+  });
+
+  test(`${implName}：间隔内记下的改名，人走了就作废`, async (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1_700_000_000_000 });
+    const { Swarm } = await loadImpl('swarm.js');
+    const swarm = new Swarm({ peerId: 'me', name: '我' });
+    const peer = swarm.addPeer(fakePeer('pa'));
+    let fired = 0;
+    swarm.on('peer-renamed', () => fired++);
+    swarm._onCtrl(peer, { t: 'name', name: '一' });
+    swarm._onCtrl(peer, { t: 'name', name: '二' });
+    assert.equal(fired, 1);
+    swarm.removePeer('pa');
+    t.mock.timers.tick(5000);
+    assert.equal(fired, 1);
+    assert.equal(peer.name, '一');
+  });
+
+  test(`${implName}：HELLO 里的昵称和 NAME、聊天走同一个 clampName；清洗后为空就用信令给的，再不行用 peerId`, async () => {
+    const { Swarm } = await loadImpl('swarm.js');
+    const { numberDuplicateNames } = await loadImpl('chat.js');
+    const swarm = new Swarm({ peerId: 'me', name: '我' });
+    const helloFrom = (peerId, name, signaled) => {
+      const peer = swarm.addPeer(fakePeer(peerId, { authenticated: false }));
+      if (signaled !== undefined) peer.name = signaled;
+      swarm._onCtrl(peer, { t: 'hello', peerId, name, ver: 2, securityMode: 'safe', platform: 'windows' });
+      assert.equal(peer.authenticated, true, peerId);
+      return peer;
+    };
+
+    // 双向覆盖字符能让「花阿」显示成「阿花」：去掉，换行和首尾空白一并清掉
+    assert.equal(helloFrom('p1', '\u202E花阿\n\t ').name, '花阿');
+    // 纯空白：退回信令 / 邀请码给的名字；那个名字也要清洗，都不行就用 peerId
+    assert.equal(helloFrom('p2', '   ', '信令给的').name, '信令给的');
+    assert.equal(helloFrom('p3', undefined, ' \u202E ').name, 'p3');
+    assert.equal(helloFrom('p4', 42, '邀请码给的').name, '邀请码给的');
+    // 按码点截到 40 字，emoji 不会被拦腰截断
+    const long = helloFrom('p5', '😀'.repeat(60)).name;
+    assert.equal(Array.from(long).length, 40);
+    assert.ok(!/[\uD800-\uDBFF]$/.test(long));
+    // 「小明 」和「小明」清洗后是同一个名字，重名照样编号
+    const a = helloFrom('p6', '小明 ');
+    const b = helloFrom('p7', '小明');
+    const shown = numberDuplicateNames([a, b].map((p) => ({ id: p.peerId, name: p.name })));
+    assert.deepEqual([shown.get('p6'), shown.get('p7')], ['小明', '小明 #2']);
+    assert.equal(swarm.peerList().find((p) => p.peerId === 'p1').name, '花阿');
+  });
+
+  test(`${implName}：版本不对的 HELLO 报出来的名字、renamePeer 换上的名字也清洗`, async () => {
+    const { Swarm } = await loadImpl('swarm.js');
+    const swarm = new Swarm({ peerId: 'me', name: '我' });
+    const mismatches = [];
+    swarm.on('version-mismatch', (e) => mismatches.push(e.name));
+    const old = swarm.addPeer(fakePeer('old-1', { authenticated: false }));
+    swarm._onCtrl(old, { t: 'hello', peerId: 'old-1', name: '\u202E客户端旧', ver: 1 });
+    assert.deepEqual(mismatches, ['客户端旧']);
+
+    const temp = swarm.addPeer(fakePeer('pending-01', { authenticated: false }));
+    temp.allowIdentityRename = true;
+    swarm._onCtrl(temp, { t: 'hello', peerId: 'real-01', name: ' 真名\u2066 ', ver: 2, securityMode: 'safe' });
+    assert.equal(temp.peerId, 'real-01');
+    assert.equal(temp.name, '真名');
+    assert.equal(swarm.renamePeer('real-01', 'real-02', '\u202E'), true);
+    assert.equal(temp.name, '真名', '清洗后为空不覆盖');
+  });
+
+  test(`${implName}：HELLO 发出去、对方还没认证时改的名，认证时补一条 NAME`, async () => {
+    const { Swarm } = await loadImpl('swarm.js');
+    const swarm = new Swarm({ peerId: 'me', name: '旧名字' });
+    // 带事件的假连接：swarm 在 open 时发 HELLO
+    const withEvents = (peerId) => {
+      const peer = fakePeer(peerId, { authenticated: false });
+      const handlers = {};
+      peer.on = (ev, fn) => {
+        (handlers[ev] ||= []).push(fn);
+        return () => {};
+      };
+      peer.fire = (ev, ...args) => (handlers[ev] || []).forEach((fn) => fn(...args));
+      peer.hellos = [];
+      peer.hello = (...args) => peer.hellos.push(args);
+      return peer;
+    };
+    const names = (p) => p.sent.filter((m) => m.t === 'name').map((m) => m.name);
+    const hello = (peerId) => ({ t: 'hello', peerId, name: '对方', ver: 2, securityMode: 'safe' });
+
+    const a = swarm.addPeer(withEvents('pa'));
+    a.fire('open');
+    assert.equal(a.hellos[0][1], '旧名字');
+    swarm.setName('新名字');
+    assert.deepEqual(names(a), [], '还没认证的连接收不到 NAME');
+    swarm._onCtrl(a, hello('pa'));
+    assert.deepEqual(names(a), ['新名字'], '认证时补上，对方不会一直显示 HELLO 里的旧名');
+
+    // 没改过名的不补
+    const b = swarm.addPeer(withEvents('pb'));
+    b.fire('open');
+    swarm._onCtrl(b, hello('pb'));
+    assert.deepEqual(names(b), []);
+
+    // 还没发 HELLO（open 之前）就改了名：HELLO 本身就带新名字，也不用补
+    const c = swarm.addPeer(withEvents('pc'));
+    swarm.setName('再改');
+    c.fire('open');
+    assert.equal(c.hellos[0][1], '再改');
+    swarm._onCtrl(c, hello('pc'));
+    assert.deepEqual(names(c), []);
+  });
+}
 
 test('没握手的连接发 NAME 不理', async () => {
   const { Swarm } = await load('swarm.js');

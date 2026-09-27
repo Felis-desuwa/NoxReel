@@ -1135,6 +1135,9 @@ select:disabled {
 .chat-state.sending {
   color: var(--warn);
 }
+.chat-state.failed {
+  color: var(--danger);
+}
 .chat-system {
   padding: 2px 0;
   font-size: 11px;

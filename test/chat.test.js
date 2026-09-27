@@ -263,6 +263,33 @@ impl('收端：只有房主转发的消息才采信 origin', async (dir) => {
   assert.equal(noHost.message.origin, 'peer-b');
 });
 
+impl('收端：消息自带的 name 不算数，署名一律按这条连接握手得来的名字', async (dir) => {
+  const C = await load(dir);
+  const gate = new C.ChatGate({ now: fakeClock().now });
+  // 正常客户端从不发 name；改过的客户端想每条换一个名字（绕过改名限速和「改名为」提示）
+  const faked = gate.accept(wire(idOf(1), '我是房主', { name: '房主' }), {
+    senderId: 'peer-b',
+    senderName: '小王',
+    hostId: 'peer-h',
+  });
+  assert.equal(faked.ok, true);
+  assert.equal(faked.message.origin, 'peer-b');
+  assert.equal(faked.message.name, '小王');
+  // 连接没带名字就退回 peerId，也不看消息里的
+  const bare = gate.accept(wire(idOf(2), '嗨', { name: '别人' }), { senderId: 'peer-b', hostId: 'peer-h' });
+  assert.equal(bare.message.name, 'peer-b');
+  // 房主自己说的话（没带 origin）同样按连接算
+  const host = gate.accept(wire(idOf(3), '开始了', { name: '冒名' }), {
+    senderId: 'peer-h',
+    senderName: '房主',
+    hostId: 'peer-h',
+  });
+  assert.equal(host.message.name, '房主');
+  assert.equal(host.message.relayed, false);
+  // 纯函数那一层同样
+  assert.equal(C.originOfChat({ name: '假名' }, { senderId: 'peer-b', senderName: '小王' }).name, '小王');
+});
+
 impl('收端：转发来的昵称截断到 40 字', async (dir) => {
   const C = await load(dir);
   const gate = new C.ChatGate({ now: fakeClock().now });

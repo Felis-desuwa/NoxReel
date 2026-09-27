@@ -83,7 +83,8 @@ export function createChatPanel({ body, foot, onSend, onTitle } = {}) {
   }
 
   function stateLabel(state) {
-    return state === 'sending' ? '发送中' : '已送达';
+    // 未送达：等了一阵房主还没转回来（房主断开了），和房主重新连上会自动补发
+    return state === 'sending' ? '发送中' : state === 'failed' ? '未送达' : '已送达';
   }
 
   function render(view = {}) {

@@ -792,6 +792,9 @@ test('安卓端：进出房、换片、谁按了暂停都显示在聊天流里',
 
   phone.swarm.removePeer('PEERB');
   await flush();
+  // 直连断了会自动重连：「离开了」先压几秒，真走了到点照样说
+  assert.ok(!systems().includes('阿里 离开了房间'));
+  await phone.advance(10_000, 1000);
   assert.ok(systems().includes('阿里 离开了房间'));
 
   // 房主按了暂停 / 播放：聊天流里各记一行，时间点也带上
@@ -1104,6 +1107,84 @@ test('安卓端：房间里重名的临时编号，成员面板和聊天用同�
   const { translate } = phone.h.i18n;
   assert.equal(translate('小明 改名为 小明二号', 'en'), '小明 is now 小明二号');
   assert.equal(translate('你改名为 大明', 'en'), 'You are now 大明');
+});
+
+test('安卓端：直连断了又连回来，聊天里不刷「离开了」「加入了」；改过名的人真走了，离开提示用新名字', async (t) => {
+  const phone = await bootPhone(t);
+  await startLink(phone);
+  const systems = () => phone.chatRows().filter((r) => r.className === 'chat-system').map((r) => r.text);
+
+  phone.join('PEERB', '阿里');
+  await flush();
+  assert.ok(systems().includes('阿里 加入了房间'));
+  const before = systems().length;
+
+  // 断了，几秒后同一个人重新握手
+  phone.swarm.removePeer('PEERB');
+  await flush();
+  await phone.advance(3000, 500);
+  const back = phone.join('PEERB', '阿里');
+  await flush();
+  await phone.advance(15_000, 1000);
+  assert.equal(systems().length, before, `连回来的进出都不说：${JSON.stringify(systems())}`);
+
+  // 改名之后真走了：离开提示用新名字（面板和聊天里早就是新名字了）
+  phone.sendFrom(back, { t: 'name', name: '阿里巴巴' });
+  await flush();
+  phone.swarm.removePeer('PEERB');
+  await phone.advance(10_000, 1000);
+  assert.ok(systems().includes('阿里巴巴 离开了房间'));
+  assert.ok(!systems().includes('阿里 离开了房间'));
+});
+
+test('安卓端：和房主断开时发的聊天——提示、等不到回执标「未送达」，房主连回来补发，回执一到改成「已送达」', async (t) => {
+  const phone = await bootPhone(t);
+  await startLink(phone);
+  phone.$('btn-chat').click();
+  const msgRow = () => phone.$('chat-body').children.find((c) => String(c.className).startsWith('chat-msg'));
+
+  // 房主的直连断了（信令模式下会自动重连）
+  phone.swarm.removePeer(HOST_ID);
+  await flush();
+  phone.type('房主在吗');
+  phone.$('chat-send').click();
+  await flush();
+  assert.equal(phone.$('chat-notice').textContent, '和房主的连接断了，连回来后补发这条消息');
+  assert.equal(textOf(msgRow()), '小明房主在吗发送中');
+
+  await phone.advance(10_000, 1000);
+  assert.equal(textOf(msgRow()), '小明房主在吗未送达', '等不到回执不能永远停在「发送中」');
+  assert.equal(msgRow().children[2].className, 'chat-state failed');
+
+  // 房主连回来：新连接握手完成，还没送达的补发给他，id 不变
+  const host2 = phone.join(HOST_ID, '房主');
+  await flush();
+  const resent = ofType(host2, 'chat');
+  assert.equal(resent.length, 1);
+  assert.equal(resent[0].text, '房主在吗');
+  assert.equal(ofType(phone.host, 'chat').length, 0, '断开的旧连接上什么都没发出去');
+  assert.equal(resent[0].origin, undefined, '手机不是房主，补发也不许自称转发');
+  assert.equal(textOf(msgRow()), '小明房主在吗发送中');
+
+  phone.chat({ id: resent[0].id, text: '房主在吗', origin: phone.peerId, originName: '小明', peer: host2 });
+  await flush();
+  assert.equal(textOf(msgRow()), '小明房主在吗已送达');
+  assert.equal(msgRow().children[2].className, 'chat-state sent');
+  await phone.advance(10_000, 1000);
+  assert.equal(textOf(msgRow()), '小明房主在吗已送达', '回执到了之后不会再被改回「未送达」');
+});
+
+test('安卓端：等待缓冲的名单和成员面板用同一套显示名，两个同名的分得清是哪一个在卡', async (t) => {
+  const phone = await bootPhone(t, { name: '小明' });
+  await startLink(phone);
+  phone.join('peer-a1', '阿花');
+  phone.join('peer-a2', '阿花');
+  await flush();
+  phone.sync.stalledPeers.set('peer-a2', { name: '阿花', position: 0, deficitSeconds: 3, via: new Set() });
+  // 星型房间里经房主转来的别人：不在显示名表里，用他报的名字
+  phone.sync.stalledPeers.set('peer-far', { name: '远方', position: 0, deficitSeconds: 3, via: new Set() });
+  phone.sync.emit('stall-change', { who: 'peer-a2', name: '阿花', stalled: true, self: false });
+  assert.equal(phone.$('waiting').textContent, '⏳ 等待缓冲：阿花 #2、远方');
 });
 
 test('安卓端：往上翻着看旧消息时，新消息不会把人拽回底下', async (t) => {

@@ -109,6 +109,8 @@ const EN = new Map(Object.entries({
   '发送': 'Send',
   '发送中': 'Sending…',
   '已送达': 'Delivered',
+  '未送达': 'Not delivered',
+  '和房主的连接断了，连回来后补发这条消息': 'Lost the connection to the host. This message will be resent once reconnected',
   '你加入前的消息': 'Messages from before you joined',
   // 弹幕与它的本地设置
   '弹幕': 'Danmaku',

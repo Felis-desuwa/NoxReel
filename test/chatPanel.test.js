@@ -572,6 +572,12 @@ test('「发送中」转「已送达」只换那一小段文字，消息元素�
     assert.equal(row.querySelector('.chat-text'), text, '正文节点也复用，选中的文字不会被吃掉');
     assert.equal(row.querySelector('.chat-state').textContent, '已送达');
 
+    // 等了一阵房主还没转回来：标「未送达」，样式单独一档
+    panel.render({ entries: [msg('a', { self: true, state: 'failed' }), msg('b')] });
+    assert.equal(body.querySelector('.chat-msg'), row);
+    assert.equal(row.querySelector('.chat-state').textContent, '未送达');
+    assert.ok(hasClass(row.querySelector('.chat-state'), 'failed'));
+
     // 别人的消息没有送达状态那一格
     assert.equal(body.children[1].querySelector('.chat-state'), null);
   });
@@ -1102,7 +1108,21 @@ test('app.js：加入、离开、换片、谁按了暂停都在聊天流里留�
 
   const gone = app.slice(app.indexOf("S.swarm.on('peer-gone'"), app.indexOf("S.swarm.on('sources'"));
   assert.match(gone, /S\.chat\?\.gate\.forget\(peerId\)/, '走了的人要把他的令牌桶一起清掉');
-  assert.match(gone, /S\.chat\.note\(`\$\{gone\} 离开了房间`\)/);
+  // 「离开了」先压几秒：直连断了会自动重连，连回来的进出都不说（行为在下面「离开提示先压着」那条真跑）
+  assert.match(gone, /noteLeaveLater\(peerId, gone\)/);
+  assert.match(fnOf('noteLeaveLater'), /S\.chat\.note\(`\$\{name\} 离开了房间`\)/);
+  assert.match(greet, /if \(!noteRejoin\(peer\.peerId, peer\.name\)\) S\.chat\?\.note\(/);
+  // 房主（重新）连上时把还没等到回执的聊天补发给他
+  assert.match(greet, /if \(peer\.peerId === S\.hostId && !isRoomHost\(\)\) resendPendingChats\(peer\);/);
+
+  // 改过名的人离开，「离开了房间」用新名字（和安卓一样）
+  const renamed = app.slice(app.indexOf("S.swarm.on('peer-renamed'"), app.indexOf("S.swarm.on('identity-mismatch'"));
+  assert.match(renamed, /if \(S\.chat\.names\.has\(peerId\)\) S\.chat\.names\.set\(peerId, name\);/);
+
+  // 卡顿的日志 / OSD、全员暂停横幅用成员表同一套显示名（重名编号）
+  const stall = app.slice(app.indexOf("S.sync.on('stall-change'"), app.indexOf("S.sync.on('remote-action'"));
+  assert.match(stall, /roomDisplayNames\(\)\.get\(peerId\) \|\| name/);
+  assert.match(fnOf('renderStatus'), /stallBannerText\(stallWaitingNames\(\)\)/);
 
   const remote = app.slice(app.indexOf("S.sync.on('remote-action'"), app.indexOf("S.sync.on('local-action'"));
   assert.match(remote, /log\(`\$\{by\} \$\{label\} @ \$\{fmtTime\(position\)\}`\)/, '事件日志照常保留');
@@ -1163,7 +1183,26 @@ function fnSource(name) {
   return APP_SRC.slice(m.index, end + 2);
 }
 
-const CHAT_FNS = ['sendChat', 'onChatMessage', 'markChatDelivered', 'onChatHistory', 'chatPeers', 'pushChatEntry', 'chatSystem'];
+const CHAT_FNS = [
+  'sendChat',
+  'onChatMessage',
+  'markChatDelivered',
+  'onChatHistory',
+  'chatPeers',
+  'pushChatEntry',
+  'chatSystem',
+  'armChatAck',
+  'resendPendingChats',
+  'noteLeaveLater',
+  'noteRejoin',
+];
+
+/** app.js 顶层的数字常量（10_000 这种），原样取值，不在测试里另抄一份。 */
+function appNumber(name) {
+  const m = new RegExp(`^const ${name} = ([\\d_]+);`, 'm').exec(APP_SRC);
+  assert.ok(m, `app.js 里没找到常量 ${name}`);
+  return Number(m[1].replace(/_/g, ''));
+}
 
 async function chatBox({ host = false, peerId = 'me-peer-000', hostId = 'host-peer-00' } = {}) {
   const { ChatGate, ChatHistory, ChatSender } = await import('../src/renderer/lib/chat.js');
@@ -1195,16 +1234,34 @@ async function chatBox({ host = false, peerId = 'me-peer-000', hostId = 'host-pe
       sender: new ChatSender(),
       history: new ChatHistory(),
       names: new Map(),
+      leaving: new Map(),
+      acks: new Map(),
       historyShown: false,
       notice: '',
       note: (text) => ctx.chatSystem(text),
     },
   };
 
+  // 定时器由测试手动拨：等回执、压着的离开提示都靠它
+  const timers = new Map(); // id -> {fn, at}
+  let timerSeq = 0;
+  let clock = 0;
+  const advance = (ms) => {
+    clock += ms;
+    for (const [id, tm] of [...timers].sort((a, b) => a[1].at - b[1].at)) {
+      if (tm.at > clock || !timers.has(id)) continue;
+      timers.delete(id);
+      tm.fn();
+    }
+  };
+
   const ctx = {
     console,
-    setTimeout,
-    clearTimeout,
+    setTimeout: (fn, ms) => {
+      timers.set(++timerSeq, { fn, at: clock + (ms || 0) });
+      return timerSeq;
+    },
+    clearTimeout: (id) => timers.delete(id),
     Promise,
     Date,
     Set,
@@ -1218,6 +1275,9 @@ async function chatBox({ host = false, peerId = 'me-peer-000', hostId = 'host-pe
     isRoomHost: () => isHost,
     trustsRelay: chat.trustsRelay,
     parseHistory: chat.parseHistory,
+    BURST_TOKENS: chat.BURST_TOKENS,
+    CHAT_ACK_TIMEOUT_MS: appNumber('CHAT_ACK_TIMEOUT_MS'),
+    LEAVE_NOTE_DELAY_MS: appNumber('LEAVE_NOTE_DELAY_MS'),
     showDanmaku: (m) => danmakus.push(m),
     renderChat: () => {},
     chatNotice: (text) => notices.push(text),
@@ -1238,6 +1298,8 @@ async function chatBox({ host = false, peerId = 'me-peer-000', hostId = 'host-pe
     setHost: (flag) => {
       isHost = flag;
     },
+    advance,
+    pendingTimers: () => timers.size,
     entries: () => S.chat.entries,
     /** 只看真正的聊天消息（系统事件另算） */
     msgs: () => S.chat.entries.filter((e) => e.kind === 'msg'),
@@ -1419,4 +1481,137 @@ test('app.js：同一条消息进不了聊天流两次（去重表过期、历�
 
   // 重绘不抛错：真面板的 patch() 遇到重复 key 会抛，抛了就再也画不出来
   assert.doesNotThrow(() => box.ctx.pushChatEntry({ key: 'dd1111dd1111', kind: 'msg', name: '阿狸', text: '同一条' }));
+});
+
+/* ============================== 房主断开时的聊天（A8-5） ============================== */
+
+test('房主不在时发的：输入框下说清楚，等不到回执标「未送达」；房主连回来补发，回执一到改成「已送达」', async () => {
+  const box = await chatBox();
+  box.addPeer('other-peer-0', '阿狸'); // 网状房间里别的成员还连着，房主在重连
+  box.S.hostLink = 'reconnecting';
+
+  assert.equal(box.ctx.sendChat('房主在吗'), true);
+  const mine = box.msgs()[0];
+  assert.equal(mine.state, 'sending');
+  assert.deepEqual(box.wire.map(([to]) => to), ['other-peer-0'], '还连着的人照常直接收到');
+  assert.deepEqual(box.notices, ['和房主的连接断了，连回来后补发这条消息']);
+
+  // 播放器里发的，同一句推到 OSD
+  box.ctx.sendChat('播放器里说的', { fromPlayer: true });
+  assert.deepEqual(box.osds.map(([text]) => text), ['和房主的连接断了，连回来后补发这条消息']);
+
+  box.advance(box.ctx.CHAT_ACK_TIMEOUT_MS);
+  assert.deepEqual(box.msgs().map((m) => m.state), ['failed', 'failed'], '等不到回执不能永远停在「发送中」');
+
+  // 房主连回来：两条都补发给他，id 不变、ts 照旧
+  const host = box.addPeer('host-peer-00', '房主');
+  box.wire.length = 0;
+  box.ctx.resendPendingChats(host);
+  assert.deepEqual(
+    box.wire.map(([to, m]) => [to, m.t, m.id, m.text, m.ts]),
+    box.msgs().map((m) => ['host-peer-00', box.MSG.CHAT, m.key, m.text, m.ts])
+  );
+  assert.ok(box.wire.every(([, m]) => m.origin === undefined), '不是房主，补发也不许自称转发');
+  assert.deepEqual(box.msgs().map((m) => m.state), ['sending', 'sending']);
+
+  // 房主把第一条转回来：只改这一条
+  box.ctx.onChatMessage({ t: box.MSG.CHAT, id: mine.key, text: '房主在吗', ts: 1, origin: 'me-peer-000', originName: '我自己' }, host);
+  assert.deepEqual(box.msgs().map((m) => m.state), ['sent', 'sending']);
+  // 回执到了的那条，之前排着的定时器不能再把它改回「未送达」
+  box.advance(box.ctx.CHAT_ACK_TIMEOUT_MS);
+  assert.deepEqual(box.msgs().map((m) => m.state), ['sent', 'failed']);
+});
+
+test('房主已经离开：提示房主收不到；只补发最近几条（房主那边按人限速，多补也是被丢）', async () => {
+  const box = await chatBox();
+  box.S.hostGone = true;
+  box.ctx.sendChat('还有人吗');
+  assert.deepEqual(box.notices, ['房主已离开，这条消息房主收不到了']);
+
+  // 房主在的时候不提示
+  const box2 = await chatBox();
+  box2.addPeer('host-peer-00', '房主');
+  box2.ctx.sendChat('你好');
+  assert.deepEqual(box2.notices, []);
+
+  // 攒了一堆没送达的，房主回来只补最近 BURST_TOKENS 条，更早的留着「未送达」
+  const box3 = await chatBox();
+  for (let i = 0; i < 8; i++) {
+    box3.S.chat.sender.reset();
+    box3.ctx.sendChat(`第 ${i} 条`);
+  }
+  const host = box3.addPeer('host-peer-00', '房主');
+  box3.ctx.resendPendingChats(host);
+  const burst = box3.ctx.BURST_TOKENS;
+  assert.deepEqual(
+    box3.wire.map(([, m]) => m.text),
+    Array.from({ length: burst }, (_, i) => `第 ${8 - burst + i} 条`)
+  );
+  assert.deepEqual(
+    box3.msgs().map((m) => m.state),
+    [...Array(8 - burst).fill('failed'), ...Array(burst).fill('sending')]
+  );
+});
+
+test('房主收到补发：收过的不重复进列表和历史、不再上弹幕，只给发言人回一份回执；没收过的照常转给大家', async () => {
+  const box = await chatBox({ host: true, peerId: 'host-peer-00', hostId: 'host-peer-00' });
+  const a = box.addPeer('aaaa-peer-00', '阿狸');
+  const b = box.addPeer('bbbb-peer-00', '小明');
+
+  box.ctx.onChatMessage({ t: box.MSG.CHAT, id: 'abcabcabcabc', text: '收到了吗', ts: 5 }, a);
+  assert.equal(box.S.chat.history.list().length, 1);
+  box.wire.length = 0;
+
+  // 阿狸没等到回执（转回去的那份丢在断掉的旧连接上），连回来补发同一条
+  box.ctx.onChatMessage({ t: box.MSG.CHAT, id: 'abcabcabcabc', text: '收到了吗', ts: 5 }, a);
+  assert.equal(box.msgs().length, 1);
+  assert.equal(box.S.chat.history.list().length, 1, '历史里不能有两条');
+  assert.equal(box.danmakus.length, 1);
+  assert.deepEqual(
+    box.wire.map(([to, m]) => [to, m.id, m.origin, m.originName]),
+    [['aaaa-peer-00', 'abcabcabcabc', 'aaaa-peer-00', '阿狸']],
+    '只回给发言人本人，当作回执'
+  );
+
+  // 别人拿阿狸的 id 来刷，不替他回执
+  box.wire.length = 0;
+  box.ctx.onChatMessage({ t: box.MSG.CHAT, id: 'abcabcabcabc', text: '收到了吗', ts: 5 }, b);
+  assert.deepEqual(box.wire, []);
+
+  // 隔久了去重表过期：照样转给大家（发言人靠它拿回执），但列表、历史、弹幕都不重复
+  box.S.chat.gate.clear();
+  box.ctx.onChatMessage({ t: box.MSG.CHAT, id: 'abcabcabcabc', text: '收到了吗', ts: 5 }, a);
+  assert.deepEqual(box.wire.map(([to]) => to), ['aaaa-peer-00', 'bbbb-peer-00']);
+  assert.equal(box.S.chat.history.list().length, 1);
+  assert.equal(box.danmakus.length, 1);
+});
+
+/* ============================== 断线重连不刷进出（A8-6） ============================== */
+
+test('离开提示先压着：几秒内同一个人连回来，进出都不说；真走了到点才说，改了名的补一句改名', async () => {
+  const box = await chatBox();
+  const systems = () => box.entries().filter((e) => e.kind === 'system').map((e) => e.text);
+
+  // 断开：先不说
+  box.ctx.noteLeaveLater('aaaa-peer-00', '阿狸');
+  assert.deepEqual(systems(), []);
+  // 连回来了
+  assert.equal(box.ctx.noteRejoin('aaaa-peer-00', '阿狸'), true);
+  box.advance(box.ctx.LEAVE_NOTE_DELAY_MS * 2);
+  assert.deepEqual(systems(), [], '连回来的进出两句都不说');
+  assert.equal(box.pendingTimers(), 0);
+
+  // 断开期间改了名：只说改名
+  box.ctx.noteLeaveLater('aaaa-peer-00', '阿狸');
+  assert.equal(box.ctx.noteRejoin('aaaa-peer-00', '狸猫'), true);
+  assert.deepEqual(systems(), ['阿狸 改名为 狸猫']);
+
+  // 真走了：到点才说
+  box.ctx.noteLeaveLater('bbbb-peer-00', '小明');
+  box.advance(box.ctx.LEAVE_NOTE_DELAY_MS - 1);
+  assert.ok(!systems().includes('小明 离开了房间'));
+  box.advance(1);
+  assert.ok(systems().includes('小明 离开了房间'));
+  // 过了压着的时间再连回来，就是正常的新加入
+  assert.equal(box.ctx.noteRejoin('bbbb-peer-00', '小明'), false);
 });

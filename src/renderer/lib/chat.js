@@ -239,6 +239,9 @@ export class SeenIds {
 /**
  * 这条聊天到底算谁说的。
  * 只有从房主那条连接来的消息才采信 origin/originName；其他人自称转发一律按他本人算。
+ * 署名也以连接为准：不是转发的，一律用这条连接握手（和 NAME 改名）得来的 senderName，消息里自带的
+ * name 不看 —— 否则改一版客户端就能每条换一个名字，绕过改名限速和「改名为」提示，房主还会照着假名
+ * 转发、写进历史。
  * @returns {{senderId:string, relayed:boolean, origin:string, name:string}|null}
  */
 export function originOfChat(msg, { senderId, senderName, hostId } = {}) {
@@ -248,7 +251,7 @@ export function originOfChat(msg, { senderId, senderName, hostId } = {}) {
     !!hostId && senderId === hostId && typeof m.origin === 'string' && m.origin !== '' && m.origin !== senderId;
   const origin = relayed ? m.origin : senderId;
   if (!PEER_ID_RE.test(origin)) return null;
-  const rawName = relayed ? m.originName : m.name || senderName;
+  const rawName = relayed ? m.originName : senderName;
   return { senderId, relayed, origin, name: clampName(rawName) || origin };
 }
 
@@ -310,7 +313,7 @@ export class ChatGate {
   }
 
   /**
-   * @param {object} msg 线缆消息 {id, text, ts, origin?, originName?, name?}
+   * @param {object} msg 线缆消息 {id, text, ts, origin?, originName?}（自带的 name 不算数）
    * @param {object} ctx {senderId, senderName, hostId, selfId}
    * @returns {{ok:true, message:{id,text,ts,origin,name,relayed}}
    *          |{ok:false, reason:'invalid'|'echo'|'duplicate'|'rate'|'empty', retryAfterMs?:number}}
