@@ -20,7 +20,7 @@ const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
 const { pipeline } = require('stream/promises');
-const { uniquePath, moveNoOverwrite, WORK_DIR } = require('./linkCache');
+const { uniquePath, moveNoOverwrite, removeWorkDir, WORK_DIR } = require('./linkCache');
 
 // 复制时一次读写这么多：几十 GB 跨盘复制，块太小全耗在系统调用上
 const COPY_CHUNK = 4 * 1024 * 1024;
@@ -138,7 +138,8 @@ class DownloadSaver {
         if (controller.signal.aborted) throw new Error('已取消');
         return await moveNoOverwrite(partial, dir, name);
       } finally {
-        await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
+        // 外层的 .noxreel-downloading 空了一起删，别在下载文件夹里留一个空目录
+        await removeWorkDir(work);
         this.copying.delete(id);
       }
     })();

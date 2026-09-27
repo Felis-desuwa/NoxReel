@@ -106,6 +106,7 @@ const EN = new Map(Object.entries({
     'It never lowers the bitrate or resolution. The video stream is already an encoder’s output, so a general-purpose compressor gains nothing on it; nothing extra is compressed during transfer.',
   '生成一个新文件放进临时缓存，原文件不动，退房时自动清理。':
     'A new file is written to the temporary cache. The original is untouched, and the copy is removed when you leave the room.',
+  '不生成新文件，直接传原文件。': 'No new file is created; the original file is sent as is.',
   '按这个方案继续': 'Continue with this plan',
   '距起播还差': 'Left before playback starts',
   '距起播还差（当前位置附近）': 'Left before playback starts (around the current position)',
@@ -250,8 +251,8 @@ const EN = new Map(Object.entries({
     'That invite was already used or has expired. Start again with the current invite link.',
   '这是上一条邀请的应答，和眼下这条邀请对不上，已忽略；当前的邀请链接照常有效。请让对方用当前这条邀请链接重新生成应答。':
     'This answer belongs to an earlier invite and does not match the current one, so it was ignored; the current invite link still works. Ask the other person to generate a new answer from the current invite link.',
-  '打洞一直没成功：对方可能在严格 NAT 后面，也可能是邀请链接放太久、里面的网络地址已经过期。已经给你备好一条新的邀请链接，重发一次试试；还是不行就在设置里配一个 TURN 中继。':
-    'The direct connection never came up: the other side may be behind a strict NAT, or the invite link sat too long and its network addresses expired. A fresh invite link is ready—send it again; if it still fails, configure a TURN relay in Settings.',
+  '打洞一直没成功：对方可能已经取消或关掉了，也可能在严格 NAT 后面，或者邀请链接放太久、里面的网络地址已经过期。已经给你备好一条新的邀请链接，重发一次试试；还是不行就在设置里配一个 TURN 中继。':
+    'The direct connection never came up: the other side may have canceled or closed the app, may be behind a strict NAT, or the invite link sat too long and its network addresses expired. A fresh invite link is ready—send it again; if it still fails, configure a TURN relay in Settings.',
   '直连没建立起来。已经给你备好一条新的邀请链接，重发一次试试；双方都在严格 NAT 后面时需要在设置里配 TURN 中继。':
     'The direct connection failed. A fresh invite link is ready—send it again; when both sides are behind strict NAT you need a TURN relay configured in Settings.',
   '连接在握手完成前就断了。已经给你备好一条新的邀请链接，重发一次试试。':
@@ -514,6 +515,15 @@ const EN = new Map(Object.entries({
   '临时片源不属于当前运行实例': 'The temporary source does not belong to this app instance',
   '缓存目录尚未初始化': 'The cache directory has not been initialized',
   '拒绝删除缓存根目录之外的路径': 'Refused to delete a path outside the cache root',
+  // 缓存位置用不了、缓存目录建不出来时的原因（主进程 fsErrorText.js；盘不在的那句带盘符，在下面的模板里）
+  '找不到这个位置，可能已被移走或删掉': 'This location cannot be found; it may have been moved or deleted',
+  '路径里有一段是文件、不是文件夹': 'Part of the path is a file, not a folder',
+  '没有权限写入这个位置': 'No permission to write to this location',
+  '要建文件夹的地方已经有一个同名文件': 'A file with the same name is already where the folder should go',
+  '这个盘是只读的，写不进去': 'This drive is read-only',
+  '这个位置正被别的程序占用': 'This location is in use by another program',
+  '读写这个盘时出错，盘可能出了问题或者刚被拔掉': 'Reading or writing this drive failed; it may be faulty or was just unplugged',
+  '路径太长了': 'The path is too long',
 
   // —— 连接层：STUN 冗余、TURN 展开、候选诊断 ——
   '留一条地址时会自动再挂两台备用服务器兜底；想自己管这个列表就用逗号或空格分隔多写几条，那样只用你写的。':
@@ -575,6 +585,8 @@ const EN = new Map(Object.entries({
     '“Hide my IP” is on, but no TURN relay is available yet: set up TURN in Settings, or turn this option off.',
   '还不能连接': 'Cannot connect yet',
   '未授权：Cloudflare 不认这组 Turn Token ID 和 API Token': 'Unauthorized: Cloudflare rejected this Turn Token ID and API Token',
+  'Turn Token ID 不对：Cloudflare 找不到这个 ID，请到 Cloudflare 控制台核对':
+    'Wrong Turn Token ID: Cloudflare cannot find this ID. Check it in the Cloudflare dashboard',
   '网络不通：连不上 Cloudflare': 'Network problem: cannot reach Cloudflare',
   'Cloudflare 暂时不可用（限流或服务故障），稍后再试': 'Cloudflare is temporarily unavailable (rate limiting or an outage); try again later',
   'Cloudflare TURN 账号拿到了，之后新建的连接会带上中继': 'Got Cloudflare TURN credentials; new connections will use the relay',
@@ -1147,7 +1159,14 @@ const EN_PATTERNS = [
     /^没法接收《(.+)》：磁盘空间不够：这部片子需要 ([\d.]+)GB，缓存所在的磁盘只剩 ([\d.]+)GB$/,
     'Cannot receive “$1”: not enough disk space. It needs $2 GB, but the cache disk has only $3 GB free',
   ],
-  [/^没法接收《(.+)》：缓存位置用不了：(.*)$/, 'Cannot receive “$1”: the cache location is unavailable: $2'],
+  [
+    /^没法接收《(.+)》：缓存位置用不了：(.*)$/,
+    (_all, name, detail) => `Cannot receive “${name}”: the cache location is unavailable: ${translate(detail, 'en')}`,
+  ],
+  [
+    /^所在的盘 (.+) 不在，可能是移动硬盘没插、网络盘没连上或者盘符变了$/,
+    'The drive $1 is not available—a removable drive may be unplugged, a network drive disconnected, or the drive letter changed',
+  ],
   [/^观众-(\d+)$/, 'Viewer-$1'],
   [/^已复制完整 (\d+) 字符 ✓$/, 'Copied all $1 characters ✓'],
   [/^复制邀请码失败：(.*)$/, (_all, detail) => `Failed to copy invite code: ${translate(detail, 'en')}`],
@@ -1187,9 +1206,18 @@ const EN_PATTERNS = [
   ],
   [/^(\d+) 条多余音轨$/, (_all, n) => `${n} extra audio track${n === '1' ? '' : 's'}`],
   [/^(\d+) 条图形字幕$/, (_all, n) => `${n} image-based subtitle track${n === '1' ? '' : 's'}`],
-  [/^(.*)\n\n如果对方没有部署信令服务器，让他改用「极简模式」生成邀请码 —— 那个不需要服务器。$/, '$1\n\nIf the other person has no signaling server, ask them to use Manual mode, which requires no server.'],
+  // 前半句是连信令的报错，本身另有词条：得递归翻，不能把 $1 原样代进来（英文界面里会夹一句中文）
+  [
+    /^(.*)\n\n如果对方没有部署信令服务器，让他改用「极简模式」生成邀请码 —— 那个不需要服务器。$/,
+    (_all, reason) =>
+      `${translate(reason, 'en')}\n\nIf the other person has no signaling server, ask them to use Manual mode, which requires no server.`,
+  ],
   // 三种加入（邀请码、信令、房间链接）同一句：邀请已经在加入框里，改完设置点「加入」即可
-  [/^房间使用(.+)，你的本机设置是(.+)。请在设置里切换为相同模式，再点「加入」重试。$/, 'The room uses $1, while your local setting is $2. Switch to the same mode in Settings, then select “Join” to try again.'],
+  [
+    /^房间使用(.+)，你的本机设置是(.+)。请在设置里切换为相同模式，再点「加入」重试。$/,
+    (_all, room, mine) =>
+      `The room uses ${translate(room, 'en')}, while your local setting is ${translate(mine, 'en')}. Switch to the same mode in Settings, then select “Join” to try again.`,
+  ],
   [
     /^你是房主，房间里还有 (\d+) 个人。$/,
     (_all, n) => (n === '1' ? 'You are the host, and 1 other person is in the room.' : `You are the host, and ${n} other people are in the room.`),
@@ -1230,7 +1258,7 @@ const EN_PATTERNS = [
   ],
   [/^重新连接《(.+)》…$/, 'Reconnecting “$1”…'],
   [/^《(.+)》缓存好了，改从本地播$/, '“$1” is cached; playing it from disk now'],
-  [/^已和 (.+) 完成(.+)握手$/, 'Completed $2 handshake with $1'],
+  [/^已和 (.+) 完成(.+)握手$/, (_all, name, mode) => `Completed ${translate(mode, 'en')} handshake with ${name}`],
   [/^(.+)的缓冲跟不上了，全员暂停等待$/, '$1 is buffering; pausing everyone'],
   [/^等待 (.+) 缓冲…$/, 'Waiting for $1 to buffer…'],
   [/^你缓冲够了$/, 'Your buffer has recovered'],
@@ -1250,7 +1278,10 @@ const EN_PATTERNS = [
   [/^开始接收：(.*)（(.*)，(\d+) 片）$/, 'Receiving: $1 ($2, $3 chunks)'],
   [/^分片 (\d+) 校验未通过（(.*)），已丢弃重下$/, 'Chunk $1 failed verification ($2) and will be downloaded again'],
   [/^已断开身份校验失败的成员：(.*)$/, 'Disconnected member after identity verification failed: $1'],
-  [/^(.+) 的模式是(.+)，本房间是(.+)，已在传输媒体前断开。$/, '$1 uses $2 while this room uses $3. Disconnected before media transfer.'],
+  [
+    /^(.+) 的模式是(.+)，本房间是(.+)，已在传输媒体前断开。$/,
+    (_all, who, theirs, ours) => `${who} uses ${translate(theirs, 'en')} while this room uses ${translate(ours, 'en')}. Disconnected before media transfer.`,
+  ],
   [/^已阻止打开接收文件：(.*)$/, (_all, detail) => `Blocked the received file: ${translate(detail, 'en')}`],
   [/^启动 mpv 失败：(.*)$/, (_all, detail) => `Failed to start mpv: ${translate(detail, 'en')}`],
   // 可切换播放器：文案里的 X 是播放器名（mpv / PotPlayer / MPC-BE），名字本身不翻译。
@@ -1302,7 +1333,10 @@ const EN_PATTERNS = [
   [/^房间已满（(\d+) 人）。请先调高人数上限。$/, 'The room is full ($1 people). Increase the capacity first.'],
   [/^完整邀请码共 (\d+) 字符；在对方真正连上前，不会计入成员列表。$/, 'Complete invite code: $1 characters. The member is not counted until the connection succeeds.'],
   [/^已生成可点击的邀请链接；压缩握手数据 (\d+) 字符。在对方真正连上前，不会计入成员列表。$/, 'Clickable invite created; compressed handshake data: $1 characters. The member is not counted until connected.'],
-  [/^对方选择的是(.+)，本房间是(.+)。双方需分别选择相同模式。$/, 'The other member selected $1 while this room uses $2. Both sides must select the same mode.'],
+  [
+    /^对方选择的是(.+)，本房间是(.+)。双方需分别选择相同模式。$/,
+    (_all, theirs, ours) => `The other member selected ${translate(theirs, 'en')} while this room uses ${translate(ours, 'en')}. Both sides must select the same mode.`,
+  ],
   [/^(.+) 已连上 ✓$/, '$1 connected ✓'],
   [/^视频链接 · (.+) · (安全模式 · 扫描后播放|可信房间 · 边下边播|Safe mode · Play after scanning|Trusted room · Progressive playback) · 每位成员从原网站播放$/, (_all, detail, mode) => `Video link · ${detail} · ${translate(mode, 'en')} · Each member streams from the original site`],
   [/^(.+) · (\d+) 片 × (.+) · (安全模式 · 扫描后播放|可信房间 · 边下边播|Safe mode · Play after scanning|Trusted room · Progressive playback) · (你是片源|接收中)$/, (_all, size, chunks, chunkSize, mode, state) => `${size} · ${chunks} chunks × ${chunkSize} · ${translate(mode, 'en')} · ${state === '你是片源' ? 'You are the source' : 'Receiving'}`],
@@ -1322,7 +1356,7 @@ const EN_PATTERNS = [
   [/^(\d+) 人$/, '$1 viewer(s)'],
   [/^(.+)（人数上限 (\d+) 人，除你之外 (\d+) 人同时接收）$/, '$1 (capacity $2; $3 viewer(s) besides you receiving at once)'],
   [/^按这个码率，你的上行最多能同时供 (\d+) 人流畅边下边播。$/, 'At this bitrate, your uplink can smoothly serve at most $1 viewer(s) at once.'],
-  [/^上行带宽没测出来，跳过卡顿预判：(.+)$/, 'Could not measure uplink bandwidth; skipping the stall check: $1'],
+  [/^上行带宽没测出来，跳过卡顿预判：(.+)$/, (_all, detail) => `Could not measure uplink bandwidth; skipping the stall check: ${translate(detail, 'en')}`],
   [/^延迟 (.+) · P2P 媒体速度 —（各自读取原网站）$/, 'Latency $1 · P2P media rate — (each member streams from source)'],
   // 名单里可能混着我们自己的「你」这个标记，它要翻，别人的昵称一个字都不能动。
   // 顺带把中文顿号换成英文逗号 —— 整句都英文了，分隔符还是顿号会很刺眼。
@@ -1339,7 +1373,7 @@ const EN_PATTERNS = [
     'Buffer low — only your playback is paused; the room keeps playing. Resuming in about $1',
   ],
   [/^缓冲还不够，约 (.+) 后自动继续$/, 'Not enough buffer yet — resuming automatically in about $1'],
-  [/^启动失败：(.+)$/, 'Startup failed: $1'],
+  [/^启动失败：(.+)$/, (_all, detail) => `Startup failed: ${translate(detail, 'en')}`],
   [
     /^这些 TURN 地址认不出来：(.+)。地址要形如 turn:example\.com:3478$/,
     'These TURN addresses could not be understood: $1. An address looks like turn:example.com:3478',
@@ -1347,9 +1381,9 @@ const EN_PATTERNS = [
   [/^当前版本 (.+)$/, 'Current version $1'],
   [/^本次会话 (.+) · 上次退出没清掉 (.+)$/, 'This session $1 · $2 left over from last exit'],
   [/^本次会话 (.+)$/, 'This session $1'],
-  [/^统计不出来：(.+)$/, 'Could not measure: $1'],
-  [/^换不了：(.+)$/, 'Could not change it: $1'],
-  [/^清不掉：(.+)$/, 'Could not clean up: $1'],
+  [/^统计不出来：(.+)$/, (_all, detail) => `Could not measure: ${translate(detail, 'en')}`],
+  [/^换不了：(.+)$/, (_all, detail) => `Could not change it: ${translate(detail, 'en')}`],
+  [/^清不掉：(.+)$/, (_all, detail) => `Could not clean up: ${translate(detail, 'en')}`],
   [/^缓存目录已改到 (.+)$/, 'Cache directory moved to $1'],
   [
     /^换位置会立刻清掉本次运行里缓存的 (\d+) 个文件（(.+)），再放要重新接收。确定要换就再点一次「换个位置」。$/,
@@ -1357,16 +1391,21 @@ const EN_PATTERNS = [
   ],
   [/^清掉了 (\d+) 处残留缓存$/, 'Cleaned up $1 leftover cache director(ies)'],
   // 缓存清理方式、下载位置、手动清理、复用收完的片
-  [/^改不了：(.+)$/, 'Could not change it: $1'],
+  [/^改不了：(.+)$/, (_all, detail) => `Could not change it: ${translate(detail, 'en')}`],
   [/^下载位置已改到 (.+)$/, 'Download folder changed to $1'],
   [/^共 (\d+) 个，(.+)$/, '$1 file(s), $2 in total'],
   [/^删掉了 (\d+) 个缓存文件$/, 'Deleted $1 cached file(s)'],
   [/^(\d+) 个正在用，没删$/, '$1 in use, not deleted'],
   [/^(\d+) 个删不掉（可能被别的程序占着）$/, '$1 could not be deleted (another program may be using them)'],
-  [/^删不掉：(.+)$/, 'Could not delete: $1'],
+  [/^删不掉：(.+)$/, (_all, detail) => `Could not delete: ${translate(detail, 'en')}`],
   [/^确认删除 (\d+) 个$/, 'Confirm deleting $1'],
   [/^本机已有《(.+)》，正在核对…$/, 'Already have “$1” on this computer, checking it…'],
   [/^本机已有的《(.+)》核对通过，不用再传$/, '“$1” on this computer checks out; no need to transfer it again'],
+  [
+    /^本机已有的《(.+)》核对通过（(\d+) 片在核对到之前已从对端收到）$/,
+    (_all, name, n) =>
+      `“${name}” on this computer checks out (${n} chunk${n === '1' ? '' : 's'} had already arrived from others before being checked)`,
+  ],
   [/^本机的《(.+)》有 (\d+)\/(\d+) 片对得上，其余照常接收$/, '$2/$3 chunks of “$1” on this computer match; receiving the rest as usual'],
   [/^本机的《(.+)》和这一部对不上，重新接收$/, '“$1” on this computer does not match this video; receiving it again'],
   // 在线视频的手动缓存
@@ -1374,18 +1413,19 @@ const EN_PATTERNS = [
   [/^下载中 (.+)$/, 'Downloading $1'],
   [/^正在把《(.+)》另存到下载位置…$/, 'Saving a copy of “$1” to the download folder…'],
   [/^《(.+)》已存到下载位置$/, '“$1” saved to the download folder'],
-  [/^《(.+)》下载失败：(.+)$/, 'Could not download “$1”: $2'],
-  [/^《(.+)》存不到下载位置：(.+)$/, 'Could not save “$1” to the download folder: $2'],
-  [/^存不到下载位置：(.+)$/, 'Could not save to the download folder: $1'],
+  [/^《(.+)》下载失败：(.+)$/, (_all, name, detail) => `Could not download “${name}”: ${translate(detail, 'en')}`],
+  [/^《(.+)》存不到下载位置：(.+)$/, (_all, name, detail) => `Could not save “${name}” to the download folder: ${translate(detail, 'en')}`],
+  [/^存不到下载位置：(.+)$/, (_all, detail) => `Could not save to the download folder: ${translate(detail, 'en')}`],
   [/^已取消下载《(.+)》$/, 'Canceled downloading “$1”'],
   [/^《(.+)》缓存好了，之后从本地播$/, '“$1” is cached and will play from disk from now on'],
-  [/^《(.+)》缓存失败：(.+)$/, 'Could not cache “$1”: $2'],
+  [/^《(.+)》缓存失败：(.+)$/, (_all, name, detail) => `Could not cache “${name}”: ${translate(detail, 'en')}`],
   [/^开始缓存《(.+)》$/, 'Started caching “$1”'],
   [/^已取消缓存《(.+)》$/, 'Canceled caching “$1”'],
-  [/^缓存不了：(.+)$/, 'Could not cache it: $1'],
+  [/^缓存不了：(.+)$/, (_all, detail) => `Could not cache it: ${translate(detail, 'en')}`],
   [
     /^你配置的 (.+) 这次用不了（(.+)），已临时用回系统临时目录。$/,
-    'The directory you configured ($1) is unavailable this time ($2); the system temp directory is being used instead.',
+    (_all, dir, reason) =>
+      `The directory you configured (${dir}) is unavailable this time (${translate(reason, 'en')}); the system temp directory is being used instead.`,
   ],
   [/^正在放映时不能换缓存目录，退出房间后再改$/, 'The cache directory cannot change during a screening; leave the room first'],
   [/^还有临时文件没回收，退出房间后再改$/, 'Temporary files are still in use; leave the room first'],
@@ -1427,14 +1467,14 @@ const EN_PATTERNS = [
   [/^本月已用 ([\d.]+) GB \/ (\d+) GB$/, 'Used this month: $1 GB / $2 GB'],
   [/^没保存：(.+)$/, (_all, detail) => `Not saved: ${translate(detail, 'en')}`],
   [/^(Cloudflare .+)（HTTP (\d{3})）$/, (_all, detail, status) => `${translate(detail, 'en')} (HTTP ${status})`],
-  [/^没清掉：(.+)$/, 'Could not clear: $1'],
+  [/^没清掉：(.+)$/, (_all, detail) => `Could not clear: ${translate(detail, 'en')}`],
   [/^Cloudflare TURN 月上限没改成：(.+)$/, (_all, detail) => `The Cloudflare TURN monthly limit was not changed: ${translate(detail, 'en')}`],
   [
     /^这些 TURN 地址用的是 53 端口，浏览器会拦下这个端口：(.+)。换一个端口，常见的是 3478 或 443$/,
     'These TURN addresses use port 53, which the browser blocks: $1. Use another port—3478 or 443 are common',
   ],
-  [/^运行环境检查失败：(.+)$/, 'Environment check failed: $1'],
-  [/^缓存目录准备失败：(.+)$/, 'Could not prepare the cache directory: $1'],
+  [/^运行环境检查失败：(.+)$/, (_all, detail) => `Environment check failed: ${translate(detail, 'en')}`],
+  [/^缓存目录准备失败：(.+)$/, (_all, detail) => `Could not prepare the cache directory: ${translate(detail, 'en')}`],
   [/^播放器已关闭（code (.+)），可在房间里重新打开$/, 'Player closed (code $1). You can reopen it from the room.'],
   [/^mpv 错误：(.*)$/, (_all, detail) => `mpv error: ${translate(detail, 'en')}`],
   [/^信令地址无效：(.*)$/, 'Invalid signaling URL: $1'],
@@ -1442,11 +1482,16 @@ const EN_PATTERNS = [
     /^连不上信令服务器：(.*)（服务器没开、满载，或者网络不通）$/,
     'Cannot connect to signaling server: $1 (the server is down or full, or the network is unreachable)',
   ],
-  [/^无法解析这个视频链接(?:：(.*))?$/, 'Unable to parse this video URL$1'],
+  // 带原因时原因前面要有冒号：以前写成 'Unable to parse this video URL$1'，冒号跟着原文一起丢了
+  [/^无法解析这个视频链接(?:：(.*))?$/, (_all, detail) => (detail ? `Unable to parse this video URL: ${translate(detail, 'en')}` : 'Unable to parse this video URL')],
   [/^(.+) 索引已在文件头，可直接边下边播$/, '$1 index is at the beginning and supports progressive playback'],
   [/^(.+) 的 moov 索引在文件末尾，顺序下载时要等整个文件下完才能起播。转封装把索引挪到开头即可，无损且不重编码。$/, '$1 has its moov index at the end, so sequential download cannot start early. Remuxing moves it to the beginning without re-encoding or quality loss.'],
-  [/^没找到 ffmpeg。请安装后重试（(.*)），或设置环境变量 (.*)$/, 'ffmpeg was not found. Install it ($1) or set $2.'],
-  [/^没找到 mpv。请安装后重试（(.*)），或设置环境变量 (.*)$/, 'mpv was not found. Install it ($1) or set $2.'],
+  // 安装命令和环境变量那两段里还夹着「或」「指向」，原样代入的话英文句子里会剩下中文
+  [
+    /^没找到 (ffmpeg|mpv)。请安装后重试（(.*)），或设置环境变量 (.*)$/,
+    (_all, name, how, env) =>
+      `${name} was not found. Install it (${how.replace(/ 或 /g, ' or ')}) or set ${env.replace(/ 指向 /, ' to point to ')}.`,
+  ],
   [/^没找到 yt-dlp，无法解析视频网页。请重新安装完整版本，或设置 (.*)。$/, 'yt-dlp was not found, so video pages cannot be parsed. Reinstall the full build or set $1.'],
   [/^安全扫描失败（代码 (.+)）$/, 'Security scan failed (code $1)'],
   [/^安全扫描超过 (\d+) 分钟仍未完成$/, 'The security scan did not finish within $1 minutes'],
@@ -1481,8 +1526,8 @@ const EN_PATTERNS = [
   [/^读取分片 (.*) 短读$/, 'Short read while reading chunk $1'],
   // 房间页重排（0.7.1）。放在最后：「持有 N% · 延迟 X」要排在上面三段式那条后面，不然会把它吞掉
   [/^还能再来 (\d+) 人$/, (_all, n) => `Room for ${n} more`],
-  [/^没能生成邀请链接：(.+)$/, 'Could not create the invite link: $1'],
-  [/^生成邀请链接失败：(.+)$/, 'Failed to create the invite link: $1'],
+  [/^没能生成邀请链接：(.+)$/, (_all, detail) => `Could not create the invite link: ${translate(detail, 'en')}`],
+  [/^生成邀请链接失败：(.+)$/, (_all, detail) => `Failed to create the invite link: ${translate(detail, 'en')}`],
   [
     /^(已连接|等人加入) · (可信房间|安全模式) · (\d+) \/ (\d+) 人$/,
     (_all, state, mode, n, max) =>

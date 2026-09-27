@@ -93,6 +93,17 @@ async function moveNoOverwrite(file, dir, name) {
   throw new Error('同名文件太多了');
 }
 
+/**
+ * 删掉一个任务的工作目录（<dir>/.noxreel-downloading/<号>/），外层的 .noxreel-downloading 空了就一起删。
+ * 不删的话每下完、复制完一次，下载文件夹和长期缓存文件夹里就留一个空的 .noxreel-downloading
+ * （Windows 上不带点号隐藏），要等下次启动才清。外层用 rmdir：别的任务还在里面放着半截文件时删不掉，正好不动。
+ */
+async function removeWorkDir(work) {
+  await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
+  const parent = path.dirname(work);
+  if (path.basename(parent) === WORK_DIR) await fsp.rmdir(parent).catch(() => {});
+}
+
 /** 路径是不是在 dir 里面（yt-dlp 报回来的文件路径不能跑到工作目录外面去）。 */
 function inside(dir, target) {
   const rel = path.relative(dir, target);
@@ -435,4 +446,4 @@ class LinkCache extends EventEmitter {
   }
 }
 
-module.exports = { LinkCache, safeTitle, uniquePath, moveNoOverwrite, WORK_DIR, FORMAT, MAX_PARALLEL, PURPOSES };
+module.exports = { LinkCache, safeTitle, uniquePath, moveNoOverwrite, removeWorkDir, WORK_DIR, FORMAT, MAX_PARALLEL, PURPOSES };

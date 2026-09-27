@@ -437,8 +437,27 @@ function openPlan(info, opts) {
     picked: select.value,
     texts: parts.filter((p) => p.tag === 'p').map((p) => p.text),
     ok: () => (modal.onOk(), result),
+    select,
+    // 「产物」那一段现在说的话：field('产物', outputHint) → outputHint 里一条 hint
+    output: () => parts.find((p) => p.tag === 'field' && p.children[0] === '产物').children[1].children[0].children[0],
   };
 }
+
+test('选方案：「产物」一段跟着所选方案说，原样传输不写「生成一个新文件」（E4-E）', () => {
+  const NEW_FILE = '生成一个新文件放进临时缓存，原文件不动，退房时自动清理。';
+  const safe = openPlan(MP4_TAIL, { needsRemux: false, optionalRemux: true, canSlim: false });
+  assert.equal(safe.picked, 'as-is');
+  assert.equal(safe.output(), '不生成新文件，直接传原文件。');
+  safe.select.value = 'remux';
+  safe.select.onchange();
+  assert.equal(safe.output(), NEW_FILE, '改选转封装就要生成新文件');
+  safe.select.value = 'as-is';
+  safe.select.onchange();
+  assert.equal(safe.output(), '不生成新文件，直接传原文件。');
+
+  const trusted = openPlan(MP4_TAIL, { needsRemux: true, optionalRemux: false, canSlim: false });
+  assert.equal(trusted.output(), NEW_FILE);
+});
 
 test('选方案：安全模式下默认原样传，转封装是可选项；可信房间只有转封装', async () => {
   const safe = openPlan(MP4_TAIL, { needsRemux: false, optionalRemux: true, canSlim: false });

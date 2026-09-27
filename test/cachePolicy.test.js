@@ -266,6 +266,8 @@ test('手动模式：长期缓存文件夹里已经有同名文件就另起名�
   assert.equal(library.findFile(manifest.fileId)?.entry.path, path.join(keptDir, 'movie (3).mkv'));
   assert.equal(await fsp.readFile(mine, 'utf8'), '用户自己的东西');
   assert.equal(await fsp.readFile(path.join(keptDir, 'movie (2).mkv'), 'utf8'), '也是用户的');
+  // E4-F：收完挪成正式片名之后，长期缓存文件夹里不留一个空的 .noxreel-downloading
+  assert.equal(fs.existsSync(path.join(keptDir, WORK_DIR)), false);
 });
 
 test('手动模式：没收完的新文件关会话就删；复用来的没收完不删（对得上的片下次还能用）', async (t) => {
@@ -277,6 +279,7 @@ test('手动模式：没收完的新文件关会话就删；复用来的没收�
   await store.close(partial.sessionId);
   assert.equal(fs.existsSync(partial.filePath), false, '新建的、没收完的删掉');
   assert.equal(fs.existsSync(path.dirname(partial.filePath)), false, '工作目录一起删');
+  assert.equal(fs.existsSync(path.dirname(path.dirname(partial.filePath))), false, '外层的 .noxreel-downloading 空了也删（E4-F）');
 
   const first = await store.openLeech(manifest);
   await receiveAll(first, chunks);
@@ -459,6 +462,18 @@ test('缓存位置写不进去（盘拔了、没权限）报成「缓存位置�
   await assert.rejects(store.openLeech({ ...manifestFor('movie.mkv', makeChunks()), chunkSize: 1 }), /无效的媒体清单/);
 });
 
+test('长期缓存文件夹所在的盘不在：原因说成「所在的盘 X: 不在」，不是 Node 的 ENOENT 原文（E4-B）', { skip: process.platform !== 'win32' }, async (t) => {
+  const letter = [...'ZYXWVUTSRQPONMLKJIHG'].find((l) => !fs.existsSync(`${l}:\\`));
+  if (!letter) return t.skip('这台机器上找不到空着的盘符');
+  await setup(t, { mode: 'manual' });
+  store.setPolicy({ mode: 'manual', keptDir: `${letter}:\\NoxReel\\kept` });
+  await assert.rejects(store.openLeech(manifestFor('movie.mkv', makeChunks())), (error) => {
+    assert.equal(error.message, `缓存位置用不了：所在的盘 ${letter}: 不在，可能是移动硬盘没插、网络盘没连上或者盘符变了`);
+    assert.equal(error.code, 'ENOENT', '错误码照旧带着');
+    return true;
+  });
+});
+
 /* ------------------------------ 复用：先开会话，后台核对 ------------------------------ */
 
 function bigChunks(count, fill) {
@@ -505,6 +520,9 @@ test('复用：抽查完片头片尾就开出会话，其余的在后台核对�
   const done = await waitForStage(events, 'done');
   assert.equal(done.sessionId, state.sessionId);
   assert.equal(done.matched, chunks.length - 1, '对端送来的那一片不核对（在落盘就跳过），不算核对上的');
+  // E4-A：这一片单独记成「对端先送到的」，界面据此仍说「核对通过」，不说成有一片对不上
+  assert.equal(done.fromPeer, 1);
+  assert.equal(done.matched + done.fromPeer, done.total);
   // done 带的 state 可能还没算上正在落盘的那一片 —— 界面那边是按写入回包记的，两边并起来就齐了
   assert.ok(done.state.haveCount >= chunks.length - 1);
   const final = store.state(state.sessionId);

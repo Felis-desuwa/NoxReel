@@ -291,6 +291,8 @@ const EN = new Map(Object.entries({
   '已保存': 'Saved',
   '已清除': 'Cleared',
   '未授权：Cloudflare 不认这组 Turn Token ID 和 API Token': 'Unauthorized: Cloudflare rejected this Turn Token ID and API Token',
+  'Turn Token ID 不对：Cloudflare 找不到这个 ID，请到 Cloudflare 控制台核对':
+    'Wrong Turn Token ID: Cloudflare cannot find this ID. Check it in the Cloudflare dashboard',
   '网络不通：连不上 Cloudflare': 'Network problem: cannot reach Cloudflare',
   'Cloudflare 暂时不可用（限流或服务故障），稍后再试': 'Cloudflare is temporarily unavailable (rate limiting or an outage); try again later',
   'Cloudflare TURN 账号拿到了，之后新建的连接会带上中继': 'Got Cloudflare TURN credentials; new connections will use the relay',
@@ -370,8 +372,13 @@ const PATTERNS = [
     '$1 lost the signaling connection, but the direct connection is still up and the transfer continues',
   ],
   [/^已和 (.+) 建立数据通道，正在校验房间模式…$/, 'Data channel established with $1; verifying room mode…'],
-  [/^已和 (.+) 完成(.+)握手$/, 'Completed $2 handshake with $1'],
-  [/^模式不一致：本机是(.+)，对方是(.+)，已在传输媒体前断开。$/, 'Mode mismatch: this device uses $1 and the peer uses $2. Disconnected before media transfer.'],
+  // 模式名（安全模式 / 可信房间）是手机上拼进去的中文，也要翻：'$2' 那种写法会把它原样留在英文界面里
+  [/^已和 (.+) 完成(.+)握手$/, (_all, name, mode) => `Completed ${translate(mode, 'en')} handshake with ${name}`],
+  [
+    /^模式不一致：本机是(.+)，对方是(.+)，已在传输媒体前断开。$/,
+    (_all, mine, theirs) =>
+      `Mode mismatch: this device uses ${translate(mine, 'en')} and the peer uses ${translate(theirs, 'en')}. Disconnected before media transfer.`,
+  ],
   [/^已断开身份校验失败的成员：(.*)$/, 'Disconnected member after identity verification failed: $1'],
   [/^开始接收《(.+)》 · (.+)$/, 'Receiving “$1” · $2'],
   [/^房主请求手机连接 (.+) 播放在线视频。是否允许？$/, 'The host wants your phone to connect to $1 for online playback. Allow it?'],
@@ -395,7 +402,10 @@ const PATTERNS = [
     'Cannot connect to signaling server: $1 (the server is down or full, or the network is unreachable)',
   ],
   [/^邀请码无效：(.*)$/, (_all, detail) => `Invalid invite code: ${translate(detail, 'en')}`],
-  [/^房间使用(.+)，本机设置是(.+)。请切换为相同模式后重试。$/, 'The room uses $1 while this device uses $2. Select the same mode and try again.'],
+  [
+    /^房间使用(.+)，本机设置是(.+)。请切换为相同模式后重试。$/,
+    (_all, room, mine) => `The room uses ${translate(room, 'en')} while this device uses ${translate(mine, 'en')}. Select the same mode and try again.`,
+  ],
   [/^房主的片子：(.+) · (.+)$/, 'Host video: $1 · $2'],
   // 具体的身份说明要排在通配的「身份：X」前面：PATTERNS first-match-wins，排在后面就永远轮不到
   [/^身份：游客 · 播放\/暂停仅对自己生效，不能拖动进度$/, 'Role: Guest · Play/pause only affects you; seeking is disabled'],
@@ -472,7 +482,11 @@ const PATTERNS = [
   ],
   [/^已收 (\d+)% · 距起播还差 (.+) · ↓(.+)$/, 'Received $1% · $2 left before playback starts · ↓$3'],
   [/^(\d+) 人在线$/, '$1 online'],
-  [/^⏳ 等待缓冲：(.*)$/, '⏳ Waiting for buffer: $1'],
+  // 名单里可能混着我们自己的「你」这个标记，它要翻，别人的昵称一个字都不能动；顿号换成英文逗号（同桌面端 joinWaiting）
+  [
+    /^⏳ 等待缓冲：(.*)$/,
+    (_all, who) => `⏳ Waiting for buffer: ${who.split('、').map((name) => (name === '你' ? 'you' : name)).join(', ')}`,
+  ],
   // 在线链接和房主差多少秒
   [
     /^你比房主(慢|快) (\d+) 秒$/,
@@ -481,7 +495,7 @@ const PATTERNS = [
   [/^和房主差了 ([\d.]+) 秒，自动对齐$/, '$1 seconds off from the host; realigned automatically'],
   [/^信令断开，(\d+) 秒后重连（已建立的直连不受影响）$/, 'Signaling disconnected. Reconnecting in $1 seconds.'],
   [/^和 (.+) 的连接迟迟没建起来，重新协商$/, 'The connection to $1 is taking too long to come up; negotiating again'],
-  [/^信令错误：(.*)$/, 'Signaling error: $1']
+  [/^信令错误：(.*)$/, (_all, detail) => `Signaling error: ${translate(detail, 'en')}`]
 ];
 
 let locale = (() => {

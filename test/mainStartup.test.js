@@ -191,8 +191,11 @@ test('默认缓存目录建不出来、第一次建窗口又失败：照样去�
   for (const fn of second) fn({}, ['C:\\Program Files\\NoxReel\\NoxReel.exe'], process.cwd());
   assert.equal(windows.length, 1);
 
-  // 页面启动时调 app:ensureDirs：再试一次，失败的原因交给界面去说
+  // 页面启动时调 app:ensureDirs：再试一次，失败的原因交给界面去说 —— 说人话，不是「EEXIST: file already exists, mkdir …」
   const main = windows[0];
   const ensureDirs = handlers.get('app:ensureDirs');
-  await assert.rejects(ensureDirs({ sender: main.webContents, senderFrame: main.webContents.mainFrame }), /EEXIST|ENOTDIR|exist/i);
+  await assert.rejects(ensureDirs({ sender: main.webContents, senderFrame: main.webContents.mainFrame }), (error) => {
+    assert.match(error.message, /^(要建文件夹的地方已经有一个同名文件|路径里有一段是文件、不是文件夹)$/);
+    return true;
+  });
 });

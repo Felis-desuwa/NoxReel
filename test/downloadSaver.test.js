@@ -62,6 +62,7 @@ test('硬链接不行（跨盘、文件系统不支持）就复制：先写进�
   assert.equal(fs.readFileSync(r.path).length, 4096);
   assert.equal(path.basename(path.dirname(path.dirname(targets[0]))), WORK_DIR, '复制写的是 .noxreel-downloading/<号>/ 里的临时文件');
   assert.equal(fs.existsSync(path.dirname(targets[0])), false, '工作目录用完就删');
+  assert.equal(fs.existsSync(path.join(dir(), WORK_DIR)), false, '外层的 .noxreel-downloading 空了也删，不在下载文件夹里留空目录（E4-F）');
   assert.equal(saver.busy, false);
 });
 

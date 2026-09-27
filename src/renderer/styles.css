@@ -479,6 +479,14 @@ select:disabled {
   line-height: 1.6;
   overflow-wrap: anywhere;
 }
+/* 一起拖进来、没能加上的文件（首页卡片上那份被准备页盖住了）。没有就不占位置 */
+.prep-skipped {
+  margin-top: 10px;
+  overflow-wrap: anywhere;
+}
+.prep-skipped:empty {
+  display: none;
+}
 .prep-actions {
   margin-top: 20px;
   display: flex;

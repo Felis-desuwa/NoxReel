@@ -342,6 +342,8 @@ function show(viewId) {
   document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
   $(viewId).classList.add('active');
   $('topbar').classList.toggle('hidden', viewId === 'view-boot');
+  // 准备页上列着的「一起拖进来却没加上的文件」只属于那一批开房：离开准备页就撤掉，别带到下一次加入里
+  if (viewId !== 'view-prepare') $('prep-skipped')?.replaceChildren();
 }
 
 function log(text, kind = '') {
@@ -354,6 +356,16 @@ function log(text, kind = '') {
   el.appendChild(line);
   el.scrollTop = el.scrollHeight;
   while (el.children.length > 300) el.removeChild(el.firstChild);
+}
+
+/**
+ * 主进程抛来的错只留我们自己那句：Electron 会套一层「Error invoking remote method 'xxx': Error: 」前缀，
+ * 原样写进日志就是半句看不懂的英文夹着中文。
+ */
+function ipcErrorText(error) {
+  return String(error?.message || error || '')
+    .replace(/^Error invoking remote method '[^']*': /, '')
+    .replace(/^[A-Za-z]*Error: /, '');
 }
 
 /**
@@ -462,6 +474,8 @@ function cfErrorCode(error) {
 
 const CF_ERROR_TEXT = {
   CF_UNAUTHORIZED: '未授权：Cloudflare 不认这组 Turn Token ID 和 API Token',
+  // Cloudflare 回 404：地址里的 Turn Token ID 找不到。要用户去核对，后台重试没用（不在 CF_RETRYABLE 里）
+  CF_BAD_KEY_ID: 'Turn Token ID 不对：Cloudflare 找不到这个 ID，请到 Cloudflare 控制台核对',
   CF_NETWORK: '网络不通：连不上 Cloudflare',
   CF_UNAVAILABLE: 'Cloudflare 暂时不可用（限流或服务故障），稍后再试',
   CF_BAD_RESPONSE: 'Cloudflare 的回应看不懂',
@@ -861,7 +875,7 @@ async function boot() {
     // 开发期端到端测试钩子（主进程只在未打包且显式打开时才报 devHooks）
     if (S.env.devHooks === true) window.__noxreel = { S, submitPlaylistOp };
   } catch (error) {
-    log(`运行环境检查失败：${error.message || error}`, 'bad');
+    log(`运行环境检查失败：${ipcErrorText(error)}`, 'bad');
     S.env = {};
   }
   // 首页角落的版本号（主进程的 app.getVersion()）。报问题时先问的就是它，别让人去翻设置
@@ -870,7 +884,8 @@ async function boot() {
   try {
     await window.sw.env.ensureDirs();
   } catch (error) {
-    log(`缓存目录准备失败：${error.message || error}`, 'bad');
+    // 原因主进程已经换成人话了，这里只去掉 Electron 套的前缀
+    log(`缓存目录准备失败：${ipcErrorText(error)}`, 'bad');
   }
 
   updateDepsPill();
@@ -1058,11 +1073,11 @@ dz.addEventListener('drop', async (e) => {
   if (!e.dataTransfer.files.length) return;
   const { paths, failures } = await approvedDropPaths(e.dataTransfer.files);
   // 用不了的留在首页卡片上说清楚（别用 alert：会响提示音）。一起拖进来的其余文件照常开房，
-  // 跳过了哪几个另记进日志，进房后也看得到。
+  // 首页卡片马上就被准备页盖住了，所以准备页上也列一遍；跳过了哪几个另记进日志，进房后也看得到。
   showDropFailures(failures);
   if (!paths.length) return;
   for (const failure of failures) log(dropFailureLine(failure), 'warn');
-  startHostMany(paths);
+  startHostMany(paths, failures);
 });
 
 /**
@@ -1114,7 +1129,11 @@ const dropFailureLine = ({ name, reason }) => `没加上《${name}》：${reason
 const DROP_FAILURES_SHOWN = 5;
 
 function showDropFailures(failures) {
-  const box = $('drop-err');
+  renderDropFailures($('drop-err'), failures);
+}
+
+/** 没加上的文件逐条列进 box（首页卡片、准备页各一份），太多就只列前几条。 */
+function renderDropFailures(box, failures) {
   if (!box) return;
   const lines = failures.slice(0, DROP_FAILURES_SHOWN).map((f) => make('div', { text: dropFailureLine(f) }));
   if (failures.length > DROP_FAILURES_SHOWN) {
@@ -1477,8 +1496,12 @@ async function prepareLocalFile(filePath, reporter) {
  *
  * 第一部没能开成房时，剩下的选择不能就这么消失：出错就换下一部接着试（失败的名字一起报出来），
  * 用户自己点了取消就整批停下 —— 那是「这一场不传了」的意思，别替他拿下一部去开房。
+ *
+ * skipped：一起拖进来却没加上的文件。首页卡片上那份马上就被准备页盖住了，准备页上再列一遍，
+ * 这一批准备、失败的结论页上都看得到；离开准备页（进房、回首页）时 show() 把它撤掉。
  */
-async function startHostMany(paths) {
+async function startHostMany(paths, skipped = []) {
+  if (skipped.length) renderDropFailures($('prep-skipped'), skipped);
   const rest = [...paths].filter(Boolean);
   const failed = [];
   while (rest.length) {
@@ -2936,7 +2959,19 @@ function choosePrepPlan(info, { needsRemux, optionalRemux = false, mustConvert =
           renderDetail();
         };
 
+        // 「产物」那一段跟着所选方案说：原样传输不生成新文件，别写成「生成一个新文件放进临时缓存」
+        const outputHint = make('div');
+        const renderOutput = () =>
+          outputHint.replaceChildren(
+            hint(
+              picked === 'as-is'
+                ? '不生成新文件，直接传原文件。'
+                : '生成一个新文件放进临时缓存，原文件不动，退房时自动清理。'
+            )
+          );
+
         const renderDetail = () => {
+          renderOutput();
           detail.replaceChildren();
           if (picked !== 'slim') return;
 
@@ -3036,7 +3071,7 @@ function choosePrepPlan(info, { needsRemux, optionalRemux = false, mustConvert =
             )
           )
         );
-        parts.push(field('产物', hint('生成一个新文件放进临时缓存，原文件不动，退房时自动清理。')));
+        parts.push(field('产物', outputHint));
         renderDetail();
         return parts;
       },
@@ -7751,7 +7786,8 @@ function watchManualHandshake(peer, status) {
   const timer = setTimeout(
     () =>
       finish(
-        '打洞一直没成功：对方可能在严格 NAT 后面，也可能是邀请链接放太久、里面的网络地址已经过期。已经给你备好一条新的邀请链接，重发一次试试；还是不行就在设置里配一个 TURN 中继。',
+        // 对方点了取消、关了软件，房主这边是不知道的：只会干等到超时。所以这一种也得说上
+        '打洞一直没成功：对方可能已经取消或关掉了，也可能在严格 NAT 后面，或者邀请链接放太久、里面的网络地址已经过期。已经给你备好一条新的邀请链接，重发一次试试；还是不行就在设置里配一个 TURN 中继。',
         { retry: true }
       ),
     MANUAL_HANDSHAKE_TIMEOUT_MS
@@ -7777,6 +7813,26 @@ function watchManualHandshake(peer, status) {
   });
 }
 
+/**
+ * 邀请卡上那行状态此刻看得见吗。邀请卡收起来时只是加了 hidden 类，#inv-status 还在文档里、isConnected 照样为真；
+ * 成员页签没开着、房间页没显示时也一样。这几种情况它都没有布局框，getClientRects() 是空的。
+ */
+function inviteStatusVisible(status) {
+  return Boolean(status?.isConnected && status.getClientRects?.().length);
+}
+
+/**
+ * 应答链接没接成的原因说给房主听。以前只看 isConnected：邀请卡收起时照样写进卡片，谁也看不见 ——
+ * 房主在房间里又点开一条用过的应答链接，「已经用过或已失效」就这样被吞掉了。
+ * 看得见就写在卡片上；人在房间里另记进房间日志（卡片收着时只有日志看得到）；还没进房、卡片也看不见，写在加入框下面。
+ */
+function reportManualAnswer(status, message, kind) {
+  const visible = inviteStatusVisible(status);
+  if (visible) status.textContent = message;
+  if (roomEntered) log(message, kind);
+  else if (!visible) $('join-err').textContent = message;
+}
+
 async function acceptManualAnswer(rawInput) {
   const raw = String(rawInput || '').trim();
   if (!raw) return;
@@ -7785,10 +7841,7 @@ async function acceptManualAnswer(rawInput) {
   if (!peer) {
     // 应答链接被点开两次，或者这条邀请已经作废（超时后重新生成过）。
     // 以前这里直接 throw，落在没人接住的地方，界面上什么都不会发生。
-    const message = '这条邀请已经用过或已失效，请用当前这条邀请链接重新走一遍。';
-    if (status?.isConnected) status.textContent = message;
-    else if (roomEntered) log(message, 'warn');
-    else $('join-err').textContent = message;
+    reportManualAnswer(status, '这条邀请已经用过或已失效，请用当前这条邀请链接重新走一遍。', 'warn');
     return;
   }
   let registered = false;
@@ -7833,12 +7886,9 @@ async function acceptManualAnswer(rawInput) {
     show('view-room');
   } catch (error) {
     if (registered) S.swarm.removePeer(peer.peerId);
-    // 登记之后再出错的话，看门狗已经把邀请区重画了，原来那个状态节点是游离的，
-    // 写进去谁也看不见 —— 这种情况把原因落到房间日志里。
-    const message = error.message || String(error);
-    if (status?.isConnected) status.textContent = message;
-    else if (roomEntered) log(message, 'bad');
-    else $('join-err').textContent = message;
+    // 登记之后再出错的话，看门狗已经把邀请区重画了，原来那个状态节点是游离的；
+    // 房主手动收起了邀请卡再贴应答也一样看不见 —— 这些情况把原因落到房间日志里。
+    reportManualAnswer(status, error.message || String(error), 'bad');
   }
 }
 
@@ -9187,12 +9237,28 @@ window.sw.store.onReuse?.((e) => {
   if (!e || typeof e.name !== 'string') return;
   mergeVerifiedChunks(e);
   if (e.stage === 'start') log(`本机已有《${e.name}》，正在核对…`);
-  else if (e.stage === 'done') {
-    if (e.matched === e.total) log(`本机已有的《${e.name}》核对通过，不用再传`, 'good');
-    else if (e.matched > 0) log(`本机的《${e.name}》有 ${e.matched}/${e.total} 片对得上，其余照常接收`, 'warn');
-    else log(`本机的《${e.name}》和这一部对不上，重新接收`, 'warn');
-  }
+  else if (e.stage === 'done') log(...reuseDoneLine(e));
 });
+
+/**
+ * 核对完的那一句。核对期间对端先送到的片（fromPeer）没核对，但也不是对不上：本机核对过的片全对得上，
+ * 就说「核对通过」。以前拿核对上的片数和总数比，会话一开调度器就向对端要片，本机副本完好也报「有 715/716 片对得上」。
+ * @returns {[string, string]} 日志文本和级别
+ */
+function reuseDoneLine(e) {
+  const fromPeer = Number(e.fromPeer) || 0;
+  const checked = e.total - fromPeer;
+  if (e.matched > 0 && e.matched >= checked) {
+    return [
+      fromPeer > 0
+        ? `本机已有的《${e.name}》核对通过（${fromPeer} 片在核对到之前已从对端收到）`
+        : `本机已有的《${e.name}》核对通过，不用再传`,
+      'good',
+    ];
+  }
+  if (e.matched > 0) return [`本机的《${e.name}》有 ${e.matched}/${checked} 片对得上，其余照常接收`, 'warn'];
+  return [`本机的《${e.name}》和这一部对不上，重新接收`, 'warn'];
+}
 
 /* ------------------------------- 控件 ------------------------------- */
 

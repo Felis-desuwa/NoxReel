@@ -312,9 +312,10 @@ test('卡顿预判与不限文件大小的新文案都有英文', async () => {
     translate('按这个码率，你的上行最多能同时供 4 人流畅边下边播。', 'en'),
     'At this bitrate, your uplink can smoothly serve at most 4 viewer(s) at once.'
   );
+  // 原因那一段本身另有词条，要递归翻（以前原样代入，英文句子里夹着中文）
   assert.equal(
     translate('上行带宽没测出来，跳过卡顿预判：测速超过 15 秒', 'en'),
-    'Could not measure uplink bandwidth; skipping the stall check: 测速超过 15 秒'
+    'Could not measure uplink bandwidth; skipping the stall check: The speed test took longer than 15 seconds'
   );
   // 0.7 起列表里可能同时有好几部，放不下时要说是哪一部；片名是用户内容，原样保留
   assert.equal(

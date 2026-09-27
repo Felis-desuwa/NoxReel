@@ -315,8 +315,9 @@ for (const { name, dir } of IMPLS) {
   });
 }
 
-function answerBox({ inviteId = 'cur001' } = {}) {
-  const status = { isConnected: true, textContent: '' };
+function answerBox({ inviteId = 'cur001', visible = true } = {}) {
+  // 邀请卡收起（hidden 类）、成员页签没开时节点还在文档里，只是没有布局框
+  const status = { isConnected: true, textContent: '', getClientRects: () => (visible ? [{}] : []) };
   const calls = [];
   const peer = {
     peerId: 'pending-abc',
@@ -337,11 +338,12 @@ function answerBox({ inviteId = 'cur001' } = {}) {
   return { status, calls, peer, S };
 }
 
-async function acceptWith(box, answer) {
+async function acceptWith(box, answer, { roomEntered = true, raw = null } = {}) {
   const { encodeCode, decodeCode } = await load('src/renderer/lib/signaling.js');
-  const ctx = sandbox([fnSource('acceptManualAnswer')], {
+  box.joinErr = { textContent: '' };
+  const ctx = sandbox([fnSource('acceptManualAnswer'), fnSource('reportManualAnswer'), fnSource('inviteStatusVisible')], {
     S: box.S,
-    $: (id) => (id === 'inv-status' ? box.status : { textContent: '' }),
+    $: (id) => (id === 'inv-status' ? box.status : id === 'join-err' ? box.joinErr : { textContent: '' }),
     decodeCode,
     PROTOCOL_VERSION: 2,
     normalizeSecurityMode: (m) => (m === 'trusted' ? 'trusted' : 'safe'),
@@ -350,21 +352,61 @@ async function acceptWith(box, answer) {
     wirePeer: () => {},
     watchManualHandshake: () => box.calls.push('watch'),
     show: () => {},
-    roomEntered: true,
-    log: (m) => box.calls.push(`log:${m}`),
+    roomEntered,
+    log: (m, kind) => box.calls.push(`log:${kind}:${m}`),
   });
-  await ctx.acceptManualAnswer(await encodeCode(answer));
+  await ctx.acceptManualAnswer(raw ?? (await encodeCode(answer)));
 }
+
+const STALE_ANSWER = '这是上一条邀请的应答，和眼下这条邀请对不上，已忽略；当前的邀请链接照常有效。请让对方用当前这条邀请链接重新生成应答。';
+const USED_INVITE = '这条邀请已经用过或已失效，请用当前这条邀请链接重新走一遍。';
 
 test('上一条邀请的应答对不上号：直接拒掉，手上这条邀请原封不动', async () => {
   const box = answerBox();
   await acceptWith(box, { ...ANSWER, invite: 'old001' });
-  assert.equal(
-    box.status.textContent,
-    '这是上一条邀请的应答，和眼下这条邀请对不上，已忽略；当前的邀请链接照常有效。请让对方用当前这条邀请链接重新生成应答。'
-  );
+  assert.equal(box.status.textContent, STALE_ANSWER);
   assert.equal(box.S.pendingManualPeer, box.peer, '当前邀请被消耗了');
-  assert.deepEqual(box.calls, [], '对不上号的应答被套到了当前这条连接上');
+  // 人在房间里：卡片上写一份，日志里也记一份
+  assert.deepEqual(box.calls, [`log:bad:${STALE_ANSWER}`], '对不上号的应答被套到了当前这条连接上');
+});
+
+test('E3-A：邀请卡收起时点开一条用过的应答链接，「已经用过或已失效」落进房间日志，不写进看不见的卡片', async () => {
+  const box = answerBox({ visible: false });
+  box.S.pendingManualPeer = null;
+  await acceptWith(box, null, { raw: 'NR3-用过的应答' });
+  assert.equal(box.status.textContent, '', '写进了收起的邀请卡');
+  assert.deepEqual(box.calls, [`log:warn:${USED_INVITE}`]);
+  assert.equal(box.joinErr.textContent, '');
+});
+
+test('E3-A：邀请卡收起后贴上一条对不上号的应答，原因也落进房间日志', async () => {
+  const box = answerBox({ visible: false });
+  await acceptWith(box, { ...ANSWER, invite: 'old001' });
+  assert.equal(box.status.textContent, '');
+  assert.deepEqual(box.calls, [`log:bad:${STALE_ANSWER}`]);
+});
+
+test('E3-A：还没进房、卡片也看不见时写在加入框下面；卡片看得见就写在卡片上', async () => {
+  const hidden = answerBox({ visible: false });
+  hidden.S.pendingManualPeer = null;
+  await acceptWith(hidden, null, { raw: 'NR3-x', roomEntered: false });
+  assert.equal(hidden.joinErr.textContent, USED_INVITE);
+  assert.deepEqual(hidden.calls, []);
+
+  const shown = answerBox({ visible: true });
+  shown.S.pendingManualPeer = null;
+  await acceptWith(shown, null, { raw: 'NR3-x', roomEntered: false });
+  assert.equal(shown.status.textContent, USED_INVITE);
+  assert.equal(shown.joinErr.textContent, '');
+  assert.deepEqual(shown.calls, []);
+});
+
+test('E3-A：邀请卡看不看得见按布局框判断，不只看在不在文档里', () => {
+  const ctx = sandbox([fnSource('inviteStatusVisible')], {});
+  assert.equal(ctx.inviteStatusVisible(null), false);
+  assert.equal(ctx.inviteStatusVisible({ isConnected: false, getClientRects: () => [{}] }), false, '游离节点');
+  assert.equal(ctx.inviteStatusVisible({ isConnected: true, getClientRects: () => [] }), false, '在文档里但被 display:none 藏着');
+  assert.equal(ctx.inviteStatusVisible({ isConnected: true, getClientRects: () => [{}] }), true);
 });
 
 test('对得上号的应答、旧版本（没有编号）的应答照常接', async () => {

@@ -39,6 +39,7 @@ const { findBridge, sharedBridge, closeSharedBridge, BRIDGE_MISSING_MESSAGE } = 
 const { OverlayController } = require('./overlay');
 const validate = require('./security');
 const { CacheManager, cleanupLegacySidecars } = require('./cacheManager');
+const { describeFsError } = require('./fsErrorText');
 const settings = require('./settings');
 const malwareScan = require('./malwareScan');
 const { validateSourceName, SOURCE_EXTENSIONS, SUBTITLE_EXTENSIONS } = require('./mediaGuard');
@@ -48,7 +49,7 @@ const { sharedProxy, closeSharedProxy } = require('./publicProxy');
 const { lockDownPermissions } = require('./permissions');
 const { CloudflareTurn } = require('./cloudflareTurn');
 const { MediaLibrary } = require('./mediaLibrary');
-const { LinkCache, moveNoOverwrite, WORK_DIR: DOWNLOAD_WORK_DIR } = require('./linkCache');
+const { LinkCache, moveNoOverwrite, removeWorkDir, WORK_DIR: DOWNLOAD_WORK_DIR } = require('./linkCache');
 const { DownloadSaver } = require('./downloadSaver');
 const { labelProtocolHandler } = require('./protocolName');
 const { displayVersion, readBuildNumber } = require('./appVersion');
@@ -151,7 +152,8 @@ async function workDirIn(dir, id, onFinish = async () => {}) {
     finish: async (file, meta) => {
       // 不覆盖：挑好名字和挪过去之间有人抢先建了同名文件，也另起名字
       const target = await moveNoOverwrite(file, dir, path.basename(file));
-      await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
+      // 外层的 .noxreel-downloading 空了一起删，别在下载文件夹里留一个空目录
+      await removeWorkDir(work);
       await onFinish(target, meta);
       return target;
     },
@@ -628,7 +630,8 @@ async function ensureCacheReady() {
     return await cache.initialize();
   } catch (error) {
     if (cache.rootDir === DEFAULT_CACHE_ROOT) throw error;
-    cacheFallback = { configured: cache.rootDir, reason: error.message || String(error) };
+    // 原因要说人话：盘没插时 Node 的原文是「ENOENT: no such file or directory, mkdir '\\?'」
+    cacheFallback = { configured: cache.rootDir, reason: await describeFsError(error, cache.rootDir) };
     cacheChoice = { root: DEFAULT_CACHE_ROOT, source: 'default' };
     // 刚刚用不了的那个根不再当旧根去扫：它多半是离线的网盘，再 opendir 一次又要等一轮网络超时
     const failedRoot = pathKey(cache.rootDir);
@@ -1369,7 +1372,13 @@ secureHandle('app:takeDeepLink', async () => {
 });
 
 secureHandle('app:ensureDirs', async () => {
-  const runDir = await ensureCacheReady();
+  let runDir;
+  try {
+    runDir = await ensureCacheReady();
+  } catch (error) {
+    // 连系统临时目录也建不出来（%TEMP%\NoxReel 是个同名文件、没权限）：把原因换成人话再交给页面
+    throw new Error(await describeFsError(error, cache.rootDir));
+  }
   return { cacheDir: cache.rootDir, runDir, fallback: cacheFallback };
 });
 

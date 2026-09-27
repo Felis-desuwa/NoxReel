@@ -1048,7 +1048,7 @@ test('首页角落显示版本号，取自主进程的 env 状态', async () => 
   const run = async (status) => {
     const $ = fakeDollar();
     const ctx = sandbox({
-      fns: ['boot'],
+      fns: ['boot', 'ipcErrorText'],
       globals: {
         $,
         S: { env: null },

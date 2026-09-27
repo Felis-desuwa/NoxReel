@@ -404,6 +404,8 @@ function cfErrorCode(error) {
 
 const CF_ERROR_TEXT = {
   CF_UNAUTHORIZED: '未授权：Cloudflare 不认这组 Turn Token ID 和 API Token',
+  // Cloudflare 回 404：地址里的 Turn Token ID 找不到。要用户去核对，后台重试没用（不在 CF_RETRYABLE 里）
+  CF_BAD_KEY_ID: 'Turn Token ID 不对：Cloudflare 找不到这个 ID，请到 Cloudflare 控制台核对',
   CF_NETWORK: '网络不通：连不上 Cloudflare',
   CF_UNAVAILABLE: 'Cloudflare 暂时不可用（限流或服务故障），稍后再试',
   CF_BAD_RESPONSE: 'Cloudflare 的回应看不懂',

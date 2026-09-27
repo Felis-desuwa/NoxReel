@@ -10,7 +10,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { execFile } = require('child_process');
 const { validateMediaHeader } = require('./mediaGuard');
-const { WORK_DIR, moveNoOverwrite } = require('./linkCache');
+const { WORK_DIR, moveNoOverwrite, removeWorkDir } = require('./linkCache');
+const { describeFsError } = require('./fsErrorText');
 
 const CHUNK_SIZE = 2 * 1024 * 1024;
 // 复用本机副本时先抽查的片：文件头 8MB（容器索引）和文件尾 4MB（MKV 的 Cues）—— 播放器最先要读的就是这些。
@@ -648,9 +649,9 @@ async function openLeech(manifest, { onReuse = null } = {}) {
   } catch (error) {
     await session?.fh?.close().catch(() => {});
     if (ownedDir) await cacheManager.removeOwned(ownedDir).catch(() => {});
-    else if (workDir) await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
+    else if (workDir) await removeWorkDir(workDir);
     else if (created && filePath) await fsp.unlink(filePath).catch(() => {});
-    throw asCacheIoError(error);
+    throw await asCacheIoError(error, manual ? keptDir : cacheManager.rootDir);
   } finally {
     if (counted) openingBytes -= manifest.size;
   }
@@ -659,10 +660,11 @@ async function openLeech(manifest, { onReuse = null } = {}) {
 /**
  * 缓存所在的盘拔了、没权限、读写出错：和「清单不安全」是两回事。套一句固定的前缀交给界面，
  * 界面据此不把这部片记成拒收（盘插回来还要接着收），也不说成「不安全的媒体清单」。
+ * 原因换成人话（where 是缓存放在哪儿，用来认出「整个盘不在」）：Node 的原文盘没插时连路径都是 '\\?'。
  */
-function asCacheIoError(error) {
+async function asCacheIoError(error, where) {
   if (!error || isDiskFull(error) || typeof error.code !== 'string' || !/^E[A-Z0-9]+$/.test(error.code)) return error;
-  const wrapped = new Error(`缓存位置用不了：${error.message}`);
+  const wrapped = new Error(`缓存位置用不了：${await describeFsError(error, where)}`);
   wrapped.code = error.code;
   return wrapped;
 }
@@ -752,8 +754,9 @@ async function tryReuse(manifest, onReuse) {
   const sample = new Set();
   for (let i = 0; i < Math.min(REUSE_HEAD_CHUNKS, total); i++) sample.add(i);
   for (let i = Math.max(0, total - REUSE_TAIL_CHUNKS); i < total; i++) sample.add(i);
+  // 会话还没登记，对端的片进不来：抽查的结果只有对得上和对不上两种
   let matched = 0;
-  for (const i of sample) if (await verifyChunk(session, i, buf)) matched++;
+  for (const i of sample) if ((await verifyChunk(session, i, buf)) === 'matched') matched++;
   session._advanceContiguous();
   if (!matched) {
     await fh.close().catch(() => {});
@@ -798,48 +801,56 @@ function reuseReporter(session, onReuse) {
  * 核对一片：读出来算 SHA-256 和清单对。哈希走 WebCrypto（线程池里算），几十 GB 的片子核对期间
  * 主进程照样能响应别的请求。第 0 片还要过一遍容器头检查 —— 和收片时 writeChunk 同一道关。
  * 对端已经送来（在落盘或落完了）的不再核对，也绝不记两遍。
- * @returns {Promise<boolean>} 这一片是核对记上的
+ * @returns {Promise<'matched'|'peer'|'mismatch'>} 核对记上了 / 对端先送到了（没核对）/ 对不上或读不出来
  */
 async function verifyChunk(session, i, buf) {
   const { manifest } = session;
-  if (session.have[i] === 1 || session.pendingByIndex.has(i)) return false;
+  if (session.have[i] === 1 || session.pendingByIndex.has(i)) return 'peer';
   try {
     const len = chunkLengthAt(i, manifest.size);
     const { bytesRead } = await session.fh.read(buf, 0, len, i * manifest.chunkSize);
-    if (bytesRead !== len) return false;
+    if (bytesRead !== len) return 'mismatch';
     const chunk = buf.subarray(0, len);
     const digest = Buffer.from(await crypto.webcrypto.subtle.digest('SHA-256', chunk)).toString('hex');
-    if (digest !== manifest.hashes[i]) return false;
-    if (i === 0 && !validateMediaHeader(manifest.name, chunk).ok) return false;
+    if (digest !== manifest.hashes[i]) return 'mismatch';
+    if (i === 0 && !validateMediaHeader(manifest.name, chunk).ok) return 'mismatch';
   } catch {
-    return false; // 读出错（盘刚被拔掉）：这一片不算，交给对端补
+    return 'mismatch'; // 读出错（盘刚被拔掉）：这一片不算，交给对端补
   }
   // 读盘、算哈希这段时间里，对端送来的同一片可能已经落盘记上了
-  if (session.have[i] === 1) return false;
+  if (session.have[i] === 1) return 'peer';
   session.have[i] = 1;
   session.haveCount++;
-  return true;
+  return 'matched';
 }
 
-/** 抽查之外的片在后台按顺序核对。会话一关就停；每半秒把进度连同最新 state 报一次。 */
+/**
+ * 抽查之外的片在后台按顺序核对。会话一关就停；每半秒把进度连同最新 state 报一次。
+ * 会话开出来之后调度器马上向对端要片，核对走到的时候有些片已经是对端送来的了：这些单独记成 fromPeer，
+ * 不算「对不上」—— 以前混在一起，本机副本完好也报「有 715/716 片对得上」。
+ */
 async function verifyInBackground(session, skip, matched, buf, report) {
   const total = session.manifest.chunkCount;
+  let fromPeer = 0;
   let lastReport = Date.now();
   try {
     for (let i = 0; i < total; i++) {
       if (session.closing) return; // 关会话、退房：不核了（没核完的临时副本关会话时登记回去，见 settleFile）
       if (skip.has(i)) continue;
-      if (await verifyChunk(session, i, buf)) {
+      const result = await verifyChunk(session, i, buf);
+      if (result === 'matched') {
         matched++;
         session._advanceContiguous();
+      } else if (result === 'peer') {
+        fromPeer++;
       }
       if (Date.now() - lastReport >= REUSE_REPORT_MS) {
         lastReport = Date.now();
-        report('progress', { done: i + 1, matched, sessionId: session.id, state: session.state() });
+        report('progress', { done: i + 1, matched, fromPeer, sessionId: session.id, state: session.state() });
       }
     }
     session.verifyDone = true;
-    report('done', { done: total, matched, sessionId: session.id, state: session.state() });
+    report('done', { done: total, matched, fromPeer, sessionId: session.id, state: session.state() });
   } catch {
     /* 核对本身出错只影响复用多少，不影响会话 */
   }
@@ -995,7 +1006,7 @@ async function settleFile(session) {
     } else if (session.discard || session.createdFresh) {
       await fsp.unlink(session.filePath).catch(() => {});
       await library?.forgetPath(session.filePath).catch(() => {});
-      if (session.workDir) await fsp.rm(session.workDir, { recursive: true, force: true }).catch(() => {});
+      if (session.workDir) await removeWorkDir(session.workDir);
     }
     return;
   }
@@ -1018,7 +1029,8 @@ async function publishKept(session) {
   if (!session.workDir || !session.keptDir) return session.filePath;
   try {
     const target = await moveNoOverwrite(session.filePath, session.keptDir, path.basename(session.filePath));
-    await fsp.rm(session.workDir, { recursive: true, force: true }).catch(() => {});
+    // 外层的 .noxreel-downloading 空了一起删，别在长期缓存文件夹里留一个空目录
+    await removeWorkDir(session.workDir);
     return target;
   } catch (error) {
     console.warn(`[fileStore] 收完的片挪不到长期缓存文件夹（${error.message}），先留在工作目录里`);

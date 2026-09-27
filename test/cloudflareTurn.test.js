@@ -262,14 +262,16 @@ test('同时只发一个请求：几路一起要，共用同一次生成', async
   for (const r of results) assert.deepEqual(r.urls, EXPECTED_URLS);
 });
 
-test('失败归类：网络 → CF_NETWORK，限流 / 服务端故障 → CF_UNAVAILABLE，其他状态码 / 坏 JSON / 没有 TURN → CF_BAD_RESPONSE，没配置 → CF_NOT_CONFIGURED；报错里没有 Token', async () => {
+test('失败归类：网络 → CF_NETWORK，限流 / 服务端故障 → CF_UNAVAILABLE，404 → CF_BAD_KEY_ID，其他状态码 / 坏 JSON / 没有 TURN → CF_BAD_RESPONSE，没配置 → CF_NOT_CONFIGURED；报错里没有 Token', async () => {
   const cases = [
     [() => Promise.reject(new TypeError('fetch failed')), 'CF_NETWORK'],
     // 限流和 5xx 是「过一会儿再试就好」，和「回应看不懂」分开说
     [() => json(429, { error: 'x' }), 'CF_UNAVAILABLE'],
     [() => json(500, { error: 'x' }), 'CF_UNAVAILABLE'],
     [() => json(503, { error: 'x' }), 'CF_UNAVAILABLE'],
-    [() => json(404, { error: 'x' }), 'CF_BAD_RESPONSE'],
+    // Turn Token ID 拼在地址里，填错了 Cloudflare 回 404（实测）：单独归成「Turn Token ID 不对」
+    [() => json(404, { error: 'x' }), 'CF_BAD_KEY_ID'],
+    [() => json(400, { error: 'x' }), 'CF_BAD_RESPONSE'],
     [() => json(201, 'not json {'), 'CF_BAD_RESPONSE'],
     [() => json(201, { iceServers: [{ urls: ['stun:stun.cloudflare.com:3478'] }] }), 'CF_BAD_RESPONSE'],
     [() => json(201, { nothing: true }), 'CF_BAD_RESPONSE'],

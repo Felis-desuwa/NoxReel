@@ -276,6 +276,11 @@ class CloudflareTurn {
         res.body?.cancel?.().catch?.(() => {});
         throw cfError('CF_UNAUTHORIZED', `HTTP ${status}`);
       }
+      // Turn Token ID 是拼进地址里的：填错了 Cloudflare 回 404（实测），和「回应看不懂」分开，告诉用户去核对这一项
+      if (status === 404) {
+        res.body?.cancel?.().catch?.(() => {});
+        throw cfError('CF_BAD_KEY_ID', `HTTP ${status}`);
+      }
       // 限流和服务端故障是「过一会儿再试就好」，和「回应看不懂」分开：用户该等一等，渲染进程也会在后台接着取
       if (status === 429 || (status >= 500 && status < 600)) {
         res.body?.cancel?.().catch?.(() => {});
