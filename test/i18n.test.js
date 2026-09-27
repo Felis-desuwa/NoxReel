@@ -1070,6 +1070,24 @@ test('IP 隐私（隐藏我的 IP、Cloudflare TURN）的新文案都有英文',
   );
   assert.match(translate(`${quota}。「隐藏我的 IP」开着，没有中继就不连接。`, 'en'), /raise the limit in Settings\. “Hide my IP” is on, so without a relay no connection is made\.$/);
   assert.match(translate(`Cloudflare TURN：${quota}`, 'en'), /^Cloudflare TURN: This month’s Cloudflare TURN usage has reached your limit \(900 GB\)/);
+  // 现在的说法标了 UTC（和主进程按 UTC 自然月计量一致）
+  const quotaUtc = quota.replace('下个月 1 日自动恢复', '下个月 1 日（UTC）自动恢复');
+  assert.equal(
+    translate(`${quotaUtc}。「隐藏我的 IP」开着，没有中继就不连接。`, 'en'),
+    'This month’s Cloudflare TURN usage has reached your limit (900 GB) and was turned off to avoid charges; it comes back on the 1st of next month (UTC), or raise the limit in Settings. “Hide my IP” is on, so without a relay no connection is made.'
+  );
+
+  // 临时账号的续取（修复批次 12）：限流 / 故障、带状态码的保存失败、后台取到了
+  assert.equal(
+    translate('Cloudflare TURN 账号没拿到（Cloudflare 暂时不可用（限流或服务故障），稍后再试），这次先不走中继、只尝试直连', 'en'),
+    'Could not get Cloudflare TURN credentials (Cloudflare is temporarily unavailable (rate limiting or an outage); try again later); trying a direct connection only this time'
+  );
+  assert.equal(
+    translate('没保存：Cloudflare 暂时不可用（限流或服务故障），稍后再试（HTTP 503）', 'en'),
+    'Not saved: Cloudflare is temporarily unavailable (rate limiting or an outage); try again later (HTTP 503)'
+  );
+  assert.equal(translate('没保存：Cloudflare 的回应看不懂（HTTP 404）', 'en'), 'Not saved: Cloudflare sent a response that could not be understood (HTTP 404)');
+  assert.equal(translate('Cloudflare TURN 账号拿到了，之后新建的连接会带上中继', 'en'), 'Got Cloudflare TURN credentials; new connections will use the relay');
 
   // 状态行、用量、80% 提醒
   assert.equal(translate('Cloudflare TURN：已配置，账号有效至 14:05', 'en'), 'Cloudflare TURN: set up, credentials valid until 14:05');

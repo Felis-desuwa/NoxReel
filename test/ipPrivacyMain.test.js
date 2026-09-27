@@ -230,6 +230,8 @@ test('turn:cfCredentials：没配置就带着代码报错（IPC 只带 message�
   await boot();
   await assert.rejects(invoke('turn:cfCredentials'), /^Error: \[CF_NOT_CONFIGURED\]/);
   await assert.rejects(invoke('turn:cfCredentials', { minValidMs: 2 * 60 * 60 * 1000 }), /\[CF_NOT_CONFIGURED\]/);
+  // 渲染进程离过期不到 12 小时就换一组：这个值得放行（放不行的话只会报「无效的 TURN 参数」、永远取不到号）
+  await assert.rejects(invoke('turn:cfCredentials', { minValidMs: 12 * 60 * 60 * 1000 }), /\[CF_NOT_CONFIGURED\]/);
   await assert.rejects(invoke('turn:cfCredentials', { minValidMs: 24 * 60 * 60 * 1000 }), /无效的 TURN 参数/, '给太大等于每次都绕过缓存去刷 Cloudflare');
   await assert.rejects(invoke('turn:cfCredentials', { minValidMs: -1 }), /无效的 TURN 参数/);
   await assert.rejects(invoke('turn:cfCredentials', [1]), /无效的 TURN 参数/);

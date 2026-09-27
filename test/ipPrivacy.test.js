@@ -242,10 +242,12 @@ const TURN_FNS = [
   'iceInputs', 'iceServers', 'cfQuotaText', 'relayOnlyBlocked', 'peerIce', 'signalPeerIce', 'cfErrorCode', 'cfErrorText',
   'turnFetchNeeded', 'markCfQuota', 'ensureTurnReady', 'scheduleCfTurnRefresh', 'applyCfUsage', 'applyCfTurnState',
   'fmtGB', 'fmtClock', 'cfTurnStatusText', 'cfUsageText', 'renderCfTurnStatus', 'meterTurnUsage', 'inviteBlocked',
+  'refreshLiveCfTurn', 'cfErrorDetail',
 ];
 const TURN_DECLS = [
   'turnWarned', 'RELAY_ONLY_NO_TURN', 'CF_REFRESH_BEFORE_MS', 'CF_RETRY_MS', 'CF_MIN_TIMER_MS', 'cfTurnFetch', 'cfTurnRetryAt',
   'cfTurnTimer', 'cfQuotaLogged', 'CF_ERROR_TEXT', 'TURN_METER_MS', 'TURN_REPORT_MAX', 'turnMeter', 'turnMeterBusy', 'turnUsagePending',
+  'CF_RETRY_MAX_MS', 'CF_RETRYABLE', 'cfFailStreak',
 ];
 
 async function turnBox({ settings = {}, turnApi = {}, fns = [], globals = {} } = {}) {
@@ -253,6 +255,7 @@ async function turnBox({ settings = {}, turnApi = {}, fns = [], globals = {} } =
   const usage = await load('src/renderer/lib/turnUsage.js');
   const logs = [];
   const timers = [];
+  const retries = [];
   const S = {
     settings: { stun: 'stun:stun.l.google.com:19302', turnEnabled: false, turnUrl: '', turnUser: '', turnPass: '', turnSource: 'manual', relayOnly: false, ...settings },
     cfTurn: null,
@@ -275,7 +278,11 @@ async function turnBox({ settings = {}, turnApi = {}, fns = [], globals = {} } =
     clearTimeout: () => {},
     buildIceServers: ice.buildIceServers,
     peerIceConfig: ice.peerIceConfig,
+    relayServer: ice.relayServer,
     turnMissingCredentials: ice.turnMissingCredentials,
+    isCloudflareTurnUrl: usage.isCloudflareTurnUrl,
+    // 后台那一轮取完会顺手重试被拦下的邀请卡（见 retryBlockedInvite），这里只记次数
+    retryBlockedInvite: () => retries.push(1),
     RelayUsageMeter: usage.RelayUsageMeter,
     cloudflareRelayPairs: usage.cloudflareRelayPairs,
     onlyCloudflareRelays: usage.onlyCloudflareRelays,
@@ -285,7 +292,7 @@ async function turnBox({ settings = {}, turnApi = {}, fns = [], globals = {} } =
   };
   vm.createContext(ctx);
   vm.runInContext([...TURN_DECLS.map(declSource), ...[...TURN_FNS, ...fns].map(fnSource)].join('\n\n'), ctx, { filename: 'app.js（节选）' });
-  return { ctx, S, logs, timers };
+  return { ctx, S, logs, timers, retries };
 }
 
 test('app.js 里每一处 new Peer 都从 peerIce()（信令事件里是 signalPeerIce()）拿 ICE 参数', () => {
@@ -331,7 +338,7 @@ test('Cloudflare 来源：有效的临时账号合进 iceServers；本月用量�
 
   r.S.cfTurnUsage = { usedBytes: 900e9, limitGB: 900, exceeded: true };
   const blocked = r.ctx.relayOnlyBlocked();
-  assert.match(blocked, /^本月 Cloudflare TURN 用量已到你设的上限（900 GB），为免扣费已停用；下个月 1 日自动恢复，或者在设置里调高上限/);
+  assert.match(blocked, /^本月 Cloudflare TURN 用量已到你设的上限（900 GB），为免扣费已停用；下个月 1 日（UTC）自动恢复，或者在设置里调高上限/);
   assert.throws(() => r.ctx.peerIce(), /已到你设的上限/);
 
   // 没开只走中继：新建的连接不再带 Cloudflare TURN，照常直连
@@ -341,7 +348,7 @@ test('Cloudflare 来源：有效的临时账号合进 iceServers；本月用量�
   assert.ok(!JSON.stringify(direct.iceServers).includes('turn'), '到上限了还把 Cloudflare TURN 塞进新连接');
 });
 
-test('ensureTurnReady：来源是 Cloudflare 才去取；同时只发一个请求；离过期不到 2 小时自己再换一组', async () => {
+test('ensureTurnReady：来源是 Cloudflare 才去取；同时只发一个请求；离过期不到 12 小时自己再换一组', async () => {
   const manual = await turnBox({ turnApi: { cfCredentials: async () => assert.fail('来源是自己填，不该去取') } });
   assert.equal(manual.ctx.turnFetchNeeded(), false);
   await manual.ctx.ensureTurnReady();
@@ -365,13 +372,13 @@ test('ensureTurnReady：来源是 Cloudflare 才去取；同时只发一个请�
   gate.resolve();
   await Promise.all([a, b]);
   assert.equal(calls.length, 1, '同时只该发一个请求');
-  assert.equal(calls[0].minValidMs, 2 * HOUR);
+  assert.equal(calls[0].minValidMs, 12 * HOUR);
   assert.equal(r.S.cfTurn.username, 'cf-user');
   assert.equal(r.ctx.turnFetchNeeded(), false, '手上的还新鲜就不用再取');
-  // 定时器排在「过期前 2 小时」
+  // 定时器排在「过期前 12 小时」：新建的连接至少带着 12 小时有效的凭据，一整晚的播放列表也盖得住
   const timer = r.timers.at(-1);
-  assert.ok(Math.abs(timer.ms - (expiresAt - 2 * HOUR - Date.now())) < 5000, `定时器排在 ${timer.ms}ms 之后`);
-  // 只剩不到 2 小时：该换了
+  assert.ok(Math.abs(timer.ms - (expiresAt - 12 * HOUR - Date.now())) < 5000, `定时器排在 ${timer.ms}ms 之后`);
+  // 只剩不到 12 小时：该换了
   r.S.cfTurn.expiresAt = Date.now() + HOUR;
   assert.equal(r.ctx.turnFetchNeeded(), true);
 });
@@ -408,6 +415,226 @@ test('主进程说 CF_QUOTA：临时账号作废、记下已到上限，日志�
   vm.runInContext('cfTurnRetryAt = 0', r.ctx);
   await r.ctx.ensureTurnReady();
   assert.equal(r.logs.filter(([text]) => /已到你设的上限/.test(text)).length, 1, '到上限的提醒刷屏了');
+});
+
+/* ---------------------- 临时账号的续取（修复批次 12） ---------------------- */
+
+const freshCreds = (username = 'cf-user') => ({ urls: CF_URLS, username, credential: 'cf-pass', expiresAt: Date.now() + 23 * HOUR });
+
+test('取号失败：后台按退避接着取（30 秒起翻倍、封顶 10 分钟）直到拿到；日志只在第一次失败和恢复时各说一句', async () => {
+  let fail = true;
+  let calls = 0;
+  const r = await turnBox({
+    settings: { turnSource: 'cloudflare' },
+    turnApi: {
+      cfCredentials: async () => {
+        calls++;
+        if (fail) throw new Error("Error invoking remote method 'turn:cfCredentials': Error: [CF_UNAVAILABLE] HTTP 503");
+        return freshCreds();
+      },
+    },
+  });
+  await r.ctx.ensureTurnReady();
+  assert.equal(calls, 1);
+  const waits = [r.timers.at(-1).ms];
+  for (let i = 0; i < 7; i++) {
+    // 定时器到点时 30 秒的冷却早过了；这里不真等，拨掉
+    vm.runInContext('cfTurnRetryAt = 0', r.ctx);
+    await r.timers.at(-1).fn();
+    waits.push(r.timers.at(-1).ms);
+  }
+  assert.deepEqual(waits, [30_000, 60_000, 120_000, 240_000, 480_000, 600_000, 600_000, 600_000]);
+  assert.equal(calls, 8, '每一轮都真的去取了');
+  assert.equal(r.logs.length, 1, '同一件事别刷屏');
+  assert.deepEqual(r.logs[0], ['Cloudflare TURN 账号没拿到（Cloudflare 暂时不可用（限流或服务故障），稍后再试），这次先不走中继、只尝试直连', 'warn']);
+  assert.equal(r.retries.length, 7, '每一轮之后都让被拦下的邀请卡看一眼');
+
+  // 恢复了：说一声，回到「离过期 12 小时前换一组」的节奏
+  fail = false;
+  vm.runInContext('cfTurnRetryAt = 0', r.ctx);
+  await r.timers.at(-1).fn();
+  assert.equal(r.S.cfTurn.username, 'cf-user');
+  assert.deepEqual(r.logs.at(-1), ['Cloudflare TURN 账号拿到了，之后新建的连接会带上中继', 'good']);
+  assert.equal(vm.runInContext('cfFailStreak', r.ctx), 0);
+  assert.ok(Math.abs(r.timers.at(-1).ms - 11 * HOUR) < 5000, `下一次排在 ${r.timers.at(-1).ms}ms 之后`);
+});
+
+test('要用户动手的失败（凭据被拒、没配置、到上限）后台不重试', async () => {
+  for (const message of ['Error: [CF_UNAUTHORIZED] HTTP 401', 'Error: [CF_NOT_CONFIGURED] 还没保存 Cloudflare 凭据', 'Error: [CF_QUOTA] 本月用量已到上限（50 GB）']) {
+    const r = await turnBox({
+      settings: { turnSource: 'cloudflare' },
+      turnApi: {
+        cfCredentials: async () => {
+          throw new Error(message);
+        },
+      },
+    });
+    await r.ctx.ensureTurnReady();
+    assert.equal(r.timers.length, 0, message);
+  }
+});
+
+test('信令事件里建连（peerIce / signalPeerIce）：没有能用的 Cloudflare 账号就顺手在后台取，不等它、这一次照旧；下一次就带上中继', async () => {
+  const peerIce = fnSource('peerIce');
+  assert.ok(!/^async /.test(peerIce) && !/await/.test(peerIce), 'peerIce 必须保持同步，不能改变信令事件里建连的时序');
+  assert.match(peerIce, /if \(turnFetchNeeded\(\)\) ensureTurnReady\(\)\.catch\(\(\) => \{\}\);/);
+  assert.doesNotMatch(fnSource('signalPeerIce'), /await/);
+
+  const gate = deferred();
+  let calls = 0;
+  const r = await turnBox({
+    settings: { turnSource: 'cloudflare' },
+    turnApi: {
+      cfCredentials: async () => {
+        calls++;
+        await gate.promise;
+        return freshCreds();
+      },
+    },
+  });
+  const first = r.ctx.peerIce();
+  assert.equal(first.iceTransportPolicy, 'all');
+  assert.ok(!JSON.stringify(first.iceServers).includes('turn:'), '这一次照旧：还没有中继');
+  await flush();
+  assert.equal(calls, 1, '顺手去取了');
+  r.ctx.peerIce();
+  await flush();
+  assert.equal(calls, 1, '在途的那次还没回来，不重复发');
+  gate.resolve();
+  await flush();
+  assert.ok(JSON.stringify(r.ctx.peerIce().iceServers).includes('cf-user'), '下一次就带上了');
+
+  // 只走中继：这一次拦下（绝不退回直连），同样顺手去取；取到之后信令事件里的下一次就放行
+  const gate2 = deferred();
+  const strict = await turnBox({
+    settings: { turnSource: 'cloudflare', relayOnly: true },
+    turnApi: {
+      cfCredentials: async () => {
+        await gate2.promise;
+        return freshCreds();
+      },
+    },
+  });
+  assert.equal(strict.ctx.signalPeerIce(), null);
+  gate2.resolve();
+  await flush();
+  const ok = strict.ctx.signalPeerIce();
+  assert.equal(ok.iceTransportPolicy, 'relay');
+  assert.equal(ok.iceServers[0].username, 'cf-user');
+});
+
+test('换到新账号后，还连着的连接用 setConfiguration 换上：只换 Cloudflare 那一条，relay / all 策略原样保留，证书不回传', async () => {
+  const r = await turnBox({
+    settings: { turnSource: 'cloudflare', relayOnly: true },
+    turnApi: { cfCredentials: async () => freshCreds('new-user') },
+  });
+  const pcOf = (iceServers, policy) => {
+    const pc = {
+      applied: [],
+      getConfiguration: () => ({
+        iceServers,
+        iceTransportPolicy: policy,
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require',
+        iceCandidatePoolSize: 4,
+        certificates: [{ id: 'cert' }],
+      }),
+      setConfiguration: (config) => pc.applied.push(config),
+    };
+    return pc;
+  };
+  const oldCf = { urls: ['turn:turn.cloudflare.com:3478?transport=udp'], username: 'old-user', credential: 'old-pass' };
+  const manual = { urls: ['turn:relay.example:3478?transport=udp'], username: 'u', credential: 'p' };
+  const stun = { urls: ['stun:stun.l.google.com:19302'] };
+  const relayPeer = { closed: false, iceTransportPolicy: 'relay', pc: pcOf([oldCf], 'relay') };
+  const allPeer = { closed: false, iceTransportPolicy: 'all', pc: pcOf([stun, oldCf, manual], 'all') };
+  const noCf = { closed: false, iceTransportPolicy: 'all', pc: pcOf([stun, manual], 'all') };
+  const closed = { closed: true, iceTransportPolicy: 'all', pc: pcOf([stun, oldCf], 'all') };
+  const pending = { closed: false, iceTransportPolicy: 'relay', pc: pcOf([oldCf], 'relay') };
+  r.S.swarm = { peers: new Map([['a', relayPeer], ['b', allPeer], ['c', noCf], ['d', closed]]) };
+  r.S.pendingManualPeer = pending;
+  r.S.cfTurn = cfTurn(Date.now() + HOUR); // 离过期不到 12 小时，该换了
+  await r.ctx.ensureTurnReady();
+  assert.equal(r.S.cfTurn.username, 'new-user');
+
+  const [relayCfg] = relayPeer.pc.applied;
+  assert.equal(relayCfg.iceTransportPolicy, 'relay', '只走中继的连接不许放宽');
+  assert.deepEqual([...relayCfg.iceServers].map((s) => s.username), ['new-user']);
+  assert.ok(!JSON.stringify(relayCfg).includes(':53'), '53 端口没滤掉');
+  assert.equal(relayCfg.iceCandidatePoolSize, 4, '候选池大小不能变（setLocalDescription 之后改会抛错）');
+  assert.equal(relayCfg.bundlePolicy, 'max-bundle');
+  assert.ok(!('certificates' in relayCfg), '证书不回传');
+  const [allCfg] = allPeer.pc.applied;
+  assert.equal(allCfg.iceTransportPolicy, 'all');
+  assert.deepEqual([...allCfg.iceServers].map((s) => s.username ?? 'stun'), ['stun', 'u', 'new-user'], '别的服务器原样留着');
+  assert.equal(noCf.pc.applied.length, 0, '本来没带 Cloudflare 中继的连接不往里加');
+  assert.equal(closed.pc.applied.length, 0);
+  assert.equal(pending.pc.applied.length, 1, '还在等应答的一对一邀请也换');
+
+  // 本月到上限了：不再给连着的连接续新账号
+  r.S.cfTurnUsage = { exceeded: true, limitGB: 1 };
+  assert.equal(r.ctx.refreshLiveCfTurn(), 0);
+  // setConfiguration 抛错（浏览器不认）：记一句，不影响别的连接，也不让取号算成失败
+  r.S.cfTurnUsage = null;
+  noCf.pc.setConfiguration = () => {
+    throw new Error('InvalidModificationError');
+  };
+  allPeer.pc.setConfiguration = () => {
+    throw new Error('InvalidModificationError');
+  };
+  assert.equal(r.ctx.refreshLiveCfTurn(), 2);
+});
+
+test('调高月上限（exceeded 由真变假）：「已到上限」那条旧错误撤掉，冷却不等，来源是 Cloudflare 就马上取一组', async () => {
+  let calls = 0;
+  const r = await turnBox({
+    settings: { turnSource: 'cloudflare' },
+    turnApi: {
+      cfCredentials: async () => {
+        calls++;
+        if (calls === 1) throw new Error('Error: [CF_QUOTA] 本月用量已到上限（50 GB）');
+        return freshCreds();
+      },
+    },
+  });
+  r.S.cfTurnState = { configured: true, expiresAt: null, lastError: null };
+  await r.ctx.ensureTurnReady();
+  assert.equal(r.S.cfTurnState.lastError, 'CF_QUOTA');
+  assert.match(r.ctx.cfTurnStatusText(), /已到你设的上限（50 GB）/);
+  assert.equal(r.ctx.turnFetchNeeded(), false, '刚失败过，本来要冷却 30 秒');
+
+  r.ctx.applyCfUsage({ usedBytes: 50e9, limitGB: 100, exceeded: false, nearLimit: false });
+  assert.equal(r.S.cfTurnState.lastError, null, '状态行不能还说已停用');
+  await flush();
+  assert.equal(calls, 2, '上限调高了就马上去取');
+  assert.match(r.ctx.cfTurnStatusText(), /^Cloudflare TURN：已配置，账号有效至 \d{2}:\d{2}$/);
+
+  // 来源不是 Cloudflare：只撤错误，不去取
+  const manual = await turnBox({ turnApi: { cfCredentials: async () => assert.fail('来源是自己填，不该去取') } });
+  manual.S.cfTurnUsage = { usedBytes: 50e9, limitGB: 50, exceeded: true };
+  manual.S.cfTurnState = { configured: true, expiresAt: null, lastError: 'CF_QUOTA' };
+  manual.ctx.applyCfUsage({ usedBytes: 50e9, limitGB: 100, exceeded: false });
+  await flush();
+  assert.equal(manual.S.cfTurnState.lastError, null);
+});
+
+test('保存凭据时 Cloudflare 回了 HTTP 错误：限流 / 故障说「稍后再试」，都带上状态码；凭据被拒照旧', async () => {
+  const r = await turnBox();
+  const detail = (message) => r.ctx.cfErrorDetail(new Error(message));
+  assert.equal(detail("Error invoking remote method 'turn:cfSave': Error: [CF_UNAVAILABLE] HTTP 503"), 'Cloudflare 暂时不可用（限流或服务故障），稍后再试（HTTP 503）');
+  assert.equal(detail('Error: [CF_UNAVAILABLE] HTTP 429'), 'Cloudflare 暂时不可用（限流或服务故障），稍后再试（HTTP 429）');
+  assert.equal(detail('Error: [CF_BAD_RESPONSE] HTTP 404'), 'Cloudflare 的回应看不懂（HTTP 404）');
+  assert.equal(detail('Error: [CF_BAD_RESPONSE] 响应不是 JSON'), 'Cloudflare 的回应看不懂');
+  assert.equal(detail('Error: [CF_UNAUTHORIZED] HTTP 401'), '未授权：Cloudflare 不认这组 Turn Token ID 和 API Token');
+});
+
+test('渲染进程要的最短有效期没超过主进程放行的上限', () => {
+  const main = fs.readFileSync(path.join(root, 'src/main/main.js'), 'utf8');
+  const hours = (src, name) => Number(new RegExp(`const ${name} = (\\d+) \\* 60 \\* 60 \\* 1000;`).exec(src)?.[1]);
+  const refresh = hours(APP, 'CF_REFRESH_BEFORE_MS');
+  const cap = hours(main, 'MAX_TURN_MIN_VALID_MS');
+  assert.equal(refresh, 12);
+  assert.ok(cap >= refresh && cap < 23, `主进程上限 ${cap} 小时`);
 });
 
 test('用量计量：每 10 秒汇报一次增量，重连不重复计数；80% 提醒一次；到上限停用 Cloudflare TURN', async () => {

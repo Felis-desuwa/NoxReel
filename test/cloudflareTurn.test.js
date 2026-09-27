@@ -262,10 +262,13 @@ test('同时只发一个请求：几路一起要，共用同一次生成', async
   for (const r of results) assert.deepEqual(r.urls, EXPECTED_URLS);
 });
 
-test('失败归类：网络 → CF_NETWORK，其他状态码 / 坏 JSON / 没有 TURN → CF_BAD_RESPONSE，没配置 → CF_NOT_CONFIGURED；报错里没有 Token', async () => {
+test('失败归类：网络 → CF_NETWORK，限流 / 服务端故障 → CF_UNAVAILABLE，其他状态码 / 坏 JSON / 没有 TURN → CF_BAD_RESPONSE，没配置 → CF_NOT_CONFIGURED；报错里没有 Token', async () => {
   const cases = [
     [() => Promise.reject(new TypeError('fetch failed')), 'CF_NETWORK'],
-    [() => json(500, { error: 'x' }), 'CF_BAD_RESPONSE'],
+    // 限流和 5xx 是「过一会儿再试就好」，和「回应看不懂」分开说
+    [() => json(429, { error: 'x' }), 'CF_UNAVAILABLE'],
+    [() => json(500, { error: 'x' }), 'CF_UNAVAILABLE'],
+    [() => json(503, { error: 'x' }), 'CF_UNAVAILABLE'],
     [() => json(404, { error: 'x' }), 'CF_BAD_RESPONSE'],
     [() => json(201, 'not json {'), 'CF_BAD_RESPONSE'],
     [() => json(201, { iceServers: [{ urls: ['stun:stun.cloudflare.com:3478'] }] }), 'CF_BAD_RESPONSE'],
@@ -276,6 +279,8 @@ test('失败归类：网络 → CF_NETWORK，其他状态码 / 坏 JSON / 没有
     await assert.rejects(turn.credentials(), (e) => {
       assert.equal(e.code, code);
       assert.ok(!e.message.includes(TOKEN) && !e.message.includes(KEY_ID), '报错里带出了凭据');
+      // 状态码留在报错里，渲染进程据此在「没保存：…」后面带上（HTTP 503）
+      if (code === 'CF_UNAVAILABLE') assert.match(e.message, /^\[CF_UNAVAILABLE\] HTTP \d{3}$/);
       return true;
     });
     assert.equal(turn.status().lastError, code, 'status 要能说出上次为什么失败');
@@ -426,13 +431,21 @@ test('用量：到 80% 提醒一次（每个月一次）；到上限就拒绝生
   assert.equal(turn.status().lastError, 'CF_QUOTA');
   assert.equal(turn.status().usage.exceeded, true);
 
-  // 调高上限：立刻恢复；下个月 1 日也自动恢复
-  await turn.setLimit(20);
+  // 调高上限：立刻恢复；「已到上限」那条旧错误当场撤掉，不用等下一次取号成功
+  const raised = await turn.setLimit(20);
+  assert.equal(raised.exceeded, false);
+  assert.equal(turn.status().lastError, null, '上限调高了，状态行还说已停用');
   assert.equal((await turn.credentials()).username, 'user-from-cloudflare');
   await turn.setLimit(10);
   await rejectsWith(turn.credentials(), 'CF_QUOTA');
+  // 调高了但还是不够（已经用了 11.5 GB）：旧错误留着
+  await turn.addUsage(1.5e9);
+  assert.equal((await turn.setLimit(11)).exceeded, true);
+  assert.equal(turn.status().lastError, 'CF_QUOTA');
+  // 下个月 1 日（UTC）自动恢复，状态跟着撤掉旧错误
   now.t = Date.UTC(2026, 9, 1, 0, 0, 0);
   assert.equal(turn.usage().exceeded, false);
+  assert.equal(turn.status().lastError, null);
   await turn.credentials();
 });
 

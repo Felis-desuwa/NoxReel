@@ -576,6 +576,8 @@ const EN = new Map(Object.entries({
   '还不能连接': 'Cannot connect yet',
   '未授权：Cloudflare 不认这组 Turn Token ID 和 API Token': 'Unauthorized: Cloudflare rejected this Turn Token ID and API Token',
   '网络不通：连不上 Cloudflare': 'Network problem: cannot reach Cloudflare',
+  'Cloudflare 暂时不可用（限流或服务故障），稍后再试': 'Cloudflare is temporarily unavailable (rate limiting or an outage); try again later',
+  'Cloudflare TURN 账号拿到了，之后新建的连接会带上中继': 'Got Cloudflare TURN credentials; new connections will use the relay',
   'Cloudflare 的回应看不懂': 'Cloudflare sent a response that could not be understood',
   '还没保存 Cloudflare 凭据': 'No Cloudflare credentials saved yet',
   '本机的加密服务不可用，不能安全地保存 API Token': 'This computer’s encryption service is unavailable, so the API Token cannot be stored safely',
@@ -1405,11 +1407,11 @@ const EN_PATTERNS = [
   [/^诊断：(.+)$/, (_all, detail) => `Diagnosis: ${translate(detail, 'en')}`],
   // IP 隐私：隐藏我的 IP、Cloudflare TURN（0.7.6）
   [
-    /^本月 Cloudflare TURN 用量已到你设的上限（(.+) GB），为免扣费已停用；下个月 1 日自动恢复，或者在设置里调高上限(。「隐藏我的 IP」开着，没有中继就不连接。)?$/,
-    (_all, gb, relayOnly) =>
-      `This month’s Cloudflare TURN usage has reached your limit (${gb} GB) and was turned off to avoid charges; it comes back on the 1st of next month, or raise the limit in Settings${
-        relayOnly ? '. “Hide my IP” is on, so without a relay no connection is made.' : ''
-      }`,
+    /^本月 Cloudflare TURN 用量已到你设的上限（(.+) GB），为免扣费已停用；下个月 1 日(（UTC）)?自动恢复，或者在设置里调高上限(。「隐藏我的 IP」开着，没有中继就不连接。)?$/,
+    (_all, gb, utc, relayOnly) =>
+      `This month’s Cloudflare TURN usage has reached your limit (${gb} GB) and was turned off to avoid charges; it comes back on the 1st of next month${
+        utc ? ' (UTC)' : ''
+      }, or raise the limit in Settings${relayOnly ? '. “Hide my IP” is on, so without a relay no connection is made.' : ''}`,
   ],
   [/^Cloudflare TURN：已配置，账号有效至 (\d{1,2}:\d{2})$/, 'Cloudflare TURN: set up, credentials valid until $1'],
   [/^Cloudflare TURN：(.+)$/, (_all, detail) => `Cloudflare TURN: ${translate(detail, 'en')}`],
@@ -1424,6 +1426,7 @@ const EN_PATTERNS = [
   ],
   [/^本月已用 ([\d.]+) GB \/ (\d+) GB$/, 'Used this month: $1 GB / $2 GB'],
   [/^没保存：(.+)$/, (_all, detail) => `Not saved: ${translate(detail, 'en')}`],
+  [/^(Cloudflare .+)（HTTP (\d{3})）$/, (_all, detail, status) => `${translate(detail, 'en')} (HTTP ${status})`],
   [/^没清掉：(.+)$/, 'Could not clear: $1'],
   [/^Cloudflare TURN 月上限没改成：(.+)$/, (_all, detail) => `The Cloudflare TURN monthly limit was not changed: ${translate(detail, 'en')}`],
   [

@@ -276,6 +276,11 @@ class CloudflareTurn {
         res.body?.cancel?.().catch?.(() => {});
         throw cfError('CF_UNAUTHORIZED', `HTTP ${status}`);
       }
+      // 限流和服务端故障是「过一会儿再试就好」，和「回应看不懂」分开：用户该等一等，渲染进程也会在后台接着取
+      if (status === 429 || (status >= 500 && status < 600)) {
+        res.body?.cancel?.().catch?.(() => {});
+        throw cfError('CF_UNAVAILABLE', `HTTP ${status}`);
+      }
       if (!(status >= 200 && status < 300)) {
         res.body?.cancel?.().catch?.(() => {});
         throw cfError('CF_BAD_RESPONSE', `HTTP ${status}`);
@@ -303,7 +308,7 @@ class CloudflareTurn {
    * 一组能用的临时 TURN 账号 { urls, username, credential, expiresAt }。
    *
    * 缓存期内直接复用，同时只发一个请求。minValidMs：缓存剩下的时间不到这么多就重新生成 ——
-   * 渲染进程在离过期不到两小时时拿它换一组新的。
+   * 渲染进程在离过期不到 12 小时时拿它换一组新的。
    * 本月用量到了上限就直接抛 CF_QUOTA，连缓存都不给。
    */
   async credentials({ minValidMs = 0 } = {}) {
@@ -357,12 +362,23 @@ class CloudflareTurn {
     } catch {
       configured = false;
     }
+    const usage = this.usage();
+    this._settleQuotaError(usage);
     return {
       configured,
       expiresAt: this._cache ? this._cache.expiresAt : null,
       lastError: this.lastError,
-      usage: this.usage(),
+      usage,
     };
+  }
+
+  /**
+   * 上一次取号撞上了月上限（lastError 是 CF_QUOTA），而现在已经不超了（调高了上限、或者跨了月）：
+   * 这条旧错误撤掉。不然设置页的状态行还说「已到上限、已停用」，下面的用量行却是「本月已用 X / 新上限」，
+   * 要等下一次取号成功才清得掉。
+   */
+  _settleQuotaError(usage) {
+    if (this.lastError === 'CF_QUOTA' && !usage.exceeded) this.lastError = null;
   }
 
   /* ------------------------------ 月用量 ------------------------------ */
@@ -437,14 +453,19 @@ class CloudflareTurn {
     return { ...this.usage(), crossedWarn };
   }
 
-  /** 改月上限（GB，1–1000）。调高到 80% 以下时，80% 的提醒下次还会再来一次。 */
+  /**
+   * 改月上限（GB，1–1000）。调高到 80% 以下时，80% 的提醒下次还会再来一次；
+   * 调到用量以上时，「已到上限」那条旧错误跟着撤掉（见 _settleQuotaError）。
+   */
   async setLimit(limitGB) {
     if (!isValidLimitGb(limitGB)) throw new TypeError('无效的 TURN 用量上限');
     const usage = this._rollover();
     usage.limitGB = limitGB;
     if (usage.usedBytes < limitGB * BYTES_PER_GB * WARN_RATIO) usage.warned = false;
     await this._persistUsage();
-    return this.usage();
+    const next = this.usage();
+    this._settleQuotaError(next);
+    return next;
   }
 }
 

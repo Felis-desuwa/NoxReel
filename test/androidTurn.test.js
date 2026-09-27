@@ -176,10 +176,14 @@ test('临时账号和月用量的几个数和桌面端一致', () => {
   assert.equal(kt('MIN_LIMIT_GB'), js('MIN_LIMIT_GB'));
   assert.equal(kt('MAX_LIMIT_GB'), js('MAX_LIMIT_GB'));
   assert.equal(kt('BYTES_PER_GB'), 1e9);
-  // 桌面端主进程的 IPC 校验上限
+  // 桌面端主进程的 IPC 校验上限：放得下桌面页面「离过期不到 12 小时就换一组」要的最短有效期
   const main = read('src/main/main.js');
-  assert.match(main, /const MAX_TURN_MIN_VALID_MS = 3 \* 60 \* 60 \* 1000;/);
-  assert.equal(kt('MAX_MIN_VALID_MS'), 3 * 60 * 60 * 1000);
+  assert.match(main, /const MAX_TURN_MIN_VALID_MS = 13 \* 60 \* 60 \* 1000;/);
+  // 安卓的上限只要盖得住安卓页面自己要的最短有效期（两端的刷新阈值各自定）
+  const androidRefreshHours = Number(
+    /const CF_REFRESH_BEFORE_MS = (\d+) \* 60 \* 60 \* 1000;/.exec(read('android/app/src/main/assets/js/app-android.js'))[1]
+  );
+  assert.ok(kt('MAX_MIN_VALID_MS') >= androidRefreshHours * 60 * 60 * 1000, '安卓页面要的最短有效期超过了原生那边放行的上限');
   assert.match(main, /const MAX_TURN_USAGE_REPORT = 64 \* 1e9;/);
   assert.equal(kt('MAX_USAGE_REPORT'), 64e9);
   // 用量按 UTC 自然月

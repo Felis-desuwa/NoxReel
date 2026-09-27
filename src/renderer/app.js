@@ -48,7 +48,7 @@ import {
   summarizeCandidates,
   turnMissingCredentials,
 } from './lib/ice.js';
-import { RelayUsageMeter, cloudflareRelayPairs, onlyCloudflareRelays } from './lib/turnUsage.js';
+import { RelayUsageMeter, cloudflareRelayPairs, isCloudflareTurnUrl, onlyCloudflareRelays } from './lib/turnUsage.js';
 import {
   bitrateOf,
   bufferLead,
@@ -388,9 +388,9 @@ function iceServers() {
 
 const RELAY_ONLY_NO_TURN = '已打开「隐藏我的 IP」，但还没有可用的 TURN 中继：请在设置里配好 TURN，或者先关掉这个开关。';
 
-/** Cloudflare TURN 本月用量到了上限时的说法。 */
+/** Cloudflare TURN 本月用量到了上限时的说法。月份按 UTC 算（和主进程的计量一致），德州这边是本地上个月最后一天的傍晚。 */
 function cfQuotaText(limitGB = S.cfTurnUsage?.limitGB) {
-  return `本月 Cloudflare TURN 用量已到你设的上限（${limitGB || '?'} GB），为免扣费已停用；下个月 1 日自动恢复，或者在设置里调高上限`;
+  return `本月 Cloudflare TURN 用量已到你设的上限（${limitGB || '?'} GB），为免扣费已停用；下个月 1 日（UTC）自动恢复，或者在设置里调高上限`;
 }
 
 /**
@@ -408,8 +408,13 @@ function relayOnlyBlocked() {
 /**
  * 建 Peer 用的 { iceServers, iceTransportPolicy }。app.js 里所有 new Peer 都从这里拿。
  * 「隐藏我的 IP」开着时策略是 'relay'（只收集中继候选）；没有可用中继就抛错，不建连接。
+ *
+ * 信令事件（有人进房、收到 offer、断线重连）建连时不停下来等取号 —— 那会改变原有的同步时序。
+ * 手上没有能用的 Cloudflare 账号就顺手在后台取一组（不 await），这一次照旧按现有的配置建连，
+ * 下一次重连就能带上中继。开房、邀请、加入那几条路径建连前已经 await 过，这里不会重复去取。
  */
 function peerIce() {
+  if (turnFetchNeeded()) ensureTurnReady().catch(() => {});
   if (!S.settings.relayOnly) return { iceServers: iceServers(), iceTransportPolicy: 'all' };
   const config = peerIceConfig(iceInputs());
   if (!config) throw new Error(relayOnlyBlocked() || RELAY_ONLY_NO_TURN);
@@ -428,15 +433,24 @@ function signalPeerIce() {
 
 /* ---------------------------- Cloudflare TURN ---------------------------- */
 
-// 临时账号离过期不到两小时就换一组新的（主进程那边的缓存本来就提前一小时算过期）
-const CF_REFRESH_BEFORE_MS = 2 * 60 * 60 * 1000;
+// 临时账号离过期不到 12 小时就换一组新的（主进程那边的缓存本来就提前一小时算过期）。
+// 新建的连接因此至少带着 13 小时有效的凭据，一整晚的播放列表也盖得住；生成账号不花钱。
+// 以前是 2 小时：长放映中途凭据过期，中继的 Refresh / CreatePermission 可能被拒、连接断掉
+const CF_REFRESH_BEFORE_MS = 12 * 60 * 60 * 1000;
 // 取账号失败后这么久之内不再去取：网络不通时别让每建一条连接都干等十秒
 const CF_RETRY_MS = 30_000;
 const CF_MIN_TIMER_MS = 60_000;
+// 取号失败后在后台按退避接着取：30 秒起翻倍，最长隔 10 分钟，直到拿到或用户改了设置
+const CF_RETRY_MAX_MS = 10 * 60_000;
+// 过一会儿再取可能就好了的失败（网络、Cloudflare 限流或故障、回应不对）。没配置、凭据被拒、到了上限
+// 这几种要用户动手，后台重试没用
+const CF_RETRYABLE = new Set(['CF_NETWORK', 'CF_UNAVAILABLE', 'CF_BAD_RESPONSE']);
 let cfTurnFetch = null;
 let cfTurnRetryAt = 0;
 let cfTurnTimer = null;
 let cfQuotaLogged = false;
+// 连着失败了几次：后台重试按它退避；日志只在第一次失败和恢复时各说一句
+let cfFailStreak = 0;
 
 /** 主进程报错里的代码（CF_NETWORK 这类）。参数校验的「无效的 xxx」也归成格式不对。 */
 function cfErrorCode(error) {
@@ -449,6 +463,7 @@ function cfErrorCode(error) {
 const CF_ERROR_TEXT = {
   CF_UNAUTHORIZED: '未授权：Cloudflare 不认这组 Turn Token ID 和 API Token',
   CF_NETWORK: '网络不通：连不上 Cloudflare',
+  CF_UNAVAILABLE: 'Cloudflare 暂时不可用（限流或服务故障），稍后再试',
   CF_BAD_RESPONSE: 'Cloudflare 的回应看不懂',
   CF_NOT_CONFIGURED: '还没保存 Cloudflare 凭据',
   CF_NO_ENCRYPTION: '本机的加密服务不可用，不能安全地保存 API Token',
@@ -460,7 +475,15 @@ function cfErrorText(code) {
   return CF_ERROR_TEXT[code] || '出错了';
 }
 
-/** 来源是 Cloudflare、手上的临时账号没有或离过期不到两小时：建连接之前得先去取一组。 */
+/** 保存凭据时的报错：Cloudflare 回了 HTTP 错误的，把状态码带上，好分清是填错了还是它那边暂时有问题。 */
+function cfErrorDetail(error) {
+  const code = cfErrorCode(error);
+  const status = /HTTP (\d{3})/.exec(String(error?.message || error || ''))?.[1];
+  const text = cfErrorText(code);
+  return status && (code === 'CF_BAD_RESPONSE' || code === 'CF_UNAVAILABLE') ? `${text}（HTTP ${status}）` : text;
+}
+
+/** 来源是 Cloudflare、手上的临时账号没有或离过期不到 12 小时：建连接之前得先去取一组。 */
 function turnFetchNeeded() {
   if (S.settings.turnSource !== 'cloudflare') return false;
   if (S.cfTurn && S.cfTurn.expiresAt - Date.now() > CF_REFRESH_BEFORE_MS) return false;
@@ -485,11 +508,15 @@ function markCfQuota(limitGB) {
  *
  * 取不到也不抛错：没开「隐藏我的 IP」就记一条日志、照常直连（TURN 本来就是兜底）；
  * 开了的话，紧接着的 relayOnlyBlocked() 会把连接拦下。同时只发一个请求。
+ * 失败了（网络、Cloudflare 暂时不可用）后台按退避接着取（见 scheduleCfTurnRefresh），日志只在
+ * 第一次失败和恢复时各说一句 —— 以前失败一次就再没人去取，这一场由信令触发的连接全都没有中继。
  */
 async function ensureTurnReady() {
   if (!turnFetchNeeded()) return;
   if (!cfTurnFetch) {
     cfTurnFetch = (async () => {
+      // 先让出一拍：取号要是在同一拍里就抛错，finally 清 cfTurnFetch 得排在它挂上之后，不然它永远清不掉
+      await null;
       try {
         const creds = await window.sw.turn.cfCredentials({ minValidMs: CF_REFRESH_BEFORE_MS });
         S.cfTurn = {
@@ -503,6 +530,10 @@ async function ensureTurnReady() {
         // 主进程肯发账号，说明这个月没到上限（跨了月、或者上限调高了）
         if (S.cfTurnUsage?.exceeded) S.cfTurnUsage = { ...S.cfTurnUsage, exceeded: false };
         S.cfTurnState = { ...(S.cfTurnState || {}), configured: true, expiresAt: creds.expiresAt, lastError: null };
+        if (cfFailStreak > 0) log('Cloudflare TURN 账号拿到了，之后新建的连接会带上中继', 'good');
+        cfFailStreak = 0;
+        // 还连着的连接也换上这组新账号（只换 Cloudflare 那一条，策略不动）
+        refreshLiveCfTurn();
         scheduleCfTurnRefresh();
       } catch (error) {
         cfTurnRetryAt = Date.now() + CF_RETRY_MS;
@@ -510,11 +541,16 @@ async function ensureTurnReady() {
         S.cfTurnState = { ...(S.cfTurnState || {}), lastError: code };
         if (code === 'CF_QUOTA') {
           markCfQuota(Number(/（(\d+) GB）/.exec(String(error?.message || ''))?.[1]) || 0);
-        } else if (S.settings.relayOnly) {
-          log(`Cloudflare TURN 账号没拿到：${cfErrorText(code)}`, 'bad');
         } else {
-          log(`Cloudflare TURN 账号没拿到（${cfErrorText(code)}），这次先不走中继、只尝试直连`, 'warn');
+          cfFailStreak += 1;
+          // 后台还会按退避接着取：同一件事只在第一次失败时说
+          if (cfFailStreak === 1 && S.settings.relayOnly) {
+            log(`Cloudflare TURN 账号没拿到：${cfErrorText(code)}`, 'bad');
+          } else if (cfFailStreak === 1) {
+            log(`Cloudflare TURN 账号没拿到（${cfErrorText(code)}），这次先不走中继、只尝试直连`, 'warn');
+          }
         }
+        scheduleCfTurnRefresh();
       } finally {
         cfTurnFetch = null;
         renderCfTurnStatus();
@@ -524,17 +560,73 @@ async function ensureTurnReady() {
   await cfTurnFetch;
 }
 
-/** 离过期不到两小时时自己换一组，不等下一次建连接。 */
+/**
+ * 后台的定时器，不等下一次建连接：
+ *  - 手上有账号：离过期不到 12 小时自己换一组；
+ *  - 取号失败、而且是过一会儿可能就好的那种（CF_RETRYABLE）：30 秒起翻倍、最长隔 10 分钟接着取，
+ *    直到拿到或者用户改了设置。手上那组还没过期的话，最晚在它过期时再试一次。
+ * 每一轮之后顺手让被「隐藏我的 IP」拦下的邀请卡重来（取到了才会真的重来，见 retryBlockedInvite）。
+ */
 function scheduleCfTurnRefresh() {
   clearTimeout(cfTurnTimer);
   cfTurnTimer = null;
-  if (S.settings.turnSource !== 'cloudflare' || !S.cfTurn || !(S.cfTurn.expiresAt > Date.now())) return;
-  const wait = Math.max(CF_MIN_TIMER_MS, S.cfTurn.expiresAt - CF_REFRESH_BEFORE_MS - Date.now());
+  if (S.settings.turnSource !== 'cloudflare') return;
+  const now = Date.now();
+  const valid = Boolean(S.cfTurn) && S.cfTurn.expiresAt > now;
+  let wait;
+  if (cfFailStreak > 0 && CF_RETRYABLE.has(S.cfTurnState?.lastError)) {
+    wait = Math.min(CF_RETRY_MAX_MS, CF_RETRY_MS * 2 ** Math.min(cfFailStreak - 1, 10));
+    if (valid) wait = Math.min(wait, Math.max(CF_MIN_TIMER_MS, S.cfTurn.expiresAt - now));
+  } else if (valid) {
+    wait = Math.max(CF_MIN_TIMER_MS, S.cfTurn.expiresAt - CF_REFRESH_BEFORE_MS - now);
+  } else {
+    return;
+  }
   cfTurnTimer = setTimeout(async () => {
     cfTurnTimer = null;
     await ensureTurnReady().catch(() => {});
+    retryBlockedInvite();
     scheduleCfTurnRefresh();
   }, wait);
+}
+
+/**
+ * 换到新的 Cloudflare 临时账号之后，给还连着的连接也换上（setConfiguration）。
+ * 已建立的 RTCPeerConnection 不会自己换凭据：长放映跨过旧账号的过期时间，中继的 Refresh / CreatePermission
+ * 可能被拒（按 TURN 协议推断，需实测）。只替换配置里 Cloudflare 的那一条 TURN，别的服务器原样留着，
+ * iceTransportPolicy（relay / all）照旧 —— 「隐藏我的 IP」只影响之后新建的连接，这里既不许把 relay 的
+ * 连接放宽，也不往本来没带 Cloudflare 中继的连接里加。证书不回传（回传了也不许变）。返回换了几条。
+ */
+function refreshLiveCfTurn() {
+  const fresh = S.cfTurnUsage?.exceeded ? null : relayServer({ turnSource: 'cloudflare', cfTurn: S.cfTurn });
+  if (!fresh) return 0;
+  const isCf = (server) => {
+    const urls = Array.isArray(server?.urls) ? server.urls : [server?.urls];
+    return urls.length > 0 && urls.every(isCloudflareTurnUrl);
+  };
+  const seen = new Set();
+  let updated = 0;
+  for (const peer of [...(S.swarm?.peers?.values() || []), S.pendingManualPeer]) {
+    const pc = peer?.pc;
+    if (!pc || peer.closed || seen.has(pc)) continue;
+    if (typeof pc.getConfiguration !== 'function' || typeof pc.setConfiguration !== 'function') continue;
+    seen.add(pc);
+    try {
+      const config = { ...pc.getConfiguration() };
+      delete config.certificates;
+      const servers = Array.isArray(config.iceServers) ? config.iceServers : [];
+      if (!servers.some(isCf)) continue;
+      pc.setConfiguration({
+        ...config,
+        iceServers: [...servers.filter((server) => !isCf(server)), fresh],
+        iceTransportPolicy: config.iceTransportPolicy || peer.iceTransportPolicy,
+      });
+      updated++;
+    } catch (error) {
+      console.warn('[turn] 给连着的连接换 Cloudflare 临时账号失败', error);
+    }
+  }
+  return updated;
 }
 
 /** 用量（主进程报来的）：第一次过 80% 在日志里提醒一次；到上限就停用 Cloudflare TURN。 */
@@ -546,7 +638,15 @@ function applyCfUsage(usage) {
     log(`本月 Cloudflare TURN 用量已超过你设的上限的 80%（${fmtGB(usage.usedBytes)} / ${usage.limitGB} GB）`, 'warn');
   }
   if (usage.exceeded && !wasExceeded) markCfQuota(usage.limitGB);
-  if (!usage.exceeded && wasExceeded) cfQuotaLogged = false;
+  if (!usage.exceeded && wasExceeded) {
+    cfQuotaLogged = false;
+    // 上限调高了（或者跨了月）：「已到上限、已停用」那条旧错误撤掉，不然状态行还说已停用、和用量行对不上；
+    // 30 秒的冷却也不用等，来源是 Cloudflare 就马上取一组
+    if (S.cfTurnState?.lastError === 'CF_QUOTA') S.cfTurnState = { ...S.cfTurnState, lastError: null };
+    cfTurnRetryAt = 0;
+    cfFailStreak = 0;
+    if (S.settings.turnSource === 'cloudflare') ensureTurnReady().catch(() => {});
+  }
   renderCfTurnStatus();
 }
 
@@ -9898,6 +9998,7 @@ async function saveCfTurnCredentials(button, result) {
     // 换了凭据：手上那组临时账号作废，下次连接前现取（主进程验证时已经顺手缓存了一组）
     S.cfTurn = null;
     cfTurnRetryAt = 0;
+    cfFailStreak = 0;
     applyCfTurnState(state);
     noteSettingsApplied('保存了 Cloudflare 凭据');
     const switched = Boolean($('set-turn-source-cf')?.checked) && S.settings.turnSource !== 'cloudflare';
@@ -9914,7 +10015,7 @@ async function saveCfTurnCredentials(button, result) {
       retryBlockedInvite();
     }
   } catch (error) {
-    result.textContent = t(`没保存：${cfErrorText(cfErrorCode(error))}`);
+    result.textContent = t(`没保存：${cfErrorDetail(error)}`);
   } finally {
     button.disabled = false;
   }
@@ -9954,6 +10055,8 @@ async function clearCfTurnCredentials(button, result) {
   try {
     const state = await window.sw.turn.cfClear();
     S.cfTurn = null;
+    // 凭据没了，后台的重试也停下（没配置不是过一会儿就能好的事）
+    cfFailStreak = 0;
     scheduleCfTurnRefresh();
     applyCfTurnState(state);
     if (had) noteSettingsApplied('清除了 Cloudflare 凭据');
@@ -10300,8 +10403,10 @@ $('btn-settings').onclick = () => {
       localStorage.setItem('sw.turnSource', S.settings.turnSource);
       localStorage.setItem('sw.relayOnly', S.settings.relayOnly ? '1' : '0');
       if (sourceChanged) {
-        scheduleCfTurnRefresh();
+        // 换了来源：上一轮的失败和后台重试都作废，从头来
         cfTurnRetryAt = 0;
+        cfFailStreak = 0;
+        scheduleCfTurnRefresh();
         ensureTurnReady().catch(() => {});
       }
       if (turnSource === 'cloudflare' && cfLimit !== S.cfTurnUsage?.limitGB) {

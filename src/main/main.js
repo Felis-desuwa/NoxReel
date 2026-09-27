@@ -994,8 +994,8 @@ secureHandle('discord:status', async () => discordPresence.status);
 
 // 一次汇报的增量上限：渲染进程每 10 秒报一次，10 Gbps 跑满也到不了这个数
 const MAX_TURN_USAGE_REPORT = 64 * 1e9;
-// 渲染进程只在离过期不到两小时时要一组新的；给大了等于允许它每次都绕过缓存去刷 Cloudflare
-const MAX_TURN_MIN_VALID_MS = 3 * 60 * 60 * 1000;
+// 渲染进程在离过期不到 12 小时时要一组新的（缓存本身能管 23 小时）；给大了等于允许它每次都绕过缓存去刷 Cloudflare
+const MAX_TURN_MIN_VALID_MS = 13 * 60 * 60 * 1000;
 
 // API Token 只进不出：这几个处理器没有一个把它交回去，报错里也不带它（见 cloudflareTurn.js）
 secureHandle('turn:cfSave', async (payload) => {
