@@ -13,6 +13,7 @@ import com.google.android.exoplayer2.source.ProgressiveMediaSource
 import com.google.android.exoplayer2.ui.StyledPlayerView
 import com.google.android.exoplayer2.source.DefaultMediaSourceFactory
 import com.google.android.exoplayer2.source.MediaSource
+import com.google.android.exoplayer2.upstream.HttpDataSource
 import java.util.concurrent.atomic.AtomicInteger
 import org.json.JSONObject
 
@@ -111,10 +112,13 @@ class SyncPlayer(private val context: Context) {
             override fun onPlayWhenReadyChanged(p: Boolean, reason: Int) {
                 updateSnap(generation) { it.copy(playWhenReady = p) }
             }
-            // 出错时 ExoPlayer 自己回到 IDLE，快照会照实报 idle；这里只留一条日志，
-            // 被 NetGuard 拦下的内网地址也是从这里看出来的
+            // 出错时 ExoPlayer 自己回到 IDLE。原因记进快照（loadFailed）：页面据此提示本人、
+            // 不再把它算作在等数据（全房不陪着一个坏掉的播放器等）、给「重试」。
+            // 日志照留，被 NetGuard 拦下的内网地址也是从这里看出来的
             override fun onPlayerError(error: PlaybackException) {
                 Log.w(TAG, "播放出错：${error.errorCodeName}", error)
+                val failure = failureOf(error)
+                updateSnap(generation) { it.copy(failure = failure) }
             }
         })
         exo.setMediaSource(source)
@@ -201,16 +205,45 @@ class SyncPlayer(private val context: Context) {
             .put("buffering", s.state == Player.STATE_BUFFERING)
             .put("idle", s.state == Player.STATE_IDLE)
             .put("eof", s.state == Player.STATE_ENDED)
+            // 这个播放器出过错、放不了了。原因只给代号和 HTTP 状态码，文字在页面那边生成、翻译
+            // （没出错时这两项是 null，JSONObject 不写进去）
+            .put("loadFailed", s.failure != null)
+            .put("loadReason", s.failure?.reason)
+            .put("loadStatus", s.failure?.status)
             .toString()
     }
 
-    /** 一次快照的全部字段，含它属于哪个播放器代号。整体替换，不逐字段写。 */
+    /**
+     * PlaybackException → 页面能说人话的原因（和桌面端 mpv 快照里的 loadError 同一个意思）：
+     * http（网站回了错误状态码）/ blocked（NetGuard 拦下的内网地址）/ network（连不上、超时）/
+     * format（认不出格式、解不了码）/ 空串（别的）。
+     */
+    private fun failureOf(error: PlaybackException): Failure {
+        val causes = generateSequence(error.cause) { it.cause }.take(8).toList()
+        val status = causes.filterIsInstance<HttpDataSource.InvalidResponseCodeException>().firstOrNull()?.responseCode ?: 0
+        val reason = when {
+            causes.any { it is NetGuard.BlockedAddressException } -> "blocked"
+            error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS -> "http"
+            error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
+                error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT -> "network"
+            // 3xxx 是解析（容器认不出），4xxx 是解码（编码不支持）
+            error.errorCode in 3000..4999 -> "format"
+            else -> ""
+        }
+        return Failure(reason, status)
+    }
+
+    /** 播放器出错的原因：代号 + HTTP 状态码（不是 HTTP 错误时是 0）。 */
+    private data class Failure(val reason: String, val status: Int)
+
+    /** 一次快照的全部字段，含它属于哪个播放器代号。整体替换，不逐字段写。failure 非空表示这个播放器出过错。 */
     private data class Snap(
         val generation: Int,
         val posMs: Long,
         val durMs: Long,
         val playWhenReady: Boolean,
         val state: Int,
+        val failure: Failure? = null,
     )
 
     companion object {

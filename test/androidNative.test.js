@@ -272,6 +272,35 @@ test('buffering 只看 STATE_BUFFERING，让没让它播都算（在线链接的
   }
 });
 
+test('播放器出过错：快照带 loadFailed 和原因代号（页面据此提示本人、不再把它算作在等数据）', () => {
+  const kt = kotlinPlayer();
+  const failed = { ...Snap(4, 0, 0, false, PLAYER_STATE.STATE_IDLE), failure: { reason: 'http', status: 403 } };
+  const json = kt.snapshot(failed);
+  assert.equal(json.loadFailed, true);
+  assert.equal(json.loadReason, 'http');
+  assert.equal(json.loadStatus, 403);
+  assert.equal(json.idle, true, '出错后 ExoPlayer 自己回到 IDLE');
+  const ok = kt.snapshot(Snap(4, 1000, 60000, true, PLAYER_STATE.STATE_READY));
+  assert.equal(ok.loadFailed, false);
+  assert.ok(!('loadReason' in ok) && !('loadStatus' in ok), '没出错时不带原因');
+
+  // 出错回调要经 updateSnap 的代号过滤写进快照（旧播放器迟到的错误不能污染新快照），日志照留
+  const replace = kotlinFun(playerSrc, 'replacePlayer');
+  assert.match(replace.body, /override fun onPlayerError\(error: PlaybackException\) \{[\s\S]*?Log\.w\(TAG[\s\S]*?updateSnap\(generation\) \{ it\.copy\(failure = failure\) \}/);
+  // 原因只给代号：NetGuard 拦下的内网地址单独认出来（它是 IOException，ExoPlayer 会把它报成连不上）
+  const failureOf = kotlinFun(playerSrc, 'failureOf');
+  assert.ok(failureOf, '没有 failureOf');
+  assert.match(failureOf.body, /NetGuard\.BlockedAddressException\s*\}\s*->\s*"blocked"/);
+  assert.match(failureOf.body, /ERROR_CODE_IO_BAD_HTTP_STATUS -> "http"/);
+  assert.match(failureOf.body, /HttpDataSource\.InvalidResponseCodeException/);
+  assert.ok(
+    failureOf.body.indexOf('"blocked"') < failureOf.body.indexOf('"network"'),
+    '被拦下的内网地址要排在「连不上」前面，否则永远报成网络问题'
+  );
+  assert.match(playerSrc, /import com\.google\.android\.exoplayer2\.upstream\.HttpDataSource/);
+  assert.match(playerSrc, /val failure: Failure\? = null,/, 'Snap 的 failure 要有默认值，resetSnap 那种五参数的构造照旧能用');
+});
+
 test('resetSnap：新代号的初始快照是 0:00、暂停、idle', () => {
   const kt = kotlinPlayer();
   const s = kt.resetSnap(9);
@@ -289,6 +318,8 @@ test('resetSnap：新代号的初始快照是 0:00、暂停、idle', () => {
     buffering: false,
     idle: true,
     eof: false,
+    // 没出过错：原因那两项是 null，JSONObject 不写进去
+    loadFailed: false,
   });
 });
 

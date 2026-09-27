@@ -1082,7 +1082,8 @@ test('安卓：顶栏按钮只在在线链接出现，差开时那一条带「�
 
 test('安卓：切换方式存本机、交给引擎；「同步到房主」只对在线链接', () => {
   assert.match(APP_ANDROID, /localStorage\.setItem\('sw\.linkSync', S\.linkSync\);\s*S\.sync\?\.setFollow\(\{ mode: S\.linkSync \}\);/);
-  assert.match(APP_ANDROID, /if \(S\.sourceType === 'link' && S\.sync\?\.syncToRoom\(\)\) log\('已同步到房主的进度', 'good'\);/);
+  // 第三个参数让这句成功提示也在房间里亮出来（大厅的日志区进房后看不见，见 app-android.js 的 roomNote）
+  assert.match(APP_ANDROID, /if \(S\.sourceType === 'link' && S\.sync\?\.syncToRoom\(\)\) log\('已同步到房主的进度', 'good'(, \{ toast: true \})?\);/);
   const html = read(ANDROID, 'assets', 'index.html');
   assert.match(html, /<button id="btn-follow" style="display:none"/);
   assert.match(html, /<div id="drift" style="display:none">/);

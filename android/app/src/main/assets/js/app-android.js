@@ -96,6 +96,9 @@ const S = {
   linkInfo: null,
   nowLink: null,
   approvedSites: new Set(),
+  // 当前这一部在手机上放不了（或者在等新地址）：{seq, kind, text, url?, position?, duration?}。
+  // kind 见 PLAY_ISSUE_STATUS；只有 seq 对得上当前项时才算数（见 playIssue）
+  playIssue: null,
   playerStarted: false,
   playerTimer: null,
   // 播放器代号：原生的 load/release 落地前，快照还属于上一代，靠它认出来并丢弃
@@ -108,6 +111,8 @@ const S = {
   entered: false,
   // 加入流程正在跑（解码邀请、收集候选、连信令）：这期间再来的邀请一律不收
   joining: false,
+  // 加入尝试的代次：resetAttempt 拆掉一次尝试就加一，异步步骤 await 回来先核对，过期的不许再改状态
+  attemptGen: 0,
   // 信令模式已经进了房（首连成功）。之后信令断线重连期间也还算在房间里
   serverJoined: false,
   // 极简模式上一次还没连上的尝试：{cancel()}，新的一次开始前把它的定时器和监听收掉
@@ -160,7 +165,12 @@ function el(tag, { className, text, title, raw = false, attrs } = {}, children =
   return node;
 }
 
-function log(msg, level) {
+/**
+ * 记一行日志。#log 在大厅里，进了房间整块都看不见：这时警告和失败（warn / bad）同时在画面上
+ * 亮一条提示（见 roomNote），不然「被房主拒了」「链接放不了」「重连放弃了」用户一条也看不到。
+ * toast：true 连成功类的也亮（用户刚点的按钮要有回音），false 只进日志（会反复出现的进度类说明）。
+ */
+function log(msg, level, { toast } = {}) {
   const box = $('log');
   const line = document.createElement('div');
   if (level) line.className = 'log-' + level;
@@ -171,6 +181,40 @@ function log(msg, level) {
   if (box.children.length > LOG_VIEW_LIMIT + 50) box.replaceChildren(...[...box.children].slice(-LOG_VIEW_LIMIT));
   box.scrollTop = box.scrollHeight;
   console.log('[app]', msg);
+  if (S.entered && (toast ?? (level === 'bad' || level === 'warn'))) roomNote(msg, level || 'good');
+}
+
+/* --------------------------- 房间里的提示条 --------------------------- */
+// 顶栏下面一小条，几秒后自己消失。同一句还亮着时只重新计时，不叠第二条；最多同时亮三条。
+// 不在 .bar 里：控件收起（沉浸全屏）时照常显示。
+const ROOM_NOTE_MS = { bad: 8000, warn: 5000, good: 3000 };
+const ROOM_NOTE_MAX = 3;
+const roomNotes = []; // {text, node, timer}
+
+function renderRoomNotes() {
+  const box = $('room-toast');
+  if (box) box.replaceChildren(...roomNotes.map((n) => n.node));
+}
+
+function dropRoomNote(note) {
+  clearTimeout(note.timer);
+  const i = roomNotes.indexOf(note);
+  if (i >= 0) roomNotes.splice(i, 1);
+  renderRoomNotes();
+}
+
+function roomNote(text, level = 'warn') {
+  let note = roomNotes.find((n) => n.text === text);
+  if (note) {
+    clearTimeout(note.timer);
+  } else {
+    note = { text, node: el('div', { className: `room-note log-${level}`, text }), timer: null };
+    roomNotes.push(note);
+    while (roomNotes.length > ROOM_NOTE_MAX) dropRoomNote(roomNotes[0]);
+  }
+  const shown = note;
+  shown.timer = setTimeout(() => dropRoomNote(shown), ROOM_NOTE_MS[level] || ROOM_NOTE_MS.warn);
+  renderRoomNotes();
 }
 
 /** 给一个 Promise 加时限：到点还没结果就按 message 失败。原来那个 Promise 不受影响。 */
@@ -184,11 +228,11 @@ function withTimeout(promise, ms, message) {
 
 // 对端能反复触发的警告：同一句一段时间内只记一次，别让人拿它刷屏（键是固定文案，数量有限）
 const noisyLoggedAt = new Map();
-function logThrottled(msg, level, windowMs = 10_000) {
+function logThrottled(msg, level, windowMs = 10_000, opts) {
   const now = Date.now();
   if (now - (noisyLoggedAt.get(msg) ?? -Infinity) < windowMs) return;
   noisyLoggedAt.set(msg, now);
-  log(msg, level);
+  log(msg, level, opts);
 }
 
 function fmtBytes(n) {
@@ -587,6 +631,8 @@ function initSwarmAndSync() {
   S.sync.on('state', renderWaiting);
   // 在线链接：和房主差了多少秒
   S.sync.on('drift', renderDrift);
+  // 在线链接断在半路（不是放完了）：提示本人、给「重试」（和桌面端 onLinkStreamCut 一样）
+  S.sync.on('stream-cut', (e) => onLinkStreamCut(e));
   S.sync.on('drift-correct', ({ seconds }) => log(`和房主差了 ${Math.abs(seconds).toFixed(1)} 秒，自动对齐`));
   S.sync.on('duration', (d) => {
     if (S.session?.slot != null) S.swarm.setDuration(S.session.slot, d);
@@ -638,6 +684,12 @@ function initSwarmAndSync() {
   S.swarm.on('mode-mismatch', ({ localMode, remoteMode }) => {
     log(`模式不一致：本机是${securityModeLabel(localMode)}，对方是${securityModeLabel(remoteMode)}，已在传输媒体前断开。`, 'bad');
     S.signaling?.close();
+    // 还没进房：这次尝试作废、拆干净，安全模式下拉框放开，好让人切成对方的模式再加入。
+    // 挪到下一轮再拆：这会儿还在 Swarm 自己的事件回调里
+    const swarm = S.swarm;
+    setTimeout(() => {
+      if (S.swarm === swarm) resetAttempt();
+    }, 0);
   });
   S.swarm.on('version-mismatch', ({ name, remoteVersion }) => {
     log(
@@ -733,6 +785,8 @@ function switchCurrent(item) {
   S.manifest = S.session?.manifest || null;
   S.sourceType = item?.kind || null;
   S.linkInfo = null;
+  S.playIssue = null;
+  renderPlayIssue();
   S.prog =
     item?.kind === 'link'
       ? { contiguousBytes: 0, runBytes: 0, runEndBytes: 0, playbackByte: 0, complete: true }
@@ -846,7 +900,8 @@ async function ensureCurrentSession() {
   } catch (e) {
     manifestRetryAt = Date.now() + MANIFEST_RETRY_MS;
     setTimeout(ensureCurrentSession, MANIFEST_RETRY_MS + 50);
-    log(`还没拿到《${item.name}》的清单：${e.message}`, 'warn');
+    // 每 5 秒重试一次：房间里不弹提示（片名一栏已经写着「正在获取清单…」），只进日志
+    log(`还没拿到《${item.name}》的清单：${e.message}`, 'warn', { toast: false });
   } finally {
     if (S.opening === item.fileId) S.opening = null;
   }
@@ -891,6 +946,10 @@ function safePlaybackFromMessage(msg) {
   return { url: playback.url, headers };
 }
 
+// 房主给的签名地址放多久算过期，和桌面端 LINK_INFO_TTL_MS 一致。晚进房时房主会先把旧的那条原样补发，
+// 紧接着重新解析一份、用同一个 seq 再发（桌面端 refreshNowLink）：拿旧的去播只会 403
+const LINK_INFO_TTL_MS = 15 * 60 * 1000;
+
 /** 房主解析好的播放地址（手机自己解析不了网页，全靠这一条）。 */
 function onNowLink(msg, peer) {
   if (!fromHost(peer)) {
@@ -898,23 +957,59 @@ function onNowLink(msg, peer) {
     return;
   }
   if (!Number.isSafeInteger(msg.seq) || msg.seq < S.playlist.seq) return;
-  S.nowLink = { seq: msg.seq, playback: safePlaybackFromMessage(msg) };
-  if (msg.seq === S.currentSeq) playLink(msg.seq);
+  // 解析时间只能往前不能往后：填个未来时间就能让过期的地址一直算新鲜。没填的按刚解析出来算（旧版房主）
+  const resolvedAt = Number.isSafeInteger(msg.resolvedAt) ? Math.min(msg.resolvedAt, Date.now()) : Date.now();
+  const playback = safePlaybackFromMessage(msg);
+  S.nowLink = { seq: msg.seq, playback, resolvedAt };
+  if (msg.seq !== S.currentSeq) return;
+  // 这一部断流了、房主正好发来一条新地址：换上重来。正常在放的不中途换源（和桌面端一样）；
+  // 打不开的那种播放器已经退了，下面的 playLink 会直接拿新地址起播
+  const issue = playIssue();
+  if (issue?.kind === 'cut' && playback && playback.url !== issue.url) {
+    retryPlayback();
+    return;
+  }
+  playLink(msg.seq);
 }
 
 /** tryPlayLink 的发射后不管版本：异常只进控制台，不往调用点抛。 */
-const playLink = (seq) => tryPlayLink(seq).catch((e) => console.warn('[android] 播放链接出错：', e));
+const playLink = (seq, opts) => tryPlayLink(seq, opts).catch((e) => console.warn('[android] 播放链接出错：', e));
 
-async function tryPlayLink(seq) {
+/**
+ * 用房主给的地址起播当前这部链接。force 是本人点了「重试」：过期的地址也试一试、拒绝过的网站再问一次、
+ * 失败过的同一条地址再开一次。房主补发地址、换片这些自动触发的不做这几件事，免得追着人问、对着坏地址反复开。
+ */
+async function tryPlayLink(seq, { force = false } = {}) {
   const item = S.current;
   if (!item || item.kind !== 'link' || S.currentSeq !== seq || S.playerStarted) return;
   S.linkInfo = { title: item.title || '在线视频', duration: item.durationSec || 0, playback: null };
   renderFilmInfo();
-  if (S.nowLink?.seq !== seq) return; // 等房主的地址
-  const playback = S.nowLink.playback;
+  renderStatus(S.prog);
+  const now = S.nowLink?.seq === seq ? S.nowLink : null;
+  if (!now) return; // 等房主的地址
+  const issue = playIssue();
+  // 本人拒绝过这个网站：房主补发的地址不再追着问，要看就点「重试」
+  if (issue?.kind === 'denied' && !force) return;
+  const playback = now.playback;
   if (!playback) {
-    log('房主分享的是网页链接，但没有可供 Android 播放的安全直链', 'bad');
+    if (issue?.kind !== 'no-direct') notePlayIssue('no-direct', '房主分享的是网页链接，但没有可供 Android 播放的安全直链', 'bad');
     return;
+  }
+  // 同一条地址已经在手机上失败过：等房主发新的，或者等本人点「重试」
+  if (!force && issue?.url === playback.url && FAILED_ISSUES.has(issue.kind)) return;
+  if (!force && Date.now() - now.resolvedAt > LINK_INFO_TTL_MS) {
+    if (issue?.kind !== 'stale') {
+      notePlayIssue('stale', '房主给的播放地址已经放了很久，多半过期了，正在等房主发新的；也可以点「重试」直接试这一条', 'warn', {
+        url: playback.url,
+      });
+    }
+    return;
+  }
+
+  // 手上这条地址能用：之前那个问题（没直链、地址过期、另一条地址打不开、本人点了重试）翻篇了
+  if (issue) {
+    S.playIssue = null;
+    renderPlayIssue();
   }
 
   // 同一个网站在这个房间里只问一次。用页面里的对话框，不用 window.confirm ——
@@ -924,33 +1019,182 @@ async function tryPlayLink(seq) {
   if (!S.approvedSites.has(origin)) {
     if (S.askingSite) return; // 已经弹着一个了，别叠第二个
     S.askingSite = true;
+    renderStatus(S.prog);
     let allowed = false;
     try {
       allowed = await askSite(origin);
     } finally {
       S.askingSite = false;
     }
+    // 等人点按钮的这段时间里可能已经换片、或者别的路径已经起播了。按 id 认当前项：
+    // 房主开播、成员进出都会发 seq 不变的新快照，当前项换成了新对象但还是这一部
+    if (S.current?.id !== item.id || S.currentSeq !== seq || S.playerStarted) return;
     if (!allowed) {
-      log('你拒绝了房主发送的视频链接', 'warn');
+      notePlayIssue('denied', '你拒绝了房主发送的视频链接', 'warn');
       return;
     }
     S.approvedSites.add(origin);
-    // 等人点按钮的这段时间里可能已经换片、或者别的路径已经起播了
-    if (S.current !== item || S.currentSeq !== seq || S.playerStarted) return;
+    // 等的这段时间里房主可能已经发来了新地址（晚进房时他会接着补发重新解析的那条）：
+    // 从头再走一遍，用最新的 S.nowLink，不用 await 之前取出来的
+    return tryPlayLink(seq, { force });
   }
 
   S.linkInfo.playback = playback;
   const started = window.swPlayer.loadUrl(playback.url, playback.headers);
   S.playerGen = started;
   if (!started) {
-    log('Android 拒绝或无法打开这个播放地址', 'bad');
+    notePlayIssue('rejected', 'Android 拒绝或无法打开这个播放地址', 'bad', { url: playback.url });
     return;
   }
+  S.playIssue = null;
+  renderPlayIssue();
   S.playerStarted = true;
   S.danmaku?.setActive(true);
   renderStatus(S.prog);
   startPlayerTicks();
   log(`正在从原网站播放《${S.linkInfo.title}》`, 'good');
+}
+
+/* ------------------------ 这一部在手机上放不了 ------------------------ */
+// 以前播放器出错只进 logcat：状态栏照写「房间同步中」，画面定格，完全同步下还对着一个 idle 的播放器
+// 反复跳转，最后报「自动同步没跟上」。现在状态栏说实话，顶栏下面那一条写清原因；能救的给「重试」。
+
+// 同一条地址在手机上失败过的几种：房主补发同一条时不自动再开
+const FAILED_ISSUES = new Set(['load', 'rejected', 'cut']);
+// 点「重试」有意义的几种（内网地址被拒、房主没给直链的，重试也没用；本地文件解不了码，重载同一个文件也救不回来）
+const RETRY_ISSUES = new Set(['load', 'cut', 'stale', 'denied']);
+// 状态栏上的短说法
+const PLAY_ISSUE_STATUS = {
+  'no-direct': '在线视频 · 没有可供 Android 播放的直链',
+  denied: '在线视频 · 你拒绝了这个网站',
+  stale: '在线视频 · 播放地址已过期，等房主发新的',
+  rejected: '在线视频 · 手机打不开这个地址',
+  load: '在线视频 · 手机上打不开',
+  cut: '在线视频 · 断流了',
+  file: '手机上的播放器放不了这一部',
+};
+
+/** 当前这一部的问题（seq 对不上的是上一部留下的，不算）。 */
+function playIssue() {
+  return S.playIssue && S.playIssue.seq === S.currentSeq ? S.playIssue : null;
+}
+
+/** 记下这一部的问题：状态栏、顶栏下面那一条跟着变。text 同时进日志（那一条已经亮着，不再另弹提示）。 */
+function notePlayIssue(kind, text, level, extra = {}) {
+  S.playIssue = { seq: S.currentSeq, kind, text, ...extra };
+  renderPlayIssue();
+  renderStatus(S.prog);
+  renderDrift();
+  log(text, level, { toast: false });
+}
+
+function clearPlayIssue() {
+  if (!S.playIssue) return;
+  S.playIssue = null;
+  renderPlayIssue();
+  renderStatus(S.prog);
+}
+
+function renderPlayIssue() {
+  const box = $('play-issue');
+  if (!box) return;
+  const issue = playIssue();
+  show(box, !!issue);
+  if (!issue) return;
+  $('play-issue-text').textContent = issue.text || '';
+  show($('play-retry'), RETRY_ISSUES.has(issue.kind));
+}
+
+/** 原生快照里的出错原因（只有代号和 HTTP 状态码）。 */
+function loadErrorOf(snap) {
+  return {
+    reason: typeof snap?.loadReason === 'string' ? snap.loadReason : '',
+    status: Number.isInteger(snap?.loadStatus) ? snap.loadStatus : 0,
+  };
+}
+
+/** 播放器打不开的原因。文字在这边生成、翻译（和桌面端 linkLoadErrorText 同一套说法）。 */
+function playErrorText(error) {
+  const status = Number.isInteger(error?.status) ? error.status : 0;
+  switch (error?.reason) {
+    case 'http':
+      if (status === 401 || status === 403) return `网站拒绝了播放请求（HTTP ${status}），播放地址可能已经过期`;
+      return status ? `网站返回了错误（HTTP ${status}）` : '网站返回了错误';
+    case 'blocked':
+      return '播放地址指向内网或本机，已拦下';
+    case 'network':
+      return '连不上视频网站（超时或网络中断）';
+    case 'format':
+      return '手机上的播放器认不出这个视频的格式';
+    default:
+      return '原因不明';
+  }
+}
+
+/**
+ * 在线视频打不开（403、签名过期、连不上、被拦下的内网地址）：这个播放器没救了，退掉、告诉本人。
+ * 同步引擎那边：它在等数据时让全房等着的卡顿一并放掉（打不开的播放器永远等不来）。
+ * 房主再发来新地址会自动换上重开（见 onNowLink），本人也可以点「重试」。
+ */
+function onLinkLoadFailed(snap) {
+  const url = S.linkInfo?.playback?.url || '';
+  stopPlayback();
+  S.sync.playerGone();
+  notePlayIssue('load', `播放器打不开这个在线视频：${playErrorText(loadErrorOf(snap))}`, 'bad', { url });
+}
+
+/** 本地文件解不了码：重载同一个文件也救不回来，只说一声（每一部说一次）。 */
+function noteFileLoadFailed(snap) {
+  if (playIssue()?.kind === 'file') return;
+  notePlayIssue('file', `手机上的播放器放不了这一部：${playErrorText(loadErrorOf(snap))}`, 'bad');
+}
+
+/**
+ * 在线链接停在一个不是片尾的 eof 上 = 断流。同步引擎的 onMpvTick 里有同一道判断（报 stream-cut），
+ * 手机不走 onMpvTick，在这里补上，照样经引擎的事件报出去。离开 eof（房主一跳、重新连上）就算好了。
+ */
+function noteStreamEof(tick) {
+  const sync = S.sync;
+  if (!tick.eof) {
+    sync._streamCut = false;
+    if (playIssue()?.kind === 'cut') clearPlayIssue();
+    return;
+  }
+  if (sync._streamCut || !sync.started || sync._streamEndPlausible(tick)) return;
+  sync._streamCut = true;
+  sync.emit('stream-cut', { position: tick.position || 0, duration: sync._streamDuration(tick) });
+}
+
+/** 同步引擎认定在线视频是半路断了、不是放完了：不当放完，提示本人重新连接。片长未知时两种都说。 */
+function onLinkStreamCut({ position = 0, duration = 0 } = {}) {
+  if (S.sourceType !== 'link' || !S.current || !S.playerStarted) return;
+  notePlayIssue(
+    'cut',
+    duration > 0
+      ? `在线视频在 ${fmtTime(position)} 断了（全片 ${fmtTime(duration)}），不是放完了：点「重试」重新连接`
+      : '在线视频停住了，但片长未知，分不清是放完了还是断流了：没放完就点「重试」重新连接',
+    'warn',
+    { url: S.linkInfo?.playback?.url || '', position, duration }
+  );
+}
+
+/**
+ * 「重试」：当前这部链接用手上最新的地址重来一遍。旧播放器（断流停在半路的）先退，
+ * 新播放器的第一条 tick 按房间位置补放（和换片后一样）。
+ */
+function retryPlayback() {
+  const issue = playIssue();
+  const item = S.current;
+  if (!issue || !RETRY_ISSUES.has(issue.kind) || item?.kind !== 'link') return;
+  const seq = S.currentSeq;
+  if (S.playerStarted || S.playerTimer) {
+    stopPlayback();
+    S.sync?.playerGone();
+  }
+  S.playIssue = null;
+  renderPlayIssue();
+  log(`重新连接《${itemName(item)}》…`);
+  playLink(seq, { force: true });
 }
 
 /**
@@ -1089,6 +1333,8 @@ function startPlayerTicks() {
     // 代号对不上：这条快照是上一部片的（release/load 还没在主线程落地），整条丢弃。
     // 宁可少更新几个 250ms 周期，也不能把旧片的位置当成这一部的用户操作广播出去。
     if (S.playerGen && snap.generation !== S.playerGen) return;
+    // 在线视频打不开：这个播放器退掉、告诉本人（见 onLinkLoadFailed），这一拍到此为止
+    if (snap.loadFailed === true && S.sourceType === 'link') return onLinkLoadFailed(snap);
     const slot = S.session?.slot;
 
     // 首次拿到时长：喂给同步引擎和调度器（前瞻窗口、stall 阈值都要它）
@@ -1106,6 +1352,11 @@ function startPlayerTicks() {
       paused: snap.paused,
       // ExoPlayer 缺数据在等（在线链接的「卡没卡」只认这个，见 syncEngine 的 streaming）
       pausedForCache: snap.buffering === true,
+      // 放到头（ENDED）、出错回到 IDLE：同步引擎的跳转外推、checkDrift、卡顿判定都要看这几个
+      // （和桌面端 mpv 的 tick 同名）。以前没带上，checkDrift 对着一个坏掉的播放器反复跳转
+      idle: snap.idle === true,
+      eof: snap.eof === true,
+      loadFailed: snap.loadFailed === true,
       streamPos: null,
       duration: snap.duration,
       at: performance.now(),
@@ -1132,6 +1383,9 @@ function startPlayerTicks() {
         complete: S.sourceType === 'link' || S.prog.complete,
       });
     }
+    // 在线链接停在半路的 eof 上是断流，不是放完了；本地文件解不了码只说一声
+    if (S.sync.streaming) noteStreamEof(S.sync.lastTick);
+    else if (snap.loadFailed === true) noteFileLoadFailed(snap);
 
     // 新播放器的第一条 tick：把房间状态补放给它。播放器起来之前收到的 SYNC 只能记着
     // （没有 lastTick 时引擎不下发跳转），新建的 ExoPlayer 又固定停在 0:00、暂停；
@@ -1296,14 +1550,16 @@ async function connectSignaling(url, roomId, relay = null) {
     cancelRecovery(peerId); // 人是真走了，不是链路断了
     const peer = S.swarm.peers.get(peerId);
     if (peer?.ctrl?.readyState === 'open') {
-      logThrottled(peer.name + ' 的信令连接断了，但直连还在，传输继续', 'warn');
+      // 什么都没坏（传输照常），房间里不弹提示
+      logThrottled(peer.name + ' 的信令连接断了，但直连还在，传输继续', 'warn', undefined, { toast: false });
       return;
     }
     if (peerId === (S.hostId || S.sync?.hostId)) logThrottled('房主离开了房间', 'warn');
     S.swarm.removePeer(peerId);
   });
   sig.on('reconnecting', ({ in: ms }) => {
-    if (live()) logThrottled(`信令断开，${Math.round(ms / 1000)} 秒后重连（已建立的直连不受影响）`, 'warn');
+    // 已建立的直连照常，房间里不弹提示（服务器停着时每一轮退避都会来一条）；直连也断了的另有提示
+    if (live()) logThrottled(`信令断开，${Math.round(ms / 1000)} 秒后重连（已建立的直连不受影响）`, 'warn', undefined, { toast: false });
   });
   // 中继信令从全断里恢复（房间链接）：断着时双方发的 offer / renegotiate 都丢了，没有别的东西
   // 会再把直连拉起来。信令给出它知道的每个人和该由谁发起，直连不通的重新排上（和电脑端一样）
@@ -1334,12 +1590,22 @@ async function connectSignaling(url, roomId, relay = null) {
  * 绝不能因此把自己当房主（hostId 不能默认成自身 peerId），这次加入作废。
  * 服务器的答案也不是绝对的：房间空了之后被别人重建，它指向的是重建的人 —— 但那种情况下首认为准一样会认下他。
  */
-function adoptSignalHost(joined) {
+function adoptSignalHost(joined, sig = S.signaling) {
   const hostId = typeof joined?.hostId === 'string' ? joined.hostId : '';
   if (!hostId) throw new Error('信令服务器没有告诉我们谁是房主，已拒绝加入');
   if (hostId === S.peerId) throw new Error('这个房间号还没有人开房：可能填错了，或者房主还没开房、已经离开');
   S.hostId = hostId;
   if (S.sync) S.sync.hostId = hostId;
+  // 服务器重启后自愈（和桌面端成员一样）：重连时把认下的房主和房间人数交给服务器当建房提示，
+  // 不然房间由先重连上的人重建、他成了房主。桌面端成员建 WsSignaling 时就从邀请码里带上这两样；
+  // 手机是直接填地址和房间号进来的，没有邀请码，只能在第一次进房之后从服务器这次的答复里补上。
+  // （这一次 joined 里的房主凭据摘要 WsSignaling 没记下 —— 那时它还不知道房主是谁。所以第一次重连的提示
+  // 不带摘要，服务器按先到先得处理；之后的 joined、房主重连的 peer-join 里拿到了就会带上）
+  if (sig) {
+    sig.hostId = hostId;
+    const capacity = Number(joined?.maxMembers);
+    if (Number.isSafeInteger(capacity) && capacity > 0) sig.maxMembers = capacity;
+  }
 }
 
 /**
@@ -1373,6 +1639,8 @@ function removedFromRoom() {
     S.signaling?.close();
     S.signaling = null;
     S.serverJoined = false;
+    // 这次尝试整个拆掉（安全模式下拉框放开）；和人握过手的 resetAttempt 自己不动
+    resetAttempt();
     log(text, 'bad');
     return;
   }
@@ -1578,6 +1846,43 @@ function roomBusy() {
 }
 
 /**
+ * 这一次加入没走进房间（房主不在、中继连不上、应答一直没人粘、信令加入失败、模式对不上……）：
+ * 把这次尝试拆干净，和桌面端 resetAttempt 一样。以前 Swarm / SyncEngine 带着第一次的安全模式、昵称和
+ * 房主身份一直留着（initSwarmAndSync 见 S.swarm 就直接返回），安全模式下拉框也一直是灰的 ——
+ * 提示「请切换为相同模式后重试」却切不了，只能杀进程。
+ * 已经进了房、或者和谁握过手的不动。@returns {boolean} 真的拆了
+ */
+function resetAttempt() {
+  if (roomConnected()) return false;
+  S.attemptGen += 1;
+  S.manualAttempt?.cancel();
+  S.manualAttempt = null;
+  const sig = S.signaling;
+  S.signaling = null;
+  S.signalTransport = null;
+  S.serverJoined = false;
+  try {
+    sig?.close();
+  } catch {}
+  for (const peerId of [...RECOVERY.keys()]) cancelRecovery(peerId);
+  RENEGOTIATING.clear();
+  rebuildBudget.clear();
+  // 先摘监听再拆：destroy 会逐个关 Peer，那些关闭事件不能再落到界面和下一次尝试的状态上
+  const { swarm, sync } = S;
+  S.swarm = null;
+  S.sync = null;
+  sync?.removeAll();
+  swarm?.removeAll();
+  swarm?.destroy();
+  S.hostId = null;
+  // 下一次按大厅里现在选的模式、填的昵称重新建（见 initSwarmAndSync）
+  $('security-mode').disabled = false;
+  // 上一次生成的应答链接作废了，别留着让人发出去
+  show($('answer-wrap'), false);
+  return true;
+}
+
+/**
  * 深链接和「生成应答链接」按钮都从这里进。已经在房间里：不动手上的连接，先问要不要离开；
  * 上一条还在处理：这条不收（深链接谁都能发，连着来几十条也只处理一条）。
  */
@@ -1594,6 +1899,11 @@ function openInvite(raw) {
   }
   if (roomBusy()) {
     askLeaveForInvite(text);
+    return;
+  }
+  // 连接设置有没保存的改动：先问，保存了再加入（见 netSettingsSettled）
+  if (netFormDirty()) {
+    netSettingsSettled().then((ok) => ok && openInvite(text));
     return;
   }
   $('tab-manual').click();
@@ -1625,6 +1935,9 @@ async function joinManual(hostCode) {
       log('邀请码无效：' + e.message, 'bad');
       return;
     }
+    // 上一次没走进房间的尝试（一对一的占位连接、等不到应答的那条、没进成的中继信令）整个拆掉，
+    // 安全模式和昵称按大厅里现在的重新来。能走到这里说明还没和任何人连上（roomBusy 挡着）
+    resetAttempt();
     relay = payload.k === 'relay';
     if (relay) {
       // 要等房主放行（最长半分钟）再加连中继的时间，闸门给宽一点
@@ -1634,12 +1947,8 @@ async function joinManual(hostCode) {
       await withTimeout(joinManualNow(payload), JOIN_STEP_TIMEOUT_MS, '生成应答链接超时');
     }
   } catch (e) {
-    if (relay) {
-      // 等放行超时的话信令还挂着：收掉，别让它之后又把人塞进来
-      S.signaling?.close();
-      S.signaling = null;
-      S.serverJoined = false;
-    }
+    // 超时的话信令、占位连接还挂着：这次尝试整个拆掉，别让它之后又把人塞进来，安全模式下拉框也放开
+    resetAttempt();
     log((relay ? '加入房间失败：' : '生成应答链接失败：') + e.message, 'bad');
   } finally {
     S.joining = false;
@@ -1690,13 +1999,10 @@ async function joinRelayNow(payload) {
   // 房主放行之后马上就要打洞：TURN 得先备好，「隐藏我的 IP」没有中继就不进
   if (turnFetchNeeded()) await ensureTurnReady();
   if (relayBlockedStop()) return;
-  // 上一次没连上的尝试（一对一的占位连接、上一条中继信令）先收干净
-  S.manualAttempt?.cancel();
-  S.manualAttempt = null;
-  if (S.swarm) for (const p of [...S.swarm.peers.values()]) if (!p.authenticated) S.swarm.removePeer(p.peerId);
+  // 上一次没连上的尝试已经在 joinManual 开头整个拆掉了（resetAttempt）
   S.hostId = payload.from; // 链接里带着房主身份（和它的签名公钥），认它做角色权威
-  if (S.sync) S.sync.hostId = payload.from;
   initSwarmAndSync();
+  const gen = S.attemptGen;
   log('正在通过公共中继找房主，等房主放行…', 'warn');
   try {
     await connectSignaling(null, null, {
@@ -1706,11 +2012,14 @@ async function joinRelayNow(payload) {
       relays: payload.relays,
     });
   } catch (e) {
-    S.signaling?.close();
-    S.signaling = null;
+    // 等的时候这次尝试已经被拆掉了（等放行超时、被移出）：原因那边已经说过
+    if (gen !== S.attemptGen) return;
+    // 房主不在、中继连不上：拆干净，安全模式下拉框放开，之后换一条模式不同的邀请也能切
+    resetAttempt();
     log('加入房间失败：' + relayJoinError(e), 'bad');
     return;
   }
+  if (gen !== S.attemptGen) return;
   S.serverJoined = true;
   log('房主已放行，正在和房间里的人打洞…', 'good');
 }
@@ -1724,21 +2033,9 @@ async function joinManualNow(payload) {
   // 应答里要带上中继候选：TURN 得先备好，「隐藏我的 IP」没有中继就不生成应答
   if (turnFetchNeeded()) await ensureTurnReady();
   if (relayBlockedStop()) return;
-  // 上一次还没连上的尝试作废：定时器、监听和那条等不到应答的连接都收掉。
-  // 不收的话，换了房主之后旧房主要是又点开了旧应答，连上来的是一个「非房主」。
-  // 能走到这里说明还没有任何人连上（roomBusy 挡着），摘掉的只可能是这种残骸。
-  S.manualAttempt?.cancel();
-  S.manualAttempt = null;
-  // 上一次用房间链接试过、没进成：那条中继信令也收掉
-  if (S.signaling) {
-    S.signaling.close();
-    S.signaling = null;
-    S.signalTransport = null;
-  }
-  if (S.swarm) for (const p of [...S.swarm.peers.values()]) if (!p.authenticated) S.swarm.removePeer(p.peerId);
+  // 上一次还没连上的尝试（定时器、监听、那条等不到应答的连接、没进成的中继信令）已经在 joinManual
+  // 开头整个拆掉了（resetAttempt）。不拆的话，换了房主之后旧房主要是又点开了旧应答，连上来的是一个「非房主」。
   S.hostId = payload.from; // 邀请码带着房主身份，认它做角色权威
-  // 同步引擎可能是上一次尝试时建的：房主身份跟着换（这时还没人连上，换它不影响谁）
-  if (S.sync) S.sync.hostId = payload.from;
   initSwarmAndSync();
 
   const peer = new Peer({
@@ -1765,6 +2062,8 @@ async function joinManualNow(payload) {
     joinSettled = true;
     clearTimeout(joinWaitTimer);
     log(text, 'bad');
+    // 这一轮作废：拆干净（应答链接收起来、安全模式下拉框放开），重新粘邀请码就是全新的一轮
+    resetAttempt();
   };
   peer.on('failed', () =>
     finishJoin('和房主的直连没建立起来。重新粘一次房主的邀请码生成新的应答链接；双方都在严格 NAT 后面时需要各自配同一个 TURN 中继。')
@@ -1793,6 +2092,9 @@ async function joinManualNow(payload) {
   const answer = await peer.acceptOffer(payload.sdp);
   const code = await encodeCode({
     k: 'answer', from: S.peerId, name: S.name, sdp: answer, securityMode: S.securityMode,
+    // 房主这条邀请的编号原样写回（和桌面端 joinViaManual 一样）：房主据此认出上一条邀请的迟到应答并拒掉。
+    // 旧版邀请没有编号，这一项就是空的，编码时不带
+    invite: payload.invite,
   });
   // 这一轮超时被放弃、后面又开了新的一轮：迟到的旧应答别把新的那条盖掉
   if (S.manualAttempt !== attempt) return;
@@ -2217,7 +2519,7 @@ async function addLinkFromPhone() {
     const res = await runPlaylistOp({ type: 'add', item: { kind: 'link', url, title: '', durationSec: 0 } });
     if (res.ok) {
       input.value = '';
-      log('链接已加进列表', 'good');
+      log('链接已加进列表', 'good', { toast: true });
     }
   } finally {
     button.disabled = false;
@@ -2282,7 +2584,7 @@ const toggleSheet = (id) => setSheet(openSheet === id ? '' : id);
 // 「等待缓冲」和「同步到房主」那一条不跟着藏，免得人不知道画面为什么停了。
 const UI_HIDE_MS = 4000;
 // 点在这些东西上算「在用控件」，只重新计时，不切换收起
-const UI_CONTROL_IDS = new Set(['topbar', 'botbar', 'drift', 'waiting', ...SHEETS.map((s) => s.sheet)]);
+const UI_CONTROL_IDS = new Set(['topbar', 'botbar', 'notes', 'drift', 'play-issue', 'waiting', ...SHEETS.map((s) => s.sheet)]);
 const UI_DIALOG_IDS = ['confirm-ask', 'invite-ask', 'site-ask'];
 let uiHidden = false;
 let uiHideTimer = null;
@@ -2834,14 +3136,29 @@ function renderStatus(p) {
     $('buf').firstElementChild.style.width = '0%';
     return;
   }
+  const issue = playIssue();
   if (S.sourceType === 'link') {
-    $('status').textContent = '视频直链 · 从原网站播放 · 房间同步中';
-    $('buf').firstElementChild.style.width = '100%';
+    // 播放器真起来了才说「房间同步中」。以前换到链接项就这么写，地址没到、没有直链、打不开时照样写
+    const playing = S.playerStarted && !issue;
+    $('status').textContent = issue
+      ? PLAY_ISSUE_STATUS[issue.kind]
+      : playing
+        ? '视频直链 · 从原网站播放 · 房间同步中'
+        : S.askingSite
+          ? '在线视频 · 等你允许连接这个网站'
+          : S.nowLink?.seq === S.currentSeq
+            ? '在线视频 · 正在打开…'
+            : '在线视频 · 等房主发来播放地址…';
+    $('buf').firstElementChild.style.width = playing ? '100%' : '0%';
     return;
   }
   if (!S.session && S.receiveError?.fileId === S.current.fileId) {
     $('status').textContent = `没法接收这一部：${S.receiveError.message}`;
     $('buf').firstElementChild.style.width = '0%';
+    return;
+  }
+  if (issue?.kind === 'file') {
+    $('status').textContent = PLAY_ISSUE_STATUS.file;
     return;
   }
   // 百分比是整部收了多少；「往后能放」按当前播放位置往后连续收到的那段算（runBytes）。
@@ -2855,6 +3172,27 @@ function renderStatus(p) {
   }
   const rate = fmtBytes(p.downRate || 0) + '/s';
   const size = S.manifest?.size || 0;
+  // 还没起播：说清楚在等什么（和桌面端 renderTransferVerdict 同一套分支），别写「往后能放 X」——
+  // 安全模式要整部收完、校验过才播，可信房间也还没过片头和起播点附近的门槛（见 maybeLaunchPlayer）
+  if (!S.playerStarted && size > 0) {
+    const remaining = fmtBytes(Math.max(0, Math.round((1 - (p.ratio || 0)) * size)));
+    if (S.securityMode === 'safe') {
+      $('status').textContent = `已收 ${pct}% · 安全模式 · 完整接收后才播，还剩 ${remaining} · ↓${rate}`;
+      return;
+    }
+    const startByte = roomPlayheadByte();
+    if (midJoinNow() && !(startByte > 0)) {
+      // 中途加入却算不出房间播到第几个字节（清单里没有时长）：这一部只能等收完，见 warnMidJoinBlind
+      $('status').textContent = `已收 ${pct}% · 片源没提供时长 · 完整接收后才播，还剩 ${remaining} · ↓${rate}`;
+      return;
+    }
+    // 中途加入时片头早就够了，还差的是起播点附近那一段 —— 只报片头会一直显示「还差 0」
+    const headLeft = Math.max(0, Math.min(HEAD_READY_BYTES, size) - (p.contiguousBytes || 0));
+    const runLeft = startByte > 0 ? Math.max(0, startRunNeeded(startByte) - (p.runBytes || 0)) : 0;
+    const label = runLeft > headLeft ? '距起播还差（当前位置附近）' : '距起播还差';
+    $('status').textContent = `已收 ${pct}% · ${label} ${fmtBytes(Math.max(headLeft, runLeft))} · ↓${rate}`;
+    return;
+  }
   const duration = S.sync?.duration > 0 ? S.sync.duration : S.manifest?.durationSec || 0;
   if (!(size > 0) || !(duration > 0)) {
     // 时长未知（房主没装 ffmpeg）换算不出秒数，只说收了多少
@@ -2948,7 +3286,9 @@ let driftKey = null;
 function renderDrift() {
   const link = S.sourceType === 'link';
   const d = S.sync?.driftStatus();
-  const shown = link && !!S.playerTimer && !!d && d.streaming && d.state !== 'ok';
+  // 这一部放不了（断流停在半路）时差多少秒没有意义，那一条让给「重试」
+  const failed = !!S.playIssue && S.playIssue.seq === S.currentSeq;
+  const shown = link && !!S.playerTimer && !!d && d.streaming && d.state !== 'ok' && !failed;
   const key = `${link}|${S.linkSync}|${shown ? `${d.state}|${d.seconds}` : ''}`;
   if (key === driftKey) return;
   driftKey = key;
@@ -2967,14 +3307,19 @@ $('btn-follow').addEventListener('click', () => {
   log(
     S.linkSync === 'manual'
       ? '改成手动同步：缓冲慢了不再把你拽走，和房主差开时提示差多少秒'
-      : '改成完全同步：一直跟房主对齐，差开了自动跳过去'
+      : '改成完全同步：一直跟房主对齐，差开了自动跳过去',
+    undefined,
+    { toast: true }
   );
   renderDrift();
 });
 
 $('drift-sync').addEventListener('click', () => {
-  if (S.sourceType === 'link' && S.sync?.syncToRoom()) log('已同步到房主的进度', 'good');
+  if (S.sourceType === 'link' && S.sync?.syncToRoom()) log('已同步到房主的进度', 'good', { toast: true });
 });
+
+// 这一部放不了时顶栏下面那一条上的「重试」（见 retryPlayback）
+$('play-retry').addEventListener('click', () => retryPlayback());
 
 // 每秒核对一次和房主差多少（播放器静止时位置不变，差距在变大只能靠这个看出来），顺手刷新那一条
 setInterval(() => {
@@ -2997,10 +3342,8 @@ $('tab-manual').addEventListener('click', () => {
   $('panel-manual').classList.add('on'); $('panel-server').classList.remove('on');
 });
 
-$('join').addEventListener('click', async () => {
-  const url = $('url').value.trim();
-  const room = $('room').value.trim();
-  if (!url || !room) { log('请填写信令地址和房间号', 'bad'); return; }
+/** 信令服务器模式加入（直接填地址和房间号）。 */
+async function joinServerNow(url, room) {
   // 连着点两下会建两条信令、用同一个身份进同一个房间；和人连上之后再点就是把自己挤掉
   if (S.joining) { log('正在加入房间，请稍候', 'warn'); return; }
   if (roomConnected()) { log('你已经在房间里了。要加入新的房间，请先离开当前房间。', 'warn'); return; }
@@ -3011,28 +3354,42 @@ $('join').addEventListener('click', async () => {
     S.joining = false;
     return;
   }
+  // 还没和任何人连上时允许换个房间号重进（或者上一次压根没连上）：上一次的信令、还没连上的连接、
+  // Swarm / SyncEngine 整个拆掉，别叠两条信令；安全模式和昵称按大厅里现在的重新来
+  resetAttempt();
   initSwarmAndSync();
+  const gen = S.attemptGen;
   log(`正在连接 ${url} …`);
   try {
-    // 还没和任何人连上时允许换个房间号重进（或者上一次压根没连上）：
-    // 旧信令和它牵出来、还没连上的连接先收掉，别叠两条信令
-    S.signaling?.close();
-    S.signaling = null;
-    S.serverJoined = false;
-    for (const p of [...S.swarm.peers.values()]) if (!p.authenticated) S.swarm.removePeer(p.peerId);
     // 连上了却一直不回「已进房」的服务器会让这一步永远挂着，「正在加入」的闸门也就再没人放开
     const joined = await withTimeout(connectSignaling(url, room), JOIN_STEP_TIMEOUT_MS, '信令服务器一直没有回应');
+    if (gen !== S.attemptGen) return; // 等的时候这次尝试已经被拆掉了
     // 房主身份要在任何人连进来之前钉上：老成员收到 peer-join 才来建连，ROLE 更在握手之后
     adoptSignalHost(joined);
     S.serverJoined = true;
     log('已进入房间，等待房主供片…', 'good');
   } catch (e) {
+    if (gen !== S.attemptGen) return;
     S.signaling?.close();
     S.signaling = null;
+    // 没进成（服务器不回话、房间号没人开、没说谁是房主）：整个拆掉，安全模式下拉框放开
+    resetAttempt();
     log('连接失败：' + e.message, 'bad');
   } finally {
     S.joining = false;
   }
+}
+
+$('join').addEventListener('click', () => {
+  const url = $('url').value.trim();
+  const room = $('room').value.trim();
+  if (!url || !room) { log('请填写信令地址和房间号', 'bad'); return; }
+  // 连接设置有没保存的改动：先问，保存了再加入（见 netSettingsSettled）
+  if (netFormDirty()) {
+    netSettingsSettled().then((ok) => ok && joinServerNow(url, room));
+    return;
+  }
+  joinServerNow(url, room);
 });
 
 $('gen-answer').addEventListener('click', () => {
@@ -3113,7 +3470,58 @@ function netError(text) {
   show(box, !!text);
 }
 
-/** 「保存连接设置」：和电脑端设置页同一套校验，写错了当场说，别让人以为中继在工作。 */
+/*
+ * 保存语义（和桌面端设置弹窗同一套规则）：本身就是动作的按钮当场生效 ——「验证并保存」「清除」「保存上限」，
+ * 界面上写着「立即生效」；其余字段（TURN 来源、自己填的中继、隐藏我的 IP）一律等底部「保存连接设置」。
+ * 表单上有没保存的改动时，加入之前先问（netSettingsSettled）：勾了「隐藏我的 IP」却没保存就去加入，
+ * 以前会照常直连 —— IP 并没有藏起来，复选框却勾着。
+ */
+
+/** 表单上的连接设置（「保存连接设置」管的那几项）。 */
+function netForm() {
+  return {
+    turnSource: $('turn-source-cf').checked ? 'cloudflare' : 'manual',
+    turnEnabled: !!$('turn-on').checked,
+    turnUrl: $('turn-url').value.trim(),
+    turnUser: $('turn-user').value.trim(),
+    turnPass: $('turn-pass').value.trim(),
+    relayOnly: !!$('relay-only').checked,
+  };
+}
+
+/** 表单和已保存的（S.net）对不上：有没点「保存连接设置」的改动。 */
+function netFormDirty() {
+  const form = netForm();
+  return Object.keys(form).some((key) => form[key] !== S.net[key]);
+}
+
+/**
+ * 加入之前核对连接设置。没有没保存的改动就直接放行；有的话先问，同意就按表单保存（写错了停下、
+ * 把连接设置展开给人看），不同意这次就不加入。
+ * @returns {Promise<boolean>} 可以接着加入
+ */
+async function netSettingsSettled() {
+  if (!netFormDirty()) return true;
+  const ok = await confirmAsk(
+    '连接设置还没保存',
+    null,
+    '连接设置里的改动（TURN、隐藏我的 IP）还没保存，不保存的话这次按上次保存的设置连接。',
+    '保存并加入'
+  );
+  if (!ok) {
+    log('没有加入：连接设置有没保存的改动。点「保存连接设置」，或者把改动改回去再加入', 'warn');
+    return false;
+  }
+  if (saveNetFromForm()) return true;
+  $('net-settings').open = true;
+  log('连接设置没保存成功，没有加入：看连接设置里的提示', 'bad');
+  return false;
+}
+
+/**
+ * 「保存连接设置」：和电脑端设置页同一套校验，写错了当场说，别让人以为中继在工作。
+ * @returns {boolean} 保存了
+ */
 function saveNetFromForm() {
   const turnSource = $('turn-source-cf').checked ? 'cloudflare' : 'manual';
   const turnRaw = $('turn-url').value.trim();
@@ -3139,7 +3547,8 @@ function saveNetFromForm() {
   }
   // Cloudflare 凭据只能经「验证并保存」进原生层；填了没保存就点这里，得说一声
   if ($('cf-key').value.trim() || $('cf-token').value.trim()) {
-    return netError('Cloudflare 凭据还没保存：先点「验证并保存」，或者把这两个框清空。');
+    netError('Cloudflare 凭据还没保存：先点「验证并保存」，或者把这两个框清空。');
+    return false;
   }
   netError('');
   // 漏了 turn: 前缀是最常见的写法错误，意思很清楚，直接补上
@@ -3154,6 +3563,7 @@ function saveNetFromForm() {
     if (turnSource === 'cloudflare') refreshCfTurnState();
   }
   log('连接设置已保存（只影响之后新建的连接）', 'good');
+  return true;
 }
 
 /** 「验证并保存」：Token 交给原生层验证、加密保存；成功后输入框清空，只显示「已保存」。 */
@@ -3178,7 +3588,15 @@ async function saveCfTurnCredentials() {
     S.cfTurn = null;
     cfTurnRetryAt = 0;
     applyCfTurnState(state);
-    result.textContent = t('已保存');
+    // 「验证并保存」本身就是动作，当场生效：表单上选的就是 Cloudflare，TURN 来源顺带存下来。
+    // 以前只存了凭据、来源还是原来的「自己填」，看到「已保存」去加入，根本不用 Cloudflare TURN。
+    // 只动来源这一项：表单上别的改动（比如「隐藏我的 IP」）照旧等「保存连接设置」
+    const switched = $('turn-source-cf').checked && S.net.turnSource !== 'cloudflare';
+    if (switched) {
+      saveNetSettings({ turnSource: 'cloudflare' });
+      turnWarned = false;
+    }
+    result.textContent = t(switched ? '已保存，之后新建的连接改用 Cloudflare TURN' : '已保存');
     if (S.net.turnSource === 'cloudflare') ensureTurnReady().catch(() => {});
   } catch (error) {
     result.textContent = t(`没保存：${cfErrorText(cfErrorCode(error))}`);
@@ -3284,14 +3702,17 @@ function closeInviteAsk() {
 }
 
 /**
- * 离开当前房间，再处理这条邀请。和桌面端退房一样整页重载：原生那边先收掉播放器和
- * 接收缓存（只重载页面的话它们没人管），邀请记在 sessionStorage 里，重载完接着处理。
+ * 离开当前房间回到大厅。和桌面端退房一样整页重载：原生那边先收掉播放器和
+ * 接收缓存（只重载页面的话它们没人管）。
+ * link：重载完接着处理的那条邀请（「离开并加入」），记在 sessionStorage 里。
  */
-function leaveRoomAndOpen(link) {
-  try {
-    sessionStorage.setItem(PENDING_INVITE_KEY, link);
-  } catch {
-    /* 存不进去就只离开，不自动加入：用户再点一次链接即可 */
+function leaveRoomNow(link = '') {
+  if (link) {
+    try {
+      sessionStorage.setItem(PENDING_INVITE_KEY, link);
+    } catch {
+      /* 存不进去就只离开，不自动加入：用户再点一次链接即可 */
+    }
   }
   try {
     S.signaling?.close();
@@ -3299,6 +3720,52 @@ function leaveRoomAndOpen(link) {
   window.sw.leaveRoom();
   location.reload();
 }
+
+/** 离开当前房间，再处理这条邀请。 */
+function leaveRoomAndOpen(link) {
+  leaveRoomNow(link);
+}
+
+/** 顶栏的「离开」和系统返回键：先问，确认了才走（会断开所有人、删掉收到的缓存）。 */
+async function askLeaveRoom() {
+  pokeUi();
+  // 说法和桌面端 confirmLeaveRoom 一致
+  const ok = await confirmAsk('要离开房间吗？', null, '会断开和房间里所有人的连接，这台手机上收到的缓存也会删掉。', '离开房间');
+  if (ok) leaveRoomNow();
+}
+
+/**
+ * 系统返回键（原生 MainActivity 先问这里）：先关对话框、再关抽屉；在房间里（含已经进了信令房间、
+ * 还在等人连上）先问要不要离开。返回 true 表示页面接住了这一下；false 交给系统（大厅里就是退出或退到后台）。
+ * 以前返回键不经过页面：开着抽屉按返回也直接结束 Activity，不确认就退房、删缓存。
+ */
+function handleBack() {
+  if (confirmDone) {
+    confirmDone(false);
+    return true;
+  }
+  if ($('invite-ask').classList.contains('on')) {
+    $('invite-stay').click();
+    return true;
+  }
+  if (siteAskDone) {
+    siteAskDone(false);
+    return true;
+  }
+  if (openSheet) {
+    setSheet('');
+    return true;
+  }
+  if (S.entered || roomBusy()) {
+    askLeaveRoom();
+    return true;
+  }
+  return false;
+}
+
+// 原生按返回键时先调这里（MainActivity 的 OnBackPressedCallback）
+window.noxreelBack = () => handleBack();
+$('btn-leave').addEventListener('click', () => askLeaveRoom());
 
 $('invite-stay').addEventListener('click', () => {
   closeInviteAsk();

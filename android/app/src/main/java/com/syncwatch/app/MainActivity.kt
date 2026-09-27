@@ -20,6 +20,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.util.Log
 import org.json.JSONObject
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -158,6 +159,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         web.loadUrl("$APP_ORIGIN/assets/index.html")
+
+        // 返回键先问页面（见 askPageToHandleBack）
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() = askPageToHandleBack(this)
+        })
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -203,8 +209,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    override fun onBackPressed() {
-        if (web.canGoBack()) web.goBack() else super.onBackPressed()
+    /**
+     * 返回键先交给页面（window.noxreelBack）：关对话框、关抽屉，在房间里先问「离开房间？」。
+     * 页面不接（大厅里、页面还没加载好、WebView 没了）才走系统默认 —— Android 12+ 从桌面图标启动的
+     * 任务是退到后台，旧系统和深链接冷启动的任务是结束 Activity（onDestroy 会删掉接收缓存）。
+     * 以前只看 WebView 能不能后退：页面从不 pushState，返回键永远直接退，开着抽屉按返回也不确认就退房。
+     */
+    private fun askPageToHandleBack(callback: OnBackPressedCallback) {
+        if (webGone || !::web.isInitialized || !pageReady) return systemBack(callback)
+        web.evaluateJavascript(PAGE_BACK_JS) { result ->
+            if (result != "true" && !isFinishing && !isDestroyed) systemBack(callback)
+        }
+    }
+
+    /** 这一下页面不接：临时让开，交给系统默认的返回处理。 */
+    private fun systemBack(callback: OnBackPressedCallback) {
+        callback.isEnabled = false
+        onBackPressedDispatcher.onBackPressed()
+        callback.isEnabled = true
     }
 
     override fun onDestroy() {
@@ -226,6 +248,10 @@ class MainActivity : AppCompatActivity() {
 
         /** 两次送链接之间的最短间隔。人点链接不会这么快，狂发的才会。 */
         private const val INVITE_MIN_INTERVAL_MS = 1000L
+
+        /** 问页面要不要接这一下返回键。结果经 evaluateJavascript 回来是 JSON：接住了就是 true。 */
+        private const val PAGE_BACK_JS =
+            "(function(){try{return window.noxreelBack?.()===true}catch(e){return false}})()"
 
         /**
          * 深链接的长度上限。正常的一对一邀请只有一两千字；邀请码是 gzip 压过的，

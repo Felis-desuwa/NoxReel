@@ -56,17 +56,25 @@
      「等待缓冲」和「同步到房主」那一条不在 .bar 里，照常显示 */
   #stage .bar { transition:opacity .25s; }
   #stage.ui-hidden .bar { opacity:0; pointer-events:none; }
-  /* 在线链接和房主差开了：顶栏下面一条，带「同步到房主」按钮 */
-  #drift { position:absolute; top:64px; left:50%; transform:translateX(-50%); z-index:2; display:flex; flex-wrap:wrap;
-           align-items:center; justify-content:center; gap:4px 8px; background:#000b; border:1px solid var(--warn);
-           color:var(--warn); padding:8px 12px; border-radius:10px; font-size:13px; max-width:90%; }
-  #drift button { padding:4px 10px; font-size:12px; }
+  /* 顶栏下面叠成一列的提示：和房主差了多少秒、这一部在手机上放不了、房间里的失败和警告。
+     都不在 .bar 里：控件收起时照常显示；压在抽屉上面，开着列表、聊天时也看得到 */
+  #notes { position:absolute; top:64px; left:50%; transform:translateX(-50%); z-index:4; width:max-content; max-width:90%;
+           display:flex; flex-direction:column; align-items:center; gap:6px; pointer-events:none; }
+  /* 在线链接和房主差开了：带「同步到房主」按钮；放不了：带「重试」按钮 */
+  #drift, #play-issue { display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:4px 8px; background:#000b;
+           border:1px solid var(--warn); color:var(--warn); padding:8px 12px; border-radius:10px; font-size:13px; pointer-events:auto; }
+  #play-issue { border-color:var(--bad); color:var(--text); }
+  #drift button, #play-issue button { padding:4px 10px; font-size:12px; }
+  /* 房间里的提示：几秒后自己消失，不吃触摸 */
+  #room-toast { display:flex; flex-direction:column; align-items:center; gap:4px; }
+  .room-note { background:#000c; padding:6px 12px; border-radius:10px; font-size:13px; text-align:center; overflow-wrap:anywhere; }
 
   /* -------- 顶部的三个开关 -------- */
   #topbtns { display:flex; gap:6px; align-items:center; }
   #topbtns button { position:relative; padding:6px 10px; font-size:12px; background:#ffffff22; border-radius:8px; }
   #topbtns button.on { background:var(--accent); color:#fff; }
   #topbtns button.dm-off { opacity:.5; }
+  #topbtns #btn-leave { color:var(--bad); }
   #chat-unread { display:none; position:absolute; top:-6px; right:-6px; min-width:16px; padding:0 4px;
                  border-radius:8px; background:var(--bad); color:#fff; font-size:10px; line-height:16px; text-align:center; }
   #chat-unread.on { display:block; }
@@ -253,6 +261,7 @@
           <button id="cf-save">验证并保存</button>
           <button id="cf-clear">清除</button>
         </div>
+        <div class="hint">这两个按钮点了立即生效，不用再点下面的「保存连接设置」；验证通过时 TURN 来源一并改成 Cloudflare。</div>
         <div class="hint" id="cf-result"></div>
         <div class="hint" id="cf-status"></div>
         <label>Cloudflare TURN 月用量上限</label>
@@ -262,6 +271,7 @@
           <span class="hint" style="margin:0">GB（本机统计）</span>
           <button id="cf-limit-save">保存上限</button>
         </div>
+        <div class="hint">「保存上限」点了立即生效。</div>
         <div class="hint" id="cf-usage"></div>
         <div class="hint" id="cf-warn" style="display:none; color:var(--warn)"></div>
         <div class="hint">到上限就不再用 Cloudflare TURN（为免扣费），下个月 1 日（UTC）自动恢复；已经连着的不会被断开。这是本机统计，和 Cloudflare 账单可能有出入；建议另外在 Cloudflare 后台建一个 Budget alert 做兜底。</div>
@@ -270,6 +280,7 @@
       <label class="check" style="margin-top:16px"><input type="checkbox" id="relay-only" /> 隐藏我的 IP（只经 TURN 中继连接）</label>
       <div class="hint">打开后，房间里的人只能看到 TURN 服务器的地址，看不到你的 IP。需要先配好 TURN；TURN 用不了时会连不上，不会退回直连。</div>
 
+      <div class="hint">TURN 来源、自己填的中继、隐藏我的 IP 改完要点「保存连接设置」才生效；有没保存的改动时，加入房间前会先问你。</div>
       <div class="hint" id="net-err" style="display:none; color:var(--bad)"></div>
       <button class="primary" id="net-save" style="margin-top:12px; width:100%">保存连接设置</button>
     </details>
@@ -296,16 +307,27 @@
         <button id="btn-playlist">列表</button>
         <button id="btn-chat">聊天<span id="chat-unread"></span></button>
         <button id="btn-danmaku">弹幕</button>
+        <!-- 离开房间回到大厅（先问）。系统返回键在房间里也走这一条 -->
+        <button id="btn-leave">离开</button>
       </div>
     </div>
 
     <div id="waiting"></div>
 
-    <!-- 在线链接：和房主没对上时差多少秒，点一下对齐 -->
-    <div id="drift" style="display:none">
-      <b id="drift-kind"></b>
-      <span id="drift-text"></span>
-      <button id="drift-sync">同步到房主</button>
+    <div id="notes">
+      <!-- 在线链接：和房主没对上时差多少秒，点一下对齐 -->
+      <div id="drift" style="display:none">
+        <b id="drift-kind"></b>
+        <span id="drift-text"></span>
+        <button id="drift-sync">同步到房主</button>
+      </div>
+      <!-- 这一部在手机上放不了：原因，能救的带「重试」 -->
+      <div id="play-issue" style="display:none">
+        <span id="play-issue-text"></span>
+        <button id="play-retry">重试</button>
+      </div>
+      <!-- 房间里的失败和警告（大厅的日志区进房后看不见） -->
+      <div id="room-toast"></div>
     </div>
 
     <div id="botbar" class="bar">

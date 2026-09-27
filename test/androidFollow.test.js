@@ -522,11 +522,11 @@ test('安卓端：换到还没有会话的片时，状态栏、缓冲条和时�
   assert.equal(phone.$('time').textContent, '0:00 / 1:00:00', '时间要按新片显示');
   assert.equal(Number(phone.$('seek').value), 0, '进度条要回到开头');
 
-  // 切到链接项：状态栏改成链接的说明
+  // 切到链接项：状态栏改成链接的说明。房主的地址还没到，不能说「房间同步中」（播放器根本没起来）
   const link = linkItem('https://video.example.org/watch?v=2');
   phone.send(playlistMsg({ rev: 3, seq: 3, queue: [link], history: [itemB, itemA] }));
   await flush();
-  assert.match(phone.$('status').textContent, /^视频直链/);
+  assert.equal(phone.$('status').textContent, '在线视频 · 等房主发来播放地址…');
 
   // 列表放完了：不再显示任何一部的进度
   phone.send(playlistMsg({ rev: 4, seq: 4, queue: [], history: [link, itemB, itemA], started: false }));

@@ -660,7 +660,11 @@ test('还没连上时换一个房主的邀请：上一次的残骸收干净，�
   assert.equal(first.peer.closed, true, '上一轮等不到应答的连接没收掉');
   assert.equal(swarm.peers.has('HOSTAAAA'), false);
   assert.equal(phone.h.syncs.at(-1).hostId, 'HOSTBBBB', '同步引擎还认着上一个房主');
-  assert.equal(listeners(), before, '每重粘一次就多挂一个监听');
+  // 上一次的尝试整个拆掉（resetAttempt）：Swarm 换了一个新的，监听不会越粘越多
+  const fresh = phone.swarm();
+  assert.notEqual(fresh, swarm, '上一次尝试的 Swarm 要整个换掉，安全模式和昵称才能按大厅里现在的来');
+  assert.equal(listeners(), 0, '旧 Swarm 上的监听要摘干净');
+  assert.equal(fresh._h.get('peer-authenticated')?.size || 0, before, '每重粘一次就多挂一个监听');
 });
 
 test('生成应答卡死：到时限放开闸门；迟到的旧应答不会盖掉新的那条', async (t) => {
@@ -1042,6 +1046,8 @@ test('房间链接：房主不在线就说清楚、收掉中继连接，之后�
   await pump(t, 50);
   const phoneSockets = [...net.sockets].filter((ws) => ws.readyState !== 3);
   assert.equal(phoneSockets.length, 0, '放弃之后中继连接要关掉');
+  // 这次尝试整个拆掉：之后换一条模式不同的邀请，提示「请切换为相同模式」时下拉框得能切
+  assert.equal(phone.$('security-mode').disabled, false, '一次失败的加入就把安全模式锁死了');
 
   phone.open(link);
   await pump(t, 100);

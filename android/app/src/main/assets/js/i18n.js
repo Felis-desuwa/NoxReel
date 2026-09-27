@@ -61,6 +61,27 @@ const EN = new Map(Object.entries({
   '你拒绝了房主发送的视频链接': 'You declined the video link sent by the host',
   'Android 拒绝或无法打开这个播放地址': 'Android rejected or could not open this stream URL',
   '视频直链 · 从原网站播放 · 房间同步中': 'Direct stream · Playing from the source site · Room sync active',
+  // 在线视频还没放起来、或者在手机上放不了：状态栏的短说法、顶栏下面那一条、出错原因
+  '在线视频 · 等房主发来播放地址…': 'Online video · Waiting for the host to send a stream URL…',
+  '在线视频 · 等你允许连接这个网站': 'Online video · Waiting for you to allow this site',
+  '在线视频 · 正在打开…': 'Online video · Opening…',
+  '在线视频 · 没有可供 Android 播放的直链': 'Online video · No Android-compatible stream URL',
+  '在线视频 · 你拒绝了这个网站': 'Online video · You declined this site',
+  '在线视频 · 播放地址已过期，等房主发新的': 'Online video · The stream URL expired; waiting for a new one from the host',
+  '在线视频 · 手机打不开这个地址': 'Online video · The phone cannot open this URL',
+  '在线视频 · 手机上打不开': 'Online video · Cannot play on this phone',
+  '在线视频 · 断流了': 'Online video · The stream cut out',
+  '手机上的播放器放不了这一部': 'The phone’s player cannot play this video',
+  '房主给的播放地址已经放了很久，多半过期了，正在等房主发新的；也可以点「重试」直接试这一条':
+    'The stream URL from the host is old and has most likely expired. Waiting for the host to send a new one; you can also tap “Retry” to try this one anyway',
+  '在线视频停住了，但片长未知，分不清是放完了还是断流了：没放完就点「重试」重新连接':
+    'The online video stopped, but its length is unknown, so it is unclear whether it finished or the stream cut out. If it had not finished, tap “Retry” to reconnect',
+  '网站返回了错误': 'The website returned an error',
+  '播放地址指向内网或本机，已拦下': 'The stream URL points to a local network or this device and was blocked',
+  '连不上视频网站（超时或网络中断）': 'Cannot reach the video website (timed out or the network dropped)',
+  '手机上的播放器认不出这个视频的格式': 'The phone’s player does not recognize this video’s format',
+  '原因不明': 'Unknown reason',
+  '重试': 'Retry',
   '已收完': 'Fully received',
   '游客不能拖动进度': 'Guests cannot seek',
   '你是游客，不能拖动进度': 'Guests cannot seek',
@@ -131,6 +152,12 @@ const EN = new Map(Object.entries({
   '留在当前房间': 'Stay in this room',
   '离开并加入': 'Leave and join',
   '已留在当前房间，新收到的邀请没有处理': 'Stayed in the current room; the new invite was not opened',
+  // 顶栏的「离开」和系统返回键
+  '离开': 'Leave',
+  '要离开房间吗？': 'Leave the room?',
+  '离开房间': 'Leave room',
+  '会断开和房间里所有人的连接，这台手机上收到的缓存也会删掉。':
+    'This disconnects you from everyone in the room and deletes the video data received on this phone.',
   '你已经在房间里了。要加入新的房间，请先离开当前房间。': 'You are already in a room. Leave it before joining another one.',
   '上一条邀请还在处理，请稍候再试': 'Still processing the previous invite. Try again in a moment.',
   '邀请链接异常过长，已忽略': 'The invite link is unexpectedly long and was ignored',
@@ -214,6 +241,21 @@ const EN = new Map(Object.entries({
     'With this on, people in the room only see the TURN server’s address, not your IP. Set up TURN first; if TURN is unavailable the connection fails rather than falling back to a direct one.',
   '保存连接设置': 'Save connection settings',
   '连接设置已保存（只影响之后新建的连接）': 'Connection settings saved (they apply to new connections only)',
+  // 保存语义：动作按钮立即生效，其余等「保存连接设置」；有没保存的改动时加入前先问
+  '这两个按钮点了立即生效，不用再点下面的「保存连接设置」；验证通过时 TURN 来源一并改成 Cloudflare。':
+    'These two buttons take effect immediately; there is no need to tap “Save connection settings” below. A successful verification also switches the TURN source to Cloudflare.',
+  '「保存上限」点了立即生效。': '“Save limit” takes effect immediately.',
+  'TURN 来源、自己填的中继、隐藏我的 IP 改完要点「保存连接设置」才生效；有没保存的改动时，加入房间前会先问你。':
+    'Changes to the TURN source, your own relay, and “Hide my IP” take effect only after you tap “Save connection settings”. If there are unsaved changes, you are asked before joining a room.',
+  '已保存，之后新建的连接改用 Cloudflare TURN': 'Saved. New connections now use Cloudflare TURN',
+  '连接设置还没保存': 'Connection settings not saved',
+  '连接设置里的改动（TURN、隐藏我的 IP）还没保存，不保存的话这次按上次保存的设置连接。':
+    'Your changes to the connection settings (TURN, “Hide my IP”) are not saved. Without saving, this connection uses the settings you saved last time.',
+  '保存并加入': 'Save and join',
+  '没有加入：连接设置有没保存的改动。点「保存连接设置」，或者把改动改回去再加入':
+    'Did not join: the connection settings have unsaved changes. Tap “Save connection settings”, or undo the changes, then join',
+  '连接设置没保存成功，没有加入：看连接设置里的提示':
+    'The connection settings could not be saved, so you did not join: see the message in the connection settings',
   '勾了启用 TURN 中继，但地址是空的 —— 这样等于没配。填一个地址，或者把勾去掉。':
     'TURN relay is enabled but the address is empty, which means there is no relay at all. Enter an address, or clear the checkbox.',
   'TURN 中继要填用户名和密码（中继服务器靠它们认人）。没有的话把「启用 TURN 中继」的勾去掉。':
@@ -321,6 +363,16 @@ const PATTERNS = [
   [/^开始接收《(.+)》 · (.+)$/, 'Receiving “$1” · $2'],
   [/^房主请求手机连接 (.+) 播放在线视频。是否允许？$/, 'The host wants your phone to connect to $1 for online playback. Allow it?'],
   [/^正在从原网站播放《(.+)》$/, 'Playing “$1” from the source site'],
+  // 在线视频在手机上放不了（原因另有词条）、断流、重试
+  [/^播放器打不开这个在线视频：(.*)$/, (_all, detail) => `The player cannot open this online video: ${translate(detail, 'en')}`],
+  [/^手机上的播放器放不了这一部：(.*)$/, (_all, detail) => `The phone’s player cannot play this video: ${translate(detail, 'en')}`],
+  [/^网站拒绝了播放请求（HTTP (\d+)），播放地址可能已经过期$/, 'The website refused the playback request (HTTP $1); the stream URL may have expired'],
+  [/^网站返回了错误（HTTP (\d+)）$/, 'The website returned an error (HTTP $1)'],
+  [
+    /^在线视频在 (\d+(?::\d+)+) 断了（全片 (\d+(?::\d+)+)），不是放完了：点「重试」重新连接$/,
+    'The online video cut out at $1 (length $2); it did not finish. Tap “Retry” to reconnect',
+  ],
+  [/^重新连接《(.+)》…$/, 'Reconnecting “$1”…'],
   [/^(.+) · (安全模式|可信房间|Safe mode|Trusted room) · 在线$/, (_all, title, mode) => `${title} · ${translate(mode, 'en')} · Online`],
   [/^正在连接 (.+) …$/, 'Connecting to $1 …'],
   [/^连接失败：(.*)$/, (_all, detail) => `Connection failed: ${translate(detail, 'en')}`],
@@ -390,6 +442,20 @@ const PATTERNS = [
   [/^已收 (\d+)% · 往后能放 (\d+(?::\d+)+) · ↓(.+)$/, 'Received $1% · $2 playable ahead · ↓$3'],
   [/^已收 (\d+)% · 能一直放到片尾 · ↓(.+)$/, 'Received $1% · playable to the end · ↓$2'],
   [/^已收 (\d+)% · ↓(.+)$/, 'Received $1% · ↓$2'],
+  // 还没起播：安全模式要整部收完、校验过才播；可信房间在等片头和起播点附近的门槛
+  [
+    /^已收 (\d+)% · 安全模式 · 完整接收后才播，还剩 (.+) · ↓(.+)$/,
+    'Received $1% · Safe mode · plays only after full receipt, $2 left · ↓$3',
+  ],
+  [
+    /^已收 (\d+)% · 片源没提供时长 · 完整接收后才播，还剩 (.+) · ↓(.+)$/,
+    'Received $1% · No duration from the source · plays only after full receipt, $2 left · ↓$3',
+  ],
+  [
+    /^已收 (\d+)% · 距起播还差（当前位置附近） (.+) · ↓(.+)$/,
+    'Received $1% · $2 left before playback starts (around the current position) · ↓$3',
+  ],
+  [/^已收 (\d+)% · 距起播还差 (.+) · ↓(.+)$/, 'Received $1% · $2 left before playback starts · ↓$3'],
   [/^(\d+) 人在线$/, '$1 online'],
   [/^⏳ 等待缓冲：(.*)$/, '⏳ Waiting for buffer: $1'],
   // 在线链接和房主差多少秒
