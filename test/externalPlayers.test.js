@@ -35,7 +35,7 @@ const {
   programPathCandidates,
 } = require('../src/main/players/discover');
 const { POT, POT_CMD_NEXT_KEYFRAME, POT_STATE, PotAdapter, buildPotArgs, formatSeek } = require('../src/main/players/potAdapter');
-const { MPC, MPC_OSD_MAX, MPC_PLAYSTATE, MpcAdapter, buildMpcArgs } = require('../src/main/players/mpcAdapter');
+const { MPC, MPC_OSD_MAX, MPC_PLAYSTATE, MpcAdapter, buildMpcArgs, titleShows } = require('../src/main/players/mpcAdapter');
 
 const BS = String.fromCharCode(92); // 反斜杠：仓库里的字面反斜杠被工具多转义过不止一次
 const LOCAL_FILE = `C:${BS}movies${BS}a.mp4`;
@@ -103,6 +103,10 @@ function fakeChild(pid = 1234) {
   proc.exitCode = null;
   proc.signalCode = null;
   proc.killed = 0;
+  proc.unrefs = 0;
+  proc.unref = () => {
+    proc.unrefs += 1;
+  };
   proc.exit = (code = 0) => {
     if (proc.exitCode !== null) return;
     proc.exitCode = code;
@@ -221,9 +225,13 @@ const potTiming = {
 async function launchPot(sim = {}, options = {}) {
   const bridge = new FakePotBridge(sim);
   const proc = fakeChild();
+  const spawns = [];
   const adapter = new PotAdapter({
     bridge,
-    spawn: () => proc,
+    spawn: (exe, args, opts) => {
+      spawns.push({ exe, args, opts });
+      return proc;
+    },
     exePath: `C:${BS}pot${BS}PotPlayerMini64.exe`,
     timing: potTiming,
   });
@@ -237,17 +245,34 @@ async function launchPot(sim = {}, options = {}) {
     proc.exit(0);
   };
   const info = await adapter.launch({ source: LOCAL_FILE, startPaused: true, startAt: 0, ...options });
-  return { adapter, bridge, proc, ticks, errors, info };
+  return { adapter, bridge, proc, ticks, errors, info, spawns };
 }
 
 class FakeMpcBridge extends EventEmitter {
+  /**
+   * sim 里几种「不回包」要分清：
+   *  - deaf：指令投得进去，但一条都不回（/slave 被资源管理器转发的命令行清掉了）；
+   *  - hung：指令投都投不进去（SendMessageTimeout 失败 —— 真卡死了）；
+   *  - loading：正在加载新片，位置和 NOWPLAYING 都不回（加载中的 MPC-BE 就是这样），别的指令照收。
+   * title 给了才回应 winTitle（旧版桥没有这条指令）。
+   */
   constructor(sim = {}) {
     super();
     this.hwnd = 777;
     this.calls = [];
     this.playerHwnd = 5150; // CMD_CONNECT 报来的
     this.enumHwnd = 9999; // 枚举窗口找到的，故意和上面不一样，好看出用的是哪条路
-    this.sim = { position: 0, duration: 600, playState: MPC_PLAYSTATE.PAUSE, alive: true, deaf: false, connect: true, ...sim };
+    this.sim = {
+      position: 0,
+      duration: 600,
+      playState: MPC_PLAYSTATE.PAUSE,
+      alive: true,
+      deaf: false,
+      hung: false,
+      loading: false,
+      connect: true,
+      ...sim,
+    };
   }
 
   async start() {
@@ -275,19 +300,25 @@ class FakeMpcBridge extends EventEmitter {
         return sim.alive ? this.enumHwnd : 0;
       case 'winState':
         return { hwnd: payload.hwnd, alive: sim.alive };
+      case 'winTitle':
+        if (typeof sim.title !== 'string') throw new Error('unknown command: winTitle');
+        return sim.title;
       case 'close':
         if (this.onClose) this.onClose();
         return true;
       case 'mpcOsd':
         return 1;
       case 'mpc':
+        if (sim.hung) throw new Error('send failed: 1460'); // 卡死：SendMessageTimeout 超时
         if (sim.deaf) return 0; // 脱管：命令进得去，回包永远不来
         switch (payload.code) {
           case MPC.GETCURRENTPOSITION:
-            this.push(MPC.CURRENTPOSITION, sim.position);
+            if (!sim.loading) this.push(MPC.CURRENTPOSITION, sim.position);
             break;
           case MPC.GETNOWPLAYING:
-            this.push(MPC.NOWPLAYING, `标题|作者|描述|${sim.fileName || 'a.mkv'}|${sim.duration}`);
+            if (!sim.loading && !sim.noNowPlaying) {
+              this.push(MPC.NOWPLAYING, `标题|作者|描述|${sim.fileName || 'a.mkv'}|${sim.duration}`);
+            }
             break;
           case MPC.SETPOSITION:
             sim.position = parseFloat(payload.arg);
@@ -323,14 +354,18 @@ const mpcTiming = {
   quitTimeoutMs: 500,
 };
 
-async function launchMpc(sim = {}, options = {}) {
+async function launchMpc(sim = {}, options = {}, timing = {}) {
   const bridge = new FakeMpcBridge(sim);
   const proc = fakeChild();
+  const spawns = [];
   const adapter = new MpcAdapter({
     bridge,
-    spawn: () => proc,
+    spawn: (exe, args, opts) => {
+      spawns.push({ exe, args, opts });
+      return proc;
+    },
     exePath: `C:${BS}mpc${BS}mpc-be64.exe`,
-    timing: mpcTiming,
+    timing: { ...mpcTiming, ...timing },
   });
   const ticks = [];
   const errors = [];
@@ -342,7 +377,7 @@ async function launchMpc(sim = {}, options = {}) {
   };
   if (bridge.sim.connect) setImmediate(() => bridge.push(MPC.CONNECT, bridge.playerHwnd));
   const info = await adapter.launch({ source: `D:${BS}a.mkv`, startPaused: true, startAt: 0, ...options });
-  return { adapter, bridge, proc, ticks, errors, info };
+  return { adapter, bridge, proc, ticks, errors, info, spawns };
 }
 
 /* ================================ 桥接客户端 ================================ */
@@ -943,9 +978,9 @@ test('MPC-BE 跳转：等 NOTIFYSEEK 且状态稳定，不需要关键帧补救'
   await adapter.quit();
 });
 
-test('MPC-BE 脱管：一直问不到位置就明说，不装作还在同步', async () => {
+test('MPC-BE 脱管：指令投不进去、一直问不到位置就明说，不装作还在同步', async () => {
   const { adapter, bridge, errors } = await launchMpc();
-  bridge.sim.deaf = true;
+  bridge.sim.hung = true;
   const error = await until(() => errors[0], { timeout: 2000 });
   assert.equal(error.code, 'PLAYER_DETACHED');
   assert.ok(/退回 mpv/.test(error.message));
@@ -971,14 +1006,14 @@ test('MPC-BE 忙上半秒不算脱管：判据是时间，不是轮数', async (
   setImmediate(() => bridge.push(MPC.CONNECT, bridge.playerHwnd));
   await adapter.launch({ source: `D:${BS}a.mkv`, startPaused: true, startAt: 0 });
 
-  bridge.sim.deaf = true; // 播放器忙着（大文件跳转 / 换音轨 / madVR 初始化）
+  bridge.sim.hung = true; // 播放器忙着（大文件跳转 / 换音轨 / madVR 初始化），消息都顾不上处理
   await sleep(200);
-  bridge.sim.deaf = false;
+  bridge.sim.hung = false;
   assert.deepEqual(errors, [], '半秒以内没回包就判脱管，等于把一个健康的播放器当场判死');
   await until(() => !adapter._awaiting, { timeout: 1000 });
 
   // 真的一直不回包才算脱管
-  bridge.sim.deaf = true;
+  bridge.sim.hung = true;
   const error = await until(() => errors[0], { timeout: 2000 });
   assert.equal(error.code, 'PLAYER_DETACHED');
   await adapter.quit();
@@ -986,7 +1021,7 @@ test('MPC-BE 忙上半秒不算脱管：判据是时间，不是轮数', async (
 
 test('MPC-BE 判死之后轮询停下来，不再空转', async () => {
   const { adapter, bridge, errors } = await launchMpc();
-  bridge.sim.deaf = true;
+  bridge.sim.hung = true;
   await until(() => errors[0], { timeout: 2000 });
   const after = bridge.calls.length;
   await sleep(60); // pollMs=10，这段时间够跑好几轮
@@ -1065,6 +1100,233 @@ test('MPC-BE 撒手：撤掉跟踪和授权，但不关窗口，之后不再轮�
   assert.deepEqual(bridge.calls, [], '撒手之后还在问他那部片的位置');
   proc.exit(0);
   assert.deepEqual(exits, []);
+});
+
+/* ============ 实测 E7-A：MPC-BE 换片时先推的状态 / 位置不许被当成用户操作 ============ */
+
+/**
+ * 实测（t1.mjs mpc admin playing）：管理员在 MPC-BE 里打开别的文件，它先推「停止 / 跳回 0:00 /
+ * 播放」，最后才推 NOWPLAYING。以前每条都当场发一条 tick，房主日志里出现「暂停 @ 0:14」
+ * 「暂停 @ 0:00」「播放 @ 0:00」，全房被拽回片头，然后才撒手。
+ */
+test('MPC-BE 换片时先推的停止 / 跳回 0 / 播放一条都不报，NOWPLAYING 认出换片就撒手', async () => {
+  // 加载那几十毫秒不回位置：脱管判据放宽，免得机器一慢就先走了「没声了」那条路
+  const { adapter, bridge, ticks, errors } = await launchMpc({}, {}, { detachMs: 2000 });
+  // 房间在播，放到 0:11
+  await adapter.seek(11);
+  bridge.sim.position = 11;
+  await adapter.setPause(false);
+  const before = ticks.length;
+
+  // 它在自己窗口里开了别的片：加载期间位置、NOWPLAYING 都不回
+  bridge.sim.loading = true;
+  bridge.push(MPC.PLAYMODE, MPC_PLAYSTATE.STOP);
+  bridge.push(MPC.NOTIFYSEEK, 0);
+  await sleep(30);
+  // 加载完：先推播放和位置，最后才推 NOWPLAYING
+  bridge.sim.loading = false;
+  bridge.sim.fileName = 'foreign2.mkv';
+  bridge.sim.position = 0;
+  bridge.push(MPC.PLAYMODE, MPC_PLAYSTATE.PLAY);
+  bridge.push(MPC.CURRENTPOSITION, 0);
+  await sleep(20);
+  assert.deepEqual(ticks.slice(before), [], '换片途中的状态和位置被当成用户操作报了上去');
+  bridge.push(MPC.NOWPLAYING, '标题|作者|描述|foreign2.mkv|1200');
+
+  const error = await until(() => errors[0]);
+  assert.equal(error.code, 'PLAYER_FOREIGN_FILE');
+  assert.deepEqual(ticks.slice(before), [], '换片途中的状态和位置被当成用户操作报了上去');
+  assert.ok(bridge.mpcCalls(MPC.PAUSE).length > 0, '在它自己窗口里开的片照旧暂停并提示');
+
+  // 撒手之后：他那部片的状态变化、播完一条都不报，也不再往他的窗口发指令
+  const calls = bridge.calls.length;
+  bridge.push(MPC.PLAYMODE, MPC_PLAYSTATE.PAUSE);
+  bridge.push(MPC.NOTIFYSEEK, 42);
+  bridge.push(MPC.NOTIFYENDOFSTREAM, '');
+  await adapter.setPause(false);
+  await sleep(40);
+  assert.deepEqual(ticks.slice(before), []);
+  assert.equal(bridge.calls.length, calls, '撒手之后还在往他的窗口发指令');
+  assert.equal(errors.length, 1);
+  await adapter.release();
+});
+
+test('MPC-BE 换片时没先推「停止」、直接推「播放」（房间暂停着）也照样扣住', async () => {
+  const { adapter, bridge, ticks, errors } = await launchMpc({}, {}, { detachMs: 2000 });
+  await adapter.seek(5);
+  bridge.sim.position = 5;
+  const before = ticks.length;
+
+  bridge.sim.loading = true;
+  bridge.push(MPC.PLAYMODE, MPC_PLAYSTATE.PLAY);
+  await sleep(30);
+  assert.deepEqual(ticks.slice(before), [], '「播放 @ 0:05」被报了上去，全房跟着播起来');
+
+  bridge.sim.loading = false;
+  bridge.sim.fileName = 'foreign2.mkv';
+  bridge.push(MPC.NOWPLAYING, '标题|作者|描述|foreign2.mkv|1200');
+  const error = await until(() => errors[0]);
+  assert.equal(error.code, 'PLAYER_FOREIGN_FILE');
+  assert.deepEqual(ticks.slice(before), []);
+  await adapter.release();
+});
+
+test('MPC-BE 里用户自己暂停、拖进度条：问一句 NOWPLAYING，还是这一部就照常报上去', async () => {
+  const { adapter, bridge, ticks, errors } = await launchMpc();
+  await adapter.setPause(false);
+  const asked = bridge.mpcCalls(MPC.GETNOWPLAYING).length;
+
+  ticks.length = 0;
+  bridge.push(MPC.PLAYMODE, MPC_PLAYSTATE.PAUSE);
+  const paused = await until(() => ticks.find((t) => t.paused));
+  assert.equal(paused.cause, 'user', '用户在它窗口里的暂停要照常广播');
+  assert.ok(bridge.mpcCalls(MPC.GETNOWPLAYING).length > asked, '没确认还是不是这一部就放行了');
+
+  ticks.length = 0;
+  bridge.sim.position = 100;
+  bridge.push(MPC.NOTIFYSEEK, 100);
+  const seeked = await until(() => ticks.find((t) => Math.abs(t.position - 100) < 0.5));
+  assert.equal(seeked.cause, 'user');
+  assert.deepEqual(errors, []);
+  await adapter.quit();
+});
+
+test('我们自己发的播放 / 跳转 / 暂停不扣，也不多问 NOWPLAYING', async () => {
+  const { adapter, bridge, ticks } = await launchMpc();
+  const asked = bridge.mpcCalls(MPC.GETNOWPLAYING).length;
+  ticks.length = 0;
+  await adapter.setPause(false);
+  await adapter.seek(30);
+  bridge.sim.position = 30;
+  await adapter.setPause(true);
+  assert.equal(bridge.mpcCalls(MPC.GETNOWPLAYING).length, asked);
+  assert.ok(ticks.some((t) => !t.paused && t.cause === 'cmd'));
+  assert.ok(ticks.some((t) => Math.abs(t.position - 30) < 0.5 && t.cause === 'cmd'));
+  await adapter.quit();
+});
+
+test('扣住之后迟迟确认不了（位置照回、NOWPLAYING 就是不回）：到点照原样报上去，不把这一路闷死', async () => {
+  const holdMs = 250;
+  const { adapter, bridge, ticks } = await launchMpc({}, {}, { holdMs, holdAskMs: 40 });
+  const asked = bridge.mpcCalls(MPC.GETNOWPLAYING).length;
+  ticks.length = 0;
+  bridge.sim.noNowPlaying = true;
+  const pushedAt = Date.now();
+  bridge.push(MPC.PLAYMODE, MPC_PLAYSTATE.PLAY);
+  const played = await until(() => ticks.find((t) => !t.paused), { timeout: 2000 });
+  assert.ok(Date.now() - pushedAt >= holdMs - 30, '没等确认就放行了');
+  assert.equal(played.cause, 'user');
+  assert.ok(bridge.mpcCalls(MPC.GETNOWPLAYING).length >= asked + 2, '扣着期间要隔一阵再问一次');
+  await adapter.quit();
+});
+
+/* ============ 实测 E7-C：被资源管理器转交了别的文件，不许关掉用户的窗口 ============ */
+
+/**
+ * 实测（dbg-mpc.mjs）：遥控着 MPC-BE 时运行 `mpc-be64.exe other.mp4`（资源管理器里双击视频），
+ * 受控的那个窗口接下文件、/slave 被清掉、什么都不再推。1.8 秒后判脱管退回 mpv，
+ * 桥发 WM_CLOSE 把正显示着用户那部片的窗口关掉了。
+ */
+test('MPC-BE 被资源管理器转交了别的文件（指令投得进去、一条不回）：撒手，不关窗口、不暂停他的片', async () => {
+  const { adapter, bridge, errors, proc } = await launchMpc();
+  bridge.calls.length = 0;
+  bridge.sim.deaf = true;
+  const error = await until(() => errors[0], { timeout: 2000 });
+  assert.equal(error.code, 'PLAYER_FOREIGN_FILE', '这是用户拿走了窗口，不是遥控坏了 —— 不许退回 mpv（那会关掉他的窗口）');
+  assert.equal(bridge.mpcCalls(MPC.PAUSE).length, 0, '他刚双击开的片被我们暂停了');
+
+  // 上层撒手之前房间还在发指令：一条都不许到他的窗口上
+  await adapter.setPause(true);
+  await adapter.seek(12);
+  await adapter.osd('全员暂停中');
+  const after = bridge.calls.length;
+  await sleep(60);
+  assert.equal(bridge.calls.length, after, '撒手之后还在轮询');
+  assert.equal(bridge.mpcCalls(MPC.PAUSE).length + bridge.mpcCalls(MPC.SETPOSITION).length, 0);
+  assert.equal(bridge.calls.filter((c) => c.cmd === 'mpcOsd').length, 0);
+
+  await adapter.release();
+  assert.equal(proc.killed, 0);
+  assert.ok(!bridge.calls.some((c) => c.cmd === 'close'), '撒手不许给他的窗口发 WM_CLOSE');
+  assert.equal(errors.length, 1);
+});
+
+test('MPC-BE 不回包、指令也投不进去，但窗口标题里的片名换了：照样按撒手处理', async () => {
+  const { adapter, bridge, errors } = await launchMpc({ title: 'a.mkv - MPC-BE x64 1.8.8' });
+  bridge.sim.title = 'data.mkv - MPC-BE x64 1.8.8'; // 「a.mkv」是它的子串，不能因此认成还是这一部
+  bridge.sim.hung = true;
+  const error = await until(() => errors[0], { timeout: 2000 });
+  assert.equal(error.code, 'PLAYER_FOREIGN_FILE');
+  await adapter.release();
+});
+
+test('MPC-BE 标题没变、指令投不进去：真卡死了，照旧判脱管退回 mpv', async () => {
+  const { adapter, bridge, errors } = await launchMpc({ title: `D:${BS}a.mkv - MPC-BE x64 1.8.8` });
+  bridge.sim.hung = true;
+  const error = await until(() => errors[0], { timeout: 2000 });
+  assert.equal(error.code, 'PLAYER_DETACHED');
+  await adapter.quit();
+});
+
+test('MPC-BE 刚推过「停止」就没声了（自己窗口里开的新片还在加载）：按撒手处理', async () => {
+  const { adapter, bridge, errors, ticks } = await launchMpc();
+  const before = ticks.length;
+  bridge.sim.hung = true; // 加载时连窗口消息都顾不上，只剩「刚推过一次停止」这条证据
+  bridge.push(MPC.PLAYMODE, MPC_PLAYSTATE.STOP);
+  const error = await until(() => errors[0], { timeout: 2000 });
+  assert.equal(error.code, 'PLAYER_FOREIGN_FILE');
+  assert.deepEqual(ticks.slice(before), [], '那一条「停止」被报了上去');
+  await adapter.release();
+});
+
+test('桥重启过：MPC-BE 的回包还发往旧桥窗口，不回包是我们这边断的 —— 照旧退回 mpv', async () => {
+  const { adapter, bridge, errors } = await launchMpc();
+  bridge.hwnd = 778; // 重启后的桥换了一个消息窗口，/slave 上写的还是旧的
+  bridge.sim.deaf = true;
+  const error = await until(() => errors[0], { timeout: 2000 });
+  assert.equal(error.code, 'PLAYER_DETACHED');
+  await adapter.quit();
+});
+
+test('MPC-BE 启动途中就不回包：照旧判脱管（上层改用 mpv），不当成被用户拿走', async () => {
+  await assert.rejects(launchMpc({ deaf: true }), (error) => {
+    assert.equal(error.code, 'PLAYER_DETACHED');
+    return true;
+  });
+});
+
+test('标题里认片名：两边不能紧挨着文件名里的字符，全路径和「名字 - MPC-BE」都算', () => {
+  assert.equal(titleShows('a.mkv - MPC-BE x64 1.8.8', 'a.mkv'), true);
+  assert.equal(titleShows(`D:${BS}cache${BS}a.mkv - MPC-BE x64 1.8.8`, 'a.mkv'), true);
+  assert.equal(titleShows('data.mkv - MPC-BE x64 1.8.8', 'a.mkv'), false);
+  assert.equal(titleShows('a.mkv2 - MPC-BE', 'a.mkv'), false);
+  assert.equal(titleShows('MPC-BE x64 1.8.8', 'a.mkv'), false);
+  assert.equal(titleShows('片子.mkv - MPC-BE', '片子.mkv'), true);
+  assert.equal(titleShows('新片子.mkv - MPC-BE', '片子.mkv'), false);
+  assert.equal(titleShows(null, 'a.mkv'), false);
+});
+
+/* ============ 实测 E7-B：撒手留下的窗口不随 NoxReel 退出被连带结束 ============ */
+
+/**
+ * 实测：撒手后退出 NoxReel，约 0.6 秒后旧的 PotPlayer / MPC-BE 进程也没了 ——
+ * Node 在 Windows 上把非 detached 的子进程放进「父进程一退就结束」的作业对象。
+ * 当前受控的那一个照旧由退出流程的 players.quit() 关掉（见 playerSwitch 的收尾顺序）。
+ */
+test('外部播放器一律 detached 启动，且不拖住主进程退出', async () => {
+  const pot = await launchPot();
+  assert.equal(pot.spawns.length, 1);
+  assert.equal(pot.spawns[0].opts.detached, true, 'PotPlayer 会随 NoxReel 退出被连带结束');
+  assert.equal(pot.proc.unrefs, 1);
+  await pot.adapter.quit();
+  assert.ok(pot.bridge.calls.some((c) => c.cmd === 'close'), '正常退出时当前这个仍要关掉');
+
+  const mpc = await launchMpc();
+  assert.equal(mpc.spawns.length, 1);
+  assert.equal(mpc.spawns[0].opts.detached, true, 'MPC-BE 会随 NoxReel 退出被连带结束');
+  assert.equal(mpc.proc.unrefs, 1);
+  await mpc.adapter.quit();
+  assert.ok(mpc.bridge.calls.some((c) => c.cmd === 'close'), '正常退出时当前这个仍要关掉');
 });
 
 test('两个外部播放器都不接手正在增长的文件', () => {

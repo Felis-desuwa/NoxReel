@@ -1002,7 +1002,7 @@ test('新文案都有英文，播放器名字原样留着', async () => {
     'Player PotPlayer error: Someone opened a different file in PotPlayer, so playback is paused'
   );
   assert.match(
-    translate('播放器 MPC-BE 报错：MPC-BE 不再响应遥控（可能是被资源管理器转发启动的）。已退回 mpv', 'en'),
+    translate('播放器 MPC-BE 报错：MPC-BE 不再响应遥控。已退回 mpv', 'en'),
     /^Player MPC-BE error: MPC-BE stopped answering remote control/
   );
   assert.equal(translate('指定路径…', 'en'), 'Set path…');
@@ -1037,6 +1037,40 @@ test('用户在播放器里打开了别的文件：撒手不再同步，但不�
   assert.equal(box.S.playerChoice, 'pot', '选择不动：用户回头还想用它');
   assert.match(box.logs[0][0], /打开了别的文件/);
   assert.equal(box.logs[0][1], 'warn', '这不是故障，是用户自己的操作');
+});
+
+/**
+ * 实测 E7-C：MPC-BE 被资源管理器转交了别的文件，/slave 被清掉、什么都不再推。
+ * 适配器按「被用户拿走」报 PLAYER_FOREIGN_FILE（不是 PLAYER_DETACHED），这里要走撒手：
+ * 以前走的是退回 mpv —— 桥给那个正显示着他那部片的窗口发 WM_CLOSE。
+ */
+test('MPC-BE 被资源管理器拿走（PLAYER_FOREIGN_FILE）：撒手，不退回 mpv、不关他的窗口', async () => {
+  const box = playerBox({ choice: 'mpc' });
+  await box.ctx.launchPlayer();
+  const gen = box.ctx.playerGate.gen;
+  box.calls.length = 0;
+  box.logs.length = 0;
+
+  await box.ctx.handlePlayerError({
+    message: 'MPC-BE 被交给了别的文件（比如在资源管理器里双击了视频），不再听遥控',
+    code: 'PLAYER_FOREIGN_FILE',
+    kind: 'mpc',
+    gen,
+  });
+  const names = box.calls.map((c) => (Array.isArray(c) ? c[0] : c));
+  assert.deepEqual(names.filter((n) => ['quit', 'launch', 'select'].includes(n)), [], '不关窗口、不退回 mpv、不改选择');
+  assert.deepEqual(box.calls.filter((c) => c[0] === 'release'), [['release', gen]]);
+  assert.equal(box.S.playerChoice, 'mpc');
+  assert.equal(box.logs[0][1], 'warn');
+
+  // 适配器报上来的正文都有英文（只有代号认不出来时才会原样摆出来）
+  const { translate } = await import('../src/renderer/lib/i18n.js');
+  for (const text of [
+    '播放器 MPC-BE 报错：MPC-BE 被交给了别的文件（比如在资源管理器里双击了视频），不再听遥控',
+    '播放器 MPC-BE 报错：MPC-BE 不再响应遥控。已退回 mpv',
+  ]) {
+    assert.doesNotMatch(translate(text, 'en'), /[一-鿿]/, `英文界面上还剩中文：${text}`);
+  }
 });
 
 /* ======================= 四、播放器生命周期（批次 7） ======================= */

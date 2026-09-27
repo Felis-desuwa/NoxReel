@@ -9,9 +9,13 @@
  *  1. **接住推送**：`/slave <hwnd>` 让它把 CMD_* 通知发到桥的消息窗口，
  *     再由桥的 copydata 事件转进来（PLAYMODE / NOTIFYSEEK / NOTIFYENDOFSTREAM / NOWPLAYING）。
  *  2. **每 250ms 主动问一次位置**：推送里没有「一直在走的位置」，只有跳转那一下。
- *  3. **脱管检测**：资源管理器转发命令行时会把 hMasterWnd 清掉，这时它照常播，
- *     但再也不理我们。连着约 1.8 秒问位置一个回包都没有才认定脱管，提示用户并退回 mpv ——
- *     一个遥控不了的播放器比没有播放器更糟：房间以为它在同步。
+ *  3. **不回包了要分清是谁的事**：连着约 1.8 秒问位置一个回包都没有，要么是它被用户拿走了
+ *     （资源管理器转发命令行会把 hMasterWnd 清掉，它照常播新片、再也不理我们；在它自己窗口里
+ *     开的新片还在加载），要么是它真卡死了。前者撒手（不关他的窗口，见 _judgeSilence），
+ *     后者才提示用户并退回 mpv —— 一个遥控不了的播放器比没有播放器更糟：房间以为它在同步。
+ *  4. **突变先扣住**：换文件时它先推「停止 / 播放」和位置，最后才推 NOWPLAYING。
+ *     不是我们发起的状态或位置突变一律先扣住 tick，问一次 NOWPLAYING 确认还是这一部再报，
+ *     否则那几条会被当成用户操作广播给全房（暂停 → 跳回 0:00 → 播放）。
  *
  * 两条硬约束：
  *  - **绝不传音量参数**：`/volume 0` 会被永久写进注册表，改的是用户自己的播放器。
@@ -19,6 +23,7 @@
  *     硬播只会 403，不如当场退回 mpv 说清楚原因。
  */
 
+const path = require('path');
 const { EventEmitter } = require('events');
 const { spawn: nodeSpawn } = require('child_process');
 const { createWaiterHub, sharedBridge, monotonicMs, normalizeSource } = require('./bridge');
@@ -60,10 +65,21 @@ const MPC_SAMPLE_INTERVAL = 0.4;
  * 按次数算（原来是 2 次 × 250ms = 500ms）等于让一次正常的卡顿把播放器判死。
  */
 const MPC_DETACH_MS = 1800;
+/**
+ * 扣住的 tick 最多等这么久确认。正在加载的 MPC-BE 不回 NOWPLAYING，加载完会自己推一次；
+ * 一直等不到（位置照回、NOWPLAYING 就是不回）才不再扣着，按原样报上去，别把这一路永远闷住。
+ */
+const MPC_HOLD_MS = 3000;
+/** 扣着期间隔多久再问一次 NOWPLAYING。 */
+const MPC_HOLD_ASK_MS = 500;
+/** 位置回包和按时间外推的预期差出这么多秒，就算一次不是我们发起的跳变。 */
+const MPC_JUMP_SECONDS = 2;
 
 const DEFAULT_TIMING = {
   pollMs: 250,
   detachMs: MPC_DETACH_MS,
+  holdMs: MPC_HOLD_MS,
+  holdAskMs: MPC_HOLD_ASK_MS,
   pauseTimeoutMs: 1000,
   seekTimeoutMs: 3000,
   seekSettleMs: 300,
@@ -83,6 +99,32 @@ function playerError(message, code) {
 function clampOsd(text) {
   const chars = [...String(text === undefined || text === null ? '' : text)];
   return chars.length > MPC_OSD_MAX ? chars.slice(0, MPC_OSD_MAX).join('') : chars.join('');
+}
+
+const TITLE_NAME_CHAR = /[\p{L}\p{N}._-]/u;
+
+/**
+ * 标题里有没有这个文件名。两边不能紧挨着文件名里的字符 —— 否则换成 data.mkv 时，
+ * 「a.mkv」照样是它的子串，换片就认不出来了。全路径（前面是反斜杠）和「名字 - MPC-BE」都算。
+ */
+function titleShows(title, name) {
+  if (!name || typeof title !== 'string') return false;
+  for (let at = title.indexOf(name); at >= 0; at = title.indexOf(name, at + 1)) {
+    const before = at > 0 ? title[at - 1] : '';
+    const after = title[at + name.length] || '';
+    if (!TITLE_NAME_CHAR.test(before) && !TITLE_NAME_CHAR.test(after)) return true;
+  }
+  return false;
+}
+
+/**
+ * 窗口标题里认得出的片名：标题带着我们交给它的文件名就返回这个文件名，否则空串。
+ * MPC-BE 的标题格式可以在它自己的设置里改（只显示程序名、显示全路径……），
+ * 启动时标题里没有文件名的话，之后标题怎么变都不拿来判断换没换片。
+ */
+function titleMark(title, source) {
+  const name = path.win32.basename(String(source || ''));
+  return titleShows(title, name) ? name : '';
 }
 
 /**
@@ -151,6 +193,13 @@ class MpcAdapter extends EventEmitter {
     this._looping = false; // 轮询该不该继续。定时器已触发时 clearTimeout 拦不住，只能靠这个标记
     this._awaiting = false; // 有一条 GETCURRENTPOSITION 还没等到回包
     this._awaitingSince = 0; // 那一条是什么时候发出去的（脱管判据按时间算）
+    this._delivery = null; // 最近一次问位置投没投进去 {at, ok}：投得进去却不回包 = 它不再理我们
+    this._slaveHwnd = 0; // 启动时写在 /slave 上的桥窗口。桥重启过的话它的回包发不到新桥，不回包是我们的事
+    this._titleMark = ''; // 启动时窗口标题里认得出的片名，见 titleMark()
+    this._holding = false; // 不是我们发起的突变：tick 先扣着，等 NOWPLAYING 确认还是这一部
+    this._holdSince = 0;
+    this._holdAskedAt = 0;
+    this._foreign = false; // 已判定换了片 / 被用户拿走：这个窗口不再是我们的，一条 tick、一条指令都不再发
     this._seekSeq = 0;
     this._onCopyData = (msg) => this._handleCopyData(msg);
     this._onWinEvent = (msg) => this._handleWinEvent(msg);
@@ -173,10 +222,15 @@ class MpcAdapter extends EventEmitter {
 
     const bridge = await this._bridge();
     const args = buildMpcArgs({ source, startAt, slaveHwnd: bridge.hwnd, headers });
+    this._slaveHwnd = Number(bridge.hwnd) || 0;
     this._quiet = true;
     this._cmdDepth++;
     try {
-      const proc = this.spawn(exe, args, { stdio: 'ignore', windowsHide: false });
+      // detached：不进 Node 在 Windows 上给子进程套的「父进程一退就结束」的作业对象。
+      // 撒手留给用户的窗口（他在里面开了别的片）不能在 NoxReel 退出时被连带结束；
+      // 当前受控的那一个照旧由退出流程里的 players.quit() 发 WM_CLOSE 关掉。和 potAdapter 同源。
+      const proc = this.spawn(exe, args, { stdio: 'ignore', windowsHide: false, detached: true });
+      if (typeof proc.unref === 'function') proc.unref();
       this.proc = proc;
       this.pid = proc.pid;
       proc.on('exit', (code) => this._onProcExit(code));
@@ -197,6 +251,8 @@ class MpcAdapter extends EventEmitter {
       const want = Math.max(0, Number(startAt) || 0);
       if (Math.abs(this.position() - want) > 1) await this._seekTo(want);
       if (!startPaused) await this._setPauseInternal(false);
+      // 标题的基准：之后不回包时，标题里的片名变了就是它被交给了别的文件（见 _judgeSilence）
+      this._titleMark = titleMark(await this._readTitle(), source);
 
       this._quiet = false;
       this._emitTick();
@@ -277,24 +333,69 @@ class MpcAdapter extends EventEmitter {
 
   /**
    * 主动问位置。回包是异步的（走 copydata），所以这里只记「从哪一刻起就没回包了」——
-   * 连着 detachMs 那么久一个回包都没有才是脱管：它还在播，但 hMasterWnd 被清掉了，
-   * 我们的指令全进了黑洞。每轮照旧再问一次，任何一条回包都算它还在。
+   * 连着 detachMs 那么久一个回包都没有，就交给 _judgeSilence 判是谁的事。
+   * 每轮照旧再问一次，任何一条回包都算它还在；每一条投没投进去也记下来，判的时候要用。
    */
   _pollPosition() {
-    if (!this.hwnd || this._closing) return;
+    if (!this.hwnd || this._closing || this._foreign) return;
     if (this._awaiting && monotonicMs() - this._awaitingSince >= this.timing.detachMs) {
-      this._fail(playerError('MPC-BE 不再响应遥控（可能是被资源管理器转发启动的）。已退回 mpv', 'PLAYER_DETACHED'));
+      this._judgeSilence().catch(() => {});
       return;
     }
     if (!this._awaiting) {
       this._awaiting = true;
       this._awaitingSince = monotonicMs();
     }
-    this._ask(MPC.GETCURRENTPOSITION);
+    const sentAt = monotonicMs();
+    this._ask(MPC.GETCURRENTPOSITION).then((ok) => {
+      // 回包顺序不保证：晚回来的旧一条不能盖掉新的
+      if (!this._delivery || sentAt >= this._delivery.at) this._delivery = { at: sentAt, ok };
+    });
+    if (this._holding) this._confirmHold();
+  }
+
+  /**
+   * 连着 detachMs 一个回包都没有：它是被用户拿走了，还是真卡死了？
+   *
+   * 被拿走（撒手，不关窗口、不退回 mpv）的三种证据，有一条就算：
+   *  - 正扣着一次突变（刚推过停止 / 播放 / 跳变）就没声了：在它自己窗口里开的新片还在加载，
+   *    加载中的 MPC-BE 不回位置、也不回 NOWPLAYING；
+   *  - 窗口标题里的片名换了（资源管理器转交的新片，/slave 已经被清掉，NOWPLAYING 等不来）；
+   *  - 指令投得进去却一条都不回：它还在处理窗口消息，只是 hMasterWnd 没了 ——
+   *    资源管理器转发命令行才会清它（MPC-BE 只在带着文件时才转发给已开的窗口）。
+   *    桥重启过的话例外：它的回包发往旧桥窗口，那是我们这边断的，照旧退回 mpv。
+   * 都不是（投都投不进去 = 卡死）才是真脱管，退回 mpv。
+   * 启动途中不做这个区分：那时它还没接手任何东西，起不来就是起不来（上层会改用 mpv）。
+   */
+  async _judgeSilence() {
+    this._stopLoop();
+    if (this._quiet) {
+      this._fail(playerError('MPC-BE 不再响应遥控。已退回 mpv', 'PLAYER_DETACHED'));
+      return;
+    }
+    const holding = this._holding;
+    const ignored = !!(this._delivery && this._delivery.ok && this._delivery.at >= this._awaitingSince);
+    const sameBridge = !this._slaveHwnd || !this.bridge || Number(this.bridge.hwnd) === this._slaveHwnd;
+    const title = this._titleMark ? await this._readTitle() : null;
+    if (this._closing || this.lastError || this._foreign) return;
+    const retitled = !!(this._titleMark && title && !titleShows(title, this._titleMark));
+    if (holding || retitled || (ignored && sameBridge)) this._onTakenOver();
+    else this._fail(playerError('MPC-BE 不再响应遥控。已退回 mpv', 'PLAYER_DETACHED'));
+  }
+
+  /** 窗口标题。桥是旧版本（没有 winTitle）、窗口没了、不许问，一律当不知道。 */
+  async _readTitle() {
+    if (!this.hwnd || !this.bridge) return null;
+    try {
+      const title = await this.bridge.call('winTitle', { hwnd: this.hwnd }, { timeoutMs: 1000 });
+      return typeof title === 'string' ? title : null;
+    } catch {
+      return null;
+    }
   }
 
   _ask(code, arg = '') {
-    if (!this.hwnd || this._closing) return Promise.resolve(false);
+    if (!this.hwnd || this._closing || this._foreign) return Promise.resolve(false);
     return this.bridge
       .call('mpc', { hwnd: this.hwnd, code, arg: String(arg) }, { timeoutMs: 1500 })
       .then(() => true)
@@ -330,7 +431,7 @@ class MpcAdapter extends EventEmitter {
       case MPC.NOTIFYSEEK:
         this._awaiting = false;
         this._awaitingSince = 0;
-        this._applyPosition(parseFloat(text));
+        this._applyPosition(parseFloat(text), { seek: true });
         this._seekSeq += 1;
         break;
       case MPC.PLAYMODE:
@@ -352,18 +453,30 @@ class MpcAdapter extends EventEmitter {
     }
   }
 
-  _applyPosition(seconds) {
+  _applyPosition(seconds, { seek = false } = {}) {
     if (!Number.isFinite(seconds) || seconds < 0) return;
     if (this._duration > 0 && seconds > this._duration + 5) return; // 明显不是秒的值，丢掉
+    // 不是我们发起的跳转（NOTIFYSEEK，或位置和预期差出一大截）：先扣住，见 _beginHold
+    if (this._cmdDepth === 0 && (seek || this._jumped(seconds))) this._beginHold();
     this._position = seconds;
     this._anchor = { seconds, at: monotonicMs() };
     this._notify(this._sample());
     this._emitTick();
   }
 
+  /** 这一条位置和上一次采样按时间外推的预期差得太多 —— 换片时它会从 0 报起。 */
+  _jumped(seconds) {
+    if (!this._anchor) return false;
+    let expected = this._anchor.seconds;
+    if (this._playState === MPC_PLAYSTATE.PLAY) expected += Math.max(0, (monotonicMs() - this._anchor.at) / 1000);
+    return Math.abs(seconds - expected) > MPC_JUMP_SECONDS;
+  }
+
   _applyPlayState(value) {
     if (!Number.isFinite(value)) return;
     if (value === this._playState) return;
+    // 不是我们发起的状态变化先扣住（「停止」一律算：我们从不发停止，换片时它第一个推的就是它）
+    if (value === MPC_PLAYSTATE.STOP || this._cmdDepth === 0) this._beginHold();
     this._playState = value;
     this._playStateAt = monotonicMs();
     if (value === MPC_PLAYSTATE.PLAY) this._eof = false;
@@ -380,20 +493,78 @@ class MpcAdapter extends EventEmitter {
     if (Number.isFinite(duration) && duration > 0) this._duration = duration;
     // 启动途中只记下来、不比较：还没稳下来时报的可能是它上一次放的文件（PotPlayer 就是这样）。
     // MPC-BE 的 NOWPLAYING 是推送、打开文件时只来一次，所以这里照样记录，不然启动完就没有基准了。
-    if (!this._quiet && this._fileName && name && name !== this._fileName) this._onFileSwitched();
+    const switched = !this._quiet && this._fileName && name && name !== this._fileName;
+    if (switched) this._onFileSwitched();
     if (name) this._fileName = name;
     this._notify(this._sample());
+    // 还是这一部：扣着的突变是用户在它窗口里的正常操作，照常报上去
+    if (!switched) this._endHold();
+  }
+
+  /**
+   * 状态或位置出现了不是我们发起的突变：先扣住 tick，问一次 NOWPLAYING。
+   *
+   * 换文件时 MPC-BE 先推「停止 / 播放」和位置（从 0 报起），最后才推 NOWPLAYING。
+   * 不扣的话这几条会先被渲染进程当成用户操作广播出去 —— 管理员一换片，全房先被暂停、
+   * 拽回 0:00 再播起来，然后才撒手。确认还是这一部就放行（用户在它窗口里暂停、拖进度条
+   * 只是晚一趟 WM_COPYDATA 来回）；文件变了直接判换片，扣着的那几条一条都不报。
+   * 没有基准文件名（这个版本从没报过 NOWPLAYING）就没法确认，不扣。
+   */
+  _beginHold() {
+    if (this._quiet || this._foreign || !this._fileName) return;
+    if (!this._holding) {
+      this._holding = true;
+      this._holdSince = monotonicMs();
+      this._holdAskedAt = 0;
+    }
+    this._confirmHold();
+  }
+
+  /** 扣着期间：隔一阵再问一次 NOWPLAYING；等太久就不再扣了。 */
+  _confirmHold() {
+    if (!this._holding) return;
+    const now = monotonicMs();
+    if (now - this._holdSince >= this.timing.holdMs) {
+      this._endHold();
+      return;
+    }
+    if (this._holdAskedAt && now - this._holdAskedAt < this.timing.holdAskMs) return;
+    this._holdAskedAt = now;
+    this._ask(MPC.GETNOWPLAYING);
+  }
+
+  _endHold() {
+    if (!this._holding) return;
+    this._holding = false;
+    this._emitTick();
   }
 
   /**
    * 用户在 MPC-BE 里自己开了别的片：暂停并提示，不推进播放列表。
    * 放完那一路走 NOTIFYENDOFSTREAM，不经过这里。
+   * 从此这个窗口不再是我们的：停轮询，一条 tick、一条指令都不再发（上层随即撒手）。
    */
   _onFileSwitched() {
+    if (this._foreign) return;
     this._ask(MPC.PAUSE);
+    this._foreign = true;
+    this._holding = false;
+    this._stopLoop();
     this._duration = 0;
     this._anchor = null;
     this.emit('error', playerError('有人在 MPC-BE 里打开了别的文件，已暂停', 'PLAYER_FOREIGN_FILE'));
+  }
+
+  /**
+   * 它被用户拿走了（见 _judgeSilence）：和换片一样撒手，只是不暂停 ——
+   * 那是他刚在资源管理器里双击开的片，/slave 被清掉之后指令照样投得进去，这一下会停在他脸上。
+   */
+  _onTakenOver() {
+    if (this._closing || this.lastError || this._foreign) return;
+    this._foreign = true;
+    this._holding = false;
+    this._stopLoop();
+    this.emit('error', playerError('MPC-BE 被交给了别的文件（比如在资源管理器里双击了视频），不再听遥控', 'PLAYER_FOREIGN_FILE'));
   }
 
   _sample() {
@@ -424,6 +595,8 @@ class MpcAdapter extends EventEmitter {
    */
   _waitFor(predicate, options = {}) {
     if (this.lastError) return options.soft ? Promise.resolve(null) : Promise.reject(this.lastError);
+    // 已经撒手的窗口不会再有属于这一部的采样，命令类的等待不必干等到上限
+    if (this._foreign && options.soft) return Promise.resolve(null);
     return this._hub.waitFor(predicate, options);
   }
 
@@ -477,7 +650,7 @@ class MpcAdapter extends EventEmitter {
   /** 一闪而过的提示。结构体由桥负责清零，这里只保证不超过 127 字。 */
   osd(text, durationMs = 2000) {
     const body = clampOsd(text);
-    if (!body || !this.hwnd || this._closing) return Promise.resolve(false);
+    if (!body || !this.hwnd || this._closing || this._foreign) return Promise.resolve(false);
     const ms = Math.max(500, Math.min(10000, Math.round(Number(durationMs) || 2000)));
     return this.bridge
       .call('mpcOsd', { hwnd: this.hwnd, pos: MPC_OSD_POS, ms, text: body }, { timeoutMs: 1500 })
@@ -528,8 +701,10 @@ class MpcAdapter extends EventEmitter {
     };
   }
 
+  /** 扣着（_holding）时不报，放行时再报一条当时的实情；撒手之后一条都不报 —— 那是另一部片。 */
   _emitTick({ force = false } = {}) {
-    if (this._quiet && !force) return;
+    if (this._foreign) return;
+    if ((this._quiet || this._holding) && !force) return;
     this.emit('tick', this.snapshot());
   }
 
@@ -542,7 +717,8 @@ class MpcAdapter extends EventEmitter {
   }
 
   _fail(error) {
-    if (this._closing || this.lastError) return;
+    // 撒手之后（换了片 / 被拿走）不再判死：DISCONNECT 之类迟到的一条会让上层退回 mpv，关掉他的窗口
+    if (this._closing || this.lastError || this._foreign) return;
     this.lastError = error;
     this._stopLoop();
     this._failWaiters(error);
@@ -620,4 +796,5 @@ module.exports = {
   MPC_SEEK_PRECISION,
   MpcAdapter,
   buildMpcArgs,
+  titleShows,
 };

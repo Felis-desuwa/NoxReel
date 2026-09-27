@@ -1308,9 +1308,10 @@ const EN_PATTERNS = [
   // 没有这几条的话英文界面上会原样蹦出一句中文。
   [/^有人在 (.+) 里打开了别的文件，已暂停$/, 'Someone opened a different file in $1, so playback is paused'],
   [
-    /^(.+) 不再响应遥控（可能是被资源管理器转发启动的）。已退回 mpv$/,
-    '$1 stopped answering remote control (it was probably launched through Explorer). Falling back to mpv.',
+    /^(.+) 被交给了别的文件（比如在资源管理器里双击了视频），不再听遥控$/,
+    '$1 was handed a different file (for example by double-clicking a video in Explorer) and no longer follows remote control',
   ],
+  [/^(.+) 不再响应遥控。已退回 mpv$/, '$1 stopped answering remote control. Falling back to mpv.'],
   [/^(.+) 没有应答$/, '$1 is not answering'],
   [/^(.+) 断开了遥控连接$/, '$1 closed the remote-control connection'],
   [

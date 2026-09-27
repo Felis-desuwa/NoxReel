@@ -101,6 +101,8 @@ namespace NoxReel
     public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int GetClassName(IntPtr hWnd, StringBuilder name, int max);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int max);
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
     [DllImport("user32.dll")]
@@ -269,6 +271,7 @@ namespace NoxReel
           case "mpcOsd": ThreadPool.QueueUserWorkItem(delegate { SafeReply(id, delegate { return MpcOsd(msg); }); }); break;
           case "close": Reply(id, PostClose(msg)); break;
           case "foreground": Reply(id, Foreground(msg)); break;
+          case "winTitle": Reply(id, WindowTitle(msg)); break;
           case "track": Window.Post(delegate { SafeReply(id, delegate { return Track(msg); }); }); break;
           case "untrack": Window.Post(delegate { Unhook(); Tracked = IntPtr.Zero; Reply(id, true); }); break;
           case "winState": Window.Post(delegate { SafeReply(id, delegate { return WinState(ToPtr(msg["hwnd"])); }); }); break;
@@ -513,6 +516,20 @@ namespace NoxReel
       IntPtr hwnd = ToPtr(msg["hwnd"]);
       RequireAllowed(hwnd);
       return Native.SetForegroundWindow(hwnd);
+    }
+
+    /// <summary>
+    /// 窗口标题。MPC-BE 被资源管理器转交了别的文件时 /slave 会被清掉、什么都不再推，
+    /// 标题里的片名是还剩下的唯一证据。别的进程的窗口 GetWindowText 不发 WM_GETTEXT、
+    /// 直接取系统记着的标题，播放器卡死也拖不住桥。
+    /// </summary>
+    private static object WindowTitle(Dictionary<string, object> msg)
+    {
+      IntPtr hwnd = ToPtr(msg["hwnd"]);
+      RequireAllowed(hwnd);
+      StringBuilder sb = new StringBuilder(1024);
+      Native.GetWindowText(hwnd, sb, sb.Capacity);
+      return sb.ToString();
     }
 
     /* ------------------------------ 窗口跟踪 ------------------------------ */

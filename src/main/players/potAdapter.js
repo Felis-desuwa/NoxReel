@@ -183,7 +183,11 @@ class PotAdapter extends EventEmitter {
     this._quiet = true;
     this._cmdDepth++;
     try {
-      const proc = this.spawn(exe, args, { stdio: 'ignore', windowsHide: false });
+      // detached：不进 Node 在 Windows 上给子进程套的「父进程一退就结束」的作业对象。
+      // 撒手留给用户的窗口（他在里面开了别的片）不能在 NoxReel 退出时被连带结束；
+      // 当前受控的那一个照旧由退出流程里的 players.quit() 发 WM_CLOSE 关掉。和 mpcAdapter 同源。
+      const proc = this.spawn(exe, args, { stdio: 'ignore', windowsHide: false, detached: true });
+      if (typeof proc.unref === 'function') proc.unref();
       this.proc = proc;
       this.pid = proc.pid;
       proc.on('exit', (code) => this._onProcExit(code));
