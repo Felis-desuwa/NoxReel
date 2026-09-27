@@ -936,6 +936,19 @@ function isSessionFile(filePath) {
 }
 
 /**
+ * 这个路径是不是一个还没收完的接收文件（可信房间边收边播）。没收到的地方全是零，
+ * 给播放器时要关掉它的缓存（见 mpv.js 的 cacheArg）；收完的、做种的、别的文件都不算。
+ */
+function isReceivingFile(filePath) {
+  if (typeof filePath !== 'string' || !path.isAbsolute(filePath)) return false;
+  const key = pathKey(filePath);
+  for (const session of sessions.values()) {
+    if (session.mode === 'leech' && !session.closed && !session.complete && pathKey(session.filePath) === key) return true;
+  }
+  return false;
+}
+
+/**
  * 开着的接收会话往这个文件里写了多少字节（不是接收文件就是 0）。缓存占用统计拿它给块数兜底：
  * Windows 上稀疏文件的块数要等缓存里的脏页写回磁盘才跟上，按块数算，接收中的片会少算最近写的那一截。
  * 它只数真写进去的，没写的空洞不算。
@@ -1081,6 +1094,7 @@ module.exports = {
   state,
   hasOpenSessions,
   isSessionFile,
+  isReceivingFile,
   writtenBytesOf,
   scanTarget,
   close,

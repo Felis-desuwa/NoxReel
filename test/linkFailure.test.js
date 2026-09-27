@@ -212,11 +212,17 @@ impl('在线链接片长未知时不信 eof；播放器报上来的片长也算�
   assert.deepEqual(r2.node('h1').events, [['eof', { position: 59.9 }]]);
 });
 
-impl('文件项的 eof 不受影响（收全了的片照常报放完了）', async (dir) => {
+impl('文件项的 eof 不受影响（收全了的片放到片尾照常报放完了）', async (dir) => {
   const r = await engineRoom(dir, { streaming: false, duration: 3600 });
   await r.play();
-  r.tick('h1', { position: 100, eof: true, paused: true });
-  assert.deepEqual(r.node('h1').events, [['eof', { position: 100 }]]);
+  r.tick('h1', { position: 3599.5, eof: true, paused: true });
+  assert.deepEqual(r.node('h1').events, [['eof', { position: 3599.5 }]]);
+  // 收全了的片停在半路（F1：之前读进缓存的零）不是放完了，也不是断流 —— 见 midJoinRun 的数据尽头用例
+  const r2 = await engineRoom(dir, { streaming: false, duration: 3600 });
+  await r2.play();
+  r2.tick('h1', { position: 100, eof: true, paused: true });
+  assert.deepEqual(r2.node('h1').events, []);
+  assert.deepEqual(r2.node('h1').seeks, [100], '停在半路要就地重放一次');
 });
 
 /* ------------------------------ 主进程：mpv ------------------------------ */
@@ -294,7 +300,8 @@ test('mpv 一连上就是空闲、没见过 start-file：等一会儿还是这�
 
 test('mpv 连上管道后要错误日志；错误日志只留最近几行、每行截短', () => {
   const src = read('src', 'main', 'mpv.js');
-  assert.match(src, /this\.command\(\['request_log_messages', 'error'\]\)/);
+  // warn 级：ffmpeg 自己拿到的 HTTP 错误码是 warn（F1 / E1-C），收到的其余 warn 不留
+  assert.match(src, /this\.command\(\['request_log_messages', 'warn'\]\)/);
   const { ctl, feed } = mpvFeed();
   for (let i = 0; i < 20; i++) feed({ event: 'log-message', prefix: 'ffmpeg', level: 'error', text: `第 ${i} 行 ${'x'.repeat(500)}` });
   assert.ok(ctl._errorLogs.length <= 8);

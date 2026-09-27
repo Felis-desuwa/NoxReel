@@ -140,7 +140,8 @@ contextBridge.exposeInMainWorld('sw', {
     // 主进程弹对话框让用户挑 exe，挑完仍要过白名单。返回的是刷新后的播放器列表。
     pickExe: (id) => ipcRenderer.invoke('player:pickExe', id),
     setPause: (paused) => ipcRenderer.invoke('player:setPause', paused),
-    seek: (seconds) => ipcRenderer.invoke('player:seek', seconds),
+    // dropBuffers：先丢掉播放器缓存里的旧数据再跳（只有 mpv 认）
+    seek: (seconds, opts) => ipcRenderer.invoke('player:seek', seconds, { dropBuffers: opts?.dropBuffers === true }),
     osd: (text, duration = 2000) => ipcRenderer.invoke('player:osd', { text, duration }),
     overlay: (text) => ipcRenderer.invoke('player:overlay', { text }),
     // 一帧弹幕 {w, h, gen?, items:[{text, x, y, fontSize?, opacity?, outline?}]}。

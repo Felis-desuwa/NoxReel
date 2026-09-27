@@ -49,6 +49,15 @@ const LOAD_ERROR_LOG_LINES = 8;
 const LOAD_ERROR_LOG_CHARS = 300;
 
 /**
+ * warn 级日志里只留这一种：ffmpeg 自己拿到 HTTP 错误码时（「https: HTTP error 403 Forbidden」）
+ * 报的是 warn 不是 error，只要 error 级的话「只有 ffmpeg 拿到 403」会被说成原因不明。
+ * 其余 warn（音画不同步、解码小毛病……）一概不收，免得把真正的原因挤出那几行。
+ */
+function isLoadWarnLine(prefix, text) {
+  return /^ffmpeg\b/i.test(String(prefix || '')) && /HTTP error \d{3}/i.test(String(text || ''));
+}
+
+/**
  * 从 mpv 的 end-file 和错误日志里认出打不开的原因。只给代号和 HTTP 状态码，
  * 文字由渲染进程生成并翻译 —— 日志原文来自网站和第三方程序，不原样往界面上放。
  * @returns {{reason: 'http'|'resolve'|'network'|'format'|'unknown', status: number|null}}
@@ -285,6 +294,20 @@ function childEnv(base = process.env) {
   return env;
 }
 
+/**
+ * 解复用器缓存开不开。
+ *
+ * 正在接收的本地文件（可信房间边收边播）一律关掉：接收方的文件是预分配的稀疏文件，没收到的地方全是零。
+ * --cache=yes 时 mpv 一打开就往后读满缓存（上限默认约 150MB；本地文件读得飞快，实测不到 1 秒
+ * 138MB 的片整部读完），连零一起读进去；之后分片落盘它也不回头重读，放到打开那一刻的水位线就报 eof
+ * （mpv v0.41 实测：mp4 在 10.8 秒、MKV 在 34 秒停住，下载比播放快也一样）。关掉之后只剩解复用器自己的预读（实测领先播放位置
+ * 约 1.6 秒），全员暂停联动的 5 秒余量盖得住它，播放头追到连续区尽头之前就先停了。
+ * 收完的文件、在线链接照旧开着：前者没有零可读，后者要靠缓存扛网络抖动。
+ */
+function cacheArg({ isRemote, growing }) {
+  return !isRemote && growing ? '--cache=no' : '--cache=yes';
+}
+
 function buildLaunchArgs({
   ipcPath,
   source,
@@ -296,6 +319,7 @@ function buildLaunchArgs({
   chatScript = null,
   chatPrompt = '',
   proxy = null,
+  growing = false,
 } = {}) {
   const isRemote = /^https?:\/\//i.test(source);
   return [
@@ -304,7 +328,7 @@ function buildLaunchArgs({
     '--idle=yes',
     '--force-window=yes',
     '--keep-open=yes',
-    '--cache=yes',
+    cacheArg({ isRemote, growing }),
     '--cache-on-disk=no',
     '--osd-level=1',
     '--osd-on-seek=msg-bar',
@@ -421,8 +445,28 @@ class MpvController extends EventEmitter {
     this._danmaku = { inFlight: false, visible: false };
     // pause/seek 在途的条数。这两条是用户等着看结果的命令，不能让 30Hz 的弹幕帧排在前面。
     this._cmdHold = 0;
+    // 攒着没发的 tick（见 _queueTick）
+    this._tickQueued = false;
     this.idleConfirmMs = IDLE_CONFIRM_MS;
     this._resetLoadState();
+  }
+
+  /**
+   * 属性变化不是一条一发，而是同一批消息处理完再合成一条 tick 发出去。
+   *
+   * mpv 的状态变化常常是几条属性一起推上来的：keep-open 放到头（在线链接断流也是）时同一毫秒里
+   * 先 pause=true、再 core-idle、再 eof-reached=true（实测）。一条一发的话，第一条 tick 是
+   * 「暂停了、还没 eof」—— 同步引擎把它当成用户按了暂停，控制者广播给全房，全房停住；
+   * 紧跟着的 eof 才说明那是断流或片尾。合成一条之后引擎看到的就是「停在 eof 上」。
+   * 用 setImmediate 而不是只在 _onData 末尾发：一批消息被管道拆成几次读到时也能合上。
+   */
+  _queueTick() {
+    if (this._tickQueued) return;
+    this._tickQueued = true;
+    setImmediate(() => {
+      this._tickQueued = false;
+      this.emit('tick', this.snapshot());
+    });
   }
 
   /**
@@ -472,10 +516,13 @@ class MpvController extends EventEmitter {
    * 关键参数说明：
    *  --keep-open=yes    播完不退出，否则窗口一关我们就断联
    *  --idle=yes         没片时也保持进程
-   *  --cache=yes        让 mpv 自己也缓冲一层
+   *  --cache=yes        让 mpv 自己也缓冲一层；正在接收的本地文件（growing）例外，见 cacheArg
    *  --pause=yes        先暂停，等同步引擎决定什么时候放
    */
-  async launch(filePath, { startPaused = true, startAt = 0, muted = false, headers = {}, chatPrompt = '', proxy = null } = {}) {
+  async launch(
+    filePath,
+    { startPaused = true, startAt = 0, muted = false, headers = {}, chatPrompt = '', proxy = null, growing = false } = {}
+  ) {
     if (this.running) await this.quit();
 
     const bin = findMpv();
@@ -499,6 +546,7 @@ class MpvController extends EventEmitter {
       chatScript: findChatScript(),
       chatPrompt,
       proxy,
+      growing,
     });
 
     this.proc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: false, env: childEnv() });
@@ -534,8 +582,9 @@ class MpvController extends EventEmitter {
     for (let i = 0; i < OBSERVED.length; i++) {
       this.command(['observe_property', i + 1, OBSERVED[i]]).catch(() => {});
     }
-    // 打不开时的原因（HTTP 403、ytdl_hook 解析失败……）只在日志里，end-file 只说「载入失败」
-    this.command(['request_log_messages', 'error']).catch(() => {});
+    // 打不开时的原因（HTTP 403、ytdl_hook 解析失败……）只在日志里，end-file 只说「载入失败」。
+    // 要 warn 级：ffmpeg 自己拿到的 HTTP 错误码是 warn（见 isLoadWarnLine），其余 warn 收到也不留
+    this.command(['request_log_messages', 'warn']).catch(() => {});
 
     this.emit('launched', { bin, filePath });
     return { bin, filePath };
@@ -625,13 +674,13 @@ class MpvController extends EventEmitter {
       this.props[msg.name] = msg.data;
       if (msg.name === 'idle-active') this._onIdleActive(msg.data);
       this.emit('property', { name: msg.name, value: msg.data });
-      this.emit('tick', this.snapshot());
+      this._queueTick();
       return;
     }
 
     // 载入成败（见 _resetLoadState）。错误日志先到、end-file 后到，同一条管道里顺序不会乱
     if (msg.event === 'log-message') {
-      if (msg.level === 'error' || msg.level === 'fatal') {
+      if (msg.level === 'error' || msg.level === 'fatal' || (msg.level === 'warn' && isLoadWarnLine(msg.prefix, msg.text))) {
         const line = `${String(msg.prefix || '')}: ${String(msg.text || '').trim()}`.slice(0, LOAD_ERROR_LOG_CHARS);
         this._errorLogs.push(line);
         if (this._errorLogs.length > LOAD_ERROR_LOG_LINES) this._errorLogs.shift();
@@ -730,8 +779,16 @@ class MpvController extends EventEmitter {
     return this._hold(this.command(['set_property', 'pause', !!paused]));
   }
 
-  seek(seconds) {
-    return this._hold(this.command(['seek', seconds, 'absolute', 'exact']));
+  /**
+   * dropBuffers：先把解复用器缓存里的旧数据丢掉再跳。可信房间边收边播时，播放器停在已接收内容的尽头
+   * （报 eof）之后，分片补齐了它也不会回头去读 —— 光跳转不够（--cache=yes 时实测照样停在 eof），
+   * 先 drop-buffers 再跳才会从磁盘重新读（mpv v0.41 实测 mp4 / MKV 都是这样）。
+   * 老版本 mpv 没有这条命令就只跳转，不因此放弃这一跳。
+   */
+  seek(seconds, { dropBuffers = false } = {}) {
+    const go = () => this.command(['seek', seconds, 'absolute', 'exact']);
+    if (!dropBuffers) return this._hold(go());
+    return this._hold(this.command(['drop-buffers']).catch(() => {}).then(go));
   }
 
   getProperty(name) {
@@ -756,17 +813,17 @@ class MpvController extends EventEmitter {
     // renderStatus 每个 tick 都会调一次，文本没变就别发 —— 否则高负载下
     // 这条 socket 上每秒十几个命令，会和 pause/seek 抢队列。
     if (this._overlays.get(id) === next) return Promise.resolve();
+    // 去重表只记真正发出去的。播放器刚拉起、管道还没连上时推过来的横幅发不出去，
+    // 记下了的话之后文本不变就再也不会重发，这一路横幅就一直是空的。
+    if (!this.sock || this.sock.destroyed) return Promise.resolve();
     this._overlays.set(id, next);
-    if (!next) return this.command(['osd-overlay', id, 'none', '']).catch(() => {});
-    return this.command([
-      'osd-overlay',
-      id,
-      'ass-events',
-      buildAssEvent(next),
-      OVERLAY_RES_X,
-      OVERLAY_RES_Y,
-      0,
-    ]).catch(() => {});
+    const cmd = next
+      ? ['osd-overlay', id, 'ass-events', buildAssEvent(next), OVERLAY_RES_X, OVERLAY_RES_Y, 0]
+      : ['osd-overlay', id, 'none', ''];
+    return this.command(cmd).catch(() => {
+      // 没发成（管道断了、超时）：从表里摘掉，下一次同样的文本照发。之后又换过文本的就别动
+      if (this._overlays.get(id) === next) this._overlays.delete(id);
+    });
   }
 
   /** 新起的 mpv 身上没有任何覆盖层，缓存必须跟着清，否则重开播放器后横幅再也不会重发。 */
@@ -882,6 +939,8 @@ module.exports = {
   youtubeArgs,
   YOUTUBE_EXTRACTOR_ARGS,
   classifyLoadFailure,
+  isLoadWarnLine,
+  cacheArg,
   IDLE_CONFIRM_MS,
   childEnv,
 };

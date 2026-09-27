@@ -311,7 +311,9 @@ test('CLAUDE.md 把两条水位线讲清楚了', () => {
   assert.match(md, /文件尾 4 MB/, '没写文件尾的索引保留区');
   assert.match(md, /只有按内容确认过是 faststart MP4/, '没写文件尾保留区的判据是反着的（扩展名不作数）');
   assert.match(md, /排在 `_evaluateStall` \*\*前面\*\*/, '没写 eof 守卫和卡顿评估的先后');
-  assert.match(md, /让播放器重新解复用一次/, '没写 eof 卡顿的恢复路径');
+  assert.match(md, /让播放器重新读一遍/, '没写 eof 卡顿的恢复路径');
+  assert.match(md, /先 `drop-buffers` 再跳回停下的地方/, '没写重放要先丢掉播放器缓存（F1 实测光跳转不够）');
+  assert.match(md, /正在接收的文件交给 mpv 时必须关掉它的缓存/, '没写边收边播的文件要关掉 mpv 的缓存');
   assert.match(md, /要看房间播到第几秒，不是看换算出来的字节位置/, '没写「码率未知时门槛会静默失效」这条');
   assert.match(md, /- \*\*中途加入（可信房间）\*\*/, '关键约定里缺中途加入这条');
   assert.match(md, /绝不能返回 -1/, '没把安卓侧那条最容易踩的不变量写下来');

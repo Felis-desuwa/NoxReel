@@ -219,8 +219,9 @@ class PlayerManager extends EventEmitter {
     return this._require().setPause(paused);
   }
 
-  async seek(seconds) {
-    return this._require().seek(seconds);
+  /** opts.dropBuffers 只有 mpv 认（见 MpvController.seek），外部播放器照常只跳转。 */
+  async seek(seconds, opts = {}) {
+    return this._require().seek(seconds, opts);
   }
 
   /** 提示和横幅是锦上添花，播放器没开时静默忽略。 */

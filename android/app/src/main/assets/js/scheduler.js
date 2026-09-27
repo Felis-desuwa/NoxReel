@@ -29,6 +29,8 @@ const RTT_PER_EXTRA_CHUNK_MS = 25; // 每多 25ms 往返延迟，窗口加一片
 const COLD_START_RATE = 1; // 还没测出速率的新 peer 先按最乐观处理，好让它尽快被采样到
 const DEFAULT_HEAD_RESERVE_BYTES = 8 * 1024 * 1024; // 容器头。实测 mpv 只要前 1.2MB，这里和起播门槛取同一个数
 const DEFAULT_TAIL_RESERVE_BYTES = 4 * 1024 * 1024; // MKV 的 Cues，两片足够盖住常见体积
+// 核对 stream-pos 时往回看多少字节（见 streamPosPlausible）。至少要比文件尾保留区多一片
+const STREAM_POS_CHECK_BYTES = 8 * 1024 * 1024;
 // 一个上游欠我的片，按他实测的速率最多攒够这么多秒的量。请求超时有硬上限（swarm 里 120 秒），
 // 慢链路上窗口开得比这还深，队尾那几片必然在到达之前就被判超时、撤回、重新要，永远收不齐。
 const WINDOW_DRAIN_SECONDS = 60;
@@ -149,11 +151,37 @@ export class Scheduler {
     return this.headContainer !== 'mp4-faststart';
   }
 
-  /** 播放位置（秒）换算成字节。mpv 给了 stream-pos 就用真值，没有才按比例估。 */
-  positionToByte(seconds, streamPos) {
-    if (typeof streamPos === 'number' && streamPos > 0) return streamPos;
+  /**
+   * 播放位置（秒）换算成字节。mpv 给了 stream-pos 就用真值，没有才按比例估。
+   *
+   * 给了本机位图（have）时，stream-pos 要先过 streamPosPlausible 这一关，过不了同样按比例估。
+   */
+  positionToByte(seconds, streamPos, have = null) {
+    if (typeof streamPos === 'number' && streamPos > 0 && (!have || this.streamPosPlausible(streamPos, have))) {
+      return streamPos;
+    }
     if (!this.duration) return 0;
     return (seconds / this.duration) * this.manifest.size;
+  }
+
+  /**
+   * stream-pos 能不能当播放位置用：它身后一段必须都是收到了的。
+   *
+   * 正在接收的文件是稀疏文件，没收到的地方全是零。mpv 撞上已接收内容的尽头时会把 stream-pos
+   * 报到文件尾附近（mp4 实测：数据断在 16MB，报 138MB，差 26KB 到文件尾）。信了它，runBytes
+   * 恒为 0、全房一直停到收完，调度器也跑去补文件尾，而播放器脚下那一段没人管。
+   * 播放器是从播放位置顺着读到 stream-pos 的，它身后那一段必然收到了；空着就是读进了零。
+   * 核对的范围要比文件尾保留区大：读穿空洞、落进早就收到的文件尾时，只看最后一片会被骗过。
+   */
+  streamPosPlausible(streamPos, have) {
+    const { chunkSize, chunkCount, size } = this.manifest;
+    if (!have || !chunkSize) return true;
+    const end = Math.min(streamPos, size);
+    const from = Math.max(0, end - Math.max(STREAM_POS_CHECK_BYTES, this.tailReserveBytes + chunkSize));
+    for (let i = Math.floor(from / chunkSize); i < chunkCount && i * chunkSize < end; i++) {
+      if (!have[i]) return false;
+    }
+    return true;
   }
 
   /**

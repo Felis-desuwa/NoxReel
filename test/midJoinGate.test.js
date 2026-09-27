@@ -200,7 +200,8 @@ async function makeSandbox({
     siteApproved: () => false,
     currentFileCtx: () => ({
       slot: 1,
-      scheduler: { positionToByte: (sec) => (sec / (durationSec || 1)) * SIZE },
+      // 这几条用例里 stream-pos 都落在已收到的片头里，核对一律放行（核对本身见 streamPosTrust.test.js）
+      scheduler: { positionToByte: (sec) => (sec / (durationSec || 1)) * SIZE, streamPosPlausible: () => true },
     }),
     launchPlayer: async () => {
       launches.push(true);

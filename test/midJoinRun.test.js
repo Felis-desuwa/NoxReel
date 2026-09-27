@@ -193,8 +193,8 @@ function fakeMpv(eng, clock, { position = 120 } = {}) {
   const cmds = [];
   const pending = [];
   const state = { position, paused: true, eof: true };
-  eng.onSeek = (p) => {
-    cmds.push(['seek', Number(p.toFixed(2))]);
+  eng.onSeek = (p, opts) => {
+    cmds.push(['seek', Number(p.toFixed(2)), opts?.dropBuffers === true]);
     state.position = p;
     state.eof = false;
     pending.push({ ...state });
@@ -255,7 +255,10 @@ impl('撞到连续区尽头后补齐分片：只发一对 STALL，并且让播�
   );
   const seeks = mpv.cmds.filter((c) => c[0] === 'seek');
   assert.equal(seeks.length, 1, '光放开暂停没用：mpv 停在 eof 上不会回头去读新落盘的分片');
-  assert.ok(seeks[0][1] < 120 && seeks[0][1] >= 119, `重放要落在断点之前的关键帧上，实际跳到 ${seeks[0][1]}`);
+  // 跳回停下的地方就行，不往回多退（F1 实测：能不能接着放取决于旧数据丢没丢，不取决于落点）；
+  // 光跳不够，跳之前要先 drop-buffers
+  assert.equal(seeks[0][1], 120, `重放要跳回停下的地方，实际跳到 ${seeks[0][1]}`);
+  assert.equal(seeks[0][2], true, '重放之前要先让播放器丢掉缓存里的旧数据');
   assert.equal(eng.localStalled, false);
   assert.equal(mpv.state.eof, false, '播放器还停在 eof 上，这一部再也播不下去了');
   assert.deepEqual(mpv.cmds.at(-1), ['pause', false], '重放之后要恢复播放');

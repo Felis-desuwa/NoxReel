@@ -1281,7 +1281,10 @@ secureHandle('player:launch', async (payload) => {
       return info;
     }
     // PlayerManager 会先摘掉旧播放器的监听器、等它退干净，再拉起新的。
-    return await players.launch('mpv', { source, startPaused, startAt: start, headers: safeHeaders, muted: TEST_MUTE, chatPrompt: prompt, proxy: proxy && proxy.url }, ticket);
+    // 还没收完的接收文件（可信房间边收边播）由主进程自己认，不听渲染进程的：mpv 要关掉缓存，
+    // 否则它会把稀疏文件里还没收到的零读进去、在打开那一刻的水位线报 eof（见 mpv.js 的 cacheArg）
+    const growing = !remote && store.isReceivingFile(source);
+    return await players.launch('mpv', { source, startPaused, startAt: start, headers: safeHeaders, muted: TEST_MUTE, chatPrompt: prompt, proxy: proxy && proxy.url, growing }, ticket);
   } catch (error) {
     throw withPlayerCode(error);
   }
@@ -1292,8 +1295,11 @@ secureHandle('player:setPause', async (paused) => {
   return players.setPause(paused);
 });
 
-secureHandle('player:seek', async (seconds) => {
-  return players.seek(validate.finiteNumber(seconds, '播放位置', { min: 0, max: 10 ** 9 }));
+// dropBuffers：先丢掉播放器缓存里的旧数据再跳（边收边播撞上已接收内容的尽头之后的重放，见 MpvController.seek）
+secureHandle('player:seek', async (seconds, opts) => {
+  const { dropBuffers = false } = opts === undefined ? {} : validate.plainObject(opts, '跳转参数');
+  if (typeof dropBuffers !== 'boolean') throw new TypeError('无效的跳转参数');
+  return players.seek(validate.finiteNumber(seconds, '播放位置', { min: 0, max: 10 ** 9 }), { dropBuffers });
 });
 
 secureHandle('player:osd', async (payload) => {

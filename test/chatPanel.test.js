@@ -1145,7 +1145,7 @@ test('app.js：弹幕帧随播放器代际启停，换片清场，pause / seek �
 
   // pause / seek 在途：用计数不用布尔，叠在一起时先回来的那个不能把还在跑的也解了
   assert.match(app, /S\.sync\.onSetPause = \(p\) => whilePlayerBusy\(/);
-  assert.match(app, /S\.sync\.onSeek = \(pos\) => whilePlayerBusy\(/);
+  assert.match(app, /S\.sync\.onSeek = \(pos, opts\) => whilePlayerBusy\(/);
   const busy = fnOf('whilePlayerBusy');
   assert.match(busy, /playerBusy \+= 1;\s*\r?\n\s*S\.danmaku\.setBusy\(true\);/);
   assert.match(busy, /if \(playerBusy === 0\) S\.danmaku\.setBusy\(false\);/);

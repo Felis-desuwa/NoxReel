@@ -70,9 +70,17 @@ const RESUME_THRESHOLD_SECONDS = 15; // 攒够 15 秒才恢复，滞后量拉开
 const FALLBACK_STALL_BYTES = 4 * 1024 * 1024;
 const FALLBACK_RESUME_BYTES = 16 * 1024 * 1024;
 const SEEK_TOLERANCE = 0.75; // 差这么多秒以内就不去动播放器了，免得抖
-// 从「读到已接收内容的末尾」恢复时往回跳这么多秒。落到断点之前的那个关键帧上，
-// 解复用器才会从那里重新开始读；跳到断点本身可能又原地报一次 eof。
-const DATA_END_REPLAY_BACK = 0.5;
+// 本地文件报 eof 时，位置离片长还差这么多秒以上就不算放完了（播放器停在了已接收内容的尽头，
+// 或者停在它之前读进缓存的零上）。留余量是因为容器写的片长和播放器最后一帧的位置常差零点几秒，
+// PotPlayer 报放完时位置本来就可能差 2 秒（potAdapter 的 EOF_MARGIN）。
+const DATA_EOF_SLACK_SECONDS = 5;
+// 数据都在、播放器却停在半路时会直接重放（见 onMpvTick 的 eof 守卫）。停在离上次重放这么近的地方
+// 算「同一个地方」：放起来之后又停回这里、或者同一个地方已经重放了 DATA_EOF_REPLAY_MAX 次，
+// 就认它是真片尾（容器写的片长不准），不再重放 —— 否则会一直原地重放下去。
+// 重放之后播放器一直没动过的，等 DATA_EOF_REPLAY_WAIT_MS 再重放（先到的多半是跳转落地之前的旧 eof）。
+const DATA_EOF_REPLAY_SAME_SECONDS = 1;
+const DATA_EOF_REPLAY_MAX = 2;
+const DATA_EOF_REPLAY_WAIT_MS = 3000;
 const SEEK_DETECT_JUMP = 1.5; // 时间线跳变超过这个数，判定是用户拖了进度条
 // 命令发出后，给播放器这么久把状态变化推回来，这段时间里的变化都算回声、不算用户操作。
 const APPLY_ECHO_MS = 250;
@@ -214,6 +222,9 @@ export class SyncEngine extends Emitter {
     this._dataEndStall = false;
     // 重放跳转发出的时刻。播放器还没跳过去的这段时间里报的 eof 说的是旧状态。
     this._replayAt = 0;
+    // 最近一次重放 {position, count, at, left}：在哪儿、同一个地方重放了几次、什么时候、之后播放器离开过 eof 没有。
+    // 同一个地方重放过还停在那儿，就不再重放（见 DATA_EOF_REPLAY_SAME_SECONDS）
+    this._eofReplay = null;
     this.duration = 0;
     this.bytesPerSecond = 0;
     this.started = false;
@@ -271,6 +282,7 @@ export class SyncEngine extends Emitter {
     this._dataEndReported = false;
     this._dataEndStall = false;
     this._replayAt = 0;
+    this._eofReplay = null;
     this._lastSeekCmd = null;
     this._streamCut = false;
     // 跳转提前量是按这一部的网站学的，换一部从头学。跟随方式不动，由上层按新的当前项重新设
@@ -598,7 +610,7 @@ export class SyncEngine extends Emitter {
    * mpv 每次属性变化都会调到这里。
    * 这里要分辨出「用户自己动的」和「我们刚才设进去的」，只有前者才需要广播。
    */
-  onMpvTick(snap, { contiguousBytes, runBytes, complete }) {
+  onMpvTick(snap, { contiguousBytes, runBytes, runEndBytes, complete }) {
     const prev = this.lastTick;
     this.lastTick = { ...snap, at: this.now() };
 
@@ -618,40 +630,65 @@ export class SyncEngine extends Emitter {
     //
     // mpv 读到手上这一段连续数据的末尾时不会「卡住等」，它报的是 EOF（keep-open 下
     // 停在最后一帧、退出码 0）。当成放完会直接跳下一部，中途加入的人一起播就跳片。
-    // 所以先确认手上真有一路连到文件尾的数据，没有就按缓冲不足处理。
-    // runBytes 没传（回退到旧调用方式）时这道守卫整个让开，行为与 0.6 一致。
+    // 所以两条都成立才认放完：手上真有一路连到文件尾的数据，而且播放位置真到了片尾附近。
+    // 只看前一条会被 stream-pos 骗过：mp4 撞上数据尽头时 mpv 把 stream-pos 报成差几十 KB
+    // 就到文件尾（mpv v0.41 实测），「播放字节 + runBytes」随之到了文件尾 —— 管理员的 60 秒短片
+    // 放到 10.8 秒，一收完就被当成放完、推进到下一部。runEndBytes 由上层按核对过的播放位置算
+    // （见 scheduler.positionToByte），比这里自己拿 stream-pos 推算可靠。
+    // runBytes 没传（回退到旧调用方式）时这道守卫整个让开，行为与 0.6 一致；
+    // 在线链接不走这里（没有分片，断流另由下面的 stream-cut 处理）。
     //
     // 这道守卫必须排在 _evaluateStall **前面**。反过来的话两者会互相打架：余量刚补够的
     // 那一刻 _evaluateStall 先解除卡顿、守卫紧接着又置回来，而解除/置上各自都会去改
     // 播放器的暂停状态，mpv 每改一次又推回一条 eof tick —— 于是每条 tick 发一对 STALL，
     // 全房按 IPC 的速度反复暂停/播放，撞到尽头的人自己还是一帧都播不下去。
-    const tailReady =
+    // 这一部已经认过放完了（eofReported）：之后的 eof tick 还是停在片尾那个状态（关窗口时 mpv 卸载文件，
+    // 位置会先归零、eof 还挂着），不再重新判，免得对着一个正在退出的播放器重放。离开 eof 就清掉，见下面。
+    const guarded = typeof runBytes === 'number' && !this.streaming && !this.eofReported;
+    const dataToEnd =
       complete ||
-      typeof runBytes !== 'number' ||
       !(this.sizeHint > 0) ||
-      this._playbackByte(snap) + runBytes >= this.sizeHint;
-    if (snap.eof && !tailReady) {
+      (typeof runEndBytes === 'number' ? runEndBytes : this._playbackByte(snap) + runBytes) >= this.sizeHint;
+    if (snap.eof && guarded && !(dataToEnd && this._fileEndPlausible(snap))) {
       // 重放跳转刚发出去、播放器还没跳过去：这段时间里报的 eof 说的是跳转之前的状态。
       // 照单收下会把刚解除的卡顿立刻又置回来，平白多发一对 STALL，全房跟着抖一下。
       if (this._replayAt && this.now() - this._replayAt < APPLY_ECHO_MS) return;
-      // 只说一次：mpv 停在最后一帧之后会一直把 eof 推上来。
-      if (!this._dataEndReported) {
-        this._dataEndReported = true;
-        this.emit('data-end', { position: snap.position });
+      if (!dataToEnd) {
+        // 数据还没到：按缓冲不足处理。只说一次：mpv 停在最后一帧之后会一直把 eof 推上来。
+        if (!this._dataEndReported) {
+          this._dataEndReported = true;
+          this.emit('data-end', { position: snap.position });
+        }
+        // 记下「这次卡顿是读到已接收内容的末尾造成的」：解除时光放开暂停没用，
+        // 播放器停在 eof 上不会回头去读新落盘的分片，必须让它重新解复用一次。
+        this._dataEndStall = true;
+        this._setLocalStall(true, 0, snap.position);
+        // 这一条 tick 到此为止：播放器已经停在尽头，此刻就算余量够了也解不开
+        // （解开也不会自己往下读）。恢复只能由下载进度那条路驱动 —— 见 _setLocalStall 里的重放。
+        return;
       }
-      // 记下「这次卡顿是读到已接收内容的末尾造成的」：解除时光放开暂停没用，
-      // 播放器停在 eof 上不会回头去读新落盘的分片，必须让它重新解复用一次。
-      this._dataEndStall = true;
-      this._setLocalStall(true, 0, snap.position);
-      // 这一条 tick 到此为止：播放器已经停在尽头，此刻就算余量够了也解不开
-      // （解开也不会自己往下读）。恢复只能由下载进度那条路驱动 —— 见 _setLocalStall 里的重放。
-      return;
+      // 数据一路到文件尾都在（多半已经收完了），播放器却停在半路：收完之前撞上的尽头、
+      // 或者之前读进缓存的零。收完了就不会再有下载进度来解除卡顿，所以不进卡顿，直接重放一次。
+      const replay = this._eofReplay;
+      const here = !!replay && Math.abs((snap.position || 0) - replay.position) <= DATA_EOF_REPLAY_SAME_SECONDS;
+      if (!here) {
+        this._replayDataEnd(snap.position);
+        return;
+      }
+      if (!replay.left && replay.count < DATA_EOF_REPLAY_MAX) {
+        // 重放之后播放器还没动过：多半是跳转落地之前的旧 eof，等一会儿；等不来再重放一次
+        if (this.now() - replay.at >= DATA_EOF_REPLAY_WAIT_MS) this._replayDataEnd(snap.position);
+        return;
+      }
+      // 放起来之后又停回同一个地方，或者重放了两次还停在这儿：认它是真片尾（容器写的片长不准），
+      // 往下照常报 eof。不设这个上限的话，片长写错的片子会在片尾原地重放下去，列表永远推不动。
     }
     this._dataEndReported = false;
     // 走到这里说明播放器已经不在「数据断流」的状态上了（要么没报 eof，要么是真片尾），
     // 之后再解除卡顿不需要强制重放，重放窗口也就此关掉。
     this._dataEndStall = false;
     this._replayAt = 0;
+    if (this._eofReplay && !snap.eof) this._eofReplay.left = true;
 
     if (this.streaming) this._evaluateStreamStall(snap);
     else this._evaluateStall(snap, { contiguousBytes, runBytes, complete });
@@ -834,10 +871,35 @@ export class SyncEngine extends Emitter {
     return duration > 0 && (snap.position || 0) >= duration - STREAM_EOF_SLACK_SECONDS;
   }
 
+  /** 本地文件报的 eof 位置像不像片尾：片长已知时要到片尾附近才算，片长未知时只能信它。 */
+  _fileEndPlausible(snap) {
+    const duration = snap.duration > 0 ? snap.duration : this.duration;
+    return !(duration > 0) || (snap.position || 0) >= duration - DATA_EOF_SLACK_SECONDS;
+  }
+
   _playbackByte(snap) {
     if (typeof snap.streamPos === 'number' && snap.streamPos > 0) return snap.streamPos;
     if (this.bytesPerSecond) return snap.position * this.bytesPerSecond;
     return 0;
+  }
+
+  /**
+   * 让停在已接收内容尽头的播放器重新读一遍：跳回它停下的地方，并且先丢掉它缓存里的旧数据（reload）。
+   *
+   * mpv 停在 eof 那一帧上，只收到 setPause(false) 是不会回头去读新落盘的分片的 ——
+   * 它一动不动，下一条 eof tick 又把卡顿置回来，两边来回抖。而 _reconcile({seekTo})
+   * 按偏差判断（drift <= seekTolerance 就不动播放器），目标恰恰就是当前位置，一定被挡掉，所以要 force。
+   * 光跳转也不够：缓存开着时（收完才打开的文件）mpv 跳回去照样停在 eof，先 drop-buffers 再跳才会
+   * 从磁盘重新读（mpv v0.41 实测）。跳回停下的地方本身就行，不用往回多退 —— 能不能接着放取决于
+   * 旧数据丢没丢，不取决于落在哪个关键帧上；多退的那一截只会让本机和房间差开。
+   */
+  _replayDataEnd(position) {
+    const at = Math.max(0, position || 0);
+    const prev = this._eofReplay;
+    const same = !!prev && Math.abs(at - prev.position) <= DATA_EOF_REPLAY_SAME_SECONDS;
+    this._eofReplay = { position: at, count: same ? prev.count + 1 : 1, at: this.now(), left: false };
+    this._replayAt = this.now();
+    this._reconcile({ seekTo: at, force: true, reload: true });
   }
 
   _setLocalStall(stalled, deficitSeconds, position = 0) {
@@ -858,17 +920,10 @@ export class SyncEngine extends Emitter {
     }
     this._syncClock();
     this.emit('stall-change', { who: this.peerId, name: this.name, stalled, self: true });
-    // 从「读到已接收内容的末尾」里恢复，必须让播放器重新解复用一次。
-    //
-    // mpv 停在 eof 那一帧上，只收到 setPause(false) 是不会回头去读新落盘的分片的 ——
-    // 它一动不动，下一条 eof tick 又把卡顿置回来，两边来回抖。而 _reconcile({seekTo})
-    // 按偏差判断（drift <= seekTolerance 就不动播放器），目标恰恰就是当前位置，一定被挡掉。
-    // 所以这里走一条显式的重放路径：往回跳一点点，让解复用器从前一个关键帧重新开始。
+    // 从「读到已接收内容的末尾」里恢复，必须让播放器重新读一遍（见 _replayDataEnd）。
     if (!stalled && this._dataEndStall) {
       this._dataEndStall = false;
-      this._replayAt = this.now();
-      const at = this.lastTick?.position ?? position ?? 0;
-      this._reconcile({ seekTo: Math.max(0, at - DATA_END_REPLAY_BACK), force: true });
+      this._replayDataEnd(this.lastTick?.position ?? position ?? 0);
       return;
     }
     this._reconcile();
@@ -1262,7 +1317,7 @@ export class SyncEngine extends Emitter {
    * 把「应该是什么样」落到 mpv 上。所有状态变化最后都汇到这里，
    * 单一出口好过散落各处各自调 mpv。
    */
-  async _reconcile({ seekTo, force = false } = {}) {
+  async _reconcile({ seekTo, force = false, reload = false } = {}) {
     if (!this.started) return;
 
     const targetPaused = this.effectivePaused;
@@ -1272,9 +1327,10 @@ export class SyncEngine extends Emitter {
         // 按外推后的位置比：只在变化时才推 tick 的播放器（PotPlayer 每 0.5 秒才变一次），
         // 拿最后一条 tick 的原值比，播放中会平白多出几百毫秒的「偏差」。
         const drift = Math.abs(this.playerPositionNow() - seekTo);
-        // force：这一跳的目的不是对时间，是逼播放器重新解复用（它停在数据尽头不会自己
+        // force：这一跳的目的不是对时间，是逼播放器重新读一遍（它停在数据尽头不会自己
         // 去读新落盘的分片）。目标就在当前位置附近，按偏差判断必然被挡掉。
-        if (force || drift > this.seekTolerance) await this.emit_seek(seekTo);
+        // reload：跳之前先让播放器丢掉缓存里的旧数据（见 _replayDataEnd）
+        if (force || drift > this.seekTolerance) await this.emit_seek(seekTo, reload ? { dropBuffers: true } : null);
       } else if (typeof seekTo === 'number') {
         // 播放器还没起来（lastTick 为空）。以前这里直接放弃，而 shared.position
         // 之后再没有任何路径会补下发 —— 观众的 mpv 是在收到房间位置之后才启动的，
@@ -1330,7 +1386,7 @@ export class SyncEngine extends Emitter {
   async resyncToShared() {
     if (!this.started) return;
     // 目标就是房间此刻的位置：记下之后房间播了多久、停了多久，房间时钟都已经算好了。
-    // 记下的位置和房间有意差着一点的（比如数据尽头的重放往回退半秒），把那点差值带上。
+    // 记下的位置和房间有意差着一点的，把那点差值带上。
     const offset = typeof this.pendingSeek === 'number' ? this.pendingSeekOffset : 0;
     const target = Math.max(0, this.sharedPositionNow() + offset);
     this.pendingSeek = null;
@@ -1365,9 +1421,10 @@ export class SyncEngine extends Emitter {
     if (this.onSetPause) await this.onSetPause(paused);
   }
 
-  async emit_seek(position) {
+  // opts.dropBuffers：先丢掉播放器缓存里的旧数据再跳（只在数据尽头的重放里带，只有 mpv 认）
+  async emit_seek(position, opts = null) {
     this._lastSeekCmd = { position, at: this.now() };
-    if (this.onSeek) await this.onSeek(position);
+    if (this.onSeek) await (opts ? this.onSeek(position, opts) : this.onSeek(position));
   }
 
   /* ---------------------------- 对外接口 ---------------------------- */

@@ -4831,7 +4831,7 @@ function initSwarmAndSync() {
   });
 
   S.sync.onSetPause = (p) => whilePlayerBusy(window.sw.player.setPause(p).catch(() => {}));
-  S.sync.onSeek = (pos) => whilePlayerBusy(applySeek(pos));
+  S.sync.onSeek = (pos, opts) => whilePlayerBusy(applySeek(pos, opts));
   S.sync.on('data-end', () => log('播放到已接收内容的末尾，等后续分片', 'warn'));
 
   // 同步引擎要发的消息，广播给所有 peer
@@ -6809,6 +6809,9 @@ async function launchPlayer({ startAt = null, relaunch = false } = {}) {
     // 这里必须把房间共识位置重放一遍，否则接收方和重开播放器的人都会
     // 独自停在片头，而房间里其他人早就播到中间了。
     S.sync?.resyncToShared?.();
+    // 启动期间推过去的横幅可能没送到（主进程那边播放器还没连上管道，或者还在等旧的退出），
+    // 这里的去重缓存却已经记下了：清掉，下一次 renderStatus 重推，否则文本不变就再也不会发
+    lastMpvBanner = '';
     // 这一代在回包之前就推过来的事件（先记下了），现在补上
     if (early.tick) handlePlayerTick(early.tick);
     if (early.exit && playerGate.acceptExit(early.exit)) handlePlayerExit(early.exit);
@@ -7988,7 +7991,7 @@ function renderProgress(p) {
   const ctx = currentFileCtx();
   if (ctx?.scheduler) {
     const byte = snap
-      ? ctx.scheduler.positionToByte(snap.position || 0, snap.streamPos) || 0
+      ? ctx.scheduler.positionToByte(snap.position || 0, snap.streamPos, ctx.have) || 0
       : roomPlayheadByte();
     S.swarm.setPlaybackByte(ctx.slot, byte);
   }
@@ -8261,10 +8264,13 @@ function midJoinNow() {
 function roomPlayheadByte() {
   const size = S.manifest?.size || 0;
   const snap = S.sync?.lastTick;
+  const ctx = currentFileCtx();
   let byte;
   if (!snap) byte = (S.sync?.sharedPositionNow?.() || 0) * mediaBitrate();
-  else if (snap.streamPos > 0) byte = snap.streamPos;
-  else byte = (snap.position || 0) * mediaBitrate();
+  // stream-pos 越过了本机已收到的内容就不是真的播放位置（见 scheduler.streamPosPlausible）
+  else if (snap.streamPos > 0 && (!ctx?.scheduler || ctx.scheduler.streamPosPlausible(snap.streamPos, ctx.have))) {
+    byte = snap.streamPos;
+  } else byte = (snap.position || 0) * mediaBitrate();
   byte = Math.max(0, byte || 0);
   return size > 0 ? Math.min(size, byte) : byte;
 }
@@ -8317,7 +8323,7 @@ function warnMidJoinBlind() {
  * 重算放进宏任务：_reconcile 在 seek 之后还要按跳转前算好的状态发一次暂停命令，
  * 抢在它前面置 stall 的话，那条旧命令会把我们刚按下的暂停又放开。
  */
-function applySeek(pos) {
+function applySeek(pos, { dropBuffers = false } = {}) {
   const ctx = currentFileCtx();
   let buffer = null;
   if (ctx?.scheduler && S.sourceType !== 'link') {
@@ -8330,7 +8336,8 @@ function applySeek(pos) {
       log('跳转到的位置还没收到，已暂停等缓冲', 'warn');
     }
   }
-  return Promise.resolve(window.sw.player.seek(pos))
+  // dropBuffers：数据尽头的重放，先让播放器丢掉缓存里的旧数据（见 syncEngine 的 _replayDataEnd）
+  return Promise.resolve(window.sw.player.seek(pos, dropBuffers ? { dropBuffers: true } : undefined))
     .catch(() => {})
     .finally(() => {
       if (buffer) setTimeout(() => S.sync?._evaluateStallNow(pos, buffer), 0);
@@ -9141,8 +9148,9 @@ function handlePlayerTick(snap) {
 
   // 播放位置先落到调度器上再取进度：runBytes 是「从播放位置起」的长度，
   // 拿上一拍的位置算出来的那个数配不上这一拍的 snap。
+  // stream-pos 要对着本机位图核对过才用：撞上已接收内容的尽头时 mpv 会把它报到文件尾（见 positionToByte）
   if (ctx?.scheduler) {
-    const byte = ctx.scheduler.positionToByte(snap.position || 0, snap.streamPos) || 0;
+    const byte = ctx.scheduler.positionToByte(snap.position || 0, snap.streamPos, ctx.have) || 0;
     S.swarm.setPlaybackByte(ctx.slot, byte);
   }
   const prog = ctx ? S.swarm.progress(ctx.slot) : null;
@@ -9150,6 +9158,8 @@ function handlePlayerTick(snap) {
   S.sync.onMpvTick(snap, {
     contiguousBytes: ctx?.contiguousBytes || 0,
     runBytes: prog?.runBytes || 0,
+    // 和 runBytes 出自同一个核对过的播放位置：eof 守卫拿它判「是不是一路连到了文件尾」
+    runEndBytes: prog ? prog.runEndBytes : undefined,
     complete: S.sourceType === 'link' || !!ctx?.complete,
   });
   if (S.sourceType === 'link') noteLinkPlayback(snap);
