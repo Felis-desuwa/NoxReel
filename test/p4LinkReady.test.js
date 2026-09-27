@@ -106,6 +106,11 @@ const LINK_FNS = [
   'cachedLinkInfo',
   'approveLinkSite',
   'skipLinkItem',
+  // 边下边播的授权守卫：approveLinkSite 放行后补下、skipLinkItem 停掉在下的（开关关着时什么都不做）
+  'linkDownloadConsented',
+  'wantDownload',
+  'saveLinkDownload',
+  'cancelLinkDownload',
   'linkFallback',
   'activateLinkItem',
   'fallbackAsking',

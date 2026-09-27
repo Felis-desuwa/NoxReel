@@ -1180,6 +1180,10 @@ test('边下边播：只存本人放到的片；P2P 收完且扫描过关才存�
     linkDownloads: new Map(),
     downloadWanted: new Set(),
     downloadSaving: new Set(),
+    // 在线视频另存要本人点过头（见下一条测试）：这里的链接是本人自己加的
+    myLinks: new Set(['https://video.example.org/v']),
+    approvedSites: new Set(),
+    skippedLinks: new Set(),
   };
   const sw = {
     download: {
@@ -1195,10 +1199,21 @@ test('边下边播：只存本人放到的片；P2P 收完且扫描过关才存�
   };
   const updates = [];
   const ctx = sandbox({
-    fns: ['downloadAllowed', 'wantDownload', 'saveLinkDownload', 'maybeSaveDownload', 'linkDownloadOf'],
+    fns: [
+      'downloadAllowed',
+      'wantDownload',
+      'linkDownloadConsented',
+      'saveLinkDownload',
+      'cancelLinkDownload',
+      'maybeSaveDownload',
+      'linkDownloadOf',
+      'siteApproved',
+      'siteOf',
+    ],
     decls: ['linkCacheBusy'],
     globals: {
       S,
+      URL,
       window: { sw },
       SCAN_RESUMABLE: ['scan-timeout', 'scan-stopped'],
       linkKey: (url) => url,
@@ -1265,6 +1280,145 @@ test('边下边播：只存本人放到的片；P2P 收完且扫描过关才存�
   assert.match(app, /\n  wantDownload\(item\);\n  if \(item\.kind === 'link'\) await activateLinkItem/, '换到这一部时记下要存');
   assert.match(app, /safety\.status = outcome\.status;\n  maybeSaveDownload\(session\);/, '扫描结果出来时存');
   assert.doesNotMatch(app, /S\.settings\.progressive|streamsWhileReceiving/, '边下边播不再改变起播时机');
+});
+
+test('边下边播不绕过网站授权：没允许过、本人跳过的链接不下；允许之后补一次；跳过时停掉在下的', async () => {
+  const saveCalls = [];
+  const cancels = [];
+  const logs = [];
+  let pendingSave = null;
+  const S = {
+    settings: { downloadWhileWatching: true },
+    current: null,
+    currentSeq: 1,
+    linkInfo: null,
+    linkConsent: null,
+    fallbackConsent: null,
+    myLinks: new Set(),
+    approvedSites: new Set(),
+    skippedLinks: new Set(),
+    linkDownloads: new Map(),
+  };
+  const sw = {
+    download: {
+      saveLink: (url, title) => {
+        saveCalls.push(url);
+        const view = { url, purpose: 'download', title, state: 'queued', downloaded: 0, total: 0 };
+        if (!pendingSave) return Promise.resolve(view);
+        // 主进程还没答复（在查地址、排任务）：测「请求在路上时本人点了跳过」
+        return pendingSave.promise.then(() => view);
+      },
+    },
+    linkCache: {
+      cancel: async (url, purpose) => {
+        cancels.push([url, purpose]);
+        const job = S.linkDownloads.get(url);
+        if (job) S.linkDownloads.set(url, { ...job, state: 'canceled' });
+        return true;
+      },
+    },
+  };
+  const activated = [];
+  const ctx = sandbox({
+    fns: [
+      'wantDownload',
+      'linkDownloadConsented',
+      'saveLinkDownload',
+      'cancelLinkDownload',
+      'linkDownloadOf',
+      'siteApproved',
+      'siteOf',
+      'siteHost',
+      'approveLinkSite',
+      'skipLinkItem',
+      'fallbackAsking',
+      'linkAsking',
+      'askLinkConsent',
+    ],
+    decls: ['linkCacheBusy', 'FALLBACK_CONFIRM_MS'],
+    globals: {
+      S,
+      URL,
+      window: { sw },
+      linkKey: (url) => url,
+      log: (text, tone) => logs.push([text, tone]),
+      onLinkCacheUpdate: (view) => S.linkDownloads.set(view.url, view),
+      activateLinkItem: async (item) => activated.push(item.id),
+      tryLinkFallback: async () => false,
+      preResolveNextLink: () => {},
+      renderPlaylist: () => {},
+      renderStatus: () => {},
+      updateLocalReady: () => {},
+    },
+  });
+  const item = { id: 'aaaaaaaa', kind: 'link', url: 'https://video.example.org/v', title: '在线' };
+  S.current = item;
+
+  // 别人加的、网站没允许过：轮到它（switchCurrent）或刚打开开关（设置保存）都不下
+  ctx.wantDownload(item);
+  await flush();
+  assert.deepEqual(saveCalls, [], '没允许过的网站，本机不该去连');
+
+  // 本人点了「允许」：当前这一部补下一次
+  ctx.approveLinkSite(item);
+  await flush();
+  assert.deepEqual(saveCalls, ['https://video.example.org/v'], '允许之后补一次');
+  assert.deepEqual(activated, ['aaaaaaaa'], '播放照常接着走');
+
+  // 已经在下：再点一次允许（别的项同网站）不重复要
+  ctx.approveLinkSite(item);
+  await flush();
+  assert.equal(saveCalls.length, 1);
+
+  // 轮到之后才点「跳过」：已经发出的下载要停掉，按主进程报来的网址取消
+  ctx.skipLinkItem(item);
+  await flush();
+  assert.deepEqual(cancels, [['https://video.example.org/v', 'download']]);
+
+  // 跳过了的：换回来、开关刚打开都不下
+  S.linkDownloads.clear();
+  ctx.wantDownload(item);
+  await flush();
+  assert.equal(saveCalls.length, 1, '本人跳过的那一部不另存');
+
+  // 「改为允许」：恢复，补一次
+  ctx.approveLinkSite(item);
+  await flush();
+  assert.equal(saveCalls.length, 2, '改为允许后补一次');
+
+  // 请求还在路上时点了跳过：那时还没有任务，等主进程答复了再取消
+  S.linkDownloads.clear();
+  cancels.length = 0;
+  S.skippedLinks.clear();
+  pendingSave = (() => {
+    let resolve;
+    const promise = new Promise((r) => (resolve = r));
+    return { promise, resolve };
+  })();
+  ctx.wantDownload(item);
+  await flush();
+  assert.equal(saveCalls.length, 3);
+  ctx.skipLinkItem(item);
+  await flush();
+  assert.deepEqual(cancels, [], '还没有任务可取消');
+  pendingSave.resolve();
+  await flush();
+  assert.deepEqual(cancels, [['https://video.example.org/v', 'download']], '答复回来就补上取消');
+
+  // 已经存好的文件不动：跳过不会去取消 done 的任务
+  pendingSave = null;
+  cancels.length = 0;
+  S.linkDownloads.set(item.url, { url: item.url, purpose: 'download', state: 'done' });
+  ctx.skipLinkItem(item);
+  await flush();
+  assert.deepEqual(cancels, []);
+
+  // 本人自己加的链接照旧直接下（不用问网站）
+  const mine = { id: 'bbbbbbbb', kind: 'link', url: 'https://mine.example.net/x', title: '' };
+  S.myLinks.add(mine.url);
+  ctx.wantDownload(mine);
+  await flush();
+  assert.equal(saveCalls.at(-1), 'https://mine.example.net/x');
 });
 
 test('新装时 TURN 勾着但没填地址（默认状态）：没动 TURN 那几栏就不拦别的设置的保存', () => {

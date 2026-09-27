@@ -3817,8 +3817,11 @@ function approveLinkSite(item) {
   }
   const origin = ask ? ask.origin : pinned ? pinned.origin : siteOf(item.url);
   if (!origin) return;
+  // 边下边播：当前这一部原先是因为没点头才没另存的，点头之后补一次（原本就能存的不重复要）
+  const couldSave = linkDownloadConsented(cur);
   S.approvedSites.add(origin);
   S.skippedLinks.delete(item.id);
+  if (!couldSave && linkDownloadConsented(cur)) wantDownload(cur);
   if (ask) {
     S.fallbackConsent = null;
     if (!S.linkInfo) tryLinkFallback(cur, S.currentSeq).catch((error) => log(error.message || String(error), 'bad'));
@@ -3835,6 +3838,8 @@ function approveLinkSite(item) {
 /** 这一部我先不看：播放器保持空闲，也算准备好了，不挡别人。 */
 function skipLinkItem(item) {
   S.skippedLinks.add(item.id);
+  // 跳过的不算「你放到的」：边下边播已经在下的这一部也停掉（轮到它时就已经发出去了）
+  cancelLinkDownload(item);
   if (S.current?.id === item.id) {
     S.linkConsent = null;
     // 改为允许时从头再走一遍，到时候再问房主地址的网站
@@ -4937,14 +4942,35 @@ function wantDownload(item) {
   maybeSaveDownload(S.sessions.get(item.fileId));
 }
 
+/**
+ * 在线视频能不能另存：和播放一样要本人点过头 —— 网站允许过（或是自己加的），而且这一部没被本人跳过。
+ * 下载会让本机去连这个网站（yt-dlp，直接下失败还会开隔离浏览器），没允许过就去连，等于绕开了网站授权；
+ * 跳过的那一部也不算「你放到的」。没点头之前不记什么「待存」：允许之后由 approveLinkSite 补一次。
+ */
+function linkDownloadConsented(item) {
+  return item?.kind === 'link' && siteApproved(item) && !S.skippedLinks.has(item.id);
+}
+
 async function saveLinkDownload(item) {
+  if (!linkDownloadConsented(item)) return;
   const current = linkDownloadOf(item);
   if (linkCacheBusy(current) || current?.state === 'done') return;
   try {
-    onLinkCacheUpdate(await window.sw.download.saveLink(item.url, item.title || ''));
+    const view = await window.sw.download.saveLink(item.url, item.title || '');
+    onLinkCacheUpdate(view);
+    // 请求还在路上时本人点了「跳过」：那时还没有任务可取消，这里补上
+    if (!linkDownloadConsented(item) && linkCacheBusy(view)) cancelLinkDownload(item);
   } catch (error) {
     log(`存不到下载位置：${error.message || error}`, 'bad');
   }
+}
+
+/** 取消这一部正在下（或排队）的另存任务。已经存好的文件不动。 */
+function cancelLinkDownload(item) {
+  const job = linkDownloadOf(item);
+  if (!linkCacheBusy(job)) return;
+  // 主进程按它核准过的网址记任务，拿它报上来的那个去取消
+  window.sw.linkCache.cancel(job.url || item.url, 'download').catch(() => {});
 }
 
 /** P2P 的片：要另存的、收完了、扫描状态允许，就交给主进程放一份到下载位置（同盘硬链接，否则复制）。 */
