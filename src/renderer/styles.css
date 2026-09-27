@@ -1850,6 +1850,67 @@ select:disabled {
 #set-cf-status {
   margin-bottom: 12px;
 }
+/* 设置顶上那句保存语义：字段等「保存」，动作按钮当场生效 */
+.settings-note {
+  margin-bottom: 14px;
+}
+/* 设置里点了当场生效的动作按钮：和输入框、勾选框区分开，一眼看出是「按了就做」 */
+.ghost.action {
+  border-color: var(--accent-dim);
+  color: var(--text);
+}
+.ghost.action.danger {
+  border-color: rgba(248, 81, 73, 0.45);
+  color: var(--danger);
+}
+.ghost.action.danger:hover:not(:disabled) {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+/* 动作按钮旁边的「立即生效」 */
+.instant-tag {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: rgba(210, 153, 34, 0.12);
+  color: var(--warn);
+  font-size: 11px;
+  line-height: 1.7;
+  white-space: nowrap;
+}
+/* Cloudflare 的「验证并保存」和「清除」：清除推到最右，别和保存挨着 */
+.cf-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.cf-actions #set-cf-clear {
+  margin-left: auto;
+}
+/* 手填 TURN 的密码框 + 「显示」 */
+.pass-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+.pass-row input {
+  flex: 1;
+  min-width: 0;
+}
+/* 跟着总开关的子选项（Discord 的「显示片名」等）：缩进一格，总开关关着时置灰 */
+.field label.check.sub-check {
+  margin-left: 24px;
+}
+.field label.check.sub-check:has(input:disabled) {
+  color: var(--dim);
+  cursor: default;
+}
+/* 取消设置时「这些改动已经生效」的清单 */
+.settings-applied {
+  margin: 8px 0 0 18px;
+  font-size: 13px;
+}
 /* 房间链接底下那行：说明文字 + 「换一条链接」，按钮不再单独占一整行 */
 .relay-extra {
   display: flex;

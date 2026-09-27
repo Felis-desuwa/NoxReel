@@ -44,6 +44,7 @@ import {
   normalizeTurnInput,
   parseSdpCandidates,
   peerIceConfig,
+  relayServer,
   summarizeCandidates,
   turnMissingCredentials,
 } from './lib/ice.js';
@@ -809,6 +810,23 @@ function applyGeoNotice(geo) {
 // 关闭按钮无条件接线：告知条是提示性质的，必须随时能划走
 $('geo-notice-x').onclick = () => $('geo-notice').classList.add('hidden');
 
+/** 安全模式下 Windows 上的扫描器用不了：没装（找不到 MpCmdRun.exe），或者装着但没在跑。 */
+function defenderMissing() {
+  if (normalizeSecurityMode(S.settings.securityMode) !== 'safe' || S.env.platform !== 'win32') return false;
+  return !S.env.defender || S.env.defenderRunning === false;
+}
+
+/** 依赖帮助框里 Defender 那一行：按「本平台没有」「装着没在跑」「没找到」分别给下一步。 */
+function defenderHelpText() {
+  if (S.env.platform && S.env.platform !== 'win32') {
+    return '本平台没有可用的扫描器：安全模式收到的文件没法扫描，会一律拒播。要边下边播，得房主开可信房间、你也在设置里选可信房间，双方一致才连得上。';
+  }
+  if (S.env.defenderRunning === false) {
+    return '装着但没在运行，多半是被第三方杀毒软件接管了。安全模式下收到的文件会因此一律拒播；可以重新启用 Defender，或改用可信房间（风险自负）—— 可信房间要房主开、你也在设置里选可信房间，双方一致才连得上。';
+  }
+  return '未找到。安全模式需要它才能放行收到的文件，没有它收到的文件会一律拒播；可信房间不受影响（要房主开可信房间、你也在设置里选可信房间）。';
+}
+
 function updateDepsPill() {
   const pill = $('pill-deps');
   const missing = [];
@@ -822,9 +840,10 @@ function updateDepsPill() {
   // 安全模式对用户的全部承诺就是「扫过才放行」。Defender 没在跑的话（最常见的原因
   // 是被第三方杀毒软件接管），这个模式下收到的每份文件都会被拒播 —— 这话得在开传
   // 之前说，而不是等人守着传完一整部片再报错。
-  if (normalizeSecurityMode(S.settings.securityMode) === 'safe' && S.env.defenderRunning === false) {
-    missing.push('Defender');
-  }
+  // 整个没有 Defender（精简版系统、没装这个功能的 Server）也一样，所以扫描器找不到也算缺件。
+  // 只在 Windows 上这么算：别的平台本来就没有 Defender，报「缺少 Defender」、叫人去启用它是空话
+  // （帮助框里另有说明）。装着但问不出在不在跑（defenderRunning 为 null）的按未知处理，不报。
+  if (defenderMissing()) missing.push('Defender');
 
   if (!missing.length) {
     pill.textContent = '依赖就绪';
@@ -871,7 +890,8 @@ function showDepsHelp() {
         className: 'fine',
         text: 'NoxReel 不自研播放器、编解码器和网站解析器，靠这些成熟组件干活：',
       }),
-      dependency('mpv —— 播放器（必需）', S.env.mpv, '未找到。装好后重启本软件即可。'),
+      // 外部程序每次现找、不缓存（findBin），装好后点「重新检测」就行，用不着重启
+      dependency('mpv —— 播放器（必需）', S.env.mpv, '未找到。装好后点下面的「重新检测」就行，不用重启本软件。'),
       dependency('ffmpeg —— 转封装与无损精简（按需）', S.env.ffmpeg, '未找到。转封装和无损精简都需要它。'),
       dependency(
         'ffprobe —— 读取媒体信息（按需）',
@@ -885,10 +905,8 @@ function showDepsHelp() {
       ),
       dependency(
         'Microsoft Defender —— 安全模式的扫描器',
-        S.env.defenderRunning ? S.env.defender : null,
-        S.env.defenderRunning === false
-          ? '装着但没在运行，多半是被第三方杀毒软件接管了。安全模式下收到的文件会因此一律拒播；可以重新启用 Defender，或改用可信房间（风险自负）。'
-          : '未找到。安全模式需要它才能放行收到的文件；可信房间不受影响。'
+        S.env.defenderRunning !== false ? S.env.defender : null,
+        defenderHelpText()
       ),
       field(
         '安装方式（任选其一）',
@@ -6499,7 +6517,11 @@ async function applyScanResult(session, result, before) {
     window.sw.player.osd(t(stopped ? '扫描已停止 · 文件仍在' : '扫描没做完 · 文件仍在'), 4000);
   } else if (result.status === 'unavailable') {
     // 这一种有明确的下一步：Defender 被第三方杀软接管停用是最常见的诱因。
-    log(`${reason}。安全模式必须扫过才放行；你可以启用 Microsoft Defender，或改用可信房间（风险自负）。`, 'bad');
+    // 房间模式由房主定、双方必须一致 —— 游客只改本机设置的话，下次连这个房间都进不来，得说全
+    log(
+      `${reason}。安全模式必须扫过才放行；你可以启用 Microsoft Defender，或改用可信房间（风险自负）—— 可信房间要房主开、每个人也在设置里选可信房间，双方一致才连得上。`,
+      'bad'
+    );
   } else {
     log(`${reason}。安全模式必须扫过才放行，先不打开播放器；文件还在，可以点「重新扫描」再来一遍。`, 'warn');
   }
@@ -7160,6 +7182,8 @@ let inviteOpen = false;
  * 每次 await 之后对一下。
  */
 let inviteGen = 0;
+// 被「隐藏我的 IP」拦下的那张邀请卡：{ retry, gen }，见 inviteBlocked / retryBlockedInvite
+let blockedInvite = null;
 
 function renderInviteArea() {
   const card = $('invite-card');
@@ -7230,16 +7254,36 @@ function applyRoomCapacity() {
 
 /**
  * 「隐藏我的 IP」开着却没有可用中继：这次邀请不发，原因画在邀请卡上（也记进日志）。
- * 拦下了返回 true。
+ * 拦下了返回 true。retry 是「按同一种邀请方式再来一次」：设置里补好 TURN 之后由 retryBlockedInvite 调。
  */
-function inviteBlocked(out) {
+function inviteBlocked(out, retry = null) {
   const blocked = relayOnlyBlocked();
   if (!blocked) return false;
   const line = make('p', { text: blocked });
   line.style.color = 'var(--danger)';
   replace(out, line);
   log(blocked, 'bad');
+  blockedInvite = retry ? { retry, gen: inviteGen } : null;
   return true;
+}
+
+/**
+ * 邀请卡被「隐藏我的 IP」拦下之后，在设置里补好了 TURN（保存设置、Cloudflare「验证并保存」、后台取到了账号）：
+ * 按原来的邀请方式自动重来一次，不用房主自己猜该点哪个按钮。
+ * 房主已经点了别的邀请方式（代次变了）就作废；中继还是没有、也没有账号可取的话不动它，免得日志里重复刷同一句。
+ */
+function retryBlockedInvite() {
+  const pending = blockedInvite;
+  if (!pending) return;
+  if (pending.gen !== inviteGen || !roomEntered || S.role !== 'host' || S.leaving) {
+    blockedInvite = null;
+    return;
+  }
+  if (relayOnlyBlocked() && !turnFetchNeeded()) return;
+  blockedInvite = null;
+  Promise.resolve()
+    .then(pending.retry)
+    .catch((error) => replace('inv-out', make('p', { text: error?.message || String(error) })));
 }
 
 /**
@@ -7257,7 +7301,7 @@ async function inviteViaRelay() {
     if (gen !== inviteGen) return;
   }
   // 被「隐藏我的 IP」拦下就停在这里，也不退回一对一邀请 —— 那一样是建连接
-  if (inviteBlocked(out)) return;
+  if (inviteBlocked(out, () => inviteViaRelay())) return;
   try {
     if (!S.signaling || S.signalTransport !== 'relay') {
       // 从信令服务器切过来：老的那条先关掉（已经建好的直连不受影响）
@@ -7350,7 +7394,7 @@ async function inviteViaServer() {
     await ensureTurnReady();
     if (gen !== inviteGen) return;
   }
-  if (inviteBlocked(out)) return;
+  if (inviteBlocked(out, () => inviteViaServer())) return;
 
   try {
     // 手上那条若是房间链接（公共中继）的，先关掉：S.roomId 只有信令服务器才有，
@@ -7451,7 +7495,7 @@ async function inviteViaManual(notice = '') {
     await ensureTurnReady();
     if (gen !== inviteGen) return;
   }
-  if (inviteBlocked(out)) {
+  if (inviteBlocked(out, () => inviteViaManual(notice))) {
     // 手上那条旧链接也作废：对方这时再发回应答，建起来的就是一条直连
     S.pendingManualPeer?.close?.();
     S.pendingManualPeer = null;
@@ -9289,6 +9333,99 @@ $('buffer').onclick = (e) => {
 
 /* ------------------------------- 设置 ------------------------------- */
 
+/*
+ * 设置弹窗的保存语义：字段一律点底部「保存」才生效，点「取消」全部丢掉。
+ * 例外只有本身就是动作的按钮 —— 换缓存位置、换下载位置、清理残留、删除所选、Cloudflare 的「验证并保存」
+ * 和「清除」：点了当场生效，旁边标着「立即生效」（instantTag）。这些撤不回，所以这一次打开设置里做过哪些
+ * 记在 settingsApplied 里，点「取消」时告诉用户（noticeSettingsApplied），别让人以为「取消 = 什么都没改」。
+ */
+let settingsApplied = null;
+// 「隐藏我的 IP」开着却还没有能用的中继：第一次点保存先提醒，再点一次才存（见 onOk）
+let relayOnlyWarned = false;
+// 两步确认的按钮（Cloudflare 的「清除」、缓存的「删除所选」）第一次点完多久之内再点才算数
+const CONFIRM_WINDOW_MS = 5000;
+
+function noteSettingsApplied(what) {
+  settingsApplied?.add(what);
+}
+
+/** 动作按钮旁边的「立即生效」小标签。 */
+function instantTag() {
+  return make('span', {
+    className: 'instant-tag',
+    text: '立即生效',
+    attrs: { title: '点了当场生效，不用点「保存」，点「取消」也撤不回' },
+  });
+}
+
+/** 点了「取消」，而这次打开设置时有动作已经当场生效：说清楚是哪些。 */
+function noticeSettingsApplied(applied) {
+  if (!applied?.size) return;
+  openModal({
+    title: '这些改动已经生效',
+    body: () => [
+      make('p', { className: 'fine', text: '下面这些是点了当场生效的，「取消」撤不回；其余没保存的改动已经丢掉了。' }),
+      make('ul', { className: 'settings-applied' }, [...applied].map((what) => make('li', { text: what }))),
+    ],
+    okText: '知道了',
+  });
+}
+
+/** 设置里各栏自己的报错框。 */
+function settingsErrorBox(id) {
+  return make('div', { id, className: 'field-error settings-err hidden' });
+}
+
+/** 上一次点保存留下的报错先都收起来，别跟这一次的一起挂着。 */
+function clearSettingsErrors() {
+  for (const box of document.querySelectorAll('#modal-body .settings-err')) box.classList.add('hidden');
+}
+
+/**
+ * 设置保存不了：报错写在出错那一栏底下，滚过去，把光标放进出错的输入框。
+ * 设置是个长弹窗，「保存」在最底下 —— 报错写在看不见的地方，用户看到的只是「点保存没反应」。
+ */
+function settingsFail(errorId, text, focusId = '') {
+  clearSettingsErrors();
+  const box = $(errorId);
+  if (!box) return;
+  box.textContent = t(text);
+  box.classList.remove('hidden');
+  box.scrollIntoView?.({ block: 'nearest' });
+  if (focusId) $(focusId)?.focus?.();
+}
+
+/**
+ * 公共中继地址：wss://主机[:端口][/路径]，主机得是正经的域名或 IP。
+ * 以前只看是不是 wss:// 开头，「wss://a.com,wss://b.com」整串也能存下来（主机解析成 a.com,wss），
+ * 变成一条连不上的中继写进房间链接。
+ */
+function isRelayUrl(text) {
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'wss:' || url.username || url.password) return false;
+  const host = url.hostname;
+  if (/^\[[0-9a-f:.]+\]$/i.test(host)) return true;
+  return /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/i.test(host);
+}
+
+/**
+ * 按设置页上此刻填的（还没保存的）内容，「隐藏我的 IP」有没有中继可用。
+ * Cloudflare 的临时账号是建连前现取的：凭据存好了就当之后能取到；只有本月用量到了上限、这次也没调高时才算没有。
+ */
+function relayReadyFor(turn, cfLimit) {
+  if (turn.turnSource === 'cloudflare') {
+    const usage = S.cfTurnUsage;
+    const overLimit = Boolean(usage?.exceeded) && (Number(usage.usedBytes) || 0) >= cfLimit * 1e9;
+    return Boolean(S.cfTurnState?.configured) && !overLimit;
+  }
+  return Boolean(relayServer(turn));
+}
+
 /**
  * 设置里的缓存这一块。
  *
@@ -9299,12 +9436,12 @@ $('buffer').onclick = (e) => {
  */
 /**
  * 设置里的「边下边播」「下载位置」两栏：看的片另存一份（见主进程 download:*）。
- * 开关随「保存」生效；下载位置和「换个位置」一样改完立刻生效。
+ * 开关随「保存」生效；下载位置的「换个位置」是个动作按钮，和缓存位置的一样点了立即生效。
  */
 function downloadFields() {
   const errorLine = make('div', { className: 'field-error hidden' });
   const dirPath = make('code', { text: S.cachePolicy?.downloadDir || '（未知）' });
-  const dirButton = make('button', { className: 'ghost tiny', text: '换个位置' });
+  const dirButton = make('button', { className: 'ghost tiny action', text: '换个位置' });
   dirButton.onclick = async () => {
     errorLine.classList.add('hidden');
     const dir = await window.sw.dialog.pickDownloadDir();
@@ -9312,6 +9449,7 @@ function downloadFields() {
     try {
       S.cachePolicy = await window.sw.download.setDir(dir);
       dirPath.textContent = S.cachePolicy.downloadDir;
+      noteSettingsApplied('换了下载位置');
       log(`下载位置已改到 ${S.cachePolicy.downloadDir}`, 'good');
     } catch (error) {
       errorLine.textContent = t(`换不了：${error.message || error}`);
@@ -9330,7 +9468,7 @@ function downloadFields() {
         '存下来的是你自己的文件，缓存清理不会碰它；这个开关也不改变什么时候开始播。'
       )
     ),
-    field('下载位置', make('div', { className: 'cmd-row' }, [dirPath, dirButton]), errorLine),
+    field('下载位置', make('div', { className: 'cmd-row' }, [dirPath, dirButton, instantTag()]), errorLine),
   ];
 }
 
@@ -9339,8 +9477,8 @@ let refreshCacheFileList = null;
 
 /**
  * 设置里的「缓存清理」「长期缓存文件夹」「管理缓存文件」三栏（见主进程 fileStore.setPolicy / mediaLibrary.js）。
- * 都是改完立刻生效，和「换个位置」一样；文件列表直接嵌在设置里 —— 设置本身是弹窗，
- * 弹窗里再开弹窗要排队到设置关了才出来。
+ * 缓存清理方式是个普通字段，随底部「保存」生效（见设置的 onOk）；「删除所选」是动作按钮，点了立即生效。
+ * 文件列表直接嵌在设置里 —— 设置本身是弹窗，弹窗里再开弹窗要排队到设置关了才出来。
  */
 function cachePolicyFields() {
   const policy = S.cachePolicy || { mode: 'auto', keptDir: '' };
@@ -9355,28 +9493,19 @@ function cachePolicyFields() {
     make('option', { attrs: { value: 'manual' }, text: '手动：从不自动清，放进长期缓存文件夹' }),
   ]);
   modeSelect.value = policy.mode;
-  modeSelect.onchange = async () => {
-    errorLine.classList.add('hidden');
-    try {
-      S.cachePolicy = await window.sw.cache.setMode(modeSelect.value);
-      keptPath.textContent = S.cachePolicy.keptDir || t('（未知）');
-      log(
-        S.cachePolicy.mode === 'manual'
-          ? '缓存改成手动清理：之后收的片放进长期缓存文件夹，不再自动删'
-          : '缓存改成自动清理：之后收的片关软件时清掉',
-        'good'
-      );
-    } catch (error) {
-      modeSelect.value = S.cachePolicy?.mode || 'auto';
-      showError(`改不了：${error.message || error}`);
-    }
-  };
 
   const keptPath = make('code', { id: 'set-kept-dir', text: policy.keptDir || '（未知）' });
 
-  // 手动清理：登记过的片子一条一行，勾选后删
+  // 手动清理：登记过的片子一条一行，勾选后删。删掉的找不回来，所以要点两次：第一次只把按钮换成「确认删除」
   const summary = make('span', { text: '正在统计…' });
-  const deleteButton = make('button', { className: 'ghost tiny', text: '删除所选', props: { disabled: true } });
+  const deleteButton = make('button', { className: 'ghost tiny action danger', text: '删除所选', props: { disabled: true } });
+  let deleteArmed = false;
+  let deleteTimer = null;
+  const disarmDelete = () => {
+    deleteArmed = false;
+    clearTimeout(deleteTimer);
+    deleteButton.textContent = t('删除所选');
+  };
   const listBox = make('div', { className: 'cache-files' });
   const checked = () => [...listBox.querySelectorAll('input[type="checkbox"]')].filter((box) => box.checked);
   const fileRow = (file) => {
@@ -9388,6 +9517,8 @@ function cachePolicyFields() {
     });
     box.onchange = () => {
       deleteButton.disabled = checked().length === 0;
+      // 勾选变了，上一次的「确认删除」就不算数了
+      disarmDelete();
     };
     return make('label', { className: 'cache-file' }, [
       box,
@@ -9411,14 +9542,23 @@ function cachePolicyFields() {
     summary.textContent = files.length ? t(`共 ${files.length} 个，${fmtBytes(total)}`) : t('还没有缓存文件');
     replace(listBox, ...files.map(fileRow));
     deleteButton.disabled = true;
+    disarmDelete();
   };
   deleteButton.onclick = async () => {
     const ids = checked().map((box) => box.getAttribute('data-id'));
     if (!ids.length) return;
+    if (!deleteArmed) {
+      deleteArmed = true;
+      deleteButton.textContent = t(`确认删除 ${ids.length} 个`);
+      deleteTimer = setTimeout(disarmDelete, CONFIRM_WINDOW_MS);
+      return;
+    }
+    disarmDelete();
     errorLine.classList.add('hidden');
     deleteButton.disabled = true;
     try {
       const r = await window.sw.cache.deleteFiles(ids);
+      if (r.removed > 0) noteSettingsApplied('删了缓存文件');
       log(`删掉了 ${r.removed} 个缓存文件`, 'good');
       if (r.skipped) log(`${r.skipped} 个正在用，没删`, 'warn');
       if (r.failed) showError(`${r.failed} 个删不掉（可能被别的程序占着）`);
@@ -9437,6 +9577,7 @@ function cachePolicyFields() {
     field(
       '缓存清理',
       modeSelect,
+      settingsErrorBox('set-cache-mode-err'),
       hint(
         '自动：收到的片先放在上面的缓存位置，换片、退房都不删，这次运行里再放同一部直接用，关软件时清掉；磁盘不够时先删最久没用的。',
         '手动：收到的片放进长期缓存文件夹，从不自动删，以后再放同一部直接用；磁盘满了会停下来提示你来这里清理。',
@@ -9450,7 +9591,7 @@ function cachePolicyFields() {
     ),
     field(
       '管理缓存文件',
-      make('div', { className: 'cmd-row' }, [summary, deleteButton]),
+      make('div', { className: 'cmd-row' }, [summary, deleteButton, instantTag()]),
       listBox,
       errorLine,
       hint('只列出本软件存下的片子，删的也只是这些；正在用的删不了。')
@@ -9461,8 +9602,8 @@ function cachePolicyFields() {
 function cacheField() {
   const pathLine = make('code', { text: S.env?.cacheDir || '（未知）' });
   const usageLine = make('span', { text: '正在统计…' });
-  const changeButton = make('button', { className: 'ghost tiny', text: '换个位置' });
-  const purgeButton = make('button', { className: 'ghost tiny', text: '清理残留' });
+  const changeButton = make('button', { className: 'ghost tiny action', text: '换个位置' });
+  const purgeButton = make('button', { className: 'ghost tiny action', text: '清理残留' });
   const errorLine = make('div', { className: 'field-error hidden' });
   // 换位置前的确认：本次运行的临时缓存会被立刻清掉（设置本身是弹窗，弹窗里不能再开确认框，就在这一栏里问）
   const confirmLine = make('div', { className: 'field-error hidden' });
@@ -9524,6 +9665,7 @@ function cacheField() {
       // 主进程换位置时已经把「配置的目录这次用不了」清掉了，这里照抄，提示跟着撤
       S.env.cacheFallback = r.fallback || null;
       if (!S.env.cacheFallback) fallbackLine?.remove();
+      noteSettingsApplied('换了缓存位置');
       log(`缓存目录已改到 ${r.cacheDir}`, 'good');
       refresh();
       // 旧运行目录连同临时缓存一起清掉了：「管理缓存文件」那张表跟着刷新
@@ -9544,6 +9686,7 @@ function cacheField() {
   purgeButton.onclick = async () => {
     try {
       const { removed } = await window.sw.cache.purge();
+      if (removed > 0) noteSettingsApplied('清理了残留缓存');
       log(`清掉了 ${removed} 处残留缓存`, 'good');
       refresh();
       // 腾出了空间：之前放不下的那几部再试一次
@@ -9556,7 +9699,7 @@ function cacheField() {
 
   return field(
     '缓存位置',
-    make('div', { className: 'cmd-row' }, [pathLine, changeButton, purgeButton]),
+    make('div', { className: 'cmd-row' }, [pathLine, changeButton, purgeButton, instantTag()]),
     usageLine,
     confirmLine,
     errorLine,
@@ -9579,12 +9722,19 @@ function cacheField() {
  */
 function turnSettingsFields() {
   const cf = S.settings.turnSource === 'cloudflare';
+  // 密码默认遮住：放映时常开着屏幕共享，设置一开就把中继密码亮给所有人看了。要核对就点「显示」
   const turnPassword = make('input', {
     id: 'set-turn-pass',
-    attrs: { type: 'text', placeholder: '密码' },
+    attrs: { type: 'password', placeholder: '密码', autocomplete: 'new-password', spellcheck: 'false' },
     props: { value: S.settings.turnPass },
   });
-  turnPassword.style.marginTop = '6px';
+  const passToggle = make('button', { className: 'ghost tiny', text: '显示', attrs: { type: 'button' } });
+  passToggle.onclick = () => {
+    const reveal = turnPassword.type === 'password';
+    turnPassword.type = reveal ? 'text' : 'password';
+    passToggle.textContent = t(reveal ? '隐藏' : '显示');
+  };
+  const passRow = make('div', { className: 'pass-row' }, [turnPassword, passToggle]);
 
   const manualGroup = make('div', { id: 'set-turn-manual', className: cf ? 'hidden' : '' }, [
     make('div', { className: 'field' }, [
@@ -9613,15 +9763,18 @@ function turnSettingsFields() {
         attrs: { type: 'text', placeholder: '用户名' },
         props: { value: S.settings.turnUser },
       }),
-      turnPassword
+      passRow
     ),
+    // 手填那几栏的报错就写在这一组底下
+    settingsErrorBox('set-turn-err'),
   ]);
 
   const cfResult = make('p', { id: 'set-cf-result', className: 'fine' });
-  const cfSave = make('button', { id: 'set-cf-save', className: 'ghost', text: '验证并保存' });
+  const cfSave = make('button', { id: 'set-cf-save', className: 'ghost action', text: '验证并保存' });
   cfSave.onclick = () => saveCfTurnCredentials(cfSave, cfResult);
-  const cfClear = make('button', { id: 'set-cf-clear', className: 'ghost', text: '清除' });
-  cfClear.onclick = () => clearCfTurnCredentials(cfResult);
+  // 「清除」删掉本机加密保存的 Token，撤不回：危险样式、和「验证并保存」拉开，点两次才真删（见 clearCfTurnCredentials）
+  const cfClear = make('button', { id: 'set-cf-clear', className: 'ghost action danger', text: '清除' });
+  cfClear.onclick = () => clearCfTurnCredentials(cfClear, cfResult);
   const cfWarn = make('p', { id: 'set-cf-warn', className: 'fine hidden' });
   cfWarn.style.color = 'var(--warn)';
   const cfGroup = make('div', { id: 'set-turn-cf', className: cf ? '' : 'hidden' }, [
@@ -9638,7 +9791,7 @@ function turnSettingsFields() {
         'API Token 加密保存在本机，只有 NoxReel 的主进程拿它向 Cloudflare 换 24 小时有效的临时账号，界面上不会再显示。'
       )
     ),
-    make('div', { className: 'cmd-row' }, [cfSave, cfClear]),
+    make('div', { className: 'cf-actions' }, [cfSave, instantTag(), cfClear]),
     cfResult,
     make('p', { id: 'set-cf-status', className: 'fine', text: cfTurnStatusText() }),
     field(
@@ -9660,12 +9813,17 @@ function turnSettingsFields() {
         '这是本机统计，和 Cloudflare 账单可能有出入；建议另外在 Cloudflare 后台 Manage Account → Billing → Billable Usage 建一个 Budget alert 做兜底。'
       )
     ),
+    // Cloudflare 这一组的报错（凭据填了没保存、月上限写错）
+    settingsErrorBox('set-cf-err'),
   ]);
 
   const pickSource = () => {
     const useCf = $('set-turn-source-cf').checked;
     manualGroup.classList.toggle('hidden', useCf);
     cfGroup.classList.toggle('hidden', !useCf);
+    // 换了来源：藏起来那一组的报错跟着收起，「没有中继」的提醒也按新来源重新判断
+    clearSettingsErrors();
+    relayOnlyWarned = false;
   };
   const sourceRadio = (value, checked) => ({
     attrs: { type: 'radio', name: 'set-turn-source', value },
@@ -9693,18 +9851,35 @@ function turnSettingsFields() {
     cfGroup,
     make('div', { className: 'field' }, [
       make('label', { className: 'check' }, [
-        make('input', { id: 'set-relay-only', attrs: { type: 'checkbox' }, props: { checked: S.settings.relayOnly } }),
+        make('input', {
+          id: 'set-relay-only',
+          attrs: { type: 'checkbox' },
+          props: {
+            checked: S.settings.relayOnly,
+            // 开关动过了：「没有中继」的提醒按新状态重新判断
+            onchange: () => {
+              relayOnlyWarned = false;
+              clearSettingsErrors();
+            },
+          },
+        }),
         '隐藏我的 IP（只经 TURN 中继连接）',
       ]),
       hint(
         '打开后，房间里的人只能看到 TURN 服务器的地址，看不到你的 IP。',
         '需要先配好 TURN（自己填，或用 Cloudflare 自动生成）；TURN 用不了时会连不上，不会退回直连。只影响之后新建的连接。'
       ),
+      settingsErrorBox('set-relay-only-err'),
     ]),
   ];
 }
 
-/** 「验证并保存」：Token 交给主进程验证、加密保存；成功后输入框清空，只显示「已保存」。 */
+/**
+ * 「验证并保存」：Token 交给主进程验证、加密保存；成功后输入框清空，只显示「已保存」。
+ *
+ * 这是个动作按钮，点了当场生效：表单上选的来源是 Cloudflare 的话，来源也一并存下。以前只存凭据、
+ * 显示「已保存」，来源要等底部「保存」—— 用户以为配好了、点了取消，Cloudflare TURN 就一直没被用上。
+ */
 async function saveCfTurnCredentials(button, result) {
   const keyInput = $('set-cf-key');
   const tokenInput = $('set-cf-token');
@@ -9724,8 +9899,20 @@ async function saveCfTurnCredentials(button, result) {
     S.cfTurn = null;
     cfTurnRetryAt = 0;
     applyCfTurnState(state);
-    result.textContent = t('已保存');
-    if (S.settings.turnSource === 'cloudflare') ensureTurnReady().catch(() => {});
+    noteSettingsApplied('保存了 Cloudflare 凭据');
+    const switched = Boolean($('set-turn-source-cf')?.checked) && S.settings.turnSource !== 'cloudflare';
+    if (switched) {
+      S.settings.turnSource = 'cloudflare';
+      localStorage.setItem('sw.turnSource', S.settings.turnSource);
+      noteSettingsApplied('TURN 来源改成了「Cloudflare 自动生成」');
+    }
+    result.textContent = t(switched ? '已保存，TURN 来源已改成 Cloudflare 自动生成' : '已保存');
+    if (S.settings.turnSource === 'cloudflare') {
+      scheduleCfTurnRefresh();
+      ensureTurnReady().catch(() => {});
+      // 邀请卡之前因为没有中继被拦下的：账号在取了，按原来的方式重来一次
+      retryBlockedInvite();
+    }
   } catch (error) {
     result.textContent = t(`没保存：${cfErrorText(cfErrorCode(error))}`);
   } finally {
@@ -9733,12 +9920,43 @@ async function saveCfTurnCredentials(button, result) {
   }
 }
 
-async function clearCfTurnCredentials(result) {
+// 「清除」点第一次之后，到这个时刻之前再点一次才真删
+let cfClearArmedUntil = 0;
+
+/**
+ * 「清除」：删掉本机加密保存的 Cloudflare 凭据，立即生效、撤不回。
+ * Token 只在 Cloudflare 新建 Key 时显示一次，没另外留底的话就得去后台新建一个 Key，所以要点两次：
+ * 第一次只把后果说清楚、按钮换成「确认清除」，几秒内再点才真删。还没存过凭据时没什么可删的，不用确认。
+ */
+async function clearCfTurnCredentials(button, result) {
+  if (S.cfTurnState?.configured && Date.now() >= cfClearArmedUntil) {
+    const armedUntil = Date.now() + CONFIRM_WINDOW_MS;
+    cfClearArmedUntil = armedUntil;
+    button.textContent = t('确认清除');
+    const cfSource = $('set-turn-source-cf')?.checked ?? S.settings.turnSource === 'cloudflare';
+    const relayOnly = $('set-relay-only')?.checked ?? S.settings.relayOnly;
+    const warning = t(
+      '再点一次「确认清除」才会删掉本机保存的 Cloudflare 凭据。之后要重新填 API Token 才能再用 —— Cloudflare 只在新建 Key 时显示一次 Token，没另外留底的话得去后台新建一个 Key。'
+    );
+    result.textContent =
+      cfSource && relayOnly ? `${warning} ${t('「隐藏我的 IP」开着：清除之后新建的连接会被拦下，已经连着的不受影响。')}` : warning;
+    setTimeout(() => {
+      if (cfClearArmedUntil !== armedUntil) return;
+      cfClearArmedUntil = 0;
+      button.textContent = t('清除');
+      result.textContent = '';
+    }, CONFIRM_WINDOW_MS);
+    return;
+  }
+  cfClearArmedUntil = 0;
+  button.textContent = t('清除');
+  const had = Boolean(S.cfTurnState?.configured);
   try {
     const state = await window.sw.turn.cfClear();
     S.cfTurn = null;
     scheduleCfTurnRefresh();
     applyCfTurnState(state);
+    if (had) noteSettingsApplied('清除了 Cloudflare 凭据');
     result.textContent = t('已清除');
   } catch (error) {
     result.textContent = t(`没清掉：${error.message || error}`);
@@ -9760,9 +9978,34 @@ $('btn-settings').onclick = () => {
     body: () => {
       const modeLocked = securityModeLocked();
       const languageLocked = roomEntered || S.role !== null;
+      // 这一次打开设置：当场生效的动作从头记，「没有中继」的提醒也重新来
+      settingsApplied = new Set();
+      relayOnlyWarned = false;
       // 设置页开着时顺手把 Cloudflare TURN 的状态和本月用量刷一遍
       refreshCfTurnState();
+      // Discord 的两个子选项跟着总开关：总开关关着时勾了也不起作用，就别让它能勾
+      // （偏好照样保留、照样保存，打开总开关时生效）
+      const discordOn = make('input', { id: 'set-discord-on', attrs: { type: 'checkbox' }, props: { checked: S.discord.enabled } });
+      const discordTitle = make('input', {
+        id: 'set-discord-title',
+        attrs: { type: 'checkbox' },
+        props: { checked: S.discord.showTitle, disabled: !S.discord.enabled },
+      });
+      const discordJoin = make('input', {
+        id: 'set-discord-join',
+        attrs: { type: 'checkbox' },
+        props: { checked: S.discord.showJoin, disabled: !S.discord.enabled },
+      });
+      discordOn.onchange = () => {
+        discordTitle.disabled = !discordOn.checked;
+        discordJoin.disabled = !discordOn.checked;
+      };
       return [
+        // 保存语义说在最前面：字段等「保存」，动作按钮当场生效
+        make('p', {
+          className: 'fine settings-note',
+          text: '改动点底部「保存」才生效；标着「立即生效」的按钮除外，点了当场生效，「取消」也撤不回。',
+        }),
         field(
           '界面语言',
           make(
@@ -9842,6 +10085,7 @@ $('btn-settings').onclick = () => {
             attrs: { rows: 2, placeholder: DEFAULT_RELAYS.slice(0, 3).join('\n') + '\n…' },
             props: { value: S.settings.relays },
           }),
+          settingsErrorBox('set-relays-err'),
           hint(
             '房间链接经这些公共 Nostr 中继交换加密后的连接信息，视频不经过它们。',
             '留空用内置的一组；想换就每行写一个 wss:// 地址，你当房主时这份列表会写进房间链接。'
@@ -9849,18 +10093,9 @@ $('btn-settings').onclick = () => {
         ),
         make('div', { className: 'field' }, [
           make('label', { text: 'Discord 状态' }),
-          make('label', { className: 'check' }, [
-            make('input', { id: 'set-discord-on', attrs: { type: 'checkbox' }, props: { checked: S.discord.enabled } }),
-            '在 Discord 上显示我在放映',
-          ]),
-          make('label', { className: 'check' }, [
-            make('input', { id: 'set-discord-title', attrs: { type: 'checkbox' }, props: { checked: S.discord.showTitle } }),
-            '显示片名',
-          ]),
-          make('label', { className: 'check' }, [
-            make('input', { id: 'set-discord-join', attrs: { type: 'checkbox' }, props: { checked: S.discord.showJoin } }),
-            '显示「加入放映」按钮（用房间链接时）',
-          ]),
+          make('label', { className: 'check' }, [discordOn, '在 Discord 上显示我在放映']),
+          make('label', { className: 'check sub-check' }, [discordTitle, '显示片名']),
+          make('label', { className: 'check sub-check' }, [discordJoin, '显示「加入放映」按钮（用房间链接时）']),
           hint(
             '你所有的 Discord 好友都能在你的资料上看到，点「加入放映」就能进房。',
             '需要电脑上开着 Discord 客户端，网页版不行。'
@@ -9893,7 +10128,6 @@ $('btn-settings').onclick = () => {
           )
         ),
         ...turnSettingsFields(),
-        make('div', { id: 'set-turn-err', className: 'field-error hidden' }),
         ...downloadFields(),
         cacheField(),
         ...cachePolicyFields(),
@@ -9908,13 +10142,14 @@ $('btn-settings').onclick = () => {
       ];
     },
     okText: '保存',
-    onOk: () => {
+    onOk: async () => {
+      // 报错一律写在出错那一栏底下，并滚过去、聚焦出错的输入框（settingsFail）
+      clearSettingsErrors();
       // TURN 地址写错了要当场说。以前这里只 trim()，而 ice.js 对认不出的地址是
       // 静默丢弃 —— 用户会看到「启用 TURN 中继」勾得好好的，实际一条中继都没有，
       // 到连不上那一刻也没人告诉他为什么。
       const turnRaw = $('set-turn-url').value.trim();
       const turnCheck = normalizeTurnInput(turnRaw);
-      const errorBox = $('set-turn-err');
       const turnSource = $('set-turn-source-cf').checked ? 'cloudflare' : 'manual';
       // 这次没动过 TURN 那几栏：「勾着但没填地址」是新装时的默认状态（等于没配），
       // 为此拦下别的设置（昵称、边下边播……）的保存就说不过去了。动过才查缺地址、缺凭据
@@ -9926,48 +10161,93 @@ $('btn-settings').onclick = () => {
       // 手动那套字段只在来源是「自己填」时才生效，也只在那时才查
       if (turnSource === 'manual') {
         if (turnCheck.invalid.length) {
-          errorBox.textContent = t(`这些 TURN 地址认不出来：${turnCheck.invalid.join('、')}。地址要形如 turn:example.com:3478`);
-          errorBox.classList.remove('hidden');
+          settingsFail('set-turn-err', `这些 TURN 地址认不出来：${turnCheck.invalid.join('、')}。地址要形如 turn:example.com:3478`, 'set-turn-url');
           return false;
         }
         // 53 端口会被浏览器拦下，留着它只会让候选收集干等到超时
         if (turnCheck.blocked.length) {
-          errorBox.textContent = t(`这些 TURN 地址用的是 53 端口，浏览器会拦下这个端口：${turnCheck.blocked.join('、')}。换一个端口，常见的是 3478 或 443`);
-          errorBox.classList.remove('hidden');
+          settingsFail(
+            'set-turn-err',
+            `这些 TURN 地址用的是 53 端口，浏览器会拦下这个端口：${turnCheck.blocked.join('、')}。换一个端口，常见的是 3478 或 443`,
+            'set-turn-url'
+          );
           return false;
         }
         if (turnTouched && $('set-turn-on').checked && !turnRaw) {
-          errorBox.textContent = t('勾了启用 TURN 中继，但地址是空的 —— 这样等于没配。填一个地址，或者把勾去掉。');
-          errorBox.classList.remove('hidden');
+          settingsFail('set-turn-err', '勾了启用 TURN 中继，但地址是空的 —— 这样等于没配。填一个地址，或者把勾去掉。', 'set-turn-url');
           return false;
         }
         // 缺用户名或密码的中继，浏览器会连整个连接对象一起拒掉（邀请、加入全都失败），得当场拦下
         if (turnTouched && $('set-turn-on').checked && (!$('set-turn-user').value.trim() || !$('set-turn-pass').value.trim())) {
-          errorBox.textContent = t('TURN 中继要填用户名和密码（中继服务器靠它们认人）。没有的话把「启用 TURN 中继」的勾去掉。');
-          errorBox.classList.remove('hidden');
+          settingsFail(
+            'set-turn-err',
+            'TURN 中继要填用户名和密码（中继服务器靠它们认人）。没有的话把「启用 TURN 中继」的勾去掉。',
+            $('set-turn-user').value.trim() ? 'set-turn-pass' : 'set-turn-user'
+          );
           return false;
         }
       }
-      // Cloudflare 凭据只能经「验证并保存」按钮进主进程；填了没保存就点确定，得说一声，别让人以为存上了
-      if ($('set-cf-key').value.trim() || $('set-cf-token').value.trim()) {
-        errorBox.textContent = t('Cloudflare 凭据还没保存：先点「验证并保存」，或者把这两个框清空。');
-        errorBox.classList.remove('hidden');
-        return false;
-      }
+      // Cloudflare 那一组同理，只在来源是它时才查：来源是「自己填」时那一组藏着，报错指过去用户也看不见、改不了。
+      // 月上限也只在这时才提交（见下面的 cfSetLimit）
       const cfLimit = Number($('set-cf-limit').value);
-      if (!Number.isInteger(cfLimit) || cfLimit < 1 || cfLimit > 1000) {
-        errorBox.textContent = t('Cloudflare TURN 每月上限要填 1 到 1000 之间的整数（GB）。');
-        errorBox.classList.remove('hidden');
-        return false;
+      if (turnSource === 'cloudflare') {
+        // Cloudflare 凭据只能经「验证并保存」按钮进主进程；填了没保存就点确定，得说一声，别让人以为存上了
+        if ($('set-cf-key').value.trim() || $('set-cf-token').value.trim()) {
+          settingsFail(
+            'set-cf-err',
+            'Cloudflare 凭据还没保存：先点「验证并保存」，或者把这两个框清空。',
+            $('set-cf-key').value.trim() ? 'set-cf-key' : 'set-cf-token'
+          );
+          return false;
+        }
+        if (!Number.isInteger(cfLimit) || cfLimit < 1 || cfLimit > 1000) {
+          settingsFail('set-cf-err', 'Cloudflare TURN 每月上限要填 1 到 1000 之间的整数（GB）。', 'set-cf-limit');
+          return false;
+        }
       }
-      const relayLines = $('set-relays').value.split(/\s+/).filter(Boolean);
-      const badRelays = relayLines.filter((line) => !/^wss:\/\/[^\s/]+/i.test(line));
+      // 中继地址逐条用 URL 解析：照 STUN 那栏的习惯用逗号隔开的也认，拆开存成一行一个
+      const relayLines = $('set-relays').value.split(/[\s,，、]+/).filter(Boolean);
+      const badRelays = relayLines.filter((line) => !isRelayUrl(line));
       if (badRelays.length) {
-        errorBox.textContent = t(`这些中继地址认不出来：${badRelays.join('、')}。地址要形如 wss://relay.example.com`);
-        errorBox.classList.remove('hidden');
+        settingsFail('set-relays-err', `这些中继地址认不出来：${badRelays.join('、')}。地址要形如 wss://relay.example.com`, 'set-relays');
         return false;
       }
-      errorBox.classList.add('hidden');
+      // 打开「隐藏我的 IP」、改了 TURN 却还没有能用的中继：之后新建的连接会一律被拦下。
+      // 保存前先说一声（再点一次「保存」照存），别等到开完房、进了房间才在邀请卡上看到红字
+      const relayOnly = $('set-relay-only').checked;
+      const nextTurn = {
+        turnSource,
+        turnEnabled: $('set-turn-on').checked,
+        turnUrl: turnCheck.urls.join(' '),
+        turnUser: $('set-turn-user').value.trim(),
+        turnPass: $('set-turn-pass').value.trim(),
+      };
+      const relayOnlyNews = !S.settings.relayOnly || turnSource !== S.settings.turnSource || turnTouched;
+      if (relayOnly && relayOnlyNews && !relayOnlyWarned && !relayReadyFor(nextTurn, cfLimit)) {
+        relayOnlyWarned = true;
+        settingsFail(
+          'set-relay-only-err',
+          '现在还没有能用的 TURN 中继：「隐藏我的 IP」打开之后，新建的连接会一律被拦下，直到配好 TURN。确定这样保存就再点一次「保存」。',
+          'set-relay-only'
+        );
+        return false;
+      }
+      // 缓存清理方式：主进程说了算，改不成就停在这里（别的设置也先不存），报错写在下拉框底下
+      const cacheMode = $('set-cache-mode')?.value;
+      if (cacheMode && cacheMode !== (S.cachePolicy?.mode || 'auto')) {
+        try {
+          S.cachePolicy = await window.sw.cache.setMode(cacheMode);
+        } catch (error) {
+          settingsFail('set-cache-mode-err', `改不了：${error.message || error}`, 'set-cache-mode');
+          return false;
+        }
+        log(
+          S.cachePolicy.mode === 'manual'
+            ? '缓存改成手动清理：之后收的片放进长期缓存文件夹，不再自动删'
+            : '缓存改成自动清理：之后收的片关软件时清掉',
+          'good'
+        );
+      }
       // 漏了 turn: 前缀是最常见的写法错误，意思很清楚，直接补上
       if (turnCheck.fixed.length) $('set-turn-url').value = turnCheck.urls.join(' ');
       const languageLocked = roomEntered || S.role !== null;
@@ -10024,16 +10304,25 @@ $('btn-settings').onclick = () => {
         cfTurnRetryAt = 0;
         ensureTurnReady().catch(() => {});
       }
-      if (cfLimit !== S.cfTurnUsage?.limitGB) {
+      if (turnSource === 'cloudflare' && cfLimit !== S.cfTurnUsage?.limitGB) {
         window.sw.turn
           .cfSetLimit(cfLimit)
           .then(applyCfUsage)
           .catch((error) => log(`Cloudflare TURN 月上限没改成：${error.message || error}`, 'bad'));
       }
-      // 切到安全模式时依赖胶囊要重算 —— Defender 没在跑这件事只在安全模式下算缺件。
+      // 邀请卡之前因为没有中继被拦下的：TURN 或开关改了，按原来的邀请方式重来一次
+      retryBlockedInvite();
+      // 切到安全模式时依赖胶囊要重算 —— Defender 用不了这件事只在安全模式下算缺件。
       updateDepsPill();
+      settingsApplied = null;
       if (languageChanged) setTimeout(() => location.reload(), 0);
       return true;
+    },
+    // 点了「取消」：字段的改动都丢掉；已经当场生效的动作撤不回，说清楚是哪些
+    onCancel: () => {
+      const applied = settingsApplied;
+      settingsApplied = null;
+      noticeSettingsApplied(applied);
     },
   });
 };

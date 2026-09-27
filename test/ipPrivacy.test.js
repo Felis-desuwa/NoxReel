@@ -655,6 +655,66 @@ test('要现取 Cloudflare 账号时先 await，回来之后照查邀请卡代�
   }
 });
 
+test('邀请卡被「隐藏我的 IP」拦下后补好了 TURN：按原来的邀请方式自动重来；房主换了邀请方式就作废；还是没中继就不动', async () => {
+  const state = { blocked: BLOCK_TEXT, fetchNeeded: false };
+  const box = flowBox(['inviteViaRelay', 'inviteBlocked', 'retryBlockedInvite'], {
+    extra: {
+      roomEntered: true,
+      blockedInvite: null,
+      relayOnlyBlocked: () => state.blocked,
+      turnFetchNeeded: () => state.fetchNeeded,
+      customRelays: () => null,
+      newRoomSecret: () => 'secret',
+      renderRelayInvite: async () => box.calls.push(['render']),
+    },
+  });
+  box.S.role = 'host';
+  await box.ctx.inviteViaRelay();
+  assert.ok(!box.calls.some((c) => c[0] === 'connect'), '拦下时不该连中继');
+  const pending = vm.runInContext('blockedInvite', box.ctx);
+  assert.ok(pending && typeof pending.retry === 'function', '拦下时记下怎么重来');
+
+  // 还是没中继、也没有账号可取：不动它，免得日志里再刷一遍同一句
+  box.ctx.retryBlockedInvite();
+  await flush();
+  assert.ok(!box.calls.some((c) => c[0] === 'connect'));
+  assert.ok(vm.runInContext('blockedInvite', box.ctx), '记录留着，等下一次补好');
+
+  // 补好了（或关掉了开关）：按原来的方式（房间链接）重来一次，只来一次
+  state.blocked = '';
+  box.ctx.retryBlockedInvite();
+  box.ctx.retryBlockedInvite();
+  await flush();
+  assert.equal(box.calls.filter((c) => c[0] === 'connect').length, 1);
+  assert.ok(box.calls.some((c) => c[0] === 'render'));
+  assert.equal(vm.runInContext('blockedInvite', box.ctx), null);
+
+  // Cloudflare 的账号还在取：一样重来（邀请流程自己会先等账号）
+  const cf = flowBox(['inviteViaServer', 'inviteBlocked', 'retryBlockedInvite'], {
+    extra: { roomEntered: true, blockedInvite: null, turnFetchNeeded: () => cf.fetch === true },
+  });
+  cf.S.role = 'host';
+  await cf.ctx.inviteViaServer();
+  cf.fetch = true;
+  const before = cf.calls.length;
+  cf.ctx.retryBlockedInvite();
+  await flush();
+  assert.ok(cf.calls.length > before, '有账号可取时应当重来');
+
+  // 房主已经点了别的邀请方式：旧的那张作废，不重来
+  const stale = flowBox(['inviteViaRelay', 'inviteBlocked', 'retryBlockedInvite'], {
+    extra: { roomEntered: true, blockedInvite: null, relayOnlyBlocked: () => state.stale ?? BLOCK_TEXT },
+  });
+  stale.S.role = 'host';
+  await stale.ctx.inviteViaRelay();
+  vm.runInContext('inviteGen += 1', stale.ctx);
+  state.stale = '';
+  stale.ctx.retryBlockedInvite();
+  await flush();
+  assert.ok(!stale.calls.some((c) => c[0] === 'connect'));
+  assert.equal(vm.runInContext('blockedInvite', stale.ctx), null);
+});
+
 test('只走中继的连接连不上时，诊断按「中继候选为 0」说话；Cloudflare 来源看这条连接有没有带上中继', async () => {
   const ice = await load('src/renderer/lib/ice.js');
   const ctx = {
@@ -713,8 +773,8 @@ test('「验证并保存」成功后清空两个输入框，只显示「已保�
   const saved = [];
   let failWith = null;
   const r = await turnBox({
-    fns: ['saveCfTurnCredentials'],
-    globals: { $ },
+    fns: ['saveCfTurnCredentials', 'noteSettingsApplied'],
+    globals: { $, settingsApplied: null, retryBlockedInvite: () => {} },
     turnApi: {
       cfSave: async (keyId, apiToken) => {
         if (failWith) throw new Error(failWith);
@@ -741,6 +801,95 @@ test('「验证并保存」成功后清空两个输入框，只显示「已保�
   failWith = "Error invoking remote method 'turn:cfSave': TypeError: 无效的 API Token";
   await r.ctx.saveCfTurnCredentials(button, result);
   assert.equal(result.textContent, '没保存：Turn Token ID 或 API Token 的格式不对');
+});
+
+/** 设置页里 Cloudflare 那几个按钮的假输入框：id → { value, checked, textContent }。 */
+function fakeInputs() {
+  const els = new Map();
+  return (id) => {
+    if (!els.has(id)) els.set(id, { id, value: '', checked: false, textContent: '', classList: { toggle() {}, add() {}, remove() {} } });
+    return els.get(id);
+  };
+}
+
+test('「验证并保存」是动作按钮：表单选的是 Cloudflare 时来源一并存下，马上取号、重试被拦的邀请卡，记进「已经生效」', async () => {
+  const $ = fakeInputs();
+  const storage = new Map();
+  const retried = [];
+  const creds = [];
+  const r = await turnBox({
+    fns: ['saveCfTurnCredentials', 'noteSettingsApplied'],
+    globals: {
+      $,
+      settingsApplied: new Set(),
+      retryBlockedInvite: () => retried.push(1),
+      localStorage: { setItem: (k, v) => storage.set(k, String(v)) },
+    },
+    turnApi: {
+      cfSave: async () => ({ configured: true, expiresAt: Date.now() + 20 * HOUR, lastError: null, usage: { usedBytes: 0, limitGB: 900 } }),
+      cfCredentials: async (opts) => {
+        creds.push(opts);
+        return { urls: CF_URLS, username: 'cf-user', credential: 'cf-pass', expiresAt: Date.now() + 23 * HOUR };
+      },
+    },
+  });
+  $('set-cf-key').value = 'abcdefgh1234';
+  $('set-cf-token').value = 'x'.repeat(20);
+  $('set-turn-source-cf').checked = true;
+  const result = { textContent: '' };
+  await r.ctx.saveCfTurnCredentials({ disabled: false }, result);
+  await flush();
+  assert.equal(r.S.settings.turnSource, 'cloudflare', '点了取消也不该丢：来源当场存下');
+  assert.equal(storage.get('sw.turnSource'), 'cloudflare');
+  assert.equal(result.textContent, '已保存，TURN 来源已改成 Cloudflare 自动生成');
+  assert.equal(creds.length, 1, '来源切过来了就马上取一组');
+  assert.equal(r.S.cfTurn.username, 'cf-user');
+  assert.equal(retried.length, 1, '被拦下的邀请卡要重来');
+  assert.deepEqual([...vm.runInContext('settingsApplied', r.ctx)], ['保存了 Cloudflare 凭据', 'TURN 来源改成了「Cloudflare 自动生成」']);
+  for (const value of storage.values()) assert.ok(!value.includes('x'.repeat(20)), 'Token 进了 localStorage');
+});
+
+test('「清除」要点两次：第一次只说后果、按钮换成「确认清除」，过了几秒自己复原；再点才真删，记进「已经生效」', async () => {
+  const $ = fakeInputs();
+  let cleared = 0;
+  const r = await turnBox({
+    fns: ['clearCfTurnCredentials', 'noteSettingsApplied'],
+    globals: { $, settingsApplied: new Set(), cfClearArmedUntil: 0, CONFIRM_WINDOW_MS: 5000 },
+    turnApi: {
+      cfClear: async () => {
+        cleared++;
+        return { configured: false, expiresAt: null, lastError: null };
+      },
+    },
+  });
+  r.S.cfTurnState = { configured: true };
+  $('set-turn-source-cf').checked = true;
+  $('set-relay-only').checked = true;
+  const button = { textContent: '清除' };
+  const result = { textContent: '' };
+  await r.ctx.clearCfTurnCredentials(button, result);
+  assert.equal(cleared, 0, '第一次点不删');
+  assert.equal(button.textContent, '确认清除');
+  assert.match(result.textContent, /^再点一次「确认清除」才会删掉本机保存的 Cloudflare 凭据/);
+  assert.match(result.textContent, /「隐藏我的 IP」开着：清除之后新建的连接会被拦下/);
+  // 没再点：几秒后按钮复原，下一次点又只是确认
+  const timer = r.timers.at(-1);
+  assert.equal(timer.ms, 5000);
+  timer.fn();
+  assert.equal(button.textContent, '清除');
+  assert.equal(result.textContent, '');
+  await r.ctx.clearCfTurnCredentials(button, result);
+  assert.equal(cleared, 0);
+  // 确认窗口里再点一次：真删
+  await r.ctx.clearCfTurnCredentials(button, result);
+  assert.equal(cleared, 1);
+  assert.equal(result.textContent, '已清除');
+  assert.equal(button.textContent, '清除');
+  assert.deepEqual([...vm.runInContext('settingsApplied', r.ctx)], ['清除了 Cloudflare 凭据']);
+  // 已经没有凭据了：没什么可删的，不用确认，也不算「已经生效」的改动
+  await r.ctx.clearCfTurnCredentials(button, result);
+  assert.equal(cleared, 2);
+  assert.equal(vm.runInContext('settingsApplied', r.ctx).size, 1);
 });
 
 test('设置页的状态行：已配置、有效到几点、出错原因、本月用量和 80% 提醒', async () => {

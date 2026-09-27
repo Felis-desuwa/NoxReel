@@ -76,9 +76,14 @@ test('扫描器不可用的提示有英文，且拼接后不会出现双句点',
   assert.match(trusted, /software\. The trusted room keeps playing/, '前半句的句号要削掉，别拼成 software..');
   assert.doesNotMatch(trusted, /\.\./);
 
-  const safe = translate(`已阻止打开接收文件：${base}。安全模式必须扫过才放行；你可以启用 Microsoft Defender，或改用可信房间（风险自负）。`, 'en');
+  const safe = translate(
+    `已阻止打开接收文件：${base}。安全模式必须扫过才放行；你可以启用 Microsoft Defender，或改用可信房间（风险自负）—— 可信房间要房主开、每个人也在设置里选可信房间，双方一致才连得上。`,
+    'en'
+  );
   assert.match(safe, /^Blocked the received file: /);
   assert.match(safe, /Safe mode plays a file only after it is scanned/);
+  // 房间模式由房主定、双方必须一致：光改本机设置的游客下次连房间都进不来，这半句不能丢
+  assert.match(safe, /the host has to open a Trusted room and everyone has to pick Trusted room in Settings too/);
   assert.doesNotMatch(safe, /\.\./);
 });
 

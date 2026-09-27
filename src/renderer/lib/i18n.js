@@ -53,7 +53,7 @@ const EN = new Map(Object.entries({
   'mpv —— 播放器（必需）': 'mpv — player (required)',
   'ffmpeg —— 转封装（按需）': 'ffmpeg — remuxing (when needed)',
   'yt-dlp —— 视频网页解析（按需）': 'yt-dlp — video page parser (when needed)',
-  '未找到。装好后重启本软件即可。': 'Not found. Install it and restart the app.',
+  '未找到。装好后点下面的「重新检测」就行，不用重启本软件。': 'Not found. Install it, then click “Check again” below—no need to restart the app.',
   '未找到。只有当片子需要转封装时才会用到。': 'Not found. It is only needed when a video must be remuxed.',
   '未找到。MP4/HLS 直链仍可播放，视频网站页面链接不可用。': 'Not found. Direct MP4/HLS links still work, but video page URLs do not.',
   '安装方式（任选其一）': 'Installation options',
@@ -330,10 +330,12 @@ const EN = new Map(Object.entries({
   '文件已完整接收，但本机扫描器不可用 —— 这份文件没有经过扫描':
     'The file is fully received, but no local scanner is available — it has not been scanned.',
   'Microsoft Defender —— 安全模式的扫描器': 'Microsoft Defender — the scanner Safe mode relies on',
-  '装着但没在运行，多半是被第三方杀毒软件接管了。安全模式下收到的文件会因此一律拒播；可以重新启用 Defender，或改用可信房间（风险自负）。':
-    'Installed but not running, most likely because third-party antivirus software took over. Safe mode will refuse every received file; re-enable Defender, or switch to a Trusted room at your own risk.',
-  '未找到。安全模式需要它才能放行收到的文件；可信房间不受影响。':
-    'Not found. Safe mode needs it before a received file can play; Trusted rooms are unaffected.',
+  '装着但没在运行，多半是被第三方杀毒软件接管了。安全模式下收到的文件会因此一律拒播；可以重新启用 Defender，或改用可信房间（风险自负）—— 可信房间要房主开、你也在设置里选可信房间，双方一致才连得上。':
+    'Installed but not running, most likely because third-party antivirus software took over. Safe mode will refuse every received file; re-enable Defender, or switch to a Trusted room at your own risk—the host has to open a Trusted room and you have to pick Trusted room in Settings too, since both sides must match to connect.',
+  '未找到。安全模式需要它才能放行收到的文件，没有它收到的文件会一律拒播；可信房间不受影响（要房主开可信房间、你也在设置里选可信房间）。':
+    'Not found. Safe mode needs it before a received file can play, so without it every received file is refused; Trusted rooms are unaffected (the host opens a Trusted room and you pick Trusted room in Settings too).',
+  '本平台没有可用的扫描器：安全模式收到的文件没法扫描，会一律拒播。要边下边播，得房主开可信房间、你也在设置里选可信房间，双方一致才连得上。':
+    'No scanner is available on this platform: files received in Safe mode cannot be scanned and are always refused. For progressive playback, the host has to open a Trusted room and you have to pick Trusted room in Settings too—both sides must match to connect.',
   '安全扫描未通过，已阻止播放并清理缓存': 'Security scan did not pass. Playback was blocked and the cache was cleared.',
   '文件已完整接收但没有扫完 —— 文件还在，可以重新扫描':
     'The file is fully received but the scan did not finish — the file is still here and can be scanned again.',
@@ -379,6 +381,21 @@ const EN = new Map(Object.entries({
     'In manual cleanup mode, received videos and online videos you cache yourself are kept here (in automatic mode, cached online videos go to the temporary cache). It follows the cache location above; when that is the default system temp directory, it lives in the local app data directory instead so system disk cleanup does not delete it.',
   '管理缓存文件': 'Manage cached files',
   '删除所选': 'Delete selected',
+  // 设置的保存语义：字段等「保存」，动作按钮当场生效（取消时列出已经生效的）
+  '改动点底部「保存」才生效；标着「立即生效」的按钮除外，点了当场生效，「取消」也撤不回。':
+    'Changes take effect when you click Save at the bottom—except buttons marked “Takes effect now”, which apply immediately and are not undone by Cancel.',
+  '立即生效': 'Takes effect now',
+  '点了当场生效，不用点「保存」，点「取消」也撤不回': 'Applies as soon as you click it—no need to Save, and Cancel does not undo it',
+  '这些改动已经生效': 'These changes already took effect',
+  '下面这些是点了当场生效的，「取消」撤不回；其余没保存的改动已经丢掉了。':
+    'These took effect the moment you clicked them, so Cancel cannot undo them; your other unsaved changes were discarded.',
+  '换了缓存位置': 'Changed the cache location',
+  '换了下载位置': 'Changed the download location',
+  '清理了残留缓存': 'Cleaned up leftover cache',
+  '删了缓存文件': 'Deleted cached files',
+  '保存了 Cloudflare 凭据': 'Saved the Cloudflare credentials',
+  'TURN 来源改成了「Cloudflare 自动生成」': 'Switched the TURN source to “Generate with Cloudflare”',
+  '清除了 Cloudflare 凭据': 'Cleared the Cloudflare credentials',
   '长期缓存': 'Long-term cache',
   '临时缓存': 'Temporary cache',
   '正在用': 'In use',
@@ -539,7 +556,17 @@ const EN = new Map(Object.entries({
   'Turn Token ID 和 API Token 都要填。': 'Enter both the Turn Token ID and the API Token.',
   '正在向 Cloudflare 验证…': 'Verifying with Cloudflare…',
   '已保存': 'Saved',
+  '已保存，TURN 来源已改成 Cloudflare 自动生成': 'Saved, and the TURN source is now “Generate with Cloudflare”',
   '已清除': 'Cleared',
+  '确认清除': 'Confirm clear',
+  '再点一次「确认清除」才会删掉本机保存的 Cloudflare 凭据。之后要重新填 API Token 才能再用 —— Cloudflare 只在新建 Key 时显示一次 Token，没另外留底的话得去后台新建一个 Key。':
+    'Click “Confirm clear” to delete the Cloudflare credentials saved on this computer. You will need to enter the API Token again to use it—Cloudflare shows the token only once, when the key is created, so without your own copy you will have to create a new key in the dashboard.',
+  '「隐藏我的 IP」开着：清除之后新建的连接会被拦下，已经连着的不受影响。':
+    '“Hide my IP” is on: after clearing, new connections will be blocked; existing ones are not affected.',
+  '现在还没有能用的 TURN 中继：「隐藏我的 IP」打开之后，新建的连接会一律被拦下，直到配好 TURN。确定这样保存就再点一次「保存」。':
+    'No TURN relay is usable yet: with “Hide my IP” on, every new connection will be blocked until TURN is set up. To save anyway, click Save again.',
+  '显示': 'Show',
+  '隐藏': 'Hide',
   'Cloudflare 凭据还没保存：先点「验证并保存」，或者把这两个框清空。':
     'The Cloudflare credentials are not saved yet: click “Verify and save” first, or clear both fields.',
   'Cloudflare TURN 每月上限要填 1 到 1000 之间的整数（GB）。':
@@ -1335,6 +1362,7 @@ const EN_PATTERNS = [
   [/^(\d+) 个正在用，没删$/, '$1 in use, not deleted'],
   [/^(\d+) 个删不掉（可能被别的程序占着）$/, '$1 could not be deleted (another program may be using them)'],
   [/^删不掉：(.+)$/, 'Could not delete: $1'],
+  [/^确认删除 (\d+) 个$/, 'Confirm deleting $1'],
   [/^本机已有《(.+)》，正在核对…$/, 'Already have “$1” on this computer, checking it…'],
   [/^本机已有的《(.+)》核对通过，不用再传$/, '“$1” on this computer checks out; no need to transfer it again'],
   [/^本机的《(.+)》有 (\d+)\/(\d+) 片对得上，其余照常接收$/, '$2/$3 chunks of “$1” on this computer match; receiving the rest as usual'],
@@ -1437,9 +1465,9 @@ const EN_PATTERNS = [
       `${trimEnd(translate(detail, 'en'))}. The trusted room keeps playing, but this file was never scanned on your computer — make sure you trust the source.`,
   ],
   [
-    /^(.*)。安全模式必须扫过才放行；你可以启用 Microsoft Defender，或改用可信房间（风险自负）。$/,
+    /^(.*)。安全模式必须扫过才放行；你可以启用 Microsoft Defender，或改用可信房间（风险自负）—— 可信房间要房主开、每个人也在设置里选可信房间，双方一致才连得上。$/,
     (_all, detail) =>
-      `${trimEnd(translate(detail, 'en'))}. Safe mode plays a file only after it is scanned; enable Microsoft Defender, or switch to a Trusted room at your own risk.`,
+      `${trimEnd(translate(detail, 'en'))}. Safe mode plays a file only after it is scanned; enable Microsoft Defender, or switch to a Trusted room at your own risk—the host has to open a Trusted room and everyone has to pick Trusted room in Settings too, since both sides must match to connect.`,
   ],
   [/^连接 mpv IPC 超时：(.*)$/, 'Timed out connecting to mpv IPC: $1'],
   [/^mpv 命令超时：(.*)$/, 'mpv command timed out: $1'],
