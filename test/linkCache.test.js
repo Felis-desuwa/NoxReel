@@ -10,8 +10,10 @@ const os = require('node:os');
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const { PassThrough } = require('node:stream');
+const { spawn } = require('node:child_process');
 const { LinkCache, FORMAT, WORK_DIR, uniquePath } = require('../src/main/linkCache');
 const { MediaLibrary } = require('../src/main/mediaLibrary');
+const { writeTwoLayer, alive, workerPidOf } = require('./helpers/twoLayerProcess');
 
 async function tempDir(t) {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'noxreel-linkcache-'));
@@ -76,7 +78,10 @@ async function workDirIn(dir, id, onFinish = async () => {}) {
   };
 }
 
-async function setup(t, { behave = succeed, maxParallel = 3, resolve = async () => null, ytDlp = 'yt-dlp.exe' } = {}) {
+async function setup(
+  t,
+  { behave = succeed, maxParallel = 3, resolve = async () => null, ytDlp = 'yt-dlp.exe', beforePlacement = async () => {}, ...extra } = {}
+) {
   const dir = await tempDir(t);
   const keptDir = path.join(dir, 'kept');
   const downloadDir = path.join(dir, 'downloads');
@@ -89,14 +94,17 @@ async function setup(t, { behave = succeed, maxParallel = 3, resolve = async () 
     proxyInfo: async () => ({ url: 'http://u:p@127.0.0.1:5555' }),
     resolve,
     alreadyDone: (url, purpose) => purpose === 'cache' && !!library.findLink(url),
-    placement: (job) =>
-      job.purpose === 'download'
+    placement: async (job) => {
+      await beforePlacement(job);
+      return job.purpose === 'download'
         ? workDirIn(downloadDir, job.id)
         : workDirIn(keptDir, job.id, (target, meta) =>
             library.addLink({ url: meta.url, title: meta.title, filePath: target, size: meta.size })
-          ),
+          );
+    },
     spawnImpl,
     maxParallel,
+    ...extra,
   });
   const updates = [];
   cache.on('update', (v) => updates.push(v));
@@ -127,6 +135,8 @@ test('缓存一个链接：经过滤代理、选音画合一的格式，下完�
   assert.equal(args[args.indexOf('--format') + 1], FORMAT, '音画合一，不用 ffmpeg 合并');
   assert.deepEqual(args.slice(-2), ['--', url], '链接放在 -- 后面，不会被当成参数');
   assert.ok(args.includes('--no-playlist'));
+  // --print 隐含 --quiet，quiet 下 yt-dlp 连进度也不报：不显式要进度，界面一直 0%
+  assert.ok(args.includes('--print') && args.includes('--progress'), '要显式要进度');
 
   const entry = library.findLink(url);
   assert.ok(entry, '登记进长期缓存');
@@ -225,6 +235,136 @@ test('取消：按用途取消；在下的杀掉 yt-dlp、工作目录删掉、�
   assert.equal(leftovers(keptDir), 0, '半截文件不留下');
   assert.equal(leftovers(downloadDir), 0);
   assert.equal(cache.cancel('https://video.example.org/a'), false, '取消过的再取消没有用');
+});
+
+/** 起了就一直在下的假 yt-dlp：写半截文件、报进度，自己不退。 */
+async function neverEnding(args, child) {
+  await fsp.writeFile(outputOf(args).replace('%(title).120B', 'x').replace('%(ext)s', 'mp4.part'), 'half');
+  child.stdout.write('NRPROG 10 100 NA\n');
+}
+
+test('取消结束的是这个任务的 yt-dlp 整棵进程树；漏网的子孙攥着管道不放时等一会儿就不等了：名额还回去、工作目录照删', async (t) => {
+  const killed = [];
+  const { cache, calls, updates } = await setup(t, {
+    maxParallel: 1,
+    cancelGraceMs: 30,
+    // 假装进程树没结束干净：管道一直有人攥着，'close' 永远不来
+    killTreeImpl: (child) => killed.push(child),
+    behave: neverEnding,
+  });
+  cache.start({ url: 'https://video.example.org/a' });
+  cache.start({ url: 'https://video.example.org/b' });
+  await until(() => calls.length === 1, '第一个开始下');
+  await flush();
+  const first = [...cache.jobs.values()][0];
+  assert.ok(fs.existsSync(first.workDir));
+  const canceledWithDir = [];
+  cache.on('update', (v) => {
+    if (v.url === 'https://video.example.org/a' && v.state === 'canceled') canceledWithDir.push(fs.existsSync(first.workDir));
+  });
+  assert.equal(cache.cancel('https://video.example.org/a'), true);
+  assert.deepEqual(killed, [calls[0].child], '结束的是这个任务起的那个 yt-dlp');
+  // 进程树退干净之前漏出来的一行进度（绕过每 500ms 报一次的节流）
+  first.lastEmit = 0;
+  calls[0].child.stdout.write('NRPROG 50 100 NA\n');
+  await until(() => calls.length === 2, '名额还回去，排队的那个轮到');
+  assert.deepEqual(canceledWithDir, [false], '「已取消」只在收完尾（工作目录删掉）之后报一次');
+  assert.ok(updates.some((u) => u.url === 'https://video.example.org/a' && u.state === 'canceled'));
+  assert.equal(calls[0].child.stdout.destroyed, true, '不再读它的管道');
+  assert.equal(fs.existsSync(first.workDir), false, '工作目录照样删');
+  assert.equal(cache.cancel('https://video.example.org/b'), true);
+  await until(() => cache.status().every((v) => v.state === 'canceled'), '第二个也收完尾');
+});
+
+test('还在建工作目录时就取消了：不再起 yt-dlp（否则它会把整部片下完才被丢掉），工作目录照删', async (t) => {
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const { cache, keptDir, calls, updates } = await setup(t, { beforePlacement: () => gate });
+  cache.start({ url: 'https://video.example.org/slow-place' });
+  await flush();
+  assert.equal(cache.status()[0].state, 'downloading');
+  assert.equal(cache.cancel('https://video.example.org/slow-place'), true);
+  release();
+  await until(() => updates.some((u) => u.state === 'canceled'), '收尾完');
+  assert.equal(calls.length, 0, 'yt-dlp 根本没起');
+  assert.equal(leftovers(keptDir), 0);
+});
+
+test('退出时的 cancelAll：返回的 Promise 等在下的那几个收完尾（yt-dlp 退了、工作目录删了）才 resolve', async (t) => {
+  const { cache, keptDir, downloadDir, calls } = await setup(t, { maxParallel: 2, behave: neverEnding });
+  cache.start({ url: 'https://video.example.org/1' });
+  cache.start({ url: 'https://video.example.org/2', purpose: 'download' });
+  cache.start({ url: 'https://video.example.org/3' });
+  await until(() => calls.length === 2, '两个在下');
+  await flush();
+  assert.equal(leftovers(keptDir) + leftovers(downloadDir), 2);
+  await cache.cancelAll();
+  assert.equal(leftovers(keptDir), 0);
+  assert.equal(leftovers(downloadDir), 0);
+  assert.ok(calls.every((c) => c.child.killed));
+  assert.ok(cache.status().every((v) => v.state === 'canceled'));
+  assert.equal(calls.length, 2, '排队的没起');
+  await cache.cancelAll(); // 没有在下的也能等
+});
+
+const waitLong = async (cond, what, ms = 20_000) => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (cond()) return;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error(`等不到：${what}`);
+};
+
+test('真的两层进程（和 yt-dlp.exe 一样）：取消后干活的子进程也结束，名额马上还回去，半截文件删掉', { timeout: 60_000 }, async (t) => {
+  const scriptDir = await tempDir(t);
+  // 干活的子进程：往 --output 指的位置写半截文件、报进度，一直不停（引导进程的参数原样传给它）
+  const parent = await writeTwoLayer(
+    scriptDir,
+    [
+      "const fs = require('fs');",
+      'const args = process.argv.slice(2);',
+      "const out = args[args.indexOf('--output') + 1].replace('%(title).120B', 'x').replace('%(ext)s', 'mp4.part');",
+      "const fd = fs.openSync(out, 'w');",
+      'let n = 0;',
+      "setInterval(() => { fs.writeSync(fd, Buffer.alloc(1024, 1)); n += 1024; process.stdout.write('NRPROG ' + n + ' 100000000 NA\\n'); }, 20);",
+    ].join('\n')
+  );
+  const children = [];
+  const workerPids = [];
+  t.after(() => {
+    for (const pid of [...children.map((c) => c.pid), ...workerPids]) {
+      if (pid && alive(pid)) process.kill(pid);
+    }
+  });
+  const { cache } = await setup(t, {
+    maxParallel: 1,
+    cancelGraceMs: 60_000, // 兜底别替它遮掩：名额要靠整棵树真的退了才还回来
+    spawnImpl: (bin, args, opts) => {
+      const child = spawn(process.execPath, [parent, ...args], opts);
+      child.workerPid = workerPidOf(child).then((pid) => (workerPids.push(pid), pid));
+      children.push(child);
+      return child;
+    },
+  });
+  cache.start({ url: 'https://video.example.org/two-layer' });
+  cache.start({ url: 'https://video.example.org/next' });
+  await waitLong(() => children.length === 1, '开始下');
+  const worker = await children[0].workerPid;
+  await waitLong(() => cache.status()[0].downloaded > 0, '在下');
+  const first = [...cache.jobs.values()][0];
+  assert.ok(fs.readdirSync(first.workDir).length > 0, '半截文件在工作目录里');
+
+  assert.equal(cache.cancel('https://video.example.org/two-layer'), true);
+  // 'close' 要等两层都退了、管道关上才来；只杀引导进程的话子进程攥着管道，名额一直不还
+  await waitLong(() => children.length === 2, '名额还回去，排队的那个轮到');
+  await waitLong(() => !alive(worker), '干活的子进程结束', 5000);
+  assert.equal(fs.existsSync(first.workDir), false, '半截文件连工作目录删掉');
+
+  await children[1].workerPid;
+  assert.equal(cache.cancel('https://video.example.org/next'), true);
+  await waitLong(() => cache.status().every((v) => v.state === 'canceled'), '第二个也收完尾');
+  for (const pid of workerPids) await waitLong(() => !alive(pid), `子进程 ${pid} 结束`, 5000);
 });
 
 test('网页直接下不了：先解析拿到媒体地址，带着请求头再下一次', async (t) => {

@@ -15,10 +15,19 @@ const os = require('os');
 const net = require('net');
 const { findBin } = require('./findBin');
 const { isPublicIp, resolvePublic, publicLookup } = require('./ipGuard');
+const { killTree } = require('./processTree');
 
 const DIRECT_MEDIA_RE = /\.(?:mp4|m4v|mov|mkv|webm|m3u8|mpd)(?:$|[?#])/i;
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const PARSE_TIMEOUT_MS = 60_000;
+// 解析和下载（linkCache.js）共用的格式串。Android 端不能像 mpv 一样把独立音视频流现场合并，
+// 所以优先选同时含音频和视频的 HTTP / HLS 格式。
+// 最后那个 /b 不能省：直链的 mp4 yt-dlp 报不出编码（vcodec/acodec 是未知），前面几项「必须有音轨和视频轨」
+// 一个都选不中，整个解析报「Requested format is not available」，每次都白白退到隔离浏览器（实测）。
+// b 本身仍要求音画都不是 none：网站给的是分开的音、视频流时它照样选不中，不会拿一条没声音的流凑数
+// （只有全部格式都没音轨、或都没画面时，yt-dlp 才退到其中最好的一条 —— 那本来就是片子的全部）。
+const MUXED_FORMAT =
+  'best[protocol^=http][vcodec!=none][acodec!=none]/best[protocol^=m3u8][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/b';
 const SAFE_PLAYBACK_HEADERS = new Set(['accept', 'accept-language', 'origin', 'referer', 'user-agent']);
 const YOUTUBE_HOST_RE = /(^|\.)(?:youtube\.com|youtube-nocookie\.com|youtu\.be)$/i;
 const MAX_REDIRECT_HOPS = 5;
@@ -203,9 +212,13 @@ function childEnv(base = process.env) {
   return env;
 }
 
-function runJson(bin, args) {
+/**
+ * 跑一次 yt-dlp 取 JSON。超时、输出过大时结束整棵进程树：yt-dlp.exe 是两层进程，
+ * 只杀引导进程的话干活的子进程接着跑（见 processTree.js）。选项只给测试用。
+ */
+function runJson(bin, args, { spawnImpl = spawn, killTreeImpl = killTree, timeoutMs = PARSE_TIMEOUT_MS, maxOutputBytes = MAX_OUTPUT_BYTES } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env: childEnv() });
+    const child = spawnImpl(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env: childEnv() });
     const chunks = [];
     let stdoutBytes = 0;
     let stderr = '';
@@ -219,16 +232,16 @@ function runJson(bin, args) {
     };
 
     const timer = setTimeout(() => {
-      child.kill();
+      killTreeImpl(child);
       finish(reject, new Error('解析视频链接超时，请检查网络或换一个链接重试'));
-    }, PARSE_TIMEOUT_MS);
+    }, timeoutMs);
 
     // 按字节累计：原来每来一块都把整段已收的字符串重新量一遍长度，8MB 的输出要白扫上百遍
     child.stdout.on('data', (chunk) => {
       if (settled) return;
       stdoutBytes += chunk.length;
-      if (stdoutBytes > MAX_OUTPUT_BYTES) {
-        child.kill();
+      if (stdoutBytes > maxOutputBytes) {
+        killTreeImpl(child);
         finish(reject, new Error('链接返回的媒体信息过大，可能是播放列表而不是单个视频'));
         return;
       }
@@ -273,14 +286,8 @@ function ytDlpArgs(url, extractorArgs = null, proxy = null) {
   // 解析出的 IP 判定，私网一律 403。这才是真正堵住 SSRF 的那一道，下面的跳转链预检只是提前报错。
   if (proxy) args.push('--proxy', proxy);
   if (extractorArgs) args.push('--extractor-args', extractorArgs);
-  args.push(
-    // Android 端不能像 mpv 一样把独立音视频流现场合并，因此优先选择同时含
-    // 音频和视频的 HTTP/HLS 格式。桌面端仍可以把原始页面地址交给 mpv。
-    '--format',
-    'best[protocol^=http][vcodec!=none][acodec!=none]/best[protocol^=m3u8][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]',
-    '--',
-    url
-  );
+  // 音画合一的格式（见 MUXED_FORMAT）。桌面端仍可以把原始页面地址交给 mpv。
+  args.push('--format', MUXED_FORMAT, '--', url);
   return args;
 }
 
@@ -391,6 +398,8 @@ module.exports = {
   playbackFromInfo,
   isYouTubeUrl,
   ytDlpArgs,
+  runJson,
+  MUXED_FORMAT,
   toolStatus,
   hostIsPublic,
   headOnce,

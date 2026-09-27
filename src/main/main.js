@@ -707,8 +707,9 @@ async function cleanup() {
     malwareScan.cancelAll();
     // 还在算哈希的任务也一起停掉，别在退出途中继续读整部片
     for (const controller of tasks.values()) controller.abort();
-    // 在线视频的手动缓存和下载：yt-dlp 杀掉，没下完的工作目录由它自己删
-    linkCache.cancelAll();
+    // 在线视频的手动缓存和下载：结束 yt-dlp 整棵进程树，没下完的工作目录由它自己删。
+    // 等它删完再端运行目录：yt-dlp 还攥着半截文件的话，cleanupRun() 当次删不掉自动模式的缓存
+    const linksStopped = linkCache.cancelAll().catch(() => {});
     // 边下边播正在跨盘复制的另存：取消，半截文件连工作目录删掉（不取消的话进程要在后台等复制做完才退，
     // 而且它还读着缓存那份，关会话、删缓存都得等它）
     const savesStopped = downloadSaver.cancelAll().catch(() => {});
@@ -728,6 +729,7 @@ async function cleanup() {
         /* 还没 ready 就退出 */
       }
     }
+    await linksStopped;
     await savesStopped;
     await store.closeAll().catch(() => {});
     await Promise.all(

@@ -16,6 +16,8 @@
  *    带着它要求的请求头再下一次。
  *  - 下在 placement 给的工作目录里，下完才由 finish 挪到位、登记；取消、失败由 abort 收拾，
  *    不会留下半截文件。yt-dlp 报回来的路径必须在工作目录里。
+ *  - 取消要结束 yt-dlp 整棵进程树（processTree.js）：yt-dlp.exe 是两层进程，只杀引导进程的话
+ *    干活的子进程接着下，还攥着管道和半截文件，工作目录删不掉、名额也不还。
  */
 
 const fsp = require('fs/promises');
@@ -24,14 +26,16 @@ const crypto = require('crypto');
 const readline = require('readline');
 const { EventEmitter } = require('events');
 const { spawn } = require('child_process');
+const { killTree } = require('./processTree');
+const { MUXED_FORMAT } = require('./linkMedia');
 
 const MAX_PARALLEL = 3;
 // 长期缓存文件夹、下载文件夹里放半截文件的子目录名（启动时按这个名字清残留）
 const WORK_DIR = '.noxreel-downloading';
-// 最后那个 /b 不能省：直链的 mp4 yt-dlp 报不出编码（vcodec/acodec 是未知），
-// 前面几项「必须有音轨和视频轨」一个都选不中，整个下载直接报「Requested format is not available」
-const FORMAT =
-  'best[protocol^=http][vcodec!=none][acodec!=none]/best[protocol^=m3u8][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/b';
+// 和解析（linkMedia.inspectLink）同一个格式串：优先音画合一，最后那个 /b 不能省（直链 mp4 报不出编码）
+const FORMAT = MUXED_FORMAT;
+// 取消后等 yt-dlp 整棵进程树退出、管道关上最多等这么久；再等不到就不等了，名额先还回去
+const CANCEL_GRACE_MS = 10_000;
 const PURPOSES = ['cache', 'download'];
 const PROGRESS_TAG = 'NRPROG';
 const FILE_TAG = 'NRFILE';
@@ -136,6 +140,8 @@ class LinkCache extends EventEmitter {
     alreadyDone = () => false,
     childEnv = () => process.env,
     spawnImpl = spawn,
+    killTreeImpl = killTree,
+    cancelGraceMs = CANCEL_GRACE_MS,
     maxParallel = MAX_PARALLEL,
   }) {
     super();
@@ -146,6 +152,8 @@ class LinkCache extends EventEmitter {
     this.alreadyDone = alreadyDone;
     this.childEnv = childEnv;
     this.spawnImpl = spawnImpl;
+    this.killTree = killTreeImpl;
+    this.cancelGraceMs = cancelGraceMs;
     this.maxParallel = maxParallel;
     this.jobs = new Map(); // jobKey -> job
     this.running = 0;
@@ -210,7 +218,8 @@ class LinkCache extends EventEmitter {
       total: 0,
       error: '',
       finalPath: '',
-      child: null,
+      stop: null, // yt-dlp 在跑时由 _download 挂上：结束它（取消用）
+      settled: null, // 开始下之后：整个任务收完尾（含 abort）才 resolve
       lastEmit: 0,
     };
     this.jobs.delete(key);
@@ -221,19 +230,27 @@ class LinkCache extends EventEmitter {
     return this.view(job);
   }
 
-  /** 取消（在下的杀掉 yt-dlp，半截文件随后删掉；在排队的直接出队）。 */
+  /**
+   * 取消（在下的结束 yt-dlp 整棵进程树，半截文件随后删掉；在排队的直接出队）。
+   * 还在建工作目录、解析网页的，轮到起 yt-dlp 时看到已取消就不起了。
+   */
   cancel(url, purpose = 'cache') {
     const job = this.jobs.get(jobKey(purpose, url));
     if (!job || (job.state !== 'queued' && job.state !== 'downloading')) return false;
     const wasQueued = job.state === 'queued';
     job.state = 'canceled';
-    job.child?.kill();
+    job.stop?.();
     if (wasQueued) this._emit(job);
     return true;
   }
 
+  /** 全部取消。返回的 Promise 等在下的那几个收完尾（yt-dlp 退干净、工作目录删掉）；从不 reject。 */
   cancelAll() {
-    for (const job of this.jobs.values()) this.cancel(job.url, job.purpose);
+    const settling = [];
+    for (const job of this.jobs.values()) {
+      if (this.cancel(job.url, job.purpose) && job.settled) settling.push(job.settled);
+    }
+    return Promise.all(settling).then(() => {});
   }
 
   _trim() {
@@ -251,7 +268,7 @@ class LinkCache extends EventEmitter {
       this.running++;
       next.state = 'downloading';
       this._emit(next);
-      this._run(next)
+      next.settled = this._run(next)
         .then(() => {
           next.state = 'done';
         })
@@ -328,6 +345,8 @@ class LinkCache extends EventEmitter {
       FORMAT,
       '--output',
       path.join(job.workDir, name),
+      // 下面的 --print 隐含 --quiet，而 quiet 连进度也不报（实测一行 NRPROG 都没有，界面一直 0%）：显式要进度
+      '--progress',
       '--progress-template',
       `download:${PROGRESS_TAG} %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s`,
       '--print',
@@ -341,6 +360,11 @@ class LinkCache extends EventEmitter {
 
   _download(ytDlp, job, url, extra, proxy) {
     return new Promise((resolve, reject) => {
+      // 建工作目录的时候就被取消了（那时还没有 yt-dlp 可杀）：不再起它，否则它会把整部片下完才被丢掉
+      if (job.state === 'canceled') {
+        reject(new Error('已取消'));
+        return;
+      }
       let child;
       try {
         child = this.spawnImpl(ytDlp, this._args(job, url, extra, proxy), {
@@ -352,10 +376,32 @@ class LinkCache extends EventEmitter {
         reject(error);
         return;
       }
-      job.child = child;
+      let settled = false;
+      let graceTimer = null;
+      const settle = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(graceTimer);
+        job.stop = null;
+        fn(value);
+      };
+      // 取消：结束整棵进程树。树都退了管道才关、'close' 才来，这时 abort 才删得掉半截文件。
+      // 万一还有漏网的子孙攥着管道，等 cancelGraceMs 就不等了：名额先还回去，删不掉的留给下次启动清
+      job.stop = () => {
+        job.stop = null;
+        this.killTree(child);
+        graceTimer = setTimeout(() => {
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+          settle(reject, new Error('已取消'));
+        }, this.cancelGraceMs);
+        graceTimer.unref?.();
+      };
       let file = null;
       let stderr = '';
       readline.createInterface({ input: child.stdout }).on('line', (line) => {
+        // 取消之后进程树退干净之前还会漏几行进度：不再报，「已取消」要等收完尾（工作目录删掉）才报
+        if (job.state === 'canceled') return;
         if (line.startsWith(`${PROGRESS_TAG} `)) {
           const [done, total, estimate] = line.slice(PROGRESS_TAG.length + 1).split(' ').map(Number);
           if (Number.isFinite(done)) job.downloaded = done;
@@ -374,19 +420,16 @@ class LinkCache extends EventEmitter {
         stderr += chunk.toString('utf8');
         if (stderr.length > 16_384) stderr = stderr.slice(-8_192);
       });
-      child.on('error', (error) => {
-        job.child = null;
-        reject(error);
-      });
+      child.on('error', (error) => settle(reject, error));
       child.on('close', (code) => {
-        job.child = null;
-        if (job.state === 'canceled') return reject(new Error('已取消'));
+        if (job.state === 'canceled') return settle(reject, new Error('已取消'));
+        job.stop = null;
         const failed = () => {
           const detail = stderr.trim().split(/\r?\n/).slice(-2).join(' ');
-          reject(new Error(`下载失败${detail ? `：${detail}` : ''}`));
+          settle(reject, new Error(`下载失败${detail ? `：${detail}` : ''}`));
         };
         if (code !== 0) return failed();
-        finalFile(job.workDir, file).then((found) => (found ? resolve(found) : failed()), failed);
+        finalFile(job.workDir, file).then((found) => (found ? settle(resolve, found) : failed()), failed);
       });
     });
   }
