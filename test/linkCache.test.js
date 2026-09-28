@@ -18,7 +18,8 @@ const { writeTwoLayer, alive, workerPidOf } = require('./helpers/twoLayerProcess
 
 async function tempDir(t) {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'noxreel-linkcache-'));
-  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  // Windows 上刚结束的进程树的目录句柄要晚一点才放掉，机器忙时收尾当场删会撞上 EPERM：让 rm 自己重试
+  t.after(() => fsp.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   return dir;
 }
 

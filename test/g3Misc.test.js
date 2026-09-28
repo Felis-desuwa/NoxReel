@@ -295,6 +295,7 @@ test('R4-B：开房失败页只写那句人话，有诊断时给「复制诊断�
       hint: (text) => ({ hint: text }),
       replace: (id, ...kids) => ($(id).kids = kids),
       copyDiagnosticsButton: () => ({ diagnostics: true }),
+      failSteps: () => {},
     },
   });
   ctx.prepFail('转封装失败：这个文件可能已损坏，或者不是视频。', '', { diagnostics: true });

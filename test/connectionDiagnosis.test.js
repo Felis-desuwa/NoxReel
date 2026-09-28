@@ -205,7 +205,8 @@ test('认不出的地址要报出来，不能像以前那样静默丢掉', async
 test('诊断接到了极简模式的两处失败界面，而不是只写进看不见的日志', () => {
   const app = read('src', 'renderer', 'app.js');
   // 加入方停在准备页，房间视图是隐藏的 —— #event-log 就在那里面
-  assert.match(app, /const advice = connectionAdvice\(peer\);\r?\n\s*\$\('prep-note'\)\.textContent/);
+  // ICE 通过过（房主那条待用连接回过连通性检查）就不拿本机候选下诊断，见 joinCancel 的 N1 用例
+  assert.match(app, /const advice = peer\.linkedOnce \? null : connectionAdvice\(peer\);\r?\n\s*\$\('prep-note'\)\.textContent/);
   // 房主侧的握手看门狗
   assert.match(app, /const advice = retry \? connectionAdvice\(peer\) : null;/);
 });

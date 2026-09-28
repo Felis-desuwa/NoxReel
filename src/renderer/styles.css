@@ -455,6 +455,9 @@ select:disabled {
 .step.active {
   color: var(--text);
 }
+.step.failed {
+  color: var(--danger);
+}
 .step-mark {
   width: 14px;
   flex-shrink: 0;

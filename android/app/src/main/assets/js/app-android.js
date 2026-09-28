@@ -1942,7 +1942,9 @@ function wirePeer(peer, sig) {
       clearGrace();
       // 这条自己通过，或者它是连通过之后失联、退避里新建的那条（RECOVERY 里记着这一轮连通过）
       if (peer.linkedOnce || RECOVERY.get(peer.peerId)?.linked) {
-        log(`和 ${peer.name} 的直连失败了。之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。`, 'warn');
+        // 没有信令（一对一）就不会自动重连，不说「正在等他回来」
+        const tail = sig ? '之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。' : '之前是连通的，多半是对方断网或关掉了 NoxReel。';
+        log(`和 ${peer.name} 的直连失败了。${tail}`, 'warn');
       } else {
         log(`和 ${peer.name} 的直连失败了（双方都在严格 NAT 后面时会这样，需要 TURN 中继兜底）`, 'bad');
       }

@@ -335,6 +335,21 @@ for (const label of Object.keys(SOURCES)) {
     if (label === '桌面端') assert.equal(gaveUp[0][0], '和 m3 的直连试了 3 次都没恢复。（诊断）');
     else assert.equal(gaveUp[0][0], '和 m3 的直连试了 3 次都没恢复。双方都在严格 NAT 后面时需要 TURN 中继兜底。');
   });
+
+  // 第三轮复测的观察：一对一（没有信令）的连接断了不会自动重连，日志却写「正在等他回来」
+  test(`${label}：一对一（没有信令）连通过的直连失败了：不说「正在等他回来」，也不排重连`, async () => {
+    const r = wireBox(label);
+    const manual = r.peerOf('h1', false);
+    r.ctx.wirePeer(manual, null);
+    await manual.emit('statechange', 'connected');
+    await manual.emit('statechange', 'failed');
+    assert.deepEqual(
+      r.logs.filter(([t]) => t.startsWith('和 h1 的直连失败了')),
+      [['和 h1 的直连失败了。之前是连通的，多半是对方断网或关掉了 NoxReel。', 'warn']]
+    );
+    r.clock.advance(10 * 60_000);
+    assert.deepEqual(r.rebuilds, []);
+  });
 }
 
 test('连通过的直连失败了：两端的英文都有，昵称原样保留', async () => {

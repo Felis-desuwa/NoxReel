@@ -260,6 +260,9 @@ const EN = new Map(Object.entries({
   '连接在握手完成前就断了。已经给你备好一条新的邀请链接，重发一次试试。':
     'The connection dropped before the handshake finished. A fresh invite link is ready—send it again.',
   '直连没建立起来': 'The direct connection failed',
+  // 一对一加入：ICE 通过过又失败了（房主取消了邀请、换了链接或者关掉了 NoxReel）
+  '和房主之间的网络是通的，连接却断了：多半是房主那边取消了这条邀请、重新生成了邀请链接，或者关掉了 NoxReel。请房主发一条新的邀请链接再试；只是网络抖了一下的话，重新生成一条应答链接发回去也行。':
+    'The network path to the host works, but the connection dropped: the host most likely cancelled this invite, generated a new invite link, or closed NoxReel. Ask the host for a new invite link; if it was just a network hiccup, generating a new answer link and sending it back also works.',
   '和房主的直连探测失败了：可能是房主那边的邀请链接放太久、网络地址已经过期，也可能双方都在严格 NAT 后面。重新生成一条应答链接发回给房主再试一次；还是不行就双方在设置里配同一个 TURN 中继。':
     'Connectivity checks with the host failed: the host’s invite link may have sat too long and its network addresses expired, or both sides are behind strict NAT. Generate a new answer link, send it back to the host, and try again; if it still fails, both sides should configure the same TURN relay in Settings.',
   '重新生成应答链接': 'Generate a new answer link',

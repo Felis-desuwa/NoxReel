@@ -1207,6 +1207,15 @@ function setSteps(steps) {
   );
 }
 
+/** 结论页：做到一半的那一步标成没过（✗），别让步骤条还停在「▸ 等待房主打开应答链接」 */
+function failSteps() {
+  for (const el of document.querySelectorAll('#prep-steps .step.active')) {
+    el.className = 'step failed';
+    const mark = el.querySelector('.step-mark');
+    if (mark) mark.textContent = '✗';
+  }
+}
+
 /**
  * 首页开房时的整页进度。
  *
@@ -3164,6 +3173,7 @@ function prepStop(title, msg, extra = '', { diagnostics = false } = {}) {
   $('prep-title').textContent = title;
   $('prep-note').textContent = msg;
   $('prep-bar').style.width = '0%';
+  failSteps();
   const back = make('button', { id: 'prep-back', className: 'ghost', text: '返回' });
   back.onclick = backHome;
   replace('prep-actions', ...(extra ? [hint(extra)] : []), back, ...(diagnostics ? [copyDiagnosticsButton()] : []));
@@ -3423,9 +3433,12 @@ async function joinViaManual(payload) {
     // 硬编码的「可能 A 也可能 B」只是穷举，而候选诊断往往能直接说出是哪一个。
     // 以前诊断只写进 #event-log —— 那个节点在房间视图里，而这时候用户停在准备页，
     // 等于写进了一个他看不见的地方。
-    const advice = connectionAdvice(peer);
+    // 但 ICE 通过过（房主那条待用连接会先回连通性检查）说明网络本身是通的，是房主那头没了或者还没打开应答，
+    // 这时「STUN 没告诉本机公网地址」之类的候选诊断只会把人往错的方向支
+    const advice = peer.linkedOnce ? null : connectionAdvice(peer);
     $('prep-note').textContent = advice?.text ? `${note}\n\n诊断：${advice.text}` : note;
     $('prep-bar').style.width = '0%';
+    failSteps();
     const retry = make('button', { className: 'primary', text: '重新生成应答链接' });
     retry.onclick = () => joinViaManual(payload).catch((error) => joinFail(error.message || String(error)));
     const back = make('button', { className: 'ghost', text: '返回' });
@@ -3436,7 +3449,9 @@ async function joinViaManual(payload) {
   peer.on('failed', () =>
     finishJoin(
       '直连没建立起来',
-      '和房主的直连探测失败了：可能是房主那边的邀请链接放太久、网络地址已经过期，也可能双方都在严格 NAT 后面。重新生成一条应答链接发回给房主再试一次；还是不行就双方在设置里配同一个 TURN 中继。'
+      peer.linkedOnce
+        ? '和房主之间的网络是通的，连接却断了：多半是房主那边取消了这条邀请、重新生成了邀请链接，或者关掉了 NoxReel。请房主发一条新的邀请链接再试；只是网络抖了一下的话，重新生成一条应答链接发回去也行。'
+        : '和房主的直连探测失败了：可能是房主那边的邀请链接放太久、网络地址已经过期，也可能双方都在严格 NAT 后面。重新生成一条应答链接发回给房主再试一次；还是不行就双方在设置里配同一个 TURN 中继。'
     )
   );
 
@@ -4397,7 +4412,9 @@ function wirePeer(peer, sig) {
       if (peer.linkedOnce || RECOVERY.get(peer.peerId)?.linked) {
         // 连通过又失败了（对方整个断网时应答方这边就是这样）：再拿本机候选下结论，
         // 「STUN 没告诉本机公网地址」之类只会把人往错的方向支
-        log(`和 ${peer.name} 的直连失败了。之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。`, 'warn');
+        // 没有信令（一对一）就不会自动重连，不说「正在等他回来」
+        const tail = sig ? '之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。' : '之前是连通的，多半是对方断网或关掉了 NoxReel。';
+        log(`和 ${peer.name} 的直连失败了。${tail}`, 'warn');
       } else {
         const advice = connectionAdvice(peer);
         log(`和 ${peer.name} 的直连失败了。${advice.text}`, advice.level === 'ok' ? 'warn' : 'bad');

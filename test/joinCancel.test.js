@@ -231,6 +231,7 @@ function world({ fns = [], decls = [], globals = {}, securityMode = 'trusted' } 
       replace: dom.replace,
       show: (v) => shown.push(v),
       setSteps: () => {},
+      failSteps: () => {},
       log: (text, tone) => logs.push([text, tone]),
       fmtBytes: (n) => `${n} B`,
       securityModeLabel: (m) => (m === 'trusted' ? '可信房间' : '安全模式'),
@@ -969,6 +970,72 @@ test('H1 N1：应答链接发出去之后 ICE 真的失败了（swarm 先摘掉�
   assert.equal(w.peers.length, 2);
   assert.equal(w.S.swarm.peers.get('host-A'), w.peers[1]);
   assert.equal(w.dom.$('prep-title').textContent, '把应答链接发回给发起者');
+});
+
+// 第三轮复测的观察：房主那条待用连接会在收到应答之前回连通性检查，加入方的 ICE 因此 connected 过；
+// 之后房主取消了邀请 / 关掉了 NoxReel，这边才 failed。网络是通的，结论页却给「STUN 没告诉本机公网地址」
+test('一对一加入：ICE 通过过又失败了：说房主那头没了、请他发新邀请，不拿本机候选下诊断', async () => {
+  const w = failingManualJoin();
+  const failed = [];
+  w.ctx.failSteps = () => failed.push(w.dom.$('prep-title').textContent);
+  await answerPageUp(w);
+  w.peers[0].linkedOnce = true;
+  w.peers[0].emit('failed', 'failed');
+  assert.equal(w.dom.$('prep-title').textContent, '直连没建立起来');
+  assert.match(w.dom.$('prep-note').textContent, /^和房主之间的网络是通的，连接却断了：多半是房主那边取消了这条邀请/);
+  assert.doesNotMatch(w.dom.$('prep-note').textContent, /诊断/);
+  assert.deepEqual(failed, ['直连没建立起来'], '步骤条上做到一半的那一步标成没过');
+  assert.deepEqual(
+    w.dom.actions().map((b) => b.text),
+    ['重新生成应答链接', '返回', '复制诊断信息']
+  );
+
+  // 三分钟兜底也一样：ICE 通过过、数据通道一直没开，是房主还没打开应答链接，不是本机 STUN 的事
+  const late = failingManualJoin();
+  await answerPageUp(late);
+  late.peers[0].linkedOnce = true;
+  late.clock.advance(appConst('MANUAL_JOIN_WAIT_TIMEOUT_MS'));
+  assert.equal(late.dom.$('prep-title').textContent, '还没能连上房主');
+  assert.doesNotMatch(late.dom.$('prep-note').textContent, /诊断/);
+});
+
+test('结论页把步骤条上做到一半的那一步标成没过（✗），做完的不动', () => {
+  const step = (state, mark) => {
+    const markEl = { textContent: mark };
+    return { className: `step ${state}`.trim(), markEl, querySelector: (sel) => (sel === '.step-mark' ? markEl : null) };
+  };
+  const steps = [step('done', '✓'), step('done', '✓'), step('active', '▸')];
+  const ctx = sandbox({
+    fns: ['failSteps'],
+    globals: {
+      document: {
+        querySelectorAll: (sel) => (sel === '#prep-steps .step.active' ? steps.filter((s) => s.className === 'step active') : []),
+      },
+    },
+  });
+  ctx.failSteps();
+  assert.deepEqual(
+    steps.map((s) => [s.className, s.markEl.textContent]),
+    [['step done', '✓'], ['step done', '✓'], ['step failed', '✗']]
+  );
+  // 结论页一律经它：prepStop（joinFail / prepFail）和一对一加入的收尾
+  assert.match(fnSource('prepStop'), /failSteps\(\);/);
+  assert.match(APP, /\$\('prep-bar'\)\.style\.width = '0%';\n\s*failSteps\(\);\n\s*const retry = make\('button', \{ className: 'primary', text: '重新生成应答链接' \}\);/);
+  assert.match(read('src/renderer/styles.css'), /\.step\.failed \{\r?\n\s*color: var\(--danger\);/);
+});
+
+test('一对一加入「网络通了又断」的结论有英文', async () => {
+  const { translate } = await load('src/renderer/lib/i18n.js');
+  const zh = '和房主之间的网络是通的，连接却断了：多半是房主那边取消了这条邀请、重新生成了邀请链接，或者关掉了 NoxReel。请房主发一条新的邀请链接再试；只是网络抖了一下的话，重新生成一条应答链接发回去也行。';
+  assert.equal(
+    translate(zh, 'en'),
+    'The network path to the host works, but the connection dropped: the host most likely cancelled this invite, generated a new invite link, or closed NoxReel. Ask the host for a new invite link; if it was just a network hiccup, generating a new answer link and sending it back also works.'
+  );
+  // 一对一连通过又失败的那一行日志：后半句照已有词条递归翻
+  assert.equal(
+    translate('和 Alice 的直连失败了。之前是连通的，多半是对方断网或关掉了 NoxReel。', 'en'),
+    'Direct connection to Alice failed. It was working before, so the other side has most likely lost their network or closed NoxReel.'
+  );
 });
 
 test('H1 N1：连接早就被摘掉了（只关了、没报 failed），三分钟兜底照样给结论', async () => {

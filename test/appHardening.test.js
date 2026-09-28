@@ -322,6 +322,7 @@ async function lobby({ securityMode = 'trusted', capacity = '4' } = {}) {
       replace: () => {},
       show: (view) => calls.shown.push(view),
       setSteps: () => {},
+      failSteps: () => {},
       log: (text, tone) => calls.logs.push([text, tone]),
       fmtBytes: (n) => `${n} B`,
       securityModeLabel: (m) => (m === 'trusted' ? '可信房间' : '安全模式'),
