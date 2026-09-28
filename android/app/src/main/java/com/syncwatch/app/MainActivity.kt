@@ -78,7 +78,7 @@ class MainActivity : AppCompatActivity() {
             store,
             player,
             CloudflareTurn(applicationContext.filesDir),
-            immersive = { on -> main.post { if (!isFinishing && !isDestroyed) setImmersive(on) } },
+            immersive = { on -> main.post { if (!isFinishing && !isDestroyed) applyImmersive(on) } },
         ) { id, json ->
             main.post {
                 if (webGone || !::web.isInitialized) return@post
@@ -198,8 +198,9 @@ class MainActivity : AppCompatActivity() {
     /**
      * 沉浸全屏：页面收起控件时把系统状态栏、导航栏也藏起来，亮出控件时还原。
      * 藏起来之后从屏幕边缘滑一下，系统栏会临时出来一会儿（BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE）。
+     * 别叫 setImmersive：Activity 自带同名的公开方法，私有函数遮住它编译不过。
      */
-    private fun setImmersive(on: Boolean) {
+    private fun applyImmersive(on: Boolean) {
         val bars = WindowCompat.getInsetsController(window, window.decorView)
         if (on) {
             bars.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE

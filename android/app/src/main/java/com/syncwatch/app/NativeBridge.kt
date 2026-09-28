@@ -26,7 +26,7 @@ class NativeBridge(
     private val store: Store,
     private val player: SyncPlayer,
     private val cloudflare: CloudflareTurn,
-    // 沉浸全屏的开关交给 Activity 去做（它在主线程上动窗口），见 setImmersive
+    // 沉浸全屏的开关交给 Activity 去做（它在主线程上动窗口），见 MainActivity.applyImmersive
     private val immersive: (on: Boolean) -> Unit = {},
     private val reply: (id: String, json: String) -> Unit,
 ) {

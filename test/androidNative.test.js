@@ -649,3 +649,16 @@ test('android/README.md 写清了手机端的新能力和那条硬限制', () =>
   assert.match(md, /generation/, '没写快照代号这条 JS 必须配合的约定');
   assert.match(md, /adjustResize/);
 });
+
+/**
+ * 这台机器上 JS 测试全过、Kotlin 却可能编译不过：0.7.8 发版打 APK 时，MainActivity 里的
+ * private fun setImmersive 撞上 Activity 自带的公开方法 setImmersive(boolean)，Kotlin 报「hides member
+ * of supertype」。这里挡住这几个常见的同名。
+ */
+test('MainActivity 的私有函数不和 Activity 自带的方法同名', () => {
+  const src = read('android/app/src/main/java/com/syncwatch/app/MainActivity.kt');
+  for (const name of ['setImmersive', 'setTitle', 'setVisible', 'setTheme', 'finish', 'recreate']) {
+    assert.doesNotMatch(src, new RegExp(`private fun ${name}\\(`), `MainActivity 的 ${name} 会遮住 Activity 的同名方法`);
+  }
+  assert.match(src, /private fun applyImmersive\(on: Boolean\)/);
+});
