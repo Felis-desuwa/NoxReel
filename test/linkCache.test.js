@@ -11,7 +11,8 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const { PassThrough } = require('node:stream');
 const { spawn } = require('node:child_process');
-const { LinkCache, FORMAT, WORK_DIR, uniquePath } = require('../src/main/linkCache');
+// placement 用的 workDirIn 就是主进程那一份（linkCache.js 导出），不再在测试里另抄一份
+const { LinkCache, FORMAT, WORK_DIR, workDirIn } = require('../src/main/linkCache');
 const { MediaLibrary } = require('../src/main/mediaLibrary');
 const { writeTwoLayer, alive, workerPidOf } = require('./helpers/twoLayerProcess');
 
@@ -61,23 +62,6 @@ async function succeed(args, child, { ext = 'mp4', bytes = 1234 } = {}) {
   setImmediate(() => child.emit('close', 0));
 }
 
-/** 和主进程 workDirIn 一样：在 dir 下开工作目录，下完挪进 dir（不重名）。 */
-async function workDirIn(dir, id, onFinish = async () => {}) {
-  const work = path.join(dir, WORK_DIR, id);
-  await fsp.mkdir(work, { recursive: true });
-  return {
-    workDir: work,
-    finish: async (file, meta) => {
-      const target = await uniquePath(dir, path.basename(file));
-      await fsp.rename(file, target);
-      await fsp.rm(work, { recursive: true, force: true });
-      await onFinish(target, meta);
-      return target;
-    },
-    abort: () => fsp.rm(work, { recursive: true, force: true }),
-  };
-}
-
 async function setup(
   t,
   { behave = succeed, maxParallel = 3, resolve = async () => null, ytDlp = 'yt-dlp.exe', beforePlacement = async () => {}, ...extra } = {}
@@ -123,6 +107,8 @@ const leftovers = (dir) => {
   const work = path.join(dir, WORK_DIR);
   return fs.existsSync(work) ? fs.readdirSync(work).length : 0;
 };
+// 外层的 .noxreel-downloading 也不留（R3-B：取消、失败时只删了 <号> 那一层，空目录一直留到下次启动）
+const workRootLeft = (dir) => fs.existsSync(path.join(dir, WORK_DIR));
 
 test('缓存一个链接：经过滤代理、选音画合一的格式，下完挪到位并登记，工作目录删掉', async (t) => {
   const { cache, library, keptDir, calls, updates } = await setup(t);
@@ -144,6 +130,7 @@ test('缓存一个链接：经过滤代理、选音画合一的格式，下完�
   assert.equal(path.basename(entry.path), 'Video Title.mp4');
   assert.equal(entry.size, 1234);
   assert.equal(leftovers(keptDir), 0, '工作目录清掉了');
+  assert.equal(workRootLeft(keptDir), false, '外层空了一起删');
   assert.deepEqual([...new Set(updates.map((u) => u.state))], ['queued', 'downloading', 'done']);
   assert.ok(updates.every((u) => u.purpose === 'cache'));
   assert.equal(cache.status()[0].path, entry.path);
@@ -234,6 +221,8 @@ test('取消：按用途取消；在下的杀掉 yt-dlp、工作目录删掉、�
   assert.equal(library.findLink('https://video.example.org/a'), null);
   assert.equal(leftovers(keptDir), 0, '半截文件不留下');
   assert.equal(leftovers(downloadDir), 0);
+  assert.equal(workRootLeft(keptDir), false, '取消后长期缓存文件夹里不留空的 .noxreel-downloading');
+  assert.equal(workRootLeft(downloadDir), false, '下载文件夹里也不留');
   assert.equal(cache.cancel('https://video.example.org/a'), false, '取消过的再取消没有用');
 });
 
@@ -288,6 +277,7 @@ test('还在建工作目录时就取消了：不再起 yt-dlp（否则它会把�
   await until(() => updates.some((u) => u.state === 'canceled'), '收尾完');
   assert.equal(calls.length, 0, 'yt-dlp 根本没起');
   assert.equal(leftovers(keptDir), 0);
+  assert.equal(workRootLeft(keptDir), false);
 });
 
 test('退出时的 cancelAll：返回的 Promise 等在下的那几个收完尾（yt-dlp 退了、工作目录删了）才 resolve', async (t) => {
@@ -301,6 +291,7 @@ test('退出时的 cancelAll：返回的 Promise 等在下的那几个收完尾�
   await cache.cancelAll();
   assert.equal(leftovers(keptDir), 0);
   assert.equal(leftovers(downloadDir), 0);
+  assert.equal(workRootLeft(keptDir) || workRootLeft(downloadDir), false, '退出后两处都不留空的 .noxreel-downloading');
   assert.ok(calls.every((c) => c.child.killed));
   assert.ok(cache.status().every((v) => v.state === 'canceled'));
   assert.equal(calls.length, 2, '排队的没起');
@@ -405,6 +396,7 @@ test('失败说清楚原因；yt-dlp 报回来的路径跑出工作目录的一�
   assert.match(cache.status()[0].error, /下载失败/);
   assert.equal(library.findLink('https://video.example.org/x'), null);
   assert.equal(leftovers(keptDir), 0, '失败了也由 abort 收拾工作目录');
+  assert.equal(workRootLeft(keptDir), false);
 
   const none = await setup(t, { ytDlp: null });
   none.cache.start({ url: 'https://video.example.org/y' });

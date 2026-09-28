@@ -221,7 +221,8 @@ test('media.remux / slim 把 signal 一路传给 run()', () => {
   // 转封装有两三条 run() 路径（按轨道映射、读不出轨道时的退路），共用同一份带 signal 的选项
   assert.match(remux, /const opts = \{ onStderr: [^\n]*signal \}/);
   const runs = remux.match(/await run\([^\n]*\)/g) || [];
-  assert.ok(runs.length >= 1 && runs.every((line) => line.endsWith(', opts)')), runs.join('\n'));
+  // 失败时经 toolFailure 换成一句人话（G3 / R4-B），signal 照样是同一份 opts
+  assert.ok(runs.length >= 1 && runs.every((line) => /, opts\)(?:\.catch\(failed\))?$/.test(line)), runs.join('\n'));
   const slim = functionBody(mediaSrc, 'async function slim(');
   assert.match(slim, /onProgress, signal \} = \{\}/);
   assert.match(slim, /await run\(bin, slimArgs[\s\S]*signal,\s*\}\)/);

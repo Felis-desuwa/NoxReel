@@ -409,10 +409,11 @@ test('E4-F：removeWorkDir 删掉工作目录，外层 .noxreel-downloading 空�
   assert.equal(fs.existsSync(path.join(dir, 'other')), true);
 });
 
-test('E4-F：在线视频下完挪到位时也经 removeWorkDir（主进程 workDirIn）', () => {
-  const main = read('src/main/main.js');
-  const fn = main.slice(main.indexOf('async function workDirIn('), main.indexOf('const linkCache = new LinkCache('));
+test('E4-F：在线视频下完挪到位时也经 removeWorkDir（linkCache.workDirIn，主进程用的就是它）', () => {
+  const lc = read('src/main/linkCache.js');
+  const fn = lc.slice(lc.indexOf('async function workDirIn('), lc.indexOf('/** 路径是不是在 dir 里面'));
   const finish = fn.slice(fn.indexOf('finish:'), fn.indexOf('abort:'));
   assert.match(finish, /await removeWorkDir\(work\);/);
+  assert.doesNotMatch(read('src/main/main.js'), /function workDirIn\(/, '主进程不再自己留一份');
   assert.match(read('src/main/downloadSaver.js'), /finally \{[\s\S]{0,200}await removeWorkDir\(work\);/);
 });

@@ -1174,6 +1174,30 @@ const EN_PATTERNS = [
   [/^缺少 (.+)$/, 'Missing $1'],
   [/^已找到：$/, 'Found:'],
   [/^已转封装到：(.*)$/, 'Remuxed to: $1'],
+  // 转封装 / 精简 / 封 MKV 时 ffmpeg 失败：结论页上只有这一句，ffmpeg 的输出进诊断（media.js 的 toolFailure）
+  [
+    /^(转封装失败|无损精简失败|封成 MKV 失败)：(磁盘空间不够|没有权限读写这个文件|这个文件可能已损坏，或者不是视频|ffmpeg 没能处理这个文件)。$/,
+    (_all, what, cause) =>
+      `${
+        { 转封装失败: 'Remuxing failed', 无损精简失败: 'Lossless slimming failed', '封成 MKV 失败': 'Packing into MKV failed' }[what]
+      }: ${
+        {
+          磁盘空间不够: 'there is not enough disk space',
+          没有权限读写这个文件: 'no permission to read or write the file',
+          '这个文件可能已损坏，或者不是视频': 'the file may be damaged, or it is not a video',
+          'ffmpeg 没能处理这个文件': 'ffmpeg could not process this file',
+        }[cause]
+      }.`,
+  ],
+  // 外部程序的输出原样留着（诊断用），只翻前缀、打头那句「xx 退出码 N」和路径占位
+  [
+    /^外部程序的输出（诊断用）：([\s\S]*)$/,
+    (_all, out) =>
+      `Tool output (for diagnostics): ${out
+        .replace(/^(\S+) 退出码 (-?\d+|null)/, '$1 exited with code $2')
+        .replace(/<文件>/g, '<file>')}`,
+  ],
+  [/^(\S+) 退出码 (-?\d+|null)$/, '$1 exited with code $2'],
   // 带体积对比的那条必须排在上面 —— 下面那条的 (.*) 是贪婪的，会把「，体积…」也吞进路径里。
   [/^已精简到：(.*)，体积 (.*) → (.*)$/, 'Slimmed to: $1 — size $2 → $3'],
   [/^已精简到：(.*)$/, 'Slimmed to: $1'],
@@ -1446,6 +1470,11 @@ const EN_PATTERNS = [
   [/^TURN 中继 (.+) 报错（(.+)）。$/, 'The TURN relay $1 reported an error ($2).'],
   [/^STUN 服务器 (.+) 没能应答 —— 换一台，或检查防火墙有没有放行 UDP。$/, 'The STUN server $1 did not answer — try another one, or check whether the firewall allows UDP.'],
   [/^诊断：(.+)$/, (_all, detail) => `Diagnosis: ${translate(detail, 'en')}`],
+  // 结论后面换一行（或空一行）接候选诊断，整段是一个文本节点：两半各自递归翻，换行原样留着
+  [
+    /^([\s\S]+?)\n(\n?)诊断：([\s\S]+)$/,
+    (_all, note, blank, detail) => `${translate(note, 'en')}\n${blank}Diagnosis: ${translate(detail, 'en')}`,
+  ],
   // IP 隐私：隐藏我的 IP、Cloudflare TURN（0.7.6）
   [
     /^本月 Cloudflare TURN 用量已到你设的上限（(.+) GB），为免扣费已停用；下个月 1 日(（UTC）)?自动恢复，或者在设置里调高上限(。「隐藏我的 IP」开着，没有中继就不连接。)?$/,
@@ -1487,6 +1516,15 @@ const EN_PATTERNS = [
   [/^无法解析这个视频链接(?:：(.*))?$/, (_all, detail) => (detail ? `Unable to parse this video URL: ${translate(detail, 'en')}` : 'Unable to parse this video URL')],
   [/^(.+) 索引已在文件头，可直接边下边播$/, '$1 index is at the beginning and supports progressive playback'],
   [/^(.+) 的 moov 索引在文件末尾，顺序下载时要等整个文件下完才能起播。转封装把索引挪到开头即可，无损且不重编码。$/, '$1 has its moov index at the end, so sequential download cannot start early. Remuxing moves it to the beginning without re-encoding or quality loss.'],
+  // 开头就不是 MP4 结构的 .mp4 / .mov（随机字节、别的格式改了扩展名）：直接说认不出，不再当成 moov 在尾
+  [
+    /^认不出这个文件：扩展名是 (MP4|MOV)，内容却不是 \1 格式，可能已损坏，或者根本不是视频。$/,
+    'Cannot recognize this file: its extension says $1, but the content is not $1. It may be damaged, or not a video at all.',
+  ],
+  [
+    /^这个文件的扩展名是 (MP4|MOV)，内容却是别的格式（(.+)）。把扩展名改成和内容一致再试，比如 MKV 的改成 \.mkv。$/,
+    'This file has a $1 extension, but its content is another format ($2). Rename it to match the content and try again—for example, an MKV file should end in .mkv.',
+  ],
   // 安装命令和环境变量那两段里还夹着「或」「指向」，原样代入的话英文句子里会剩下中文
   [
     /^没找到 (ffmpeg|mpv)。请安装后重试（(.*)），或设置环境变量 (.*)$/,

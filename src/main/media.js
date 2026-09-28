@@ -234,9 +234,70 @@ function run(bin, args, { onStderr, signal, timeoutMs = 0, maxStdout = Infinity 
       if (cancelled) reject(new Error('操作已取消'));
       else if (failure) reject(new Error(failure));
       else if (code === 0) resolve({ stdout: Buffer.concat(chunks).toString('utf8'), stderr: err });
-      else reject(new Error(`${path.basename(bin)} 退出码 ${code}：${err.slice(-600)}`));
+      else {
+        // stderr 不拼进 message：拼进去的话整段 ffmpeg 输出会原样上到准备页。挂在错误上，由 toolFailure 取尾部进诊断
+        const error = new Error(`${path.basename(bin)} 退出码 ${code}`);
+        error.exitCode = code;
+        error.stderr = err;
+        reject(error);
+      }
     });
   });
+}
+
+// 主进程报错跨 IPC 只剩 message（Electron 丢掉 Error 上别的字段）。外部程序失败时的诊断输出
+// 接在给人看的那句后面、用这个标记隔开；渲染进程按同一个标记拆开（app.js 的 TOOL_DETAIL_MARK）
+const TOOL_DETAIL_MARK = '\n——诊断——\n';
+// 诊断里留 ffmpeg 输出的最后几行：够看出是哪一步、为什么失败，又不会一屏装不下
+const TOOL_DETAIL_LINES = 8;
+const TOOL_DETAIL_CHARS = 1500;
+
+// ffmpeg 失败的常见原因，按 stderr 认。认不出来的只说「没能处理」，细节在诊断里
+const TOOL_FAILURE_CAUSES = [
+  [/No space left on device|not enough space on the disk/i, '磁盘空间不够'],
+  [/Permission denied|Access is denied/i, '没有权限读写这个文件'],
+  [
+    /Invalid data found when processing input|moov atom not found|EBML header parsing failed|could not find codec parameters|Error opening input/i,
+    '这个文件可能已损坏，或者不是视频',
+  ],
+];
+
+/** 文本里出现的这些路径（原样和正反斜杠两种写法）一律换成占位：诊断信息不收文件路径和片名。 */
+function redactPaths(text, paths) {
+  let out = String(text || '');
+  for (const p of paths) {
+    if (!p) continue;
+    for (const form of new Set([p, p.replace(/\\/g, '/'), p.replace(/\//g, '\\')])) out = out.split(form).join('<文件>');
+  }
+  return out;
+}
+
+/**
+ * ffmpeg 退出码不为 0 时的报错：给人看的只有一句（「转封装失败：这个文件可能已损坏，或者不是视频。」，
+ * what 是「转封装失败」这半句），stderr 的最后几行挂在 detail 上留作诊断，里面的路径换成占位。
+ * 取消、超时、输出超限本来就是一句人话，原样放过。
+ */
+function toolFailure(what, error, paths = []) {
+  if (!error || !('exitCode' in error)) return error;
+  const stderr = String(error.stderr || '');
+  const cause = TOOL_FAILURE_CAUSES.find(([re]) => re.test(stderr))?.[1] || 'ffmpeg 没能处理这个文件';
+  const failure = new Error(`${what}：${cause}。`);
+  const tail = stderr
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    // 版本横幅（ffmpeg version、built with、configuration、各个 lib 的版本号）占位置又说明不了原因
+    .filter((line) => line && !/^(ffmpeg|ffprobe) version |^\s+(built with|configuration:|lib\w+\s+\d)/.test(line))
+    .slice(-TOOL_DETAIL_LINES)
+    .join('\n')
+    .slice(-TOOL_DETAIL_CHARS);
+  failure.detail = redactPaths(`${error.message}${tail ? `\n${tail}` : ''}`, paths);
+  return failure;
+}
+
+/** 交给 IPC 的报错：带 detail 的把它接在 message 后面（见 TOOL_DETAIL_MARK），别的原样。 */
+function errorForIpc(error) {
+  if (!error?.detail) return error;
+  return new Error(`${error.message}${TOOL_DETAIL_MARK}${error.detail}`);
 }
 
 /** 从 ffmpeg 的 stderr 里解出 time=，换算成 0..1 的进度。拿不到总时长就不报进度。 */
@@ -253,11 +314,17 @@ function progressWatcher(total, onProgress) {
 /**
  * 顺序扫描 MP4 顶层 box，看 moov 和 mdat 谁先出现。
  * 纯 Node 实现，不依赖 ffprobe —— 这是启动前必查的项，不能因为没装 ffmpeg 就跳过。
+ *
+ * 第一个 box 就不像样（类型不是四个可打印字符、长度对不上文件）时返回 valid: false：
+ * 这根本不是 ISOBMFF 文件（随机字节、别的格式改了扩展名）。以前它和「走到头也没见到 moov」
+ * 一样被当成 moov 在尾，弹出转封装选择窗，转到最后才报 ffmpeg 的一整段错。
  */
 async function inspectMp4Faststart(filePath) {
   const fh = await fsp.open(filePath, 'r');
   try {
     const stat = await fh.stat();
+    // 连一个 box 头（8 字节）都放不下
+    if (stat.size < 8) return { faststart: false, valid: false };
     const head = Buffer.allocUnsafe(16);
     let offset = 0;
 
@@ -283,6 +350,11 @@ async function inspectMp4Faststart(filePath) {
 
       if (type === 'moov') return { faststart: true, moovOffset: offset };
       if (type === 'mdat') return { faststart: false, mdatOffset: offset };
+      // 第一个 box：ftyp、free、wide 这些都是四个可打印字符，长度在文件范围内。
+      // 随机字节两条同时满足的概率在十万分之一以下；文本文件开头四个字节当长度至少 500 多 MB
+      if (i === 0 && !(/^[\x20-\x7e]{4}$/.test(type) && size >= headerLen && size <= stat.size)) {
+        return { faststart: false, valid: false };
+      }
 
       if (size < headerLen) break; // 畸形
       offset += size;
@@ -659,6 +731,19 @@ async function inspect(filePath) {
 
   const label = ext === '.mov' ? 'MOV' : 'MP4';
   const fs4 = await inspectMp4Faststart(filePath);
+  // 开头就不是 MP4 的结构：直接说认不出，别当成 moov 在尾弹转封装选择窗、转到最后才报 ffmpeg 的错。
+  // ffprobe 也认成 mov/mp4 的（我们的判据漏看了的怪文件）才照旧走下面，交给 ffmpeg 转封装
+  if (fs4.valid === false && !/(^|,)(mov|mp4)(,|$)/.test(probe?.formatName || '')) {
+    const other = probe?.formatName && probe.streams?.some((s) => s.codecType === 'video' || s.codecType === 'audio');
+    return {
+      action: 'reject',
+      ext,
+      size: stat.size,
+      reason: other
+        ? `这个文件的扩展名是 ${label}，内容却是别的格式（${probe.formatName}）。把扩展名改成和内容一致再试，比如 MKV 的改成 .mkv。`
+        : `认不出这个文件：扩展名是 ${label}，内容却不是 ${label} 格式，可能已损坏，或者根本不是视频。`,
+    };
+  }
   if (fs4.faststart) {
     return { action: 'ok', ext, size: stat.size, probe, slim, faststart: true, reason: `${label} 索引已在文件头，可直接边下边播` };
   }
@@ -739,6 +824,9 @@ async function remux(filePath, outDir, { onProgress, signal } = {}) {
 
   const probe = await probeStreams(filePath).catch(() => null);
   const opts = { onStderr: progressWatcher(probe?.duration || 0, onProgress), signal };
+  const failed = (error) => {
+    throw toolFailure('转封装失败', error, [filePath, outPath]);
+  };
 
   if (probe) {
     const plan = mp4StreamPlan(probe.streams);
@@ -746,7 +834,7 @@ async function remux(filePath, outDir, { onProgress, signal } = {}) {
     if (!plan.map.some((i) => ['video', 'audio'].includes(byIndex.get(i)?.codecType))) {
       throw new Error('这个文件里没有能放进 MP4 的音视频轨');
     }
-    await run(bin, remuxArgs(filePath, outPath, plan.map), opts);
+    await run(bin, remuxArgs(filePath, outPath, plan.map), opts).catch(failed);
     return { outPath, droppedSubtitles: plan.droppedSubtitles };
   }
 
@@ -757,7 +845,7 @@ async function remux(filePath, outDir, { onProgress, signal } = {}) {
     return { outPath, droppedSubtitles: [] };
   } catch (error) {
     if (signal?.aborted) throw error;
-    await run(bin, remuxArgs(filePath, outPath, ['V?', 'a?']), opts);
+    await run(bin, remuxArgs(filePath, outPath, ['V?', 'a?']), opts).catch(failed);
     return { outPath, droppedSubtitles: [], subtitlesUnchecked: true };
   }
 }
@@ -822,6 +910,8 @@ async function slim(filePath, outDir, { keepIndexes, toFlac: toFlacIn, onProgres
   await run(bin, slimArgs(filePath, outPath, indexes, { toFlac }), {
     onStderr: progressWatcher(probe?.duration || 0, onProgress),
     signal,
+  }).catch((error) => {
+    throw toolFailure('无损精简失败', error, [filePath, outPath]);
   });
 
   const [inputSize, outputSize] = await Promise.all([
@@ -953,7 +1043,9 @@ async function convert(filePath, outDir, { keepIndexes, toFlac: toFlacIn, subtit
       subtitles: subs,
       genpts: CONVERT_EXT.has(ext),
     });
-    await run(bin, args, { onStderr: progressWatcher(probe.duration || 0, onProgress), signal });
+    await run(bin, args, { onStderr: progressWatcher(probe.duration || 0, onProgress), signal }).catch((error) => {
+      throw toolFailure('封成 MKV 失败', error, [filePath, outPath, ...subtitlePaths, ...subs.map((s) => s.path)]);
+    });
 
     const [inputSize, outputSize] = await Promise.all([
       fsp.stat(filePath).then((s) => s.size, () => 0),
@@ -999,6 +1091,9 @@ module.exports = {
   measureFlacRatio,
   probeStreams,
   run,
+  toolFailure,
+  errorForIpc,
+  TOOL_DETAIL_MARK,
   sampleBitRates,
   streamBitRate,
   inspectMp4Faststart,

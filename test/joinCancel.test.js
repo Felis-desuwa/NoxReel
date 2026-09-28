@@ -748,7 +748,7 @@ test('加入失败的标题是「没能加入房间」，「没法用这个文�
   const version = init.slice(init.indexOf("S.swarm.on('version-mismatch'"), init.indexOf("S.swarm.on('complete'"));
   assert.match(version, /joinFail\(message\)/);
   // 开房那一路照旧
-  assert.match(fnSource('startHost'), /prepFail\(message\)/);
+  assert.match(fnSource('startHost'), /prepFail\(message[,)]/);
 });
 
 /* ------------------------- A1-8：房间里点开应答链接 ------------------------- */

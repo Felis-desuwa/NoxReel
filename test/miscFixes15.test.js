@@ -160,13 +160,19 @@ test('确认房主走了（hostReallyGone）也结算', () => {
 
 test('没等到回执的准备行写「没等到房主确认」，不说成房主不接受', () => {
   const logs = [];
-  const ctx = sandbox([fnSource('failPrepJob'), fnSource('removePrepJob'), fnSource('playlistOpError')], {
-    S: { prepJobs: [] },
-    roomEntered: true,
-    isRoomHost: () => false,
-    log: (m) => logs.push(m),
-    renderPlaylist: () => {},
-  });
+  const ctx = sandbox(
+    [
+      declSource('TOOL_DETAIL_MARK'),
+      ...['failPrepJob', 'removePrepJob', 'playlistOpError', 'splitIpcError', 'ipcErrorText', 'logToolDetail'].map(fnSource),
+    ],
+    {
+      S: { prepJobs: [] },
+      roomEntered: true,
+      isRoomHost: () => false,
+      log: (m) => logs.push(m),
+      renderPlaylist: () => {},
+    }
+  );
   const lost = { state: 'submitting', cancelled: false, cancelHooks: [], name: 'a.mkv' };
   ctx.failPrepJob(lost, ctx.playlistOpError({ ok: false, reason: '和房主的连接断了，结果以列表为准', uncertain: true }));
   assert.equal(lost.text, '没等到房主确认');

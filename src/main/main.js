@@ -49,7 +49,8 @@ const { sharedProxy, closeSharedProxy } = require('./publicProxy');
 const { lockDownPermissions } = require('./permissions');
 const { CloudflareTurn } = require('./cloudflareTurn');
 const { MediaLibrary } = require('./mediaLibrary');
-const { LinkCache, moveNoOverwrite, removeWorkDir, WORK_DIR: DOWNLOAD_WORK_DIR } = require('./linkCache');
+// workDirIn：在线视频下到下载文件夹、长期缓存文件夹时的工作目录（取消、下完都连外层空目录一起收）
+const { LinkCache, workDirIn } = require('./linkCache');
 const { DownloadSaver } = require('./downloadSaver');
 const { labelProtocolHandler } = require('./protocolName');
 const { displayVersion, readBuildNumber } = require('./appVersion');
@@ -142,24 +143,6 @@ function keptCacheDir() {
 const mediaLibrary = new MediaLibrary({ dataDir: USER_DATA_DIR, removeOwned: (dir) => cache.removeOwned(dir) });
 // 用户在「选择下载位置」对话框里挑过的目录，理由同 approvedCacheDirs
 const approvedDownloadDirs = new Set();
-
-/** 在 dir 下开一个放半截文件的工作目录；finish 把下好的文件挪进 dir（不重名），abort 删掉工作目录。 */
-async function workDirIn(dir, id, onFinish = async () => {}) {
-  const work = path.join(dir, DOWNLOAD_WORK_DIR, id);
-  await fsp.mkdir(work, { recursive: true });
-  return {
-    workDir: work,
-    finish: async (file, meta) => {
-      // 不覆盖：挑好名字和挪过去之间有人抢先建了同名文件，也另起名字
-      const target = await moveNoOverwrite(file, dir, path.basename(file));
-      // 外层的 .noxreel-downloading 空了一起删，别在下载文件夹里留一个空目录
-      await removeWorkDir(work);
-      await onFinish(target, meta);
-      return target;
-    },
-    abort: () => fsp.rm(work, { recursive: true, force: true }),
-  };
-}
 
 // 在线视频下到本机（见 linkCache.js），两种用途：
 //  - cache（播放列表里的「开始手动缓存」）：进缓存，跟着清理方式走 —— 自动模式放本次运行的临时缓存、
@@ -943,7 +926,8 @@ secureHandle('media:remux', async (payload) => {
       } catch (error) {
         // 取消也走这里：ffmpeg 已经退出，半截产物连目录一起删
         await cache.removeOwned(ownedDir).catch(() => {});
-        throw error;
+        // ffmpeg 的输出尾部跨 IPC 只能跟着 message 走，渲染进程拆开：一句人话上准备页，尾部进诊断
+        throw media.errorForIpc(error);
       }
     });
   } finally {
@@ -973,7 +957,7 @@ secureHandle('media:slim', async (payload) => {
         return { outPath, plan, inputSize, outputSize, droppedSubtitles };
       } catch (error) {
         await cache.removeOwned(ownedDir).catch(() => {});
-        throw error;
+        throw media.errorForIpc(error);
       }
     });
   } finally {
@@ -1073,7 +1057,7 @@ secureHandle('media:convert', async (payload) => {
         return result;
       } catch (error) {
         await cache.removeOwned(ownedDir).catch(() => {});
-        throw error;
+        throw media.errorForIpc(error);
       }
     });
   } finally {

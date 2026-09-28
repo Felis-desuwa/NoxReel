@@ -104,6 +104,28 @@ async function removeWorkDir(work) {
   if (path.basename(parent) === WORK_DIR) await fsp.rmdir(parent).catch(() => {});
 }
 
+/**
+ * 在 dir 下开一个放半截文件的工作目录（placement 用）：finish 把下好的文件挪进 dir（不重名）再登记，
+ * abort 删掉工作目录。两条收尾都经 removeWorkDir —— 只删 <号> 那一层的话，取消、退出之后
+ * 下载文件夹和长期缓存文件夹里照样留一个空的 .noxreel-downloading。
+ * 放在这里而不是主进程里，测试用的就是同一份，不会再跟主进程那份走岔。
+ */
+async function workDirIn(dir, id, onFinish = async () => {}) {
+  const work = path.join(dir, WORK_DIR, id);
+  await fsp.mkdir(work, { recursive: true });
+  return {
+    workDir: work,
+    finish: async (file, meta) => {
+      // 不覆盖：挑好名字和挪过去之间有人抢先建了同名文件，也另起名字
+      const target = await moveNoOverwrite(file, dir, path.basename(file));
+      await removeWorkDir(work);
+      await onFinish(target, meta);
+      return target;
+    },
+    abort: () => removeWorkDir(work),
+  };
+}
+
 /** 路径是不是在 dir 里面（yt-dlp 报回来的文件路径不能跑到工作目录外面去）。 */
 function inside(dir, target) {
   const rel = path.relative(dir, target);
@@ -446,4 +468,15 @@ class LinkCache extends EventEmitter {
   }
 }
 
-module.exports = { LinkCache, safeTitle, uniquePath, moveNoOverwrite, removeWorkDir, WORK_DIR, FORMAT, MAX_PARALLEL, PURPOSES };
+module.exports = {
+  LinkCache,
+  safeTitle,
+  uniquePath,
+  moveNoOverwrite,
+  removeWorkDir,
+  workDirIn,
+  WORK_DIR,
+  FORMAT,
+  MAX_PARALLEL,
+  PURPOSES,
+};

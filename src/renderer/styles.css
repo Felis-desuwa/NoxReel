@@ -478,6 +478,8 @@ select:disabled {
   margin-top: 14px;
   line-height: 1.6;
   overflow-wrap: anywhere;
+  /* 结论常是「原因\n\n怎么办」两段：不保留换行的话两段挤成一行（中英文都是） */
+  white-space: pre-line;
 }
 /* 一起拖进来、没能加上的文件（首页卡片上那份被准备页盖住了）。没有就不占位置 */
 .prep-skipped {

@@ -402,7 +402,8 @@ test('等测速期间取消，测完不再给已取消的任务弹卡顿预判�
 });
 
 test('本机准备阶段失败不写成「房主没有接受」', () => {
-  const ctx = sandbox(fns('failPrepJob', 'removePrepJob'), {
+  const ctx = sandbox(fns('failPrepJob', 'removePrepJob', 'splitIpcError', 'ipcErrorText', 'logToolDetail'), {
+    TOOL_DETAIL_MARK: '\n——诊断——\n',
     S: { prepJobs: [] },
     roomEntered: true,
     isRoomHost: () => false, // 管理员

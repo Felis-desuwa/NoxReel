@@ -90,8 +90,26 @@ function field(label, ...children) {
   return make('div', { className: 'field' }, [make('label', { text: label }), ...children]);
 }
 
+/**
+ * 几句说明各是一个文本节点、分开翻译。中文句子之间不空格，英文译文首尾相接就成了
+ * 「“Verify and save”.The API Token」，所以英文界面在相邻两句之间补一个空格；
+ * 后一句本身以空白或标点开头的（「。诊断信息里只有……」译成 ". The diagnostics…"）不补。
+ */
 function hint(...children) {
-  return make('p', { className: 'hint' }, children);
+  const parts = [];
+  for (const child of children.flat(Infinity)) {
+    if (child == null || child === false) continue;
+    const prev = parts[parts.length - 1];
+    if (typeof child === 'string' && typeof prev === 'string' && sentenceGap(prev, child)) parts.push(' ');
+    parts.push(child);
+  }
+  return make('p', { className: 'hint' }, parts);
+}
+
+/** 两段相邻的界面文案之间要不要补一个空格：只有英文界面要，前一段以空白结尾、后一段以空白或标点开头的不补。 */
+function sentenceGap(prev, next) {
+  if (currentLocale() !== 'en') return false;
+  return !/\s$/.test(t(prev)) && !/^[\s.,;:!?)\]]/.test(t(next));
 }
 
 const S = {
@@ -366,6 +384,24 @@ function ipcErrorText(error) {
   return String(error?.message || error || '')
     .replace(/^Error invoking remote method '[^']*': /, '')
     .replace(/^[A-Za-z]*Error: /, '');
+}
+
+// 主进程把外部程序（ffmpeg）的输出尾部接在报错后面、用这个标记隔开（media.js 的 TOOL_DETAIL_MARK，两边要一致）
+const TOOL_DETAIL_MARK = '\n——诊断——\n';
+
+/**
+ * 主进程的报错拆成两半：text 是给人看的那句（去掉 IPC 前缀），detail 是诊断用的输出尾部（没有就是空串）。
+ * 整段 ffmpeg 输出不上界面；detail 进日志，「复制诊断信息」带得上。
+ */
+function splitIpcError(error) {
+  const full = ipcErrorText(error);
+  const at = full.indexOf(TOOL_DETAIL_MARK);
+  return at === -1 ? { text: full, detail: '' } : { text: full.slice(0, at), detail: full.slice(at + TOOL_DETAIL_MARK.length) };
+}
+
+/** 外部程序的输出尾部记进日志（诊断信息从日志里取）。输出本身原样记，英文界面只翻前缀。 */
+function logToolDetail(detail) {
+  if (detail) log(`外部程序的输出（诊断用）：${detail}`, 'warn');
 }
 
 /**
@@ -1517,15 +1553,16 @@ async function startHostMany(paths, skipped = []) {
     }
     // 准备到一半被换成了别的尝试（用户确认改去加入一条邀请）：界面已经是那边的了，一个字都别动
     if (result.outcome === 'superseded') return;
-    failed.push({ name: baseName(path), message: result.message });
+    failed.push({ name: baseName(path), message: result.message, detail: result.detail });
   }
   if (failed.length > 1) {
     const others = failed.slice(0, -1).map((f) => f.name).join('、');
-    prepFail(failed[failed.length - 1].message, `这些也没能用：${others}`);
+    const last = failed[failed.length - 1];
+    prepFail(last.message, `这些也没能用：${others}`, { diagnostics: failed.some((f) => f.detail) });
   }
 }
 
-/** @returns {Promise<{outcome: 'entered'|'cancelled'|'failed'|'superseded', message?: string}>} */
+/** @returns {Promise<{outcome: 'entered'|'cancelled'|'failed'|'superseded', message?: string, detail?: string}>} */
 async function startHost(filePath) {
   // 房间里加片不占整页，进度画在列表行内
   if (roomEntered) {
@@ -1558,9 +1595,11 @@ async function startHost(filePath) {
   } catch (e) {
     if (!attemptLive(gen)) return { outcome: 'superseded' };
     console.error(e);
-    const message = e.message || String(e);
-    prepFail(message);
-    return { outcome: 'failed', message };
+    // 主进程的报错去掉 IPC 前缀；ffmpeg 的输出尾部不上结论页，进日志和诊断信息
+    const { text: message, detail } = splitIpcError(e);
+    logToolDetail(detail);
+    prepFail(message, '', { diagnostics: !!detail });
+    return { outcome: 'failed', message, detail };
   }
 }
 
@@ -1605,7 +1644,7 @@ async function startHostLink(rawUrl) {
   } catch (e) {
     if (!attemptLive(gen)) return;
     console.error(e);
-    prepFail(e.message || String(e));
+    prepFail(ipcErrorText(e));
   }
 }
 
@@ -1936,7 +1975,9 @@ function failPrepJob(job, error) {
   job.state = 'failed';
   job.tone = 'bad';
   job.ratio = null;
-  job.detail = String(error?.message || error || '');
+  // 转封装、精简失败时主进程的报错带着 IPC 前缀和 ffmpeg 输出：行内只写那句人话，输出接在后面进日志
+  const { text, detail } = splitIpcError(error);
+  job.detail = text;
   if (blamedHost && error?.uncertain) {
     // 请求交出去了、回执没等到（超时或直连断了）：房主那边可能已经加上了，别说成他不接受
     job.text = '没等到房主确认';
@@ -1945,6 +1986,7 @@ function failPrepJob(job, error) {
     job.text = blamedHost ? (isRoomHost() ? '没加进列表' : '房主没有接受') : '没法用这个文件';
     log(`《${job.name}》没加进列表：${job.detail}`, 'warn');
   }
+  logToolDetail(detail);
   renderPlaylist();
 }
 
@@ -3091,9 +3133,12 @@ function choosePrepPlan(info, { needsRemux, optionalRemux = false, mustConvert =
   });
 }
 
-/** 开房准备文件时的失败。加入流程的失败走 joinFail —— 标题别说成文件的问题。 */
-function prepFail(msg, extra = '') {
-  prepStop('没法用这个文件', msg, extra);
+/**
+ * 开房准备文件时的失败。加入流程的失败走 joinFail —— 标题别说成文件的问题。
+ * diagnostics：ffmpeg 的输出尾部已经记进日志，结论页上给个「复制诊断信息」把它带走。
+ */
+function prepFail(msg, extra = '', { diagnostics = false } = {}) {
+  prepStop('没法用这个文件', msg, extra, { diagnostics });
 }
 
 /** 加入流程的失败（找不到房主、连不上信令或中继、被移出、模式或版本对不上）。 */
@@ -3101,8 +3146,8 @@ function joinFail(msg, extra = '') {
   prepStop('没能加入房间', msg, extra);
 }
 
-/** 准备页上的一条结论：标题 + 说明 +（可选）补一行没处理完的文件，只留「返回」。 */
-function prepStop(title, msg, extra = '') {
+/** 准备页上的一条结论：标题 + 说明 +（可选）补一行没处理完的文件，留「返回」（有诊断输出时再加「复制诊断信息」）。 */
+function prepStop(title, msg, extra = '', { diagnostics = false } = {}) {
   // 这次尝试有了结论：之后再点开的邀请直接接手，不用再问「要不要放弃」
   endAttempt();
   show('view-prepare');
@@ -3111,7 +3156,7 @@ function prepStop(title, msg, extra = '') {
   $('prep-bar').style.width = '0%';
   const back = make('button', { id: 'prep-back', className: 'ghost', text: '返回' });
   back.onclick = backHome;
-  replace('prep-actions', ...(extra ? [hint(extra), back] : [back]));
+  replace('prep-actions', ...(extra ? [hint(extra)] : []), back, ...(diagnostics ? [copyDiagnosticsButton()] : []));
 }
 
 function backHome() {
