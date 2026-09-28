@@ -56,8 +56,9 @@ test('访客侧在 ICE 永远不进入 failed 时也有定时兜底', () => {
   assert.match(body, /clearTimeout\(joinWaitTimer\)/);
   assert.match(body, /还没能连上房主/, '兜底要给用户一个明确结论');
   assert.match(body, /TURN/, '并且要告诉用户下一步能做什么');
-  // 用户点过「重新生成应答链接」之后，旧连接的定时器不能盖掉新界面。
-  assert.match(body, /S\.swarm\?\.peers\?\.get\(payload\.from\) !== peer/);
+  // 用户点过「重新生成应答链接」之后，旧连接的定时器不能盖掉新界面。只认「换成了别的 Peer」：
+  // ICE 真的失败时 swarm 已经先把这条摘掉了，按「不在表里」早退就永远没有结论（H1 / N1，行为见 joinCancel.test.js）
+  assert.match(body, /const current = S\.swarm\?\.peers\?\.get\(payload\.from\);\r?\n\s*if \(current && current !== peer\) return;/);
 });
 
 /**

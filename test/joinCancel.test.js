@@ -253,6 +253,8 @@ function world({ fns = [], decls = [], globals = {}, securityMode = 'trusted' } 
       connectionAdvice: (peer) => ({ level: 'bad', text: `诊断了 ${peer.peerId}` }),
       copyDiagnosticsButton: () => ({ tag: 'button', text: '复制诊断信息' }),
       renderPlaylistSoon: () => {},
+      // 界面语言（一对一加入给房主的兜底昵称按它取）：这里原样返回
+      t: (text) => text,
       ...globals,
     },
   });
@@ -873,4 +875,172 @@ test('这一批的新文案都有英文', async () => {
   assert.match(en('诊断：本机一个网络候选地址都没收集到 —— 通常是网络被完全隔离，或者防火墙拦掉了 NoxReel。'), /^Diagnosis: /);
   // 用到的现成按钮和标题
   for (const line of ['取消', '重试', '返回', '离开房间', '直连没建立起来', '还没能连上房主']) assert.notEqual(en(line), line);
+});
+
+/* --------------- H1（第三轮）：一对一加入时直连真的失败了、准备页残留上一次的说明 --------------- */
+
+/**
+ * N1：真 Swarm 在 addPeer 时就把 forgetSelf 挂在 close / failed 上，早于 joinViaManual 挂的那条 ——
+ * ICE 真的 failed 时，轮到加入方收尾时这条连接已经不在成员表里了。以前收尾按「不在表里」早退，
+ * 加入方永远停在「把应答链接发回给发起者」（实测到 90 秒页面都没变，日志只有一句「直连失败了」）。
+ * 这里的假 Swarm、假 Peer 照真的来：摘掉时 close() 报一次 close 再清掉监听，同一次 emit 里后挂的监听照样会跑。
+ */
+function failingManualJoin() {
+  const peers = [];
+  const offer = deferred();
+  class FakePeer extends Emitter {
+    constructor(o) {
+      super();
+      Object.assign(this, o);
+      this.closed = false;
+      this.authenticated = false;
+      peers.push(this);
+    }
+    acceptOffer() {
+      return offer.promise;
+    }
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      this.emit('close');
+      this.removeAll();
+    }
+  }
+  const Base = swarmClass();
+  class ForgetfulSwarm extends Base {
+    addPeer(peer) {
+      super.addPeer(peer);
+      const forgetSelf = () => {
+        if (this.peers.get(peer.peerId) === peer) this.removePeer(peer.peerId);
+      };
+      peer.on('close', forgetSelf);
+      peer.on('failed', forgetSelf);
+    }
+  }
+  const w = world({
+    fns: ['joinViaManual'],
+    decls: ['MANUAL_JOIN_WAIT_TIMEOUT_MS'],
+    globals: {
+      Peer: FakePeer,
+      wirePeer: () => {},
+      encodeCode: async () => 'NR2-answer',
+      shareLink: (code) => `https://example.test/#a/${code}/`,
+      copyCode: () => {},
+      window: { sw: { clipboard: { writeText: async () => {} } } },
+    },
+  });
+  // vm 沙箱的全局就是 ctx 本身：换掉它，joinViaManual 建的就是会自己摘掉失败连接的 Swarm
+  w.ctx.initSwarmAndSync = () => {
+    if (w.S.swarm) return;
+    w.S.swarm = new ForgetfulSwarm();
+    w.S.sync = { removeAll() {} };
+  };
+  return { ...w, peers, offer };
+}
+
+async function answerPageUp(w) {
+  const joining = w.ctx.joinViaManual(OFFER);
+  w.offer.resolve({ type: 'answer', sdp: 'a' });
+  await joining;
+  assert.equal(w.dom.$('prep-title').textContent, '把应答链接发回给发起者');
+}
+
+test('H1 N1：应答链接发出去之后 ICE 真的失败了（swarm 先摘掉这条连接）：给「直连没建立起来」、诊断和「重新生成应答链接」', async () => {
+  const w = failingManualJoin();
+  await answerPageUp(w);
+  const peer = w.peers[0];
+  assert.equal(w.S.swarm.peers.get('host-A'), peer);
+
+  peer.emit('failed', 'failed');
+  assert.equal(w.S.swarm.peers.has('host-A'), false, '这个用例要的就是「先被摘掉、再轮到加入方收尾」');
+  assert.equal(w.dom.$('prep-title').textContent, '直连没建立起来', '加入方停在应答页，没有结论');
+  assert.match(w.dom.$('prep-note').textContent, /^和房主的直连探测失败了/);
+  assert.match(w.dom.$('prep-note').textContent, /\n\n诊断：诊断了 host-A$/);
+  assert.deepEqual(
+    w.dom.actions().map((b) => b.text),
+    ['重新生成应答链接', '返回', '复制诊断信息']
+  );
+  assert.equal(w.ctx.joinAttempt.busy, null, '有了结论，之后再点开的邀请直接接手');
+  assert.equal(w.clock.pending, 0, '三分钟兜底要撤掉');
+
+  // 「重新生成应答链接」：同一份邀请整个重来一遍
+  w.dom.button('重新生成应答链接').onclick();
+  await flush();
+  assert.equal(w.peers.length, 2);
+  assert.equal(w.S.swarm.peers.get('host-A'), w.peers[1]);
+  assert.equal(w.dom.$('prep-title').textContent, '把应答链接发回给发起者');
+});
+
+test('H1 N1：连接早就被摘掉了（只关了、没报 failed），三分钟兜底照样给结论', async () => {
+  const w = failingManualJoin();
+  await answerPageUp(w);
+  w.peers[0].close();
+  assert.equal(w.S.swarm.peers.has('host-A'), false);
+  assert.equal(w.dom.$('prep-title').textContent, '把应答链接发回给发起者');
+  w.clock.advance(appConst('MANUAL_JOIN_WAIT_TIMEOUT_MS'));
+  assert.equal(w.dom.$('prep-title').textContent, '还没能连上房主');
+  assert.ok(w.dom.button('重新生成应答链接'));
+});
+
+test('H1 N1：别处已经给过结论（握手时模式对不上），兜底定时器不再盖掉它', async () => {
+  const w = failingManualJoin();
+  await answerPageUp(w);
+  // mode-mismatch 的处理：swarm 断开这条连接，准备页说原因
+  w.S.swarm.removePeer('host-A');
+  w.ctx.joinFail('host-A 的模式是安全模式，本房间是可信房间，已在传输媒体前断开。');
+  w.clock.advance(appConst('MANUAL_JOIN_WAIT_TIMEOUT_MS'));
+  assert.equal(w.dom.$('prep-title').textContent, '没能加入房间');
+  assert.match(w.dom.$('prep-note').textContent, /模式是安全模式/);
+});
+
+test('H1 N1：还在收集候选时直连就失败了：结论留着，候选收集完也不再画应答页', async () => {
+  const w = failingManualJoin();
+  const joining = w.ctx.joinViaManual(OFFER);
+  w.peers[0].emit('failed', 'failed');
+  assert.equal(w.dom.$('prep-title').textContent, '直连没建立起来');
+  w.offer.resolve({ type: 'answer', sdp: 'a' });
+  await joining;
+  assert.equal(w.dom.$('prep-title').textContent, '直连没建立起来', '迟到的应答把结论盖掉了');
+  assert.ok(!w.dom.button('复制应答链接'));
+});
+
+test('H1 N1：这个房主 id 已经换成了别的连接，旧连接的收尾不动界面', async () => {
+  const w = failingManualJoin();
+  await answerPageUp(w);
+  const old = w.peers[0];
+  w.S.swarm.peers.set('host-A', { peerId: 'host-A', close() {} });
+  old.emit('failed', 'failed');
+  assert.equal(w.dom.$('prep-title').textContent, '把应答链接发回给发起者');
+  w.clock.advance(appConst('MANUAL_JOIN_WAIT_TIMEOUT_MS'));
+  assert.equal(w.dom.$('prep-title').textContent, '把应答链接发回给发起者');
+});
+
+test('H1 N3：邀请里没带昵称时给房主的兜底名按界面语言取，英文日志里不再是「Direct connection to 发起者 failed」', async () => {
+  const { translate } = await load('src/renderer/lib/i18n.js');
+  const w = failingManualJoin();
+  w.ctx.t = (text) => translate(text, 'en');
+  w.ctx.joinViaManual({ ...OFFER, name: '' });
+  assert.equal(w.peers[0].name, 'Host');
+  const zh = failingManualJoin();
+  zh.ctx.joinViaManual({ ...OFFER, name: undefined });
+  assert.equal(zh.peers[0].name, '房主');
+});
+
+test('H1 N8：信令加入、房间链接加入一开始就清掉准备页上一次失败的说明', () => {
+  const server = serverJoin({ connect: () => new Promise(() => {}) });
+  server.dom.$('prep-note').textContent = '找不到房主：房主不在线';
+  server.ctx.joinViaServer(ROOM);
+  assert.equal(server.dom.$('prep-title').textContent, '正在连接信令服务器');
+  assert.equal(server.dom.$('prep-note').textContent, '', '新一次加入的前几秒说明栏还是上一次的失败原因');
+
+  const relay = world({
+    fns: ['joinViaRelay'],
+    globals: { connectSignaling: () => new Promise(() => {}) },
+  });
+  relay.dom.$('prep-note').textContent = '找不到房主：房主不在线';
+  relay.ctx.joinViaRelay({ k: 'relay', key: 'K'.repeat(43), hk: 'a'.repeat(64), from: 'host-A', securityMode: 'trusted', protocolVersion: 2 });
+  assert.equal(relay.dom.$('prep-title').textContent, '正在通过公共中继找房主');
+  assert.equal(relay.dom.$('prep-note').textContent, '');
+  // 一对一加入一开始就写了自己的说明
+  assert.match(fnSource('joinViaManual'), /\$\('prep-note'\)\.textContent = '正在收集网络候选地址，通常需要几秒钟…';/);
 });

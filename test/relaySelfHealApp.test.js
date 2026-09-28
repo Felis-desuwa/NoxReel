@@ -297,6 +297,44 @@ for (const label of Object.keys(SOURCES)) {
     assert.deepEqual(r.rebuilds.sort(), ['m2', 'm3']);
     assert.deepEqual(plain(sig.signals), [['m1', { kind: 'renegotiate' }]]);
   });
+
+  // H1（N6）：G2 只改了「直连失败了」那一行。对方冻结 100 秒时退避约 78 秒用尽，那一行照旧拿本机候选说
+  // 「STUN 服务器没能告诉本机公网地址……」；退避里新建的连接自己从没通过，失败时也一样被误诊
+  test(`${label}：连通过的人失联到退避用尽，也说对方可能断网或关掉了；退避里新建的连接失败同样不给诊断；从没连通过的照旧诊断`, async () => {
+    const r = wireBox(label);
+    r.S.swarm.removePeer = (id) => r.S.swarm.peers.delete(id);
+    const sig = fakeSig();
+    const lines = (name, re) => r.logs.filter(([t]) => t.startsWith(`和 ${name} 的直连`) && re.test(t));
+
+    const opened = r.peerOf('m1', false);
+    r.ctx.wirePeer(opened, sig);
+    opened.ctrl.readyState = 'open';
+    await opened.emit('open');
+    opened.ctrl.readyState = 'closed';
+    await opened.emit('statechange', 'failed');
+    // 退避第一轮：对面重发 offer 建的那条也没打通（它自己从没连通过）
+    r.clock.advance(1500);
+    const rebuilt = r.peerOf('m1', false);
+    r.ctx.wirePeer(rebuilt, sig);
+    await rebuilt.emit('statechange', 'failed');
+    const failed = lines('m1', /直连失败了/);
+    assert.equal(failed.length, 2);
+    for (const line of failed) {
+      assert.deepEqual(line, ['和 m1 的直连失败了。之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。', 'warn']);
+    }
+    r.clock.advance(10 * 60_000);
+    assert.deepEqual(lines('m1', /都没恢复/), [['和 m1 的直连试了 3 次都没恢复。之前是连通的，多半是对方断网或关掉了 NoxReel。', 'bad']]);
+
+    const never = r.peerOf('m3', false);
+    r.ctx.wirePeer(never, sig);
+    await never.emit('statechange', 'failed');
+    r.clock.advance(10 * 60_000);
+    const gaveUp = lines('m3', /都没恢复/);
+    assert.equal(gaveUp.length, 1);
+    assert.doesNotMatch(gaveUp[0][0], /之前是连通的/);
+    if (label === '桌面端') assert.equal(gaveUp[0][0], '和 m3 的直连试了 3 次都没恢复。（诊断）');
+    else assert.equal(gaveUp[0][0], '和 m3 的直连试了 3 次都没恢复。双方都在严格 NAT 后面时需要 TURN 中继兜底。');
+  });
 }
 
 test('连通过的直连失败了：两端的英文都有，昵称原样保留', async () => {
@@ -317,6 +355,23 @@ test('连通过的直连失败了：两端的英文都有，昵称原样保留',
   const nat = android.translate('和 Bob 的直连失败了（双方都在严格 NAT 后面时会这样，需要 TURN 中继兜底）', 'en');
   assert.doesNotMatch(nat, cjk);
   assert.match(nat, /^Direct connection to Bob failed \(/);
+});
+
+test('H1（N6）：退避用尽那一行两端都有英文，后半句递归翻，昵称原样保留', async () => {
+  const cjk = /[㐀-鿿]/;
+  const linked = '和 张三 的直连试了 3 次都没恢复。之前是连通的，多半是对方断网或关掉了 NoxReel。';
+  const expected =
+    'The direct connection to 张三 did not recover after 3 attempts. It was working before, so the other side has most likely lost their network or closed NoxReel.';
+  for (const file of ['src/renderer/lib/i18n.js', 'android/app/src/main/assets/js/i18n.js']) {
+    const { translate } = await import(pathToFileURL(path.join(root, file)).href);
+    assert.equal(translate(linked, 'en'), expected, file);
+    assert.equal(translate(linked, 'zh-CN'), linked);
+  }
+  // 安卓端从没连通过的那句（以前整行都没有英文）
+  const android = await import(pathToFileURL(path.join(root, 'android/app/src/main/assets/js/i18n.js')).href);
+  const nat = android.translate('和 Bob 的直连试了 3 次都没恢复。双方都在严格 NAT 后面时需要 TURN 中继兜底。', 'en');
+  assert.doesNotMatch(nat.replace('Bob', ''), cjk);
+  assert.equal(nat, 'The direct connection to Bob did not recover after 3 attempts. When both sides are behind strict NAT, a TURN relay is needed as a fallback.');
 });
 
 /* ------------------------- offer 标记与 reconnected（桌面端） ------------------------- */

@@ -1704,8 +1704,9 @@ test('超长昵称和片名不撑坏布局', () => {
     assert.match(rule(selector), /overflow-wrap: anywhere;/, `${selector} 里一长串不带空格的名字会撑出去`);
   }
   // 邀请码、应答码里的昵称和片名进界面前截断
-  assert.match(fnSource('joinViaManual'), /name: peerName\(payload\.name, '发起者'\)/);
-  assert.match(fnSource('acceptManualAnswer'), /peer\.name = peerName\(payload\.name, '观众'\);/);
+  // 兜底昵称按界面语言取（H1 / N3：以前是写死的「发起者」「观众」，英文日志里原样夹着中文）
+  assert.match(fnSource('joinViaManual'), /name: peerName\(payload\.name, t\('房主'\)\)/);
+  assert.match(fnSource('acceptManualAnswer'), /peer\.name = peerName\(payload\.name, t\('观众'\)\);/);
   assert.match(fnSource('inviteFileLine'), /String\(file\.name \|\| ''\)\.slice\(0, 200\)/);
 });
 

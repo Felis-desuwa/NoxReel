@@ -355,6 +355,8 @@ async function acceptWith(box, answer, { roomEntered = true, raw = null } = {}) 
     normalizeSecurityMode: (m) => (m === 'trusted' ? 'trusted' : 'safe'),
     securityModeLabel: (m) => m,
     peerName: (n, fallback) => n || fallback,
+    // 兜底昵称按界面语言取（H1 / N3）
+    t: (text) => text,
     wirePeer: () => {},
     watchManualHandshake: () => box.calls.push('watch'),
     show: () => {},

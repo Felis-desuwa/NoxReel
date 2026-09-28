@@ -288,6 +288,10 @@ const EN = new Map(Object.entries({
     'The STUN server never reported this device’s public address, so only local candidates exist. Unless both sides are on the same LAN this cannot connect; check that the network allows UDP.',
   '之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。':
     'It was working before, so the other side has most likely lost their network or closed NoxReel. Waiting for them to come back.',
+  // 重连退避用尽那一行的后半句（连通过的人、从没连通过的人各一句）
+  '之前是连通的，多半是对方断网或关掉了 NoxReel。':
+    'It was working before, so the other side has most likely lost their network or closed NoxReel.',
+  '双方都在严格 NAT 后面时需要 TURN 中继兜底。': 'When both sides are behind strict NAT, a TURN relay is needed as a fallback.',
   'Turn Token ID 和 API Token 都要填。': 'Enter both the Turn Token ID and the API Token.',
   '正在向 Cloudflare 验证…': 'Verifying with Cloudflare…',
   '已保存': 'Saved',
@@ -502,6 +506,12 @@ const PATTERNS = [
     'Direct connection to $1 failed (this happens when both sides are behind strict NAT; a TURN relay is needed as a fallback)',
   ],
   [/^和 (.+) 的直连失败了。(.*)$/, (_all, name, advice) => `Direct connection to ${name} failed. ${translate(advice, 'en')}`],
+  // 重连退避用尽：后半句另有词条，递归翻（同桌面端）
+  [
+    /^和 (.+) 的直连试了 (\d+) 次都没恢复。(.*)$/,
+    (_all, name, tries, advice) =>
+      `The direct connection to ${name} did not recover after ${tries} attempts. ${translate(advice, 'en')}`,
+  ],
   [/^信令错误：(.*)$/, (_all, detail) => `Signaling error: ${translate(detail, 'en')}`]
 ];
 

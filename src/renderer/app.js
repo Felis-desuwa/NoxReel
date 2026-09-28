@@ -94,22 +94,32 @@ function field(label, ...children) {
  * 几句说明各是一个文本节点、分开翻译。中文句子之间不空格，英文译文首尾相接就成了
  * 「“Verify and save”.The API Token」，所以英文界面在相邻两句之间补一个空格；
  * 后一句本身以空白或标点开头的（「。诊断信息里只有……」译成 ". The diagnostics…"）不补。
+ * 句子和行内元素相邻也一样：「自己跑一个：」后面紧跟 <code>npm run signal</code>，英文成了「Run your own:npm run signal」。
  */
 function hint(...children) {
   const parts = [];
   for (const child of children.flat(Infinity)) {
     if (child == null || child === false) continue;
     const prev = parts[parts.length - 1];
-    if (typeof child === 'string' && typeof prev === 'string' && sentenceGap(prev, child)) parts.push(' ');
+    if (prev != null && sentenceGap(prev, child)) parts.push(' ');
     parts.push(child);
   }
   return make('p', { className: 'hint' }, parts);
 }
 
-/** 两段相邻的界面文案之间要不要补一个空格：只有英文界面要，前一段以空白结尾、后一段以空白或标点开头的不补。 */
+/**
+ * 两段相邻的界面文案之间要不要补一个空格：只有英文界面要。
+ * 字符串看翻译后的首尾：前一段以空白或左括号、左引号结尾，后一段以空白或标点开头的不补。
+ * 元素（<code>、<b>）那一侧看不到译文，只看挨着它的字符串；两个元素相邻、或挨着换行 <br> 的不补。
+ */
 function sentenceGap(prev, next) {
   if (currentLocale() !== 'en') return false;
-  return !/\s$/.test(t(prev)) && !/^[\s.,;:!?)\]]/.test(t(next));
+  const isText = (part) => typeof part === 'string';
+  if (!isText(prev) && !isText(next)) return false;
+  if (prev?.tagName === 'BR' || next?.tagName === 'BR') return false;
+  if (isText(prev) && /[\s(\[“‘]$/.test(t(prev))) return false;
+  if (isText(next) && /^[\s.,;:!?)\]”’。，、；：！？）]/.test(t(next))) return false;
+  return true;
 }
 
 const S = {
@@ -3374,7 +3384,8 @@ async function joinViaManual(payload) {
 
   const peer = new Peer({
     peerId: payload.from,
-    name: peerName(payload.name, '发起者'),
+    // 兜底名会进日志（「Direct connection to 发起者 failed」）：按当前界面语言取
+    name: peerName(payload.name, t('房主')),
     initiator: false,
     ...peerIce(),
     trickle: false, // 手动模式必须等候选集齐，SDP 得是自包含的
@@ -3394,11 +3405,16 @@ async function joinViaManual(payload) {
   let joinSettled = false;
   let joinWaitTimer = null;
   let offJoinAuthenticated = () => {};
+  // 这次尝试的登记：别处先给过结论（模式、版本对不上走 joinFail）会把它清掉，兜底定时器就不能再盖一遍
+  const busy = joinAttempt.busy;
 
   const finishJoin = (title, note) => {
-    if (joinSettled || peer.authenticated || roomEntered || !attemptLive(gen)) return;
+    if (joinSettled || peer.authenticated || roomEntered || !attemptLive(gen) || joinAttempt.busy !== busy) return;
     // 用户点过「重新生成应答链接」的话，swarm 里已经换成新连接了，旧的定时器不能盖掉新界面。
-    if (S.swarm?.peers?.get(payload.from) !== peer) return;
+    // 只认「换成了别的 Peer」：swarm 的 forgetSelf 比这里先挂在 failed 上，ICE 真的失败时
+    // 这条连接已经被摘掉了 —— 按「不在表里」早退的话，加入方永远停在「把应答链接发回给发起者」
+    const current = S.swarm?.peers?.get(payload.from);
+    if (current && current !== peer) return;
     joinSettled = true;
     endAttempt();
     clearTimeout(joinWaitTimer);
@@ -3455,11 +3471,12 @@ async function joinViaManual(payload) {
     });
   } catch (error) {
     // 以前这里的异常落到没人接住的地方，准备页永远停在「正在收集网络候选地址」
-    if (attemptLive(gen)) joinFail(error.message || String(error));
+    if (attemptLive(gen) && joinAttempt.busy === busy) joinFail(error.message || String(error));
     return;
   }
-  // 收集候选要几秒，这期间可能已经换了一次尝试：界面归那边，这条应答不再往外交
-  if (!attemptLive(gen)) return;
+  // 收集候选要几秒，这期间可能已经换了一次尝试（界面归那边），或者这次已经有了结论（直连失败）：
+  // 这条应答都不再往外交
+  if (!attemptLive(gen) || joinAttempt.busy !== busy) return;
   // 发出去的是 https 跳转页：Discord 这类聊天软件只会把 https 变成能点的链接
   const answerLink = shareLink(code, 'answer');
 
@@ -3520,6 +3537,8 @@ async function joinViaServer(payload) {
 
   show('view-prepare');
   $('prep-title').textContent = '正在连接信令服务器';
+  // 上一次没进成房的说明（「找不到房主：…」）别留到这一次：连上服务器之前这一栏没有别的内容
+  $('prep-note').textContent = '';
   $('prep-file').textContent = inviteFileLine(payload.file);
   setSteps([
     { label: '解析邀请码', state: 'done' },
@@ -3671,6 +3690,8 @@ async function joinViaRelay(payload) {
 
   show('view-prepare');
   $('prep-title').textContent = '正在通过公共中继找房主';
+  // 上一次没进成房的说明（「找不到房主：…」）别留到这一次：等房主放行之前这一栏没有别的内容
+  $('prep-note').textContent = '';
   $('prep-file').textContent = '';
   setSteps([
     { label: '解析房间链接', state: 'done' },
@@ -4200,14 +4221,21 @@ function scheduleReconnect(peer, sig, { retry = false } = {}) {
     if (peerId === S.hostId) hostReallyGone('left', peer);
     return;
   }
-  const st = RECOVERY.get(peerId) || { attempts: 0, timer: null, watch: null };
+  const st = RECOVERY.get(peerId) || { attempts: 0, timer: null, watch: null, linked: false };
+  // 这一轮失联之前和他连通过：跟着这份记录走，退避里新建的连接自己从没通过，也不会让结论改说成 STUN / NAT
+  if (peer.linkedOnce) st.linked = true;
   if (st.timer) return; // 已经排上了
   clearTimeout(st.watch);
   st.watch = null;
 
   if (st.attempts >= RECONNECT_BACKOFF_MS.length) {
-    const advice = connectionAdvice(peer);
-    log(`和 ${peer.name} 的直连试了 ${st.attempts} 次都没恢复。${advice.text}`, 'bad');
+    if (st.linked) {
+      // 连通过的人失联到退避用尽：多半是对方断网或关掉了，拿本机候选说「STUN 没告诉公网地址」只会把人往错的方向支
+      log(`和 ${peer.name} 的直连试了 ${st.attempts} 次都没恢复。之前是连通的，多半是对方断网或关掉了 NoxReel。`, 'bad');
+    } else {
+      const advice = connectionAdvice(peer);
+      log(`和 ${peer.name} 的直连试了 ${st.attempts} 次都没恢复。${advice.text}`, 'bad');
+    }
     // 退避用尽才承认失联：在这之前列表横幅只说「正在重连」，别把 ICE 抖一下说成房主走了
     if (peerId === S.hostId) hostReallyGone('unreachable', peer);
     // 最后一轮新建的连接还停在半路（对面一直没应答）：摘掉，别让它一直占着名额和一条 RTCPeerConnection
@@ -4319,8 +4347,9 @@ function wirePeer(peer, sig) {
     clearTimeout(graceTimer);
     graceTimer = null;
   };
-  // 这条连接通过没有（ICE 连上过、或数据通道打开过）：通过的说明网络这条路走得通，之后再失败不是 STUN / NAT 的问题
-  let linkedOnce = false;
+  // 这条连接通过没有（ICE 连上过、或数据通道打开过）：通过的说明网络这条路走得通，之后再失败不是 STUN / NAT 的问题。
+  // 记在 Peer 上：scheduleReconnect 据此给这一轮失联记一笔「连通过」，退避用尽时照样不给 STUN 诊断
+  peer.linkedOnce = false;
 
   // 握手兜底：offer 或 answer 在中继上丢了，这条连接就停在半路（没有远端描述，ICE 永远是 new），
   // 既不会 connected 也不会 failed。到时还没打开数据通道就按失败处理，接着退避重连。
@@ -4337,7 +4366,7 @@ function wirePeer(peer, sig) {
     : null;
 
   peer.on('open', () => {
-    linkedOnce = true;
+    peer.linkedOnce = true;
     clearTimeout(handshakeTimer);
     clearGrace();
     cancelRecovery(peer.peerId); // 连上了，退避计数归零
@@ -4345,7 +4374,7 @@ function wirePeer(peer, sig) {
   });
   peer.on('statechange', (s) => {
     if (s === 'connected' || s === 'completed') {
-      linkedOnce = true;
+      peer.linkedOnce = true;
       clearGrace();
       // ICE 自己缓过来了，把已经排上的重连撤掉。
       // cancelRecovery 原来只在 'open'（数据通道首次打开）和 peer-leave 时调，
@@ -4364,7 +4393,8 @@ function wirePeer(peer, sig) {
     }
     if (s === 'failed') {
       clearGrace();
-      if (linkedOnce) {
+      // 这条自己通过，或者它是连通过之后失联、退避里新建的那条（RECOVERY 里记着这一轮连通过）
+      if (peer.linkedOnce || RECOVERY.get(peer.peerId)?.linked) {
         // 连通过又失败了（对方整个断网时应答方这边就是这样）：再拿本机候选下结论，
         // 「STUN 没告诉本机公网地址」之类只会把人往错的方向支
         log(`和 ${peer.name} 的直连失败了。之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。`, 'warn');
@@ -7935,7 +7965,8 @@ async function acceptManualAnswer(rawInput) {
     if (S.hostId && claimed === S.hostId) throw new Error('应答码冒用了房主的身份，已拒绝');
     if (S.swarm?.peers?.has(claimed)) throw new Error('这个身份已经在房间里了，已拒绝');
     peer.peerId = claimed;
-    peer.name = peerName(payload.name, '观众');
+    // 兜底名会进日志：按当前界面语言取
+    peer.name = peerName(payload.name, t('观众'));
     wirePeer(peer);
     S.swarm.addPeer(peer);
     registered = true;

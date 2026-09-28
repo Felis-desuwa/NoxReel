@@ -1795,12 +1795,18 @@ function scheduleReconnect(peer, sig, { retry = false } = {}) {
     if (stale && !directLinkUp(stale)) S.swarm.removePeer(peerId);
     return;
   }
-  const st = RECOVERY.get(peerId) || { attempts: 0, timer: null, watch: null };
+  const st = RECOVERY.get(peerId) || { attempts: 0, timer: null, watch: null, linked: false };
+  // 这一轮失联之前和他连通过：跟着这份记录走，退避里新建的连接自己从没通过，结论也不改说成 NAT（和电脑端一样）
+  if (peer.linkedOnce) st.linked = true;
   if (st.timer) return;
   clearTimeout(st.watch);
   st.watch = null;
   if (st.attempts >= RECONNECT_BACKOFF_MS.length) {
-    log('和 ' + peer.name + ' 的直连试了 ' + st.attempts + ' 次都没恢复。双方都在严格 NAT 后面时需要 TURN 中继兜底。', 'bad');
+    log(
+      '和 ' + peer.name + ' 的直连试了 ' + st.attempts + ' 次都没恢复。' +
+        (st.linked ? '之前是连通的，多半是对方断网或关掉了 NoxReel。' : '双方都在严格 NAT 后面时需要 TURN 中继兜底。'),
+      'bad'
+    );
     // 最后一轮新建的连接还停在半路（对面一直没应答）：摘掉，别让它一直占着名额和一条 RTCPeerConnection（和电脑端一样）
     const stuck = S.swarm.peers.get(peerId);
     if (stuck && stuck.ctrl?.readyState !== 'open') S.swarm.removePeer(peerId);
@@ -1892,8 +1898,9 @@ function wirePeer(peer, sig) {
     clearTimeout(graceTimer);
     graceTimer = null;
   };
-  // 这条连接通过没有（ICE 连上过、或数据通道打开过）：通过的之后再失败，不是 NAT 的问题（和电脑端一样）
-  let linkedOnce = false;
+  // 这条连接通过没有（ICE 连上过、或数据通道打开过）：通过的之后再失败，不是 NAT 的问题（和电脑端一样）。
+  // 记在 Peer 上：scheduleReconnect 据此给这一轮失联记一笔「连通过」，退避用尽时照样不给 NAT 诊断
+  peer.linkedOnce = false;
 
   // 握手兜底（和电脑端一样）：offer 或 answer 丢了，这条连接就停在半路。到时还没打开数据通道
   // 就按失败处理、接着退避；应答的一方多等一会儿，让发起方先重发 offer
@@ -1910,7 +1917,7 @@ function wirePeer(peer, sig) {
   peer.on('close', () => clearTimeout(handshakeTimer));
 
   peer.on('open', () => {
-    linkedOnce = true;
+    peer.linkedOnce = true;
     clearTimeout(handshakeTimer);
     clearGrace();
     cancelRecovery(peer.peerId);
@@ -1918,7 +1925,7 @@ function wirePeer(peer, sig) {
   });
   peer.on('statechange', (s) => {
     if (s === 'connected' || s === 'completed') {
-      linkedOnce = true;
+      peer.linkedOnce = true;
       clearGrace();
       cancelRecovery(peer.peerId); // ICE 自己缓过来了，撤掉排着的重连
       return;
@@ -1933,8 +1940,12 @@ function wirePeer(peer, sig) {
     }
     if (s === 'failed') {
       clearGrace();
-      if (linkedOnce) log(`和 ${peer.name} 的直连失败了。之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。`, 'warn');
-      else log(`和 ${peer.name} 的直连失败了（双方都在严格 NAT 后面时会这样，需要 TURN 中继兜底）`, 'bad');
+      // 这条自己通过，或者它是连通过之后失联、退避里新建的那条（RECOVERY 里记着这一轮连通过）
+      if (peer.linkedOnce || RECOVERY.get(peer.peerId)?.linked) {
+        log(`和 ${peer.name} 的直连失败了。之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。`, 'warn');
+      } else {
+        log(`和 ${peer.name} 的直连失败了（双方都在严格 NAT 后面时会这样，需要 TURN 中继兜底）`, 'bad');
+      }
       if (sig) scheduleReconnect(peer, sig);
     }
   });
@@ -2153,7 +2164,8 @@ async function joinManualNow(payload) {
 
   const peer = new Peer({
     peerId: payload.from,
-    name: payload.name || '房主',
+    // 邀请码里的昵称照样清洗截断；兜底名会进日志（「Direct connection to 房主 failed」），按当前界面语言取
+    name: peerName(payload.name, t('房主')),
     initiator: false,
     ...peerIce(),
     trickle: false, // 手动模式等候选集齐，SDP 自包含
@@ -2171,7 +2183,10 @@ async function joinManualNow(payload) {
   let joinWaitTimer = null;
   const finishJoin = (text) => {
     if (joinSettled || peer.authenticated || S.entered) return;
-    if (S.swarm?.peers?.get(payload.from) !== peer) return; // 已经被新一轮顶替的旧连接
+    // 已经被新一轮顶替的旧连接。只认「换成了别的 Peer」：swarm 的 forgetSelf 比这里先挂在 failed 上，
+    // ICE 真的失败时这条连接已经被摘掉了 —— 按「不在表里」早退的话，这边永远没有结论（和电脑端一样）
+    const current = S.swarm?.peers?.get(payload.from);
+    if (current && current !== peer) return;
     joinSettled = true;
     clearTimeout(joinWaitTimer);
     log(text, 'bad');

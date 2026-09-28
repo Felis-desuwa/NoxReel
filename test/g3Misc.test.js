@@ -402,6 +402,46 @@ test('R4-C：后一句以标点开头、或中间隔着元素的不补空格', a
   assert.equal(ctx.hint('只有一句。').children.length, 1);
 });
 
+// H1（N2）：hint() 以前只在两个字符串之间补空格，句子后面紧跟 <code> 的照样粘在一起
+test('H1 N2：英文界面句子和行内元素（<code>）相邻也补空格；自带空格、标点、<br> 两边、两个元素之间不补；中文不加', async () => {
+  const en = await hintBox('en');
+  const zh = await hintBox('zh-CN');
+  const code = (text) => ({ tag: 'code', tagName: 'CODE', text });
+  const br = { tag: 'br', tagName: 'BR' };
+  // 设置里「信令服务器」下面那句、依赖帮助的「已找到：」
+  assert.equal(
+    en.render(en.ctx.hint('只转发连接地址，不接触视频内容。自己跑一个：', code('npm run signal'))),
+    'Relays connection metadata only, never video. Run your own: <code>'
+  );
+  assert.equal(en.render(en.ctx.hint('已找到：', code('C:\\mpv\\mpv.exe'))), 'Found: <code>');
+  // 元素后面紧跟一个以字母开头的句子也隔开；以标点开头的不隔
+  assert.equal(en.render(en.ctx.hint(code('x'), '已找到：')), '<code> Found:');
+  assert.equal(en.render(en.ctx.hint(code('x'), '。')), '<code>.');
+  // 依赖帮助的安装方式：译文自带结尾空格、「 / 」两边自带空格、句号、<br> 两边、两个元素之间都不补
+  const deps = en.ctx.hint(
+    code('winget install …'),
+    br,
+    code('scoop install …'),
+    br,
+    '或者手动下载后，把可执行文件路径写进环境变量',
+    code('SYNCWATCH_MPV_PATH'),
+    ' / ',
+    code('SYNCWATCH_FFMPEG_PATH'),
+    '。'
+  );
+  assert.equal(deps.children.length, 9, en.render(deps));
+  // 无损精简、PCM 转 FLAC 那两段：译文两头已经留好空格或以标点开头
+  const b = { tag: 'b', tagName: 'B' };
+  assert.equal(en.ctx.hint('丢掉 ', b, '，保留下来的轨', b, '，画质音质都不变，几秒到几十秒完成。').children.length, 5);
+  assert.equal(
+    en.ctx.hint('这条轨是', b, '，转成 FLAC 是数学无损的 —— 解码出来的采样逐字节相同。已经拿这个文件实测过：能压掉', b, '，约 1 MB。').children.length,
+    5
+  );
+  // 中文界面一概不加
+  assert.equal(zh.ctx.hint('已找到：', code('p')).children.length, 2);
+  assert.equal(zh.ctx.hint(code('x'), '已找到：').children.length, 2);
+});
+
 test('R4-C：设置页这几处多句说明都用 hint() 拼，而且每一句都有英文', async () => {
   const { translate } = await load('src/renderer/lib/i18n.js');
   // 找 hint( 调用里相邻的两个字符串字面量（它们各自成一个文本节点、分开翻译）
