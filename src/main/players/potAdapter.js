@@ -8,9 +8,12 @@
  *  1. **只能轮询**：每 200ms 问一批状态/位置/时长，文件名每秒问一次（它走 WM_COPYDATA 回包）。
  *  2. **位置每 500ms 才变一次**：直接上报会一顿一顿的，同步引擎会把它当成跳变。
  *     所以记下「数值跳变的那一刻」，播放中按这个锚点外推，精度约 ±100ms。
- *  3. **跳转落到目标之前的关键帧**（10 秒 GOP 下最远差 4.8 秒）：先跳目标，再发一次
- *     「下一个关键帧」，这样落点变成目标之后的第一个关键帧，然后原地暂停 ——
- *     宁可停在房间前面等大家追上来，也不要悄悄落后半个 GOP。实测偏差平均 -15ms。
+ *     从暂停放起来的那一刻也要重新记锚点：暂停期间数值不变，锚点还停在暂停之前，一放起来外推就直接顶到上限。
+ *  3. **跳转落到目标之前的关键帧**（10 秒 GOP 下最远差 4.8 秒）：先跳目标，落点确实早了
+ *     （比目标早 KEYFRAME_BEHIND_OK 以上）才再发一次「下一个关键帧」把落点推到目标之后，然后原地暂停 ——
+ *     宁可停在房间前面等大家追上来，也不要悄悄落后半个 GOP。这一下推多远看片子：10 秒 GOP 下是下一个关键帧，
+ *     2 秒 GOP 的片实测会越过目标 4–5 秒。**等房间追上来这一步在同步引擎里**（caps.keyframeAhead →
+ *     syncEngine 的 _lead：原地停着，房间时钟走到落点再放），少了它就一直领先那几秒。实测偏差平均 -15ms。
  *
  * 另外两件必须记住的事：
  *  - **绝不传音量/静音参数**：`/volume=` 会被 PotPlayer 永久写进注册表，改的是用户自己的播放器。
@@ -49,6 +52,13 @@ const EOF_MARGIN = 2;
 const DURATION_EPSILON = 0.5;
 /** 跳转落点离目标多近就不必做关键帧补救 —— 跳到 0:00 正好落在关键帧上，补救反而会跳过片头。 */
 const KEYFRAME_EPSILON = 0.3;
+/**
+ * 落点比目标早不超过这么多秒就不补救，和 mpv 的对齐容差（syncEngine 的 SEEK_TOLERANCE）一样。
+ * 补救那一下在短 GOP 的片上会越过目标好几秒（见文件头第 3 条），这几秒要停着等房间，
+ * 为了抹掉不到一秒的落后不划算。同步引擎那边落后超过 1 秒（KEYFRAME_BEHIND_TOLERANCE）才重跳，
+ * 得比这个数大出位置读数的误差，否则刚落地就又被判成落后。
+ */
+const KEYFRAME_BEHIND_OK = 0.75;
 
 const DEFAULT_TIMING = {
   pollMs: 200,
@@ -126,7 +136,8 @@ class PotAdapter extends EventEmitter {
       banner: 'overlay',
       osd: true,
       danmaku: 'overlay',
-      // 跳转落点只会在目标之后（关键帧补救的结果），上层据此「原地暂停等房间追上」。
+      // 跳转落点只会在目标之后（关键帧补救的结果）。同步引擎据此「原地暂停等房间追上」，
+      // 对齐容差也只放宽领先那一侧（syncEngine 的 _lead / _needSeek）。
       keyframeAhead: true,
     };
     this.bridge = bridge || null;
@@ -399,7 +410,11 @@ class PotAdapter extends EventEmitter {
       this._onFileSwitched();
     }
 
-    if (positionMs !== this._rawMs || this._anchor === null) this._anchor = { ms: positionMs, at };
+    // 锚点是「数值跳变的那一刻」。刚从暂停 / 停止放起来也要重记：暂停期间数值不变，锚点还停在暂停之前，
+    // 不重记的话一放起来外推就顶到上限（凭空领先 0.75 秒），要等半秒后数值变了才回来 ——
+    // 同步引擎恰好在这时比位置（停着等房间追上、刚放行的那一下），会把它当成又领先了。
+    const resumed = playing && this._state !== POT_STATE.PLAYING;
+    if (positionMs !== this._rawMs || this._anchor === null || resumed) this._anchor = { ms: positionMs, at };
     this._rawMs = positionMs;
     if (durationMs > 0) this._durationMs = durationMs;
     const wasRunningState = this._state > POT_STATE.STOPPED;
@@ -522,10 +537,12 @@ class PotAdapter extends EventEmitter {
    * 跳转 + 关键帧补救。
    *
    * PotPlayer 的 0x5005 总是落到目标之前的那个关键帧，10 秒 GOP 下最远差 4.8 秒。
-   * 补救办法是紧接着发一次「下一个关键帧」，落点就变成目标之后的第一个关键帧，
-   * 然后原地暂停，等房间追上来再播（这一步由上层的同步引擎做）。
+   * 补救办法是紧接着发一次「下一个关键帧」，落点就推到目标之后，
+   * 然后原地暂停，等房间追上来再播（这一步由上层的同步引擎做，见 syncEngine 的 _lead）。
+   * 结果里的 position 就是落点，引擎拿它算要停几秒。
    *
-   * 落点已经贴着目标时（比如跳到 0:00，本来就在关键帧上）不补救 —— 那一下会白白跳过一个 GOP。
+   * 只在落点确实早了（超过 KEYFRAME_BEHIND_OK）时补救：落点已经贴着目标（比如跳到 0:00，本来就在关键帧上）
+   * 那一下会白白跳过一个 GOP；早了不到一秒也不值得换成停几秒（2 秒 GOP 的片补救一下会越过目标 4–5 秒）。
    */
   async _seekTo(seconds) {
     const target = Math.max(0, Number(seconds) || 0);
@@ -533,6 +550,7 @@ class PotAdapter extends EventEmitter {
     const left = () => Math.max(50, deadline - monotonicMs());
     const before = this._rawMs;
 
+    const sentAt = monotonicMs();
     await this._send(POT.SET_POSITION, Math.round(target * 1000));
 
     // 「离开旧值，且连续两次与播放速率自洽」：暂停时位置不该动，播放时只该按时间往前走。
@@ -550,14 +568,18 @@ class PotAdapter extends EventEmitter {
       { times: 2, timeoutMs: left(), label: '跳转', soft: true }
     );
 
-    const landed = this._rawMs / 1000;
-    // 已经判死的话轮询停了，_rawMs 停在跳转之前的那个数上 —— 拿它判断「落到哪儿了」
+    // 落点比目标早了多少秒（负数是落在了目标之后）。播放中要和「目标按跳转以来的时间往后推」比：
+    // 跳转是同步引擎按房间的进度发的，房间这段时间照样在走；只拿读数和原目标比，
+    // settle 那大半秒里播放器自己往前走的一截会被算成「落得够靠前」，其实照样落后房间那么多。
+    const moving = this._state === POT_STATE.PLAYING;
+    const behind = target + (moving ? (monotonicMs() - sentAt) / 1000 : 0) - this.position();
+    // 已经判死的话轮询停了，位置停在跳转之前的那个数上 —— 拿它判断「落到哪儿了」
     // 只会得出错的结论（往回跳时它比目标大，看着像落点够靠前，其实照样落在目标之前的关键帧）。
     // 位置不明时一律补救：这一路的约定就是宁可停在房间前面等大家追上来。
     // 跳到片头那一下除外 —— 0:00 本来就在关键帧上，补一下反而跳过一个 GOP 的片头。
     const blind = this.lastError !== null && target > KEYFRAME_EPSILON;
     let keyframe = false;
-    if (blind || landed < target - KEYFRAME_EPSILON) {
+    if (blind || behind > KEYFRAME_BEHIND_OK) {
       await this._send(POT.SEND_COMMAND, POT_CMD_NEXT_KEYFRAME);
       await this._send(POT.SET_STATE, POT_STATE.PAUSED);
       await this._waitFor((s) => s.paused && s.rawMs / 1000 >= target - KEYFRAME_EPSILON, {
@@ -735,6 +757,7 @@ class PotAdapter extends EventEmitter {
 
 module.exports = {
   EOF_MARGIN,
+  KEYFRAME_BEHIND_OK,
   KEYFRAME_EPSILON,
   POT,
   POT_CMD_NEXT_KEYFRAME,

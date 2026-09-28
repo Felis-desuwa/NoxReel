@@ -15,7 +15,8 @@
  *     后者才提示用户并退回 mpv —— 一个遥控不了的播放器比没有播放器更糟：房间以为它在同步。
  *  4. **突变先扣住**：换文件时它先推「停止 / 播放」和位置，最后才推 NOWPLAYING。
  *     不是我们发起的状态或位置突变一律先扣住 tick，问一次 NOWPLAYING 确认还是这一部再报，
- *     否则那几条会被当成用户操作广播给全房（暂停 → 跳回 0:00 → 播放）。
+ *     否则那几条会被当成用户操作广播给全房（暂停 → 跳回 0:00 → 播放）。确认之后还要等突变消停一下
+ *     （holdQuietMs）才报：拖进度条是「暂停、跳、恢复」三连推送，只报最后的实情，全房不会跟着停一下。
  *
  * 两条硬约束：
  *  - **绝不传音量参数**：`/volume 0` 会被永久写进注册表，改的是用户自己的播放器。
@@ -72,6 +73,11 @@ const MPC_DETACH_MS = 1800;
 const MPC_HOLD_MS = 3000;
 /** 扣着期间隔多久再问一次 NOWPLAYING。 */
 const MPC_HOLD_ASK_MS = 500;
+/**
+ * 确认还是这一部之后，突变还要消停这么久才放行（见 _confirmHold）。和跳转 settle 一样长：
+ * SETPOSITION 的「暂停、跳、恢复」三条推送在这个窗口里都到齐了。
+ */
+const MPC_HOLD_QUIET_MS = 300;
 /** 位置回包和按时间外推的预期差出这么多秒，就算一次不是我们发起的跳变。 */
 const MPC_JUMP_SECONDS = 2;
 
@@ -80,6 +86,7 @@ const DEFAULT_TIMING = {
   detachMs: MPC_DETACH_MS,
   holdMs: MPC_HOLD_MS,
   holdAskMs: MPC_HOLD_ASK_MS,
+  holdQuietMs: MPC_HOLD_QUIET_MS,
   pauseTimeoutMs: 1000,
   seekTimeoutMs: 3000,
   seekSettleMs: 300,
@@ -199,6 +206,9 @@ class MpcAdapter extends EventEmitter {
     this._holding = false; // 不是我们发起的突变：tick 先扣着，等 NOWPLAYING 确认还是这一部
     this._holdSince = 0;
     this._holdAskedAt = 0;
+    this._holdConfirmed = false; // 这一次扣住之后确认过还是这一部（之后又来突变就作废，见 _beginHold）
+    this._holdLastAt = 0; // 最后一次突变的时刻：确认之后还要等它消停
+    this._holdTimer = null;
     this._foreign = false; // 已判定换了片 / 被用户拿走：这个窗口不再是我们的，一条 tick、一条指令都不再发
     this._seekSeq = 0;
     this._onCopyData = (msg) => this._handleCopyData(msg);
@@ -329,6 +339,8 @@ class MpcAdapter extends EventEmitter {
     this._looping = false;
     if (this._loopTimer) clearTimeout(this._loopTimer);
     this._loopTimer = null;
+    // 停轮询的都是终态（退出、撒手、判死）：扣着的那条不会再放行了
+    this._clearHoldTimer();
   }
 
   /**
@@ -497,8 +509,11 @@ class MpcAdapter extends EventEmitter {
     if (switched) this._onFileSwitched();
     if (name) this._fileName = name;
     this._notify(this._sample());
-    // 还是这一部：扣着的突变是用户在它窗口里的正常操作，照常报上去
-    if (!switched) this._endHold();
+    // 还是这一部：扣着的突变是用户在它窗口里的正常操作，等它消停下来照常报上去
+    if (!switched && this._holding) {
+      this._holdConfirmed = true;
+      this._confirmHold();
+    }
   }
 
   /**
@@ -512,20 +527,44 @@ class MpcAdapter extends EventEmitter {
    */
   _beginHold() {
     if (this._quiet || this._foreign || !this._fileName) return;
+    const now = monotonicMs();
     if (!this._holding) {
       this._holding = true;
-      this._holdSince = monotonicMs();
+      this._holdSince = now;
       this._holdAskedAt = 0;
     }
+    // 扣着期间又来一次突变：之前那句「还是这一部」不作数（换片时新文件的 NOWPLAYING 排在最后才来），
+    // 重新确认，而且要等它消停下来再放行（见 _confirmHold）
+    this._holdConfirmed = false;
+    this._holdLastAt = now;
     this._confirmHold();
   }
 
-  /** 扣着期间：隔一阵再问一次 NOWPLAYING；等太久就不再扣了。 */
+  /**
+   * 扣着期间：隔一阵再问一次 NOWPLAYING；确认还是这一部之后，再等突变消停 holdQuietMs 才放行；
+   * 等太久就不再扣了。
+   *
+   * 等消停是因为 SETPOSITION（拖进度条同理）在 MPC-BE 里是「先暂停、再跳、再恢复」，三条推送之间
+   * NOWPLAYING 的回话常常插进来：一确认就放行的话，一次拖动会报成「暂停 → 跳转 → 播放」三条，
+   * 全房跟着停一下（R5-B）。等它消停了只报一条当时的实情 —— 在播、位置变了，引擎认作一次跳转。
+   */
   _confirmHold() {
-    if (!this._holding) return;
+    if (!this._holding || this._closing) return;
     const now = monotonicMs();
     if (now - this._holdSince >= this.timing.holdMs) {
       this._endHold();
+      return;
+    }
+    if (this._holdConfirmed) {
+      const wait = this.timing.holdQuietMs - (now - this._holdLastAt);
+      if (wait <= 0) this._endHold();
+      else if (!this._holdTimer) {
+        this._holdTimer = setTimeout(() => {
+          this._holdTimer = null;
+          this._confirmHold();
+        }, wait);
+        if (this._holdTimer.unref) this._holdTimer.unref();
+      }
       return;
     }
     if (this._holdAskedAt && now - this._holdAskedAt < this.timing.holdAskMs) return;
@@ -534,9 +573,16 @@ class MpcAdapter extends EventEmitter {
   }
 
   _endHold() {
+    this._clearHoldTimer();
     if (!this._holding) return;
     this._holding = false;
+    this._holdConfirmed = false;
     this._emitTick();
+  }
+
+  _clearHoldTimer() {
+    if (this._holdTimer) clearTimeout(this._holdTimer);
+    this._holdTimer = null;
   }
 
   /**

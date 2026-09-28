@@ -72,6 +72,16 @@ const RESUME_THRESHOLD_SECONDS = 15; // 攒够 15 秒才恢复，滞后量拉开
 const FALLBACK_STALL_BYTES = 4 * 1024 * 1024;
 const FALLBACK_RESUME_BYTES = 16 * 1024 * 1024;
 const SEEK_TOLERANCE = 0.75; // 差这么多秒以内就不去动播放器了，免得抖
+// 跳转落点总在目标之后的播放器（caps.keyframeAhead，也就是 PotPlayer 的关键帧补救，见 potAdapter）：
+// 落地后领先房间超过这么多秒，就原地停着等房间时钟追上落点再放。刚跳完它多半本来就停着（补救之后原地暂停），
+// 多停一会儿不费什么。不等的话它会一直领先一截（实测 2 秒 GOP 的片领先 4–5 秒），而且再没人把它拉回来。
+const LEAD_HOLD_MIN_SECONDS = 0.3;
+// 房间追到离落点这么近就放行，余下这一点正好抵掉播放器从暂停到真正走起来的那一下
+const LEAD_HOLD_END_SECONDS = 0.1;
+// 这种播放器落后房间超过这么多秒才重新跳。跳一次要先落到关键帧、再停几秒等房间，比 mpv 贵得多；
+// 又得大过适配器「落后不到 0.75 秒就不补救」（potAdapter 的 KEYFRAME_BEHIND_OK）加上位置读数的误差，
+// 否则它刚落地就又被判成落后，每条同步指令都重跳一次。
+const KEYFRAME_BEHIND_TOLERANCE = 1;
 // 本地文件报 eof 时，位置离片长还差这么多秒以上就不算放完了（播放器停在了已接收内容的尽头，
 // 或者停在它之前读进缓存的零上）。留余量是因为容器写的片长和播放器最后一帧的位置常差零点几秒，
 // PotPlayer 报放完时位置本来就可能差 2 秒（potAdapter 的 EOF_MARGIN）。
@@ -223,6 +233,15 @@ export class SyncEngine extends Emitter {
     this.pendingSeek = null; // 播放器还没起来时收到的房间位置，起来后补放
     this.pendingSeekOffset = 0; // 它和当时房间时钟差多少秒（有意偏离房间时才不是 0）
     this.seekTolerance = SEEK_TOLERANCE;
+    // 跳转落点只会在目标之后的播放器（caps.keyframeAhead，PotPlayer）：落在房间前面就原地停着，
+    // 等房间时钟追上落点再放（见 _reconcile）。
+    this.keyframeAhead = false;
+    // 正在停着等房间追上：{position 落点, lead 定下时领先几秒, at 什么时候定下的, held 之后见没见过它停下}；
+    // null = 没在等
+    this._lead = null;
+    this._leadTimer = null;
+    // 正在跑的 _reconcile 有几个。放行的定时器赶上时由它们收尾时重排，别插进一次跳转中间去发暂停/播放
+    this._reconciling = 0;
     this.eofReported = false;
     this._dataEndReported = false;
     // 当前这次卡顿是不是「播放器读到了已接收内容的末尾」造成的。解除这种卡顿要额外重放一次。
@@ -257,10 +276,15 @@ export class SyncEngine extends Emitter {
   /**
    * 播放器的跳转精度。落点有误差的播放器，容差要比误差大，
    * 否则每条同步指令都会把它再拽一次。
+   * keyframeAhead：落点只会在目标之后（PotPlayer）。放宽的容差只管「领先」那一侧 —— 领先的原地停着
+   * 等房间追上（见 _reconcile）；落后超过 KEYFRAME_BEHIND_TOLERANCE 照样重跳（见 _needSeek）。
    */
-  setPlayerCaps({ seekPrecision = 0 } = {}) {
+  setPlayerCaps({ seekPrecision = 0, keyframeAhead = false } = {}) {
     const precision = Number(seekPrecision);
     this.seekTolerance = Math.max(SEEK_TOLERANCE, (Number.isFinite(precision) ? precision : 0) + 0.5);
+    this.keyframeAhead = keyframeAhead === true;
+    // 换了播放器：上一个的「停着等房间」作废，新播放器起来后由 resyncToShared 重新落状态
+    this._clearLead();
   }
 
   setMediaInfo({ duration, size }) {
@@ -294,6 +318,7 @@ export class SyncEngine extends Emitter {
     this._replayAt = 0;
     this._eofReplay = null;
     this._lastSeekCmd = null;
+    this._clearLead();
     this._streamCut = false;
     this._dropPendingPause();
     // 跳转提前量是按这一部的网站学的，换一部从头学。跟随方式不动，由上层按新的当前项重新设
@@ -404,7 +429,19 @@ export class SyncEngine extends Emitter {
     // 在线链接自己在等数据时不用再按暂停：mpv 本来就停着在等，而且按了暂停之后 core-idle 恒为真，
     // 就分不清「还在起播」和「已经好了」—— 放开、再卡、再放开，全房跟着一走一停。
     const ownStall = this.localStalled && !this.streaming;
-    return this.intendedPaused || ownStall || this.stalledPeers.size > 0;
+    // 停在房间前面等房间追上（_lead）的这几秒本机播放器也该停着 —— 算进来，它停下的那条 tick 才不会被当成用户按了暂停
+    return this.intendedPaused || ownStall || this.stalledPeers.size > 0 || this._lead !== null;
+  }
+
+  /** 撇开「停着等房间追上」之后该不该停：房间、自己、缓冲要求的。界面上的「已暂停」只看这个。 */
+  _pausedExceptLead() {
+    const lead = this._lead;
+    this._lead = null;
+    try {
+      return this.effectivePaused;
+    } finally {
+      this._lead = lead;
+    }
   }
 
   /**
@@ -439,6 +476,8 @@ export class SyncEngine extends Emitter {
   _syncClock(base) {
     const pos = typeof base === 'number' ? base : this.sharedPositionNow();
     this._clock = { base: pos, at: this.now(), running: this._clockRunning() };
+    // 房间时钟变了，停着等它追上的放行时刻跟着变（用户在播放器里拖进度条广播出去时不经过 _reconcile）
+    this._scheduleLead();
   }
 
   /**
@@ -1203,10 +1242,11 @@ export class SyncEngine extends Emitter {
 
   /**
    * 控制者按暂停/播放时报给全房的位置。手动同步的人报房间的位置：他可能正落后十几秒，
-   * 报自己的会把全房拽回他那里。拖进度条是真的要跳，不走这里。
+   * 报自己的会把全房拽回他那里。停在房间前面等房间追上的（_lead）同理报房间的位置，
+   * 报自己的会把全房往前拽几秒。拖进度条是真的要跳，不走这里。
    */
   _actionPosition(position) {
-    return this._manual() ? this.sharedPositionNow() : position;
+    return this._manual() || this._lead ? this.sharedPositionNow() : position;
   }
 
   _onRemoteStall(msg, fromPeer) {
@@ -1426,17 +1466,26 @@ export class SyncEngine extends Emitter {
   async _reconcile({ seekTo, force = false, reload = false } = {}) {
     if (!this.started) return;
 
-    const targetPaused = this.effectivePaused;
+    // 停着等房间追上的：追上了、或者用户在播放器里自己放起来了，这一次就不再按住它
+    this._checkLead();
+    // 暂停与否按跳转之前的状态定（见 app.js 的 applySeek）；「停着等房间追上」要看跳完落在哪，跳完再并进来
+    const targetPaused = this._pausedExceptLead();
     this._applyBegin();
+    this._reconciling++;
     try {
       if (typeof seekTo === 'number' && this.lastTick) {
         // 按外推后的位置比：只在变化时才推 tick 的播放器（PotPlayer 每 0.5 秒才变一次），
         // 拿最后一条 tick 的原值比，播放中会平白多出几百毫秒的「偏差」。
-        const drift = Math.abs(this.playerPositionNow() - seekTo);
+        const off = this.playerPositionNow() - seekTo;
         // force：这一跳的目的不是对时间，是逼播放器重新读一遍（它停在数据尽头不会自己
         // 去读新落盘的分片）。目标就在当前位置附近，按偏差判断必然被挡掉。
         // reload：跳之前先让播放器丢掉缓存里的旧数据（见 _replayDataEnd）
-        if (force || drift > this.seekTolerance) await this.emit_seek(seekTo, reload ? { dropBuffers: true } : null);
+        if (force || this._needSeek(off)) {
+          const result = await this.emit_seek(seekTo, reload ? { dropBuffers: true } : null);
+          this._leadAfterSeek(result);
+        } else {
+          this._leadInPlace();
+        }
       } else if (typeof seekTo === 'number') {
         // 播放器还没起来（lastTick 为空）。以前这里直接放弃，而 shared.position
         // 之后再没有任何路径会补下发 —— 观众的 mpv 是在收到房间位置之后才启动的，
@@ -1447,13 +1496,117 @@ export class SyncEngine extends Emitter {
         // 同步指令的目标就是房间时钟刚定下的起点，差值是 0。
         this.pendingSeek = seekTo;
         this.pendingSeekOffset = seekTo - this.sharedPositionNow();
+      } else {
+        this._leadInPlace(true);
       }
-      await this.emit_pause(targetPaused);
+      await this.emit_pause(targetPaused || this._lead !== null);
+      // 暂停落下去了：之后再见它在走，就是用户自己按的播放（见 _checkLead）
+      const t = this.lastTick;
+      if (this._lead && t?.paused && t.at >= this._lead.at) this._lead.held = true;
     } finally {
+      this._reconciling--;
       this._applyEnd();
+      this._scheduleLead();
     }
 
     this.emit('state', this.status());
+  }
+
+  /**
+   * 播放器离目标差 off 秒（正数是在前面）要不要跳。一般的播放器差出容差就跳。
+   * 落点只会在目标之后的播放器（keyframeAhead）两边分开算：落后超过 KEYFRAME_BEHIND_TOLERANCE 就跳；
+   * 领先的不超过容差（正停着等房间追上的，不超过定下时的那个领先量）就原地停着等，不跳 ——
+   * 跳一次落点照样在目标之后，白白多停一个关键帧间隔，而且每条同步指令都会再跳一次。
+   */
+  _needSeek(off) {
+    if (!this.keyframeAhead) return Math.abs(off) > this.seekTolerance;
+    if (off < -KEYFRAME_BEHIND_TOLERANCE) return true;
+    const wait = this._lead ? Math.max(this.seekTolerance, this._lead.lead + SEEK_TOLERANCE) : this.seekTolerance;
+    return off > wait;
+  }
+
+  /**
+   * 跳完了：落点在房间前面（PotPlayer 的关键帧补救总落在目标之后）就原地停着，等房间时钟追上落点再放。
+   * 跳转结果里有落点就用它 —— 落地那几条 tick 可能还排在跳转结果后面。
+   */
+  _leadAfterSeek(result) {
+    this._clearLead();
+    if (!this.keyframeAhead || !this.lastTick) return;
+    const landed = result && Number.isFinite(result.position) ? result.position : this.playerPositionNow();
+    this._armLead(landed, LEAD_HOLD_MIN_SECONDS);
+  }
+
+  /**
+   * 没跳，但播放器本来就在房间前面超出容差（游客被拉回原处时补救落在了前面、跳转被判成回声……）：
+   * 同样原地停着等。超出 seekTolerance 太多的不在这里管，那要跳，等下一条带目标的同步指令。
+   * onlyPaused：没有目标的那几次（缓冲变化、核对暂停状态、放行定时器）只接住停着的 ——
+   * 它在走的话多半是用户刚在播放器里自己按了播放（见 _checkLead），别又去按住它。
+   */
+  _leadInPlace(onlyPaused = false) {
+    if (!this.keyframeAhead || this._lead || !this.lastTick) return;
+    if (onlyPaused && !this.lastTick.paused) return;
+    const position = this.playerPositionNow();
+    if (position - this.sharedPositionNow() <= this.seekTolerance) this._armLead(position, SEEK_TOLERANCE);
+  }
+
+  _armLead(position, min) {
+    if (!Number.isFinite(position) || this.streaming) return;
+    const lead = position - this.sharedPositionNow();
+    if (lead > min) this._lead = { position, lead, at: this.now(), held: false };
+  }
+
+  /** 播放器还领先房间多少秒。落地之后的 tick 还没到（IPC 排在跳转结果后面）时按落点算。 */
+  _leadAhead() {
+    const t = this.lastTick;
+    const position = t && t.at >= this._lead.at ? this.playerPositionNow() : this._lead.position;
+    return (Number.isFinite(position) ? position : 0) - this.sharedPositionNow();
+  }
+
+  /**
+   * 停着等房间追上的这一段该不该结束：房间追到落点了、播放器没了 / 换了，
+   * 或者已经停下过的播放器又走起来了 —— 那是用户在播放器里自己按了播放，不再拦他。
+   */
+  _checkLead() {
+    const lead = this._lead;
+    if (!lead) return;
+    const t = this.lastTick;
+    if (!t || !this.keyframeAhead || this.streaming) {
+      this._clearLead();
+      return;
+    }
+    if (t.at >= lead.at) {
+      if (t.paused) lead.held = true;
+      else if (lead.held) {
+        this._clearLead();
+        return;
+      }
+    }
+    if (this._leadAhead() <= LEAD_HOLD_END_SECONDS) this._clearLead();
+  }
+
+  /**
+   * 停着等房间追上时排一个放行的定时器：房间走到落点时重新落一次状态（_reconcile 开头的 _checkLead 放行）。
+   * 房间停着（暂停、有人卡着）不排 —— 它一动起来必然经过 _syncClock，那时再排。
+   */
+  _scheduleLead() {
+    if (this._leadTimer) clearTimeout(this._leadTimer);
+    this._leadTimer = null;
+    if (!this._lead || !this._clockRunning()) return;
+    const wait = Math.max(0, this._leadAhead() - LEAD_HOLD_END_SECONDS);
+    this._leadTimer = setTimeout(() => this._onLeadTimer(), wait * 1000);
+  }
+
+  _onLeadTimer() {
+    this._leadTimer = null;
+    // 正在落一次状态（多半是一次跳转）：它收尾时会自己重排
+    if (this._reconciling > 0 || !this._lead) return;
+    this._reconcile();
+  }
+
+  _clearLead() {
+    this._lead = null;
+    if (this._leadTimer) clearTimeout(this._leadTimer);
+    this._leadTimer = null;
   }
 
   _applyBegin() {
@@ -1512,6 +1665,7 @@ export class SyncEngine extends Emitter {
     this._streamCut = false;
     // 播放器没了，刚才那下没确认的暂停分不清是不是本人按的：撤回，本机随房间走
     this._dropPendingPause({ restore: true });
+    this._clearLead();
   }
 
   /**
@@ -1530,9 +1684,11 @@ export class SyncEngine extends Emitter {
   }
 
   // opts.dropBuffers：先丢掉播放器缓存里的旧数据再跳（只在数据尽头的重放里带，只有 mpv 认）
+  // 返回播放器报的跳转结果（外部播放器带落点 position），拿不到就是 undefined
   async emit_seek(position, opts = null) {
     this._lastSeekCmd = { position, at: this.now() };
-    if (this.onSeek) await (opts ? this.onSeek(position, opts) : this.onSeek(position));
+    if (this.onSeek) return opts ? this.onSeek(position, opts) : this.onSeek(position);
+    return undefined;
   }
 
   /* ---------------------------- 对外接口 ---------------------------- */
@@ -1856,7 +2012,8 @@ export class SyncEngine extends Emitter {
     const waiting = [...this.stalledPeers.values()].map((v) => v.name);
     if (this.localStalled) waiting.unshift('你'); // 由 app.js 的 t() 统一翻译
     return {
-      paused: this.effectivePaused,
+      // 停在房间前面等房间追上（_lead）不算「已暂停」：房间在播，本机只是晚几秒接着放
+      paused: this._pausedExceptLead(),
       intendedPaused: this.intendedPaused,
       position: this.playerPositionNow() ?? this.sharedPositionNow(),
       duration: this.duration,

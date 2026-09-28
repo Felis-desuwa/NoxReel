@@ -36,6 +36,7 @@ const {
 } = require('../src/main/players/discover');
 const { POT, POT_CMD_NEXT_KEYFRAME, POT_STATE, PotAdapter, buildPotArgs, formatSeek } = require('../src/main/players/potAdapter');
 const { MPC, MPC_OSD_MAX, MPC_PLAYSTATE, MpcAdapter, buildMpcArgs, titleShows } = require('../src/main/players/mpcAdapter');
+const { IMPLS } = require('./helpers/impls');
 
 const BS = String.fromCharCode(92); // 反斜杠：仓库里的字面反斜杠被工具多转义过不止一次
 const LOCAL_FILE = `C:${BS}movies${BS}a.mp4`;
@@ -183,29 +184,104 @@ class FakePotBridge extends EventEmitter {
         }
         return payload.calls.map(([code, value]) => {
           if (sim.denied) return { err: 5 };
-          switch (code) {
-            case POT.GET_STATE:
-              return { v: sim.state };
-            case POT.GET_POSITION:
-              return { v: sim.positionMs };
-            case POT.GET_DURATION:
-              return { v: sim.durationMs };
-            case POT.SET_STATE:
-              if (value === POT_STATE.PAUSED && sim.ignorePauses > 0) sim.ignorePauses -= 1;
-              else sim.state = value;
-              return { v: 1 };
-            case POT.SET_POSITION:
-              sim.positionMs = keyframeBefore(value);
-              return { v: 1 };
-            case POT.SEND_COMMAND:
-              if (value === POT_CMD_NEXT_KEYFRAME) sim.positionMs = keyframeBefore(sim.positionMs) + GOP_MS;
-              return { v: 1 };
-            default:
-              return { v: 0 };
-          }
+          return { v: this.potValue(code, value) };
         });
       default:
         return true;
+    }
+  }
+
+  /** 一条 WM_USER 指令的效果和回值。LivePotBridge 换成会自己往前走的版本。 */
+  potValue(code, value) {
+    const sim = this.sim;
+    switch (code) {
+      case POT.GET_STATE:
+        return sim.state;
+      case POT.GET_POSITION:
+        return sim.positionMs;
+      case POT.GET_DURATION:
+        return sim.durationMs;
+      case POT.SET_STATE:
+        if (value === POT_STATE.PAUSED && sim.ignorePauses > 0) sim.ignorePauses -= 1;
+        else sim.state = value;
+        return 1;
+      case POT.SET_POSITION:
+        sim.positionMs = keyframeBefore(value);
+        return 1;
+      case POT.SEND_COMMAND:
+        if (value === POT_CMD_NEXT_KEYFRAME) sim.positionMs = keyframeBefore(sim.positionMs) + GOP_MS;
+        return 1;
+      default:
+        return 0;
+    }
+  }
+}
+
+const nowMs = () => Number(process.hrtime.bigint()) / 1e6;
+
+/**
+ * 会自己往前走的 PotPlayer，照 P0 和 R5-A 的实测来：
+ *  - 播放中位置按真实时间走，但 GET_POSITION 每 stepMs（500ms）才变一次；
+ *  - SET_POSITION 落到目标之前的关键帧（关键帧从 offsetMs 起、每 gopMs 一个）；
+ *  - 「下一个关键帧」（0x5010 / 0x0327）不是紧挨着的那一个：往后推 jumpMs 再落到之后的关键帧 ——
+ *    2 秒 GOP 的片跳到 1:00 停在 64.08、跳到 0:31 停在约 36 秒，就是这么来的；
+ *  - busyAfterSeek：跳转之后这么多轮不处理窗口消息（大文件跳转常这样），settle 因此拖长。
+ * 测试里的时长都缩小了（关键帧间隔 1 秒、多跳 1.5 秒），免得一条测试要等好几秒。
+ */
+class LivePotBridge extends FakePotBridge {
+  constructor(sim = {}) {
+    super({ state: POT_STATE.PAUSED, gopMs: 1000, offsetMs: 80, jumpMs: 1500, stepMs: 500, busyAfterSeek: 0, ...sim });
+    this.base = this.sim.positionMs;
+    this.since = nowMs();
+  }
+
+  /** 播放器此刻真正播到哪（毫秒）。 */
+  actualMs() {
+    const moved = this.sim.state === POT_STATE.PLAYING ? nowMs() - this.since : 0;
+    return Math.min(this.base + moved, this.sim.durationMs);
+  }
+
+  /** 状态或位置要变了：把走过的那段并进起点。 */
+  fold() {
+    this.base = this.actualMs();
+    this.since = nowMs();
+  }
+
+  jumpTo(ms) {
+    this.base = ms;
+    this.since = nowMs();
+  }
+
+  keyframeAtOrBefore(ms) {
+    const { gopMs, offsetMs } = this.sim;
+    return Math.max(0, Math.floor((ms - offsetMs) / gopMs) * gopMs + offsetMs);
+  }
+
+  keyframeAtOrAfter(ms) {
+    const { gopMs, offsetMs } = this.sim;
+    return Math.ceil((ms - offsetMs) / gopMs) * gopMs + offsetMs;
+  }
+
+  potValue(code, value) {
+    const sim = this.sim;
+    switch (code) {
+      case POT.GET_POSITION: {
+        if (sim.state !== POT_STATE.PLAYING) return Math.round(this.base);
+        const steps = Math.floor((nowMs() - this.since) / sim.stepMs);
+        return Math.round(Math.min(this.base + steps * sim.stepMs, sim.durationMs));
+      }
+      case POT.SET_STATE:
+        this.fold();
+        return super.potValue(code, value);
+      case POT.SET_POSITION:
+        this.jumpTo(this.keyframeAtOrBefore(value));
+        sim.deaf = sim.busyAfterSeek;
+        return 1;
+      case POT.SEND_COMMAND:
+        if (value === POT_CMD_NEXT_KEYFRAME) this.jumpTo(this.keyframeAtOrAfter(this.actualMs() + sim.jumpMs));
+        return 1;
+      default:
+        return super.potValue(code, value);
     }
   }
 }
@@ -222,8 +298,8 @@ const potTiming = {
   quitTimeoutMs: 500,
 };
 
-async function launchPot(sim = {}, options = {}) {
-  const bridge = new FakePotBridge(sim);
+async function launchPot(sim = {}, options = {}, Bridge = FakePotBridge) {
+  const bridge = new Bridge(sim);
   const proc = fakeChild();
   const spawns = [];
   const adapter = new PotAdapter({
@@ -349,6 +425,8 @@ const mpcTiming = {
   pauseTimeoutMs: 300,
   seekTimeoutMs: 800,
   seekSettleMs: 30,
+  // 确认还是这一部之后等突变消停（默认 300ms）
+  holdQuietMs: 30,
   launchTimeoutMs: 2000,
   connectTimeoutMs: 600,
   quitTimeoutMs: 500,
@@ -889,6 +967,97 @@ test('PotPlayer 判死之后往回跳：不能拿判死前的旧位置当落点'
   await adapter.quit();
 });
 
+/* ---------------- PotPlayer 跳转对齐（R5-A）：用会自己往前走的假 PotPlayer ---------------- */
+
+test('PotPlayer 跳转：落点比目标早不到 0.75 秒不补救，早了才补救，结果里带落点', async () => {
+  const { adapter, bridge } = await launchPot({ positionMs: 0 }, {}, LivePotBridge);
+  bridge.calls.length = 0;
+  // 落到 9.08，只早 0.42 秒：补救那一下会越过目标一秒半，还得停着等，不划算
+  const near = await adapter.seek(9.5);
+  assert.equal(bridge.potCalls(POT.SEND_COMMAND).length, 0);
+  assert.equal(near.keyframe, false);
+  assert.ok(Math.abs(near.position - 9.08) < 0.01, `落点 ${near.position}`);
+
+  // 落到 12.08，早 0.82 秒：补救，落点在目标之后，原地停住，同步引擎按结果里的落点算要等几秒
+  const far = await adapter.seek(12.9);
+  assert.equal(far.keyframe, true);
+  assert.equal(far.paused, true);
+  assert.ok(Math.abs(far.position - 14.08) < 0.01, `落点 ${far.position}`);
+  await adapter.quit();
+});
+
+test('PotPlayer 播放中跳转：落点要和「目标按时间往后推」比，settle 期间自己走的那截不算落得够靠前', async () => {
+  // 位置 50ms 一变，跳完忙 20 轮不理窗口消息：这期间照样在播，读数一直往前走
+  const { adapter } = await launchPot({ positionMs: 0, stepMs: 50, busyAfterSeek: 20 }, {}, LivePotBridge);
+  adapter.timing.unreachableMs = 5000; // 忙的那几轮别被判成失联
+  await adapter.setPause(false);
+  // 落到 9.08，比房间（跳转发出后照样在走）一直落后 0.82 秒。
+  // 只拿读数和原目标 9.9 比的话，忙完时读数已经走到 9.2–9.4，看着只早了半秒多，就不补救了
+  const result = await adapter.seek(9.9);
+  assert.equal(result.keyframe, true, '落后房间 0.82 秒却没补救');
+  await adapter.quit();
+});
+
+test('PotPlayer 从暂停放起来的那一刻重记锚点：外推不会凭空领先', async () => {
+  const { adapter } = await launchPot({ positionMs: 20000 }, { startAt: 20 }, LivePotBridge);
+  // 暂停了好一阵：锚点还是暂停之前的那一刻
+  adapter._anchor.at -= 5000;
+  await adapter.setPause(false);
+  const p = adapter.position();
+  // 位置每 500ms 才变一次，这时读数还是 20.00。旧的锚点一外推就顶到上限 20.75 ——
+  // 同步引擎刚放行、正拿它和房间比，会以为又领先了 0.75 秒
+  assert.ok(p - 20 < 0.3, `刚放起来就外推到 ${p.toFixed(2)}`);
+  await adapter.quit();
+});
+
+for (const { name, dir } of IMPLS) {
+  test(`${name}：PotPlayer 跳转落在房间前面，停着等房间追上，之后和房间对齐（R5-A）`, async () => {
+    const { SyncEngine } = await import(dir + 'syncEngine.js');
+    const { adapter } = await launchPot({ positionMs: 0 }, {}, LivePotBridge);
+    const eng = new SyncEngine({ peerId: 'me', name: 'me', isSeeder: true, hostId: 'host' });
+    const out = [];
+    eng.on('outbound', (m) => out.push(m));
+    // 和 app.js 同样的接法：跳转结果（带落点）原样交回引擎，tick 一条不落地送进去
+    eng.onSeek = (p) => adapter.seek(p);
+    eng.onSetPause = (p) => adapter.setPause(p);
+    adapter.on('tick', (snap) => eng.onMpvTick(snap, { contiguousBytes: 0, complete: true }));
+    eng.setPlayerCaps(adapter.caps);
+    eng.applyRoles([['me', 'admin']], 'host');
+    eng.start();
+    const sync = (paused, position, lamport) =>
+      eng.onCtrl({ t: 'sync', paused, position, lamport, seq: 0 }, { peerId: 'host', name: '房主' });
+    const diff = () => adapter.position() - eng.sharedPositionNow();
+    try {
+      // 暂停中房主跳到 0:10：落到 9.08，补救推到 11.08（实测 1:00 → 64.08 的缩小版）
+      sync(true, 10, 5);
+      await until(() => eng._lead);
+      assert.ok(Math.abs(adapter.position() - 11.08) < 0.05, `落点 ${adapter.position()}`);
+      // 房主按播放：本机停在 11.08，等房间走过去
+      sync(false, 10, 6);
+      await sleep(400);
+      assert.equal(adapter.snapshot().paused, true, '房间还没追上落点，本机该停着');
+      await until(() => !adapter.snapshot().paused, { timeout: 3000 });
+      await sleep(600);
+      assert.ok(Math.abs(diff()) < 0.3, `放起来之后差 ${diff().toFixed(2)} 秒（以前一直领先一秒多）`);
+
+      // 播放中房主跳到 0:30：落到 29.08，补救推到 31.08，同样停着等
+      sync(false, 30, 7);
+      await until(() => eng._lead);
+      await until(() => !eng._lead && !adapter.snapshot().paused, { timeout: 3000 });
+      await sleep(600);
+      assert.ok(Math.abs(diff()) < 0.3, `播放中跳转之后差 ${diff().toFixed(2)} 秒`);
+      assert.deepEqual(
+        out.filter((m) => m.t === 'sync'),
+        [],
+        '停着等房间、补救那一下都不是用户操作，不许广播给全房'
+      );
+    } finally {
+      eng._clearLead();
+      await adapter.quit();
+    }
+  });
+}
+
 test('外部播放器不画弹幕帧，但横幅和 OSD 都要有', async () => {
   const { adapter, bridge } = await launchPot();
   assert.equal(typeof adapter.setDanmakuFrame, 'undefined', '弹幕由覆盖窗画，适配器不能假装能画');
@@ -1187,6 +1356,39 @@ test('MPC-BE 里用户自己暂停、拖进度条：问一句 NOWPLAYING，还�
   bridge.push(MPC.NOTIFYSEEK, 100);
   const seeked = await until(() => ticks.find((t) => Math.abs(t.position - 100) < 0.5));
   assert.equal(seeked.cause, 'user');
+  assert.deepEqual(errors, []);
+  await adapter.quit();
+});
+
+/**
+ * 实测 R5-B：从外部给 MPC-BE 发 CMD_SETPOSITION（拖进度条同理），它是「先暂停、再跳、再恢复」，
+ * 三条推送之间 NOWPLAYING 的回话插了进来，房主那边收到「暂停 @ 1:11 → 暂停 @ 1:40 → 播放 @ 1:40」，
+ * 全房跟着停了一下。
+ */
+test('MPC-BE 里拖进度条（暂停、跳、恢复三连推送）只报一条：在播、位置变了，不先报一次暂停', async () => {
+  const { adapter, bridge, ticks, errors } = await launchMpc({}, {}, { holdQuietMs: 80, holdAskMs: 40 });
+  bridge.sim.position = 11;
+  await adapter.setPause(false);
+  await sleep(30);
+  ticks.length = 0;
+
+  bridge.sim.playState = MPC_PLAYSTATE.PAUSE;
+  bridge.push(MPC.PLAYMODE, MPC_PLAYSTATE.PAUSE);
+  await sleep(15); // NOWPLAYING 的回话赶在后两条前面到了
+  bridge.sim.position = 100;
+  bridge.push(MPC.NOTIFYSEEK, 100);
+  await sleep(15);
+  bridge.sim.playState = MPC_PLAYSTATE.PLAY;
+  bridge.push(MPC.PLAYMODE, MPC_PLAYSTATE.PLAY);
+
+  const seeked = await until(() => ticks.find((t) => Math.abs(t.position - 100) < 0.5), { timeout: 2000 });
+  assert.equal(seeked.paused, false);
+  assert.equal(seeked.cause, 'user', '这是用户在它窗口里的跳转，照常报上去');
+  assert.deepEqual(
+    ticks.filter((t) => t.paused).map((t) => t.position),
+    [],
+    '一次拖动先报了一条暂停，全房跟着停一下'
+  );
   assert.deepEqual(errors, []);
   await adapter.quit();
 });
