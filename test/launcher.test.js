@@ -27,11 +27,11 @@ test('源码目录只提供带图标的 EXE 启动入口，不再保留 BAT', ()
   }
 });
 
-test('启动器构建脚本嵌入 NoxReel 图标和 0.7.7.101 版本信息', () => {
+test('启动器构建脚本嵌入 NoxReel 图标和 0.7.8 版本信息', () => {
   const source = fs.readFileSync(path.join(root, 'src/launcher/NoxReelLauncher.cs'), 'utf8');
   const build = fs.readFileSync(path.join(root, 'scripts/build-launcher.ps1'), 'utf8');
-  assert.match(source, /AssemblyVersion\("0\.7\.7\.101"\)/);
-  assert.match(source, /AssemblyFileVersion\("0\.7\.7\.101"\)/);
+  assert.match(source, /AssemblyVersion\("0\.7\.8\.0"\)/);
+  assert.match(source, /AssemblyFileVersion\("0\.7\.8\.0"\)/);
   assert.match(source, /WindowsPowerShell/);
   assert.match(source, /--self-test/);
   assert.match(build, /noxreel-icon\.ico/);
@@ -46,7 +46,7 @@ test('启动器构建脚本嵌入 NoxReel 图标和 0.7.7.101 版本信息', () 
  */
 test('package.json、启动器与安卓的版本号一致', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
-  // version 只能是三段（electron-builder 按 semver 校验）；构建号另记在 buildNumber，拼成 0.7.7.101
+  // version 只能是三段（electron-builder 按 semver 校验）；构建号另记在 buildNumber，拼成 0.7.7.101 这样的四段（0.7.8 没有构建号）
   assert.match(pkg.version, /^\d+\.\d+\.\d+$/, 'package.json 的 version 写成四段的话打包直接报 Invalid version');
   const { displayVersion } = require('../src/main/appVersion');
   const version = displayVersion(pkg.version, pkg.buildNumber);

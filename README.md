@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析；一整晚的片单、飘过画面的弹幕和你自己惯用的播放器都在里面。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.7.101-7C5CFF?style=for-the-badge" alt="Version 0.7.7.101">
+    <img src="https://img.shields.io/badge/version-0.7.8-7C5CFF?style=for-the-badge" alt="Version 0.7.8">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -61,9 +61,12 @@
 - **缓存怎么清由你定**（设置 → 缓存清理）：默认「自动」—— 收到的片放在缓存里，换片、退房都不删，这次运行里再放同一部直接用，关软件时清掉；改成「手动」则放进长期缓存文件夹（跟着缓存位置走，默认在本机应用数据目录，不会被系统的磁盘清理删掉），从不自动删，以后再放同一部直接用（逐片核对哈希，对不上的片照常重新接收）。设置里能列出缓存的片子勾选删除。异常残留会在下次启动时回收。
 - **在线视频手动缓存**：播放列表里在线视频的「…」菜单有「开始手动缓存」，可以同时缓存好几部；经本机过滤代理下进缓存（跟着上面的清理方式走），下次轮到这一部时从本地播。
 - **边下边播**（设置里，默认关）：边看边另存一份到下载位置（默认「视频NoxReel」，可以换）。只存你放到的片：P2P 的片收完并通过扫描后存（可信房间没扫出威胁就存），在线视频在后台另下一份，缓存过的直接复制。存下来的是你自己的文件，缓存清理不碰；它不改变什么时候开始播。
-- **双模式安全门槛**：可信房间为默认，收完就播（不等扫描）；在设置里打开「边下边播」后，约 8 MB 片头就绪就边收边播；两种情况完整后都补做扫描。也可切换安全模式，完整接收并通过 Microsoft Defender 扫描后才播放。
+- **双模式安全门槛**：可信房间为默认，片头约 8 MB 到了、并且连续数据够放十几秒就边收边播，收完后仍补做扫描；也可切换安全模式，完整接收并通过 Microsoft Defender 扫描后才播放。
 - **模式握手**：邀请码和 P2P 数据通道都会核对协议版本和房间模式；任一项不一致会在媒体清单、控制消息和视频数据传输前断开。
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
+
+> [!NOTE]
+> `v0.7.8` 是一次大修：逐条审查加三轮真机实测，修掉了**一百四十多处**问题，最严重的一处是可信房间从片头边收边播时，成员的播放器会误以为片子已经放完。新功能有**缓存清理方式**（自动 / 手动；手动的放进长期缓存文件夹，下次放同一部直接复用）、在线视频**手动缓存**、**边下边播**（边看边另存一份到下载位置）、进房后**改昵称**。连接更稳：房间链接和信令服务器断线后自己恢复；信令服务器重启后，房间按原来的房主和人数上限恢复（服务器和客户端都要是新版）。设置弹窗统一成「点保存才生效」。**协议版本没变，和 0.7.x 互通**。
 
 > [!NOTE]
 > `v0.7.7.101` 让房间里的每个人都能看到**别人用什么设备加入的**。电脑端成员表每一行（包括你自己）都标着 Windows、macOS、Linux 或 Android；手机端点顶栏的「N 人在线」打开成员面板，能看到每个人的设备和角色。老版本的电脑端只显示成「电脑」。**P2P 协议没变，和 0.7.x 互通**。
@@ -96,8 +99,8 @@
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.7.101.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.7.101.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.7.101.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.7.101.exe) |
+| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.8.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.8.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.8.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.8.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
