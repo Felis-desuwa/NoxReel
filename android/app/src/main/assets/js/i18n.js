@@ -286,6 +286,8 @@ const EN = new Map(Object.entries({
     'No network candidates were gathered at all—usually the network is fully isolated, or a firewall is blocking NoxReel.',
   'STUN 服务器没能告诉本机公网地址，只有局域网候选。除非双方在同一个局域网，否则连不上；请在设置里换一台 STUN 服务器，或检查防火墙有没有放行 UDP。':
     'The STUN server never reported this device’s public address, so only local candidates exist. Unless both sides are on the same LAN this cannot connect; check that the network allows UDP.',
+  '之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。':
+    'It was working before, so the other side has most likely lost their network or closed NoxReel. Waiting for them to come back.',
   'Turn Token ID 和 API Token 都要填。': 'Enter both the Turn Token ID and the API Token.',
   '正在向 Cloudflare 验证…': 'Verifying with Cloudflare…',
   '已保存': 'Saved',
@@ -495,6 +497,11 @@ const PATTERNS = [
   [/^和房主差了 ([\d.]+) 秒，自动对齐$/, '$1 seconds off from the host; realigned automatically'],
   [/^信令断开，(\d+) 秒后重连（已建立的直连不受影响）$/, 'Signaling disconnected. Reconnecting in $1 seconds.'],
   [/^和 (.+) 的连接迟迟没建起来，重新协商$/, 'The connection to $1 is taking too long to come up; negotiating again'],
+  [
+    /^和 (.+) 的直连失败了（双方都在严格 NAT 后面时会这样，需要 TURN 中继兜底）$/,
+    'Direct connection to $1 failed (this happens when both sides are behind strict NAT; a TURN relay is needed as a fallback)',
+  ],
+  [/^和 (.+) 的直连失败了。(.*)$/, (_all, name, advice) => `Direct connection to ${name} failed. ${translate(advice, 'en')}`],
   [/^信令错误：(.*)$/, (_all, detail) => `Signaling error: ${translate(detail, 'en')}`]
 ];
 

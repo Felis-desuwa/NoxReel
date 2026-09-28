@@ -1892,6 +1892,8 @@ function wirePeer(peer, sig) {
     clearTimeout(graceTimer);
     graceTimer = null;
   };
+  // 这条连接通过没有（ICE 连上过、或数据通道打开过）：通过的之后再失败，不是 NAT 的问题（和电脑端一样）
+  let linkedOnce = false;
 
   // 握手兜底（和电脑端一样）：offer 或 answer 丢了，这条连接就停在半路。到时还没打开数据通道
   // 就按失败处理、接着退避；应答的一方多等一会儿，让发起方先重发 offer
@@ -1908,6 +1910,7 @@ function wirePeer(peer, sig) {
   peer.on('close', () => clearTimeout(handshakeTimer));
 
   peer.on('open', () => {
+    linkedOnce = true;
     clearTimeout(handshakeTimer);
     clearGrace();
     cancelRecovery(peer.peerId);
@@ -1915,6 +1918,7 @@ function wirePeer(peer, sig) {
   });
   peer.on('statechange', (s) => {
     if (s === 'connected' || s === 'completed') {
+      linkedOnce = true;
       clearGrace();
       cancelRecovery(peer.peerId); // ICE 自己缓过来了，撤掉排着的重连
       return;
@@ -1929,7 +1933,8 @@ function wirePeer(peer, sig) {
     }
     if (s === 'failed') {
       clearGrace();
-      log(`和 ${peer.name} 的直连失败了（双方都在严格 NAT 后面时会这样，需要 TURN 中继兜底）`, 'bad');
+      if (linkedOnce) log(`和 ${peer.name} 的直连失败了。之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。`, 'warn');
+      else log(`和 ${peer.name} 的直连失败了（双方都在严格 NAT 后面时会这样，需要 TURN 中继兜底）`, 'bad');
       if (sig) scheduleReconnect(peer, sig);
     }
   });

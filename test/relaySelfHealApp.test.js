@@ -260,7 +260,64 @@ for (const label of Object.keys(SOURCES)) {
     r.clock.advance(120_000);
     assert.deepEqual(r.rebuilds, []);
   });
+
+  // G2（R2-B）：对方整个断网时，应答方这边 connectionState 走到 failed。那条连接之前是通的，
+  // 拿本机候选下结论（「STUN 没告诉本机公网地址……请换 STUN」）只会把人往错的方向支
+  test(`${label}：连通过的直连失败了：说对方可能断网或关掉了，不给 STUN / NAT 诊断；从没连通过的照旧诊断`, async () => {
+    const r = wireBox(label);
+    const sig = fakeSig();
+    const failLog = (name) => r.logs.filter(([t]) => t.startsWith(`和 ${name} 的直连失败了`));
+
+    const opened = r.peerOf('m1', false);
+    r.ctx.wirePeer(opened, sig);
+    opened.ctrl.readyState = 'open';
+    await opened.emit('open');
+    await opened.emit('statechange', 'failed');
+    assert.deepEqual(failLog('m1'), [['和 m1 的直连失败了。之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。', 'warn']]);
+
+    // ICE 连上过、数据通道还没来得及开的也算连通过
+    const iced = r.peerOf('m2', true);
+    r.ctx.wirePeer(iced, sig);
+    await iced.emit('statechange', 'connected');
+    await iced.emit('statechange', 'disconnected');
+    await iced.emit('statechange', 'failed');
+    assert.equal(failLog('m2').length, 1);
+    assert.match(failLog('m2')[0][0], /之前是连通的/);
+
+    const never = r.peerOf('m3', true);
+    r.ctx.wirePeer(never, sig);
+    await never.emit('statechange', 'failed');
+    assert.equal(failLog('m3').length, 1);
+    assert.doesNotMatch(failLog('m3')[0][0], /之前是连通的/);
+    assert.equal(failLog('m3')[0][1], 'bad');
+    if (label === '桌面端') assert.equal(failLog('m3')[0][0], '和 m3 的直连失败了。（诊断）');
+    else assert.match(failLog('m3')[0][0], /严格 NAT/);
+    // 两种失败都照常排上重连
+    r.clock.advance(1500);
+    assert.deepEqual(r.rebuilds.sort(), ['m2', 'm3']);
+    assert.deepEqual(plain(sig.signals), [['m1', { kind: 'renegotiate' }]]);
+  });
 }
+
+test('连通过的直连失败了：两端的英文都有，昵称原样保留', async () => {
+  const cjk = /[㐀-鿿]/;
+  const line = '和 张三 的直连失败了。之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。';
+  for (const file of ['src/renderer/lib/i18n.js', 'android/app/src/main/assets/js/i18n.js']) {
+    const { translate } = await import(pathToFileURL(path.join(root, file)).href);
+    const en = translate(line, 'en');
+    assert.equal(
+      en,
+      'Direct connection to 张三 failed. It was working before, so the other side has most likely lost their network or closed NoxReel. Waiting for them to come back.',
+      file
+    );
+    assert.equal(translate(line, 'zh-CN'), line);
+  }
+  // 安卓端从没连通过的那句以前就没有英文，顺手补上
+  const android = await import(pathToFileURL(path.join(root, 'android/app/src/main/assets/js/i18n.js')).href);
+  const nat = android.translate('和 Bob 的直连失败了（双方都在严格 NAT 后面时会这样，需要 TURN 中继兜底）', 'en');
+  assert.doesNotMatch(nat, cjk);
+  assert.match(nat, /^Direct connection to Bob failed \(/);
+});
 
 /* ------------------------- offer 标记与 reconnected（桌面端） ------------------------- */
 

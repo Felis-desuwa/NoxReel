@@ -4319,6 +4319,8 @@ function wirePeer(peer, sig) {
     clearTimeout(graceTimer);
     graceTimer = null;
   };
+  // 这条连接通过没有（ICE 连上过、或数据通道打开过）：通过的说明网络这条路走得通，之后再失败不是 STUN / NAT 的问题
+  let linkedOnce = false;
 
   // 握手兜底：offer 或 answer 在中继上丢了，这条连接就停在半路（没有远端描述，ICE 永远是 new），
   // 既不会 connected 也不会 failed。到时还没打开数据通道就按失败处理，接着退避重连。
@@ -4335,6 +4337,7 @@ function wirePeer(peer, sig) {
     : null;
 
   peer.on('open', () => {
+    linkedOnce = true;
     clearTimeout(handshakeTimer);
     clearGrace();
     cancelRecovery(peer.peerId); // 连上了，退避计数归零
@@ -4342,6 +4345,7 @@ function wirePeer(peer, sig) {
   });
   peer.on('statechange', (s) => {
     if (s === 'connected' || s === 'completed') {
+      linkedOnce = true;
       clearGrace();
       // ICE 自己缓过来了，把已经排上的重连撤掉。
       // cancelRecovery 原来只在 'open'（数据通道首次打开）和 peer-leave 时调，
@@ -4360,8 +4364,14 @@ function wirePeer(peer, sig) {
     }
     if (s === 'failed') {
       clearGrace();
-      const advice = connectionAdvice(peer);
-      log(`和 ${peer.name} 的直连失败了。${advice.text}`, advice.level === 'ok' ? 'warn' : 'bad');
+      if (linkedOnce) {
+        // 连通过又失败了（对方整个断网时应答方这边就是这样）：再拿本机候选下结论，
+        // 「STUN 没告诉本机公网地址」之类只会把人往错的方向支
+        log(`和 ${peer.name} 的直连失败了。之前是连通的，多半是对方断网或关掉了 NoxReel，正在等他回来。`, 'warn');
+      } else {
+        const advice = connectionAdvice(peer);
+        log(`和 ${peer.name} 的直连失败了。${advice.text}`, advice.level === 'ok' ? 'warn' : 'bad');
+      }
       if (sig) scheduleReconnect(peer, sig);
     }
   });

@@ -414,10 +414,14 @@ for (const { name, dir } of IMPLS) {
     assert.deepEqual(r.events(again, 'error'), []);
   });
 
-  test(`${name}：成员断网期间别人发给他的 offer：恢复时不理 limit 的中继在 EOSE 之前回放，不交给 app；恢复后实时发来的照常收`, async (t) => {
+  // G2（R2-A）：EOSE 之前回放的只丢真正旧的 —— 发送时刻（签名覆盖的 ts）比这次订阅早 replaySlack 以上的；
+  // 订阅前后脚刚发出的照收，那是 bucket.coracle.social 这类中继把几十毫秒前的 offer 当存货送来
+  test(`${name}：成员断网期间别人发给他的 offer：恢复时不理 limit 的中继在 EOSE 之前回放；比订阅早 replaySlack 以上的不交给 app，刚发的照收；恢复后实时发来的照常收`, async (t) => {
     const net = new FakeNet();
     for (const url of RELAYS) net.replay.set(url, 'always');
-    const r = await room(t, dir, { grace: 5000, net });
+    // 断网期间中继重连的退避（最多 80 毫秒）加上高负载时定时器的拖延，都要落在 replaySlack 里
+    const replaySlack = 1000;
+    const r = await room(t, dir, { grace: 5000, net, timing: { replaySlack } });
     const a = r.guest('a');
     await a.connect();
     r.linked.add('a');
@@ -425,16 +429,105 @@ for (const { name, dir } of IMPLS) {
     r.net.cut('a');
     await until(() => a.connected === false, 'a 发现中继全断');
     r.host.signal('a', { kind: 'offer', sdp: { type: 'offer', sdp: 'v=0 old' } });
-    await sleep(30);
+    await sleep(replaySlack + 300);
+    r.host.signal('a', { kind: 'offer', sdp: { type: 'offer', sdp: 'v=0 recent' } });
+    await sleep(10);
     r.net.restore('a');
     await until(() => r.events(a, 'reconnected').length === 1, 'a 恢复');
-    await until(() => r.net.replayed.some((x) => x.owner === 'a'), '中继向 a 回放了');
+    await until(() => r.net.replayed.filter((x) => x.owner === 'a').length >= 2, '中继向 a 回放了');
+    await until(() => r.events(a, 'signal').length > 0, '刚发出的 offer 被当成回放丢了');
     await sleep(60);
-    assert.deepEqual(r.events(a, 'signal'), [], '回放的旧 offer 交给了 app：它会拆掉正在重建的连接');
+    assert.deepEqual(
+      r.events(a, 'signal').map((s) => s.payload.sdp.sdp),
+      ['v=0 recent'],
+      '回放的旧 offer 交给了 app：它会拆掉正在重建的连接'
+    );
+    assert.ok([...a._sockets.values()].every((s) => !s.held), 'EOSE 到了，扣着的旧事件还留着');
     r.host.signal('a', { kind: 'offer', sdp: { type: 'offer', sdp: 'v=0 new' } });
-    await until(() => r.events(a, 'signal').length > 0, 'a 收到恢复之后的 offer');
+    await until(() => r.events(a, 'signal').length > 1, 'a 收到恢复之后的 offer');
     await sleep(30);
-    assert.deepEqual(r.events(a, 'signal').map((s) => s.payload.sdp.sdp), ['v=0 new']);
+    assert.deepEqual(r.events(a, 'signal').map((s) => s.payload.sdp.sdp), ['v=0 recent', 'v=0 new']);
+  });
+
+  // R2-A 实测：新人最先连上、用来发 hello 的中继几乎总是 nostr-relay.corb.net，它带 limit:0 从不回 EOSE。
+  // 以前订阅后 eoseWait（3 秒）里经它来的 offer 全被当成「EOSE 之前」丢掉，别的中继又恰好订阅晚了，
+  // 就只能等 30 秒握手超时重来
+  test(`${name}：新人最先连上的中继带 limit:0 不回 EOSE：房主刚发的 offer 马上交给 app，不等 eoseWait`, async (t) => {
+    const net = new FakeNet();
+    for (const url of RELAYS) net.noEose.add(url);
+    const r = await room(t, dir, { net, grace: 5000, timing: { eoseWait: 30 } });
+    await sleep(60); // 房主那边早就按实时算了
+    const a = r.guest('a', { timing: { ...FAST, eoseWait: 60_000 } });
+    await a.connect(); // welcome 不在保险范围里：EOSE 之前也照收
+    const t0 = Date.now();
+    r.host.signal('a', { kind: 'offer', sdp: { type: 'offer', sdp: 'v=0 fresh' } });
+    await until(() => r.events(a, 'signal').length === 1, '刚发出的 offer 被当成回放丢了', 1000);
+    assert.ok(Date.now() - t0 < 1000);
+    assert.equal(a._live(RELAYS[0]), false, '测试前提：a 这边还在等中继表态');
+  });
+
+  test(`${name}：发送方的钟慢了几十秒：不回 EOSE 的中继在表态前送来的 offer 先扣下，等满 eoseWait 照常交给 app；换了订阅就扔掉`, async (t) => {
+    const net = new FakeNet();
+    for (const url of RELAYS) net.noEose.add(url);
+    // 要比 a 进房的耗时（高负载时几百毫秒）长得多：offer 得在 a 这边还没按实时算的时候到
+    const eoseWait = 1500;
+    const r = await room(t, dir, { net, grace: 5000, timing: { eoseWait: 30 } });
+    await sleep(60);
+    const a = r.guest('a', { timing: { ...FAST, eoseWait } });
+    await a.connect();
+    const subAt = Math.min(...[...a._sockets.values()].map((s) => s.subAt));
+    // 房主的钟比 a 慢 20 秒：ts 在 _send 里同步取，只在这一次调用里拨慢
+    const skewed = (sdp) => {
+      const realNow = Date.now;
+      Date.now = () => realNow() - 20_000;
+      try {
+        r.host.signal('a', { kind: 'offer', sdp: { type: 'offer', sdp } });
+      } finally {
+        Date.now = realNow;
+      }
+    };
+    skewed('v=0 slow-clock');
+    await sleep(100);
+    assert.deepEqual(r.events(a, 'signal'), [], '看上去比订阅早 20 秒的 offer 没等中继表态就收了');
+    assert.ok([...a._sockets.values()].some((s) => s.held?.length), '应当扣着等中继表态');
+    await until(() => r.events(a, 'signal').length === 1, '中继一直不回 EOSE（它送来的都是实时的），扣着的 offer 该交给 app', 4000);
+    assert.ok(Date.now() - subAt >= eoseWait - 20, '没等满 eoseWait 就放出来了');
+    assert.equal(r.events(a, 'signal')[0].payload.sdp.sdp, 'v=0 slow-clock');
+
+    // 扣着的时候订阅换了（换话题、重连）：那次订阅作废，扣着的扔掉，不再交给 app
+    const b = r.guest('b', { timing: { ...FAST, eoseWait: 60_000 } });
+    await b.connect();
+    const realNow = Date.now;
+    Date.now = () => realNow() - 20_000;
+    try {
+      r.host.signal('b', { kind: 'offer', sdp: { type: 'offer', sdp: 'v=0 stale-sub' } });
+    } finally {
+      Date.now = realNow;
+    }
+    await until(() => [...b._sockets.values()].some((s) => s.held?.length), 'b 扣下了那条 offer');
+    for (const s of b._sockets.values()) b._subscribe(s);
+    assert.ok([...b._sockets.values()].every((s) => !s.held && !s.heldTimer));
+    b._t.eoseWait = 0;
+    await sleep(100);
+    assert.deepEqual(r.events(b, 'signal'), []);
+  });
+
+  // hello 里的发送时刻是新人自己的钟：钟快几十秒的人，早就放弃了的 hello 看上去也是新的。
+  // 陌生人的 hello 在中继表态前一律等下一条（他每隔 hello 周期重发）；已放行的成员重新 hello（恢复后要名册）照发送时刻判断
+  test(`${name}：中继表态前送来的 hello：陌生人的一律不理，已放行成员的按发送时刻判断`, async (t) => {
+    const r = await room(t, dir, { grace: 5000 });
+    const a = r.guest('a');
+    await a.connect();
+    const url = RELAYS[0];
+    const slot = r.host._sockets.get(url);
+    const now = Date.now();
+    const ev = { id: 'x'.repeat(64) };
+    const hello = (from, ts) => ({ t: 'hello', from, ts });
+    assert.equal(r.host._earlyOk(url, slot.sub, ev, r.host._room, hello('late', now), 'stranger'), false, '陌生人的 hello 在表态前放行了');
+    assert.equal(r.host._earlyOk(url, slot.sub, ev, r.host._room, hello('a', now), a.publicKey), true, '已放行成员刚发的 hello 被当成了回放');
+    const old = hello('a', slot.subAt - 60_000);
+    assert.equal(r.host._earlyOk(url, slot.sub, ev, r.host._room, old, a.publicKey), false, '一分钟前的 hello 被当成了新的');
+    assert.equal(slot.held?.length || 0, 0, '已经表态（回过 EOSE）的中继上不该再扣');
   });
 
   test(`${name}：带 limit:0 时不回 EOSE 的中继：等 eoseWait 之后按实时算，照常放行、照常收信令；只认当前这次订阅的 EOSE`, async (t) => {

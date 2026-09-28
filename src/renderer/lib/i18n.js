@@ -534,6 +534,8 @@ const EN = new Map(Object.entries({
     'No network candidates were gathered at all—usually the network is fully isolated, or a firewall is blocking NoxReel.',
   'STUN 服务器没能告诉本机公网地址，只有局域网候选。除非双方在同一个局域网，否则连不上；请在设置里换一台 STUN 服务器，或检查防火墙有没有放行 UDP。':
     'The STUN server never reported this machine\u2019s public address, so only local candidates exist. Unless both sides are on the same LAN this cannot connect: choose a different STUN server in Settings, or check that the firewall allows UDP.',
+  '\u4e4b\u524d\u662f\u8fde\u901a\u7684\uff0c\u591a\u534a\u662f\u5bf9\u65b9\u65ad\u7f51\u6216\u5173\u6389\u4e86 NoxReel\uff0c\u6b63\u5728\u7b49\u4ed6\u56de\u6765\u3002':
+    'It was working before, so the other side has most likely lost their network or closed NoxReel. Waiting for them to come back.',
   '配了 TURN 中继却没拿到中继候选 —— 地址、端口或用户名密码大概率有一项不对，这时中继等于没配。':
     'A TURN relay is configured but no relay candidate arrived—the address, port, username, or password is almost certainly wrong, which leaves you with no relay at all.',
   '拿到了公网地址，但没有中继兜底。双方都在严格 NAT（对称 NAT、CGNAT、部分手机热点）后面时会连不上，配一个 TURN 中继可以解决。':
