@@ -216,6 +216,67 @@ impl('停下之后用户在播放器里自己按了播放：不再按住他，�
   s.done();
 });
 
+/**
+ * 播放中跳到 0:31、落在 36.08 停着等房间（和实测 N4 同一个场景），再交给 fn(s, waitMs)。
+ * waitMs 是放行定时器按落点排的等待时长（毫秒）；交出去时播放器停着，pauses 已清空。
+ * 收尾放在 finally 里：以前的代码在这里断言失败时，放行定时器按冻住的假时钟每几毫秒重排一次，拖住整个测试进程。
+ */
+async function heldAfterSeek(dir, fn) {
+  const s = await setup(dir, { landing: (t) => (t === 31 ? 36.08 : t) });
+  try {
+    s.eng.onCtrl(syncMsg({ paused: false, position: 75, lamport: 5 }), { peerId: 'host' });
+    await flush();
+    s.seeks.length = 0;
+    s.advance(1000);
+    s.eng.onCtrl(syncMsg({ paused: false, position: 31, lamport: 6 }), { peerId: 'host' });
+    await flush();
+    assert.deepEqual(s.seeks, [31]);
+    assert.equal(s.player.paused, true);
+    assert.ok(s.eng._lead && s.eng._leadTimer);
+    s.pauses.length = 0;
+    await fn(s, (s.eng._leadAhead() - 0.1) * 1000);
+  } finally {
+    s.done();
+  }
+}
+
+impl('放行定时器早一两毫秒到点、停着的读数又漂了几毫秒：直接放行，不多发一条暂停', (dir) =>
+  heldAfterSeek(dir, async (s, waitMs) => {
+    // 停着的 PotPlayer 之后报的位置比落点多了几毫秒（实测读数会漂）
+    s.move(36.084, true);
+    s.report();
+    // 定时器早 2 毫秒到点：按严格的 0.1 秒判，这时还差 6 毫秒没追上
+    s.advance(waitMs - 2);
+    await s.fire();
+    // 实测（N4）：以前这一拍又给 PotPlayer 发一条暂停，桥往返约 0.3 秒之后才放，从此落后房间约 0.3 秒，
+    // 又小于重跳的门槛（1 秒），一直没人纠正
+    assert.deepEqual(s.pauses, [false], '到点就该直接放，不许先多发一条暂停');
+    assert.equal(s.player.paused, false);
+    assert.equal(s.eng._lead, null);
+    s.advance(3000);
+    const diff = s.position() - s.eng.sharedPositionNow();
+    assert.ok(Math.abs(diff) < 0.2, `差 ${diff.toFixed(2)} 秒`);
+    assert.equal(s.out.filter((m) => m.t === 'sync').length, 0);
+  })
+);
+
+impl('放行定时器到点时还领先得多（读数往前漂了一截）：只重排定时器，不再下发暂停', (dir) =>
+  heldAfterSeek(dir, async (s, waitMs) => {
+    s.move(36.38, true);
+    s.report();
+    s.advance(waitMs);
+    await s.fire();
+    assert.deepEqual(s.pauses, [], '播放器本来就停着，到点还没追上只该接着等，不该再按一次暂停');
+    assert.equal(s.player.paused, true);
+    assert.ok(s.eng._lead, '还领先 0.3 秒，接着等');
+    assert.ok(s.eng._leadTimer, '要按新的读数重排放行');
+    s.advance(300);
+    await s.fire();
+    assert.deepEqual(s.pauses, [false]);
+    assert.equal(s.eng._lead, null);
+  })
+);
+
 impl('落后超过 1 秒就重跳；领先几秒原地停着等，不跳', async (dir) => {
   const s = await setup(dir);
   // 落后 1.5 秒：以前 PotPlayer 的容差是 5.3 秒，这一截永远没人管

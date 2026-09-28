@@ -348,6 +348,60 @@ impl('说不出位置时报出去的 STALL 位置也是个数（收端对不是�
   assert.ok(Number.isFinite(stall.position), `STALL 的位置 ${stall.position}`);
 });
 
+/* ------------------- 第三轮 H2 / N5：在线链接关窗不闪一对 STALL ------------------- */
+
+const stalls = (rec) => rec.out.filter((m) => m.t === 'stall').map((m) => m.stalled);
+
+impl('在线链接正常播放时关掉播放器：卸载那几条 tick 不算在等数据，全房不闪一对 STALL', async (dir) => {
+  const { eng, rec, tick, advance } = await playing(dir);
+  advance(200);
+  tick({ position: 43.23 });
+  advance(30);
+  // 静音 mpv 实测（fix/G1/close-stall 的 link-play）：time-pos 没了、core-idle、没暂停，片长先在后归零 ——
+  // 和「刚打开链接在起播」一模一样。以前第一条就让全房等，紧接着 playerGone 又放开（r6-link2 两次都有）
+  tick({ position: null, idle: true });
+  tick({ position: null, idle: true, duration: 0 });
+  // 退出前 mpv 偶尔还零零星星推一两条，照样不算
+  tick({ position: null, idle: true, duration: 0, seeking: false });
+  eng.playerGone();
+  assert.deepEqual(stalls(rec), [], '关窗不是在等数据，不许让全房等');
+  assert.equal(eng.localStalled, false);
+});
+
+impl('缓冲中关掉播放器：已经在让全房等的，卸载那几条 tick 不动它，播放器没了才放开（只放一次）', async (dir) => {
+  const { eng, rec, tick, advance } = await playing(dir);
+  tick({ position: 43.2, pausedForCache: true });
+  assert.deepEqual(stalls(rec), [true]);
+  advance(3000);
+  tick({ position: null, idle: true, pausedForCache: true });
+  tick({ position: null, idle: true, duration: 0 });
+  assert.deepEqual(stalls(rec), [true]);
+  eng.playerGone();
+  assert.deepEqual(stalls(rec), [true, false]);
+});
+
+impl('刚打开链接、还没载入完（说不出位置、没暂停、core-idle）照旧让全房等，载入之后照常判', async (dir) => {
+  const { eng, rec, tick, advance } = await playing(dir);
+  // 上一个播放器卸载了、退出了；重新打开的这个还在解析 / 起播
+  tick({ position: null, idle: true });
+  tick({ position: null, idle: true, duration: 0 });
+  eng.playerGone();
+  assert.deepEqual(stalls(rec), []);
+  tick({ position: null, idle: true, duration: 0 });
+  assert.deepEqual(stalls(rec), [true], '重新起播时房主在等数据，全房要等他');
+  advance(2000);
+  tick({ position: 45.5, idle: true });
+  assert.deepEqual(stalls(rec), [true]);
+  advance(200);
+  tick({ position: 45.5 });
+  assert.deepEqual(stalls(rec), [true, false]);
+  // 同一个播放器之后再卸载（关窗）照样不算
+  advance(200);
+  tick({ position: 45.7 });
+  tick({ position: null, idle: true });
+  assert.deepEqual(stalls(rec), [true, false]);
+});
+
 /* ------------------------------ 主进程 mpv ------------------------------ */
 
 const { MpvController } = require('../src/main/mpv');

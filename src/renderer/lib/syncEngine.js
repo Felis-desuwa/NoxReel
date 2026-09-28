@@ -61,6 +61,7 @@ import { MSG } from './protocol.js';
  * 房主是参照，没有选择，按完全同步走。
  * 本机播放器打不开链接（tick 带 loadFailed：403、签名过期、解析失败，mpv 留在 idle）时不算「在等数据」，
  * 否则控制者会把全房一直挂在「等待缓冲」；播放器没了（playerGone）同理放掉本机的卡顿。
+ * 关窗时 mpv 先卸载文件再退出，卸载那几条 tick 同样不算（见 onMpvTick 的 _unloading）。
  * 在线链接没有分片水位线兜底，断流时 mpv 同样报 eof：片长已知且离片尾还远、或者片长未知时不认「放完了」，
  * 改报 stream-cut（由上层提示本人重新连接），不然控制者网络一抖，全房就跳到下一部。
  * 断流时 mpv 同一刻先推 pause、再推 eof，偶尔被拆成两条 tick：在线链接里播放器报的暂停因此先只停本机，
@@ -78,6 +79,10 @@ const SEEK_TOLERANCE = 0.75; // 差这么多秒以内就不去动播放器了，
 const LEAD_HOLD_MIN_SECONDS = 0.3;
 // 房间追到离落点这么近就放行，余下这一点正好抵掉播放器从暂停到真正走起来的那一下
 const LEAD_HOLD_END_SECONDS = 0.1;
+// 放行判定再多给这么一点余量：定时器按落点排，到点时常常早一两毫秒，停着的 PotPlayer 报的位置也会漂几毫秒，
+// 卡死在 LEAD_HOLD_END_SECONDS 上就差那一丝没追上 —— 以前这一拍照常落一次状态，给播放器多发一条暂停，
+// 等桥往返完（约 0.3 秒）才放，之后一直落后房间这一截，又小于重跳的门槛，没人纠正（实测 5 次放行 2 次）。
+const LEAD_RELEASE_SLACK_SECONDS = 0.05;
 // 这种播放器落后房间超过这么多秒才重新跳。跳一次要先落到关键帧、再停几秒等房间，比 mpv 贵得多；
 // 又得大过适配器「落后不到 0.75 秒就不补救」（potAdapter 的 KEYFRAME_BEHIND_OK）加上位置读数的误差，
 // 否则它刚落地就又被判成落后，每条同步指令都重跳一次。
@@ -230,6 +235,8 @@ export class SyncEngine extends Emitter {
     this._applyDepth = 0;
     this._divergeRetries = 0;
     this.lastTick = null;
+    // 本机播放器正在卸载片子（关窗口），见 onMpvTick
+    this._unloading = false;
     this.pendingSeek = null; // 播放器还没起来时收到的房间位置，起来后补放
     this.pendingSeekOffset = 0; // 它和当时房间时钟差多少秒（有意偏离房间时才不是 0）
     this.seekTolerance = SEEK_TOLERANCE;
@@ -664,6 +671,13 @@ export class SyncEngine extends Emitter {
   onMpvTick(snap, { contiguousBytes, runBytes, runEndBytes, complete }) {
     const prev = this.lastTick;
     this.lastTick = { ...snap, at: this.now() };
+    // 播放器在卸载片子（关窗口时 mpv 先卸载文件再退出）：这个播放器报过位置、现在说不出了，或者片长归零了。
+    // 一直记到它重新报出位置为止；换了播放器（lastTick 被清空）从头算。刚打开、还没载入完的播放器同样说不出位置，
+    // 但它之前从没报过 —— 那是在等数据，不能混进来（见 _evaluateStreamStall）。
+    this._unloading =
+      !!prev &&
+      !Number.isFinite(snap.position) &&
+      (this._unloading || Number.isFinite(prev.position) || (prev.duration > 0 && !(snap.duration > 0)));
 
     // 在线链接里刚按下、还没报出去的暂停：这一条带出了断流的迹象，或者又放起来了，就作废（见 _deferPause）。
     // 必须排在 eof 那几道分支前面 —— 断流的那条 tick 走到那里就返回了。
@@ -917,6 +931,10 @@ export class SyncEngine extends Emitter {
    */
   _evaluateStreamStall(snap) {
     if (!this.started) return;
+    // 卸载那几条 tick（见 onMpvTick 的 _unloading）说不出位置、core-idle、没暂停，和「刚打开链接在起播」一模一样，
+    // 但播放器马上就要退出了，不是在等数据。照常判的话控制者正常播放时关窗，先让全房等、紧接着 playerGone 又放开，
+    // 全房闪一对 STALL。已经在让全房等的（缓冲中关窗）也先不动，由 playerGone 放开。
+    if (this._unloading) return;
     // 「在等数据」不只是 paused-for-cache：跳转之后重新请求、重新起播那几秒（seeking，
     // 或者没暂停却 core-idle，比如刚打开链接）位置同样不动。房主跳到 5:00，网络流要好几秒才起播，
     // 这段不让房间等的话，房间时钟跑在房主前面，房主反倒要被自动对齐往前拽、跳过自己没看到的内容。
@@ -1581,7 +1599,7 @@ export class SyncEngine extends Emitter {
         return;
       }
     }
-    if (this._leadAhead() <= LEAD_HOLD_END_SECONDS) this._clearLead();
+    if (this._leadAhead() <= LEAD_HOLD_END_SECONDS + LEAD_RELEASE_SLACK_SECONDS) this._clearLead();
   }
 
   /**
@@ -1600,6 +1618,14 @@ export class SyncEngine extends Emitter {
     this._leadTimer = null;
     // 正在落一次状态（多半是一次跳转）：它收尾时会自己重排
     if (this._reconciling > 0 || !this._lead) return;
+    this._checkLead();
+    // 到点了却还没追上（排定时器之后停着的读数又往前漂了一截）：播放器本来就停着，只按新的读数重排，不落状态 ——
+    // 落一次只会再给它发一条暂停，等桥往返完才轮到放行，从此落后房间这一次往返的时间。
+    // 它没停住（那条暂停没落下去）才照旧落一次，把它按住
+    if (this._lead && this.lastTick?.paused) {
+      this._scheduleLead();
+      return;
+    }
     this._reconcile();
   }
 
@@ -1662,6 +1688,7 @@ export class SyncEngine extends Emitter {
    */
   forgetPlayerState() {
     this.lastTick = null;
+    this._unloading = false;
     this._streamCut = false;
     // 播放器没了，刚才那下没确认的暂停分不清是不是本人按的：撤回，本机随房间走
     this._dropPendingPause({ restore: true });
