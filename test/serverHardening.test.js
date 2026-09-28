@@ -275,9 +275,11 @@ test('各字段类型不对一律拒掉，乱七八糟的消息一条都打不�
   const sig = await guest.waitFor((m) => m.t === 'signal', '正常信令');
   assert.deepEqual(sig.payload, { kind: 'probe' }, '坏消息一条都不该转发出去');
   assert.equal(guest.inbox.filter((m) => m.t === 'signal').length, 1);
+  // 报错回给房主走的是房主自己那条连接，和游客收到信令谁先到没有保证：机器忙时刚等到游客那条，
+  // 房主的报错可能还在路上，所以这里等它到，而不是当场查收件箱
+  await host.waitFor((m) => m.t === 'error' && m.code === 'BAD_SIGNAL', 'BAD_SIGNAL 报错');
+  await host.waitFor((m) => m.t === 'error' && m.code === 'BAD_CONFIG', 'BAD_CONFIG 报错');
   assert.equal(host.isClosed(), false, '坏的 signal / room-config 只报错，不断开房主');
-  assert.ok(host.inbox.some((m) => m.t === 'error' && m.code === 'BAD_SIGNAL'));
-  assert.ok(host.inbox.some((m) => m.t === 'error' && m.code === 'BAD_CONFIG'));
   // maxMembers 是字符串 / 数组时不能被 parseInt 悄悄认下
   assert.ok(!guest.inbox.some((m) => m.t === 'room-config'), '非数字的人数上限被当成了数字');
   assert.ok(srv.alive(), srv.stderr());
