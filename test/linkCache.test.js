@@ -350,7 +350,8 @@ test('真的两层进程（和 yt-dlp.exe 一样）：取消后干活的子进�
   // 'close' 要等两层都退了、管道关上才来；只杀引导进程的话子进程攥着管道，名额一直不还
   await waitLong(() => children.length === 2, '名额还回去，排队的那个轮到');
   await waitLong(() => !alive(worker), '干活的子进程结束', 5000);
-  assert.equal(fs.existsSync(first.workDir), false, '半截文件连工作目录删掉');
+  // 名额先还、工作目录随后删（删是异步的，机器忙时比下一个任务起来晚一点），所以等它删掉，不当场查
+  await waitLong(() => !fs.existsSync(first.workDir), '半截文件连工作目录删掉', 5000);
 
   await children[1].workerPid;
   assert.equal(cache.cancel('https://video.example.org/next'), true);
