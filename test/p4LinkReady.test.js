@@ -556,7 +556,7 @@ test('自动开播按房间共识的位置广播，不按还没载入完的播�
   // 上一部被 playNow 切走时记下 754 秒，现在换回来接着放
   eng.resetMedia({ isSeeder: true, seq: 2, position: 754, broadcast: true });
   assert.equal(outbound.at(-1).position, 754);
-  // mpv 刚连上 IPC，time-pos 还没有：snapshot() 报 position 0
+  // mpv 刚连上 IPC，time-pos 还没有：老的 snapshot() 报 position 0（现在报 null），两种都不能当成房间位置
   eng.onMpvTick({ position: 0, paused: true, eof: false, gen: 1 }, { contiguousBytes: 0, complete: true });
   assert.equal(eng.playerPositionNow(), 0, '这条 tick 确实会被记成 0（问题的来源）');
 

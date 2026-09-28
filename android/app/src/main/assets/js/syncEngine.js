@@ -63,6 +63,8 @@ import { MSG } from './protocol.js';
  * 否则控制者会把全房一直挂在「等待缓冲」；播放器没了（playerGone）同理放掉本机的卡顿。
  * 在线链接没有分片水位线兜底，断流时 mpv 同样报 eof：片长已知且离片尾还远、或者片长未知时不认「放完了」，
  * 改报 stream-cut（由上层提示本人重新连接），不然控制者网络一抖，全房就跳到下一部。
+ * 断流时 mpv 同一刻先推 pause、再推 eof，偶尔被拆成两条 tick：在线链接里播放器报的暂停因此先只停本机，
+ * 等 STREAM_PAUSE_CONFIRM_MS 没见到断流的迹象才当成本人按的暂停报出去（见 _deferPause）。
  */
 
 const STALL_THRESHOLD_SECONDS = 5; // 身前不足 5 秒的连续数据 → 喊停
@@ -87,6 +89,11 @@ const APPLY_ECHO_MS = 250;
 // 自己发出的跳转，落点在这么多毫秒内推回来都认作回声。网络流跳转要重新连接，
 // 位置变化可能晚于上面那个窗口才到 —— 被当成用户拖进度条的话，控制者会把这个落点广播给全房。
 const SEEK_ECHO_MS = 3000;
+// 在线链接：播放器报「暂停了」之后等这么久，才当成本人按的暂停广播出去（见 _deferPause）。
+// 断流时 mpv 同一刻先推 pause、再推 eof，偶尔被拆成前后两条 tick：当场广播的话，控制者网络一断
+// 全房就被暂停，重试之后还得有人再按播放。这段时间里来了断流的迹象（eof、paused-for-cache、打不开）
+// 就作废；真人按的暂停只晚这么一点同步出去。本地文件不等。
+const STREAM_PAUSE_CONFIRM_MS = 200;
 // 在线链接：和房间差超过 DRIFT_OUT 秒算「没对上」，回到 DRIFT_BACK 秒以内才算重新对上（滞回）。
 const DRIFT_OUT_SECONDS = 2;
 const DRIFT_BACK_SECONDS = 1;
@@ -230,6 +237,9 @@ export class SyncEngine extends Emitter {
     this.started = false;
     // 最近一次自己发给播放器的跳转 {position, at}，用来认出迟到的回声（见 SEEK_ECHO_MS）
     this._lastSeekCmd = null;
+    // 在线链接里本人刚按的暂停，确认不是断流之前先不报出去（见 _deferPause）
+    this._pendingPause = null;
+    this.pauseConfirmMs = STREAM_PAUSE_CONFIRM_MS;
 
     // 在线链接（见类注释）：当前项是不是各自从原网站拉流，以及本机选的跟随方式
     this.streaming = false;
@@ -285,6 +295,7 @@ export class SyncEngine extends Emitter {
     this._eofReplay = null;
     this._lastSeekCmd = null;
     this._streamCut = false;
+    this._dropPendingPause();
     // 跳转提前量是按这一部的网站学的，换一部从头学。跟随方式不动，由上层按新的当前项重新设
     this._seekLead = 0;
     this._resetDrift();
@@ -434,11 +445,12 @@ export class SyncEngine extends Emitter {
    * 本机播放器此刻的位置（秒），按最后一条 tick 外推；播放器没起来时返回 null。
    * 打不开（loadFailed）、在线链接断在半路（_streamCut）的播放器报的位置不是房间的进度 ——
    * 控制者这时在界面上按暂停，拿它广播会把全房拽回片头或断流的地方，所以同样当作没有。
+   * 说不出位置的播放器（还没载入完、正在卸载，tick 的位置是 null）也一样。
    */
   playerPositionNow() {
     const t = this.lastTick;
-    if (!t || t.loadFailed === true || this._streamCut) return null;
-    const base = t.position || 0;
+    if (!t || t.loadFailed === true || this._streamCut || !Number.isFinite(t.position)) return null;
+    const base = t.position;
     if (!this._advancing(t)) return base;
     return base + Math.max(0, this.now() - t.at) / 1000;
   }
@@ -614,6 +626,10 @@ export class SyncEngine extends Emitter {
     const prev = this.lastTick;
     this.lastTick = { ...snap, at: this.now() };
 
+    // 在线链接里刚按下、还没报出去的暂停：这一条带出了断流的迹象，或者又放起来了，就作废（见 _deferPause）。
+    // 必须排在 eof 那几道分支前面 —— 断流的那条 tick 走到那里就返回了。
+    if (this._pendingPause) this._checkPendingPause(snap);
+
     // 新播放器的第一条 tick。launchPlayer 里的 resyncToShared 常常赶在它前面，
     // 那时还没有 lastTick，目标位置只能先记进 pendingSeek —— 没人再来消费它的话，
     // 新播放器就一直停在片头。
@@ -728,25 +744,38 @@ export class SyncEngine extends Emitter {
         // 窗口里按空格，不该被当成「他想改变房间状态」，而要把暂停压回去。
         // 原来只更新 intendedPaused 就完事，于是全员暂停期间自己按一下空格，
         // 本机就一路播下去、播到没数据为止，而且没有任何人会来纠正。
-        const forced = this.localStalled || this.stalledPeers.size > 0;
+        // 在线链接自己在等数据时本来就不按暂停（见 effectivePaused），也就谈不上「被强制停着」：
+        // 缓冲中按了暂停、又按播放，或者按了播放那条 tick 还 core-idle（还没真正走起来），
+        // 都会被判成在等数据 —— 拿它拒掉的话，本人按的播放被压回暂停。
+        const forced = (this.localStalled && !this.streaming) || this.stalledPeers.size > 0;
         if (forced && !snap.paused) {
           this.emit('denied', { action: 'play' });
           this._reconcile();
           return;
         }
+        const prevIntended = this.intendedPaused;
         this.intendedPaused = snap.paused;
-        // 游客的播放/暂停只作用于自己这一路，不广播、不动共识状态。
-        if (this.canIControl()) this._broadcastSync(this._actionPosition(snap.position));
-        this.emit('local-action', {
-          kind: snap.paused ? 'pause' : 'play',
-          position: snap.position,
-          local: !this.canIControl(),
-        });
+        if (snap.paused && this.streaming) {
+          // 在线链接的暂停先停着、晚一点再报：可能是断流，紧跟着的 eof 被拆到了下一条 tick 里
+          this._deferPause(snap, prevIntended);
+        } else {
+          // 游客的播放/暂停只作用于自己这一路，不广播、不动共识状态。
+          if (this.canIControl()) this._broadcastSync(this._actionPosition(this._tickPosition(snap)));
+          this.emit('local-action', {
+            kind: snap.paused ? 'pause' : 'play',
+            position: this._tickPosition(snap),
+            local: !this.canIControl(),
+          });
+        }
       }
     }
 
     // 用户拖了进度条？mpv 没有独立的 seek 事件，只能看时间线有没有不连续跳变。
-    if (prev && typeof snap.position === 'number' && typeof prev.position === 'number') {
+    // 播放器说不出位置（没有 time-pos：还没载入完，或者正在卸载 —— 关窗口时 mpv 先卸载文件再退出）、
+    // 片长没了（卸载）的 tick 不参与：拿它和上一条比，控制者会把「跳到 0」广播给全房。
+    // 缓冲中关窗尤其躲不开 —— 上一条停着不外推，0 和它一比就是往回拖了一大截。
+    const unloaded = !Number.isFinite(snap.position) || (prev?.duration > 0 && !(snap.duration > 0));
+    if (prev && !unloaded && Number.isFinite(prev.position)) {
       // 有主进程的采样时间就用它：渲染进程收到 tick 的时刻会被 IPC 排队抖动拉开，
       // 这点抖动会直接算进 1.5 秒的跳变阈值里。
       const elapsed =
@@ -905,6 +934,8 @@ export class SyncEngine extends Emitter {
   _setLocalStall(stalled, deficitSeconds, position = 0) {
     if (this.localStalled === stalled) return;
     this.localStalled = stalled;
+    // 播放器说不出位置（tick 的位置是 null）时报房间时钟：STALL 里的位置不是个数的话收端整条不认
+    if (!Number.isFinite(position)) position = this.sharedPositionNow();
     // 游客的缓冲不足只暂停自己，不广播、不拖累全员（他本就是「自己看自己的」）。
     if (this.canIControl()) {
       this.emit('outbound', {
@@ -923,13 +954,22 @@ export class SyncEngine extends Emitter {
     // 从「读到已接收内容的末尾」里恢复，必须让播放器重新读一遍（见 _replayDataEnd）。
     if (!stalled && this._dataEndStall) {
       this._dataEndStall = false;
-      this._replayDataEnd(this.lastTick?.position ?? position ?? 0);
+      this._replayDataEnd(Number.isFinite(this.lastTick?.position) ? this.lastTick.position : position);
+      return;
+    }
+    // 在线链接自己在等数据不改本机播放器该停该放（见 effectivePaused），不去动它：动了反倒会把本人
+    // 刚在 mpv 里按的播放压回去 —— 那条 tick 常常还 core-idle，同一拍里先被判成在等数据，
+    // 这一下 _reconcile 又开出回声窗口，本人的操作被整条当成回声吞掉（静音 mpv 实测 6 次里 1 次）。
+    if (this.streaming) {
+      this.emit('state', this.status());
       return;
     }
     this._reconcile();
   }
 
   _broadcastSync(position) {
+    // 这一条带着此刻的暂停状态出去，还没确认的那下暂停（如果有）不用再单独报
+    this._dropPendingPause();
     this.shared = {
       paused: this.intendedPaused,
       position,
@@ -948,6 +988,70 @@ export class SyncEngine extends Emitter {
       seq: this.seq,
     });
     if (!this.intendedPaused) this.emit('playing', { seq: this.seq });
+  }
+
+  /**
+   * 在线链接里播放器报「暂停了」：本机先按本人的意思停着，广播和「你 暂停」那一行等 pauseConfirmMs 再发。
+   *
+   * 断流时 mpv 同一刻先推 pause、再推 eof，偶尔被拆成两条 tick（主进程那边合批也有等不到的时候）——
+   * 第一条看上去就是本人按了暂停，当场广播的话控制者网络一断全房就停住，重试之后房间还停着。
+   * 等的这段时间里来了断流的迹象就作废，连本人「想停着」一起撤回（见 _checkPendingPause）；
+   * 真人按的暂停晚这么一点同步出去。游客、手动同步的人也一样等：他们的暂停虽然只停自己，
+   * 断流被当成暂停的话，重试之后播放器照样停着不动。
+   */
+  _deferPause(snap, prevIntended) {
+    this._dropPendingPause();
+    const at = this._tickPosition(snap);
+    const pending = {
+      seq: this.seq,
+      prevIntended,
+      // 位置按按下那一刻取：等的这段时间里房间还在走
+      position: this._actionPosition(at),
+      at,
+      // 按下时本来就在缓冲：之后 paused-for-cache 还挂着不说明什么，不能拿它把真人的暂停作废
+      buffering: snap.pausedForCache === true,
+      timer: null,
+    };
+    pending.timer = setTimeout(() => this._confirmPause(pending), this.pauseConfirmMs);
+    this._pendingPause = pending;
+  }
+
+  /**
+   * 这一条 tick 说明刚才那下暂停不是本人按的（放到断流处、开始等数据、打不开），或者他又放起来了：作废。
+   * paused-for-cache 只认暂停之后新冒出来的：在缓冲时按的暂停，它本来就挂着。
+   */
+  _checkPendingPause(snap) {
+    const pending = this._pendingPause;
+    const cacheWait = snap.pausedForCache === true && !pending.buffering;
+    if (snap.eof || cacheWait || snap.loadFailed === true || !snap.paused) {
+      this._dropPendingPause({ restore: true });
+    }
+  }
+
+  _confirmPause(pending) {
+    if (this._pendingPause !== pending) return;
+    this._pendingPause = null;
+    // 换了片、播放器没了，或者这期间房间 / 界面按钮已经把状态改回「播放」：这下暂停不再算数
+    if (!this.started || pending.seq !== this.seq || !this.lastTick || !this.intendedPaused) return;
+    if (this.canIControl()) this._broadcastSync(pending.position);
+    this.emit('local-action', { kind: 'pause', position: pending.at, local: !this.canIControl() });
+  }
+
+  /**
+   * 放弃还没报出去的暂停。restore：把本人「想停着」的意思一起撤回 —— 那下暂停是断流造成的，
+   * 房间照走，重试之后播放器按房间状态接着放。
+   */
+  _dropPendingPause({ restore = false } = {}) {
+    const pending = this._pendingPause;
+    if (!pending) return;
+    this._pendingPause = null;
+    clearTimeout(pending.timer);
+    if (restore) this.intendedPaused = pending.prevIntended;
+  }
+
+  /** 这条 tick 报的位置。播放器说不出位置（还没载入完、正在卸载）时报的是 null，这里改用房间时钟。 */
+  _tickPosition(snap) {
+    return Number.isFinite(snap?.position) ? snap.position : this.sharedPositionNow();
   }
 
   /* ---------------------------- 远端消息 ---------------------------- */
@@ -1068,6 +1172,8 @@ export class SyncEngine extends Emitter {
       this._reconcile(following && seekTo !== null ? { seekTo } : {});
       return true;
     }
+    // 房间刚被别人改了：本机还没报出去的那下暂停排在它前面，不再单独报（本人的状态随房间走）
+    this._dropPendingPause();
     this.intendedPaused = msg.paused;
     this._relay(msg, { ...from, origin: author, name: byName });
     this.emit('remote-action', {
@@ -1404,6 +1510,8 @@ export class SyncEngine extends Emitter {
   forgetPlayerState() {
     this.lastTick = null;
     this._streamCut = false;
+    // 播放器没了，刚才那下没确认的暂停分不清是不是本人按的：撤回，本机随房间走
+    this._dropPendingPause({ restore: true });
   }
 
   /**
@@ -1436,6 +1544,8 @@ export class SyncEngine extends Emitter {
 
   /** 用户点了 UI 上的播放/暂停（不是在 mpv 窗口里点的）。 */
   userSetPaused(paused) {
+    // 界面上按的这一下比播放器里那下还没报出去的暂停新
+    this._dropPendingPause();
     this.intendedPaused = paused;
     // 游客：只暂停/播放自己这一路，不广播、不动共识。
     // 播放器没开着（比如刚关掉）时按的是界面上的按钮，这时报 0 会把全房拉回片头 —— 用房间时钟。
@@ -1491,8 +1601,9 @@ export class SyncEngine extends Emitter {
     if (!this.streaming || !this.started) return;
     const t = this.lastTick;
     // 正在跳转、缓冲、重新起播，或者放到头了：此刻的位置说明不了什么，维持上一次的判断。
-    // 打不开的播放器也不去拽它（跳转发给一个 idle 的 mpv 什么都不会发生）
+    // 打不开的播放器也不去拽它（跳转发给一个 idle 的 mpv 什么都不会发生）；说不出位置的（还没载入完、正在卸载）同理
     if (!t || t.seeking || t.pausedForCache || t.eof || t.loadFailed || (t.idle && !t.paused) || this.applying) return;
+    if (!Number.isFinite(t.position)) return;
     // 自己按了暂停、只停自己（游客）：这是有意和房间分开，不算没对上
     if (this.intendedPaused !== this.shared.paused) {
       this._driftOver = 0;
@@ -1566,6 +1677,7 @@ export class SyncEngine extends Emitter {
    */
   syncToRoom() {
     if (!this.streaming || !this.started || !this.lastTick) return false;
+    this._dropPendingPause();
     this.intendedPaused = this.shared.paused;
     this._corrections = [];
     this._failedAt = 0;
@@ -1761,6 +1873,7 @@ export {
   SEEK_TOLERANCE,
   APPLY_ECHO_MS,
   SEEK_ECHO_MS,
+  STREAM_PAUSE_CONFIRM_MS,
   DRIFT_OUT_SECONDS,
   DRIFT_BACK_SECONDS,
   DRIFT_CORRECT_COOLDOWN_MS,

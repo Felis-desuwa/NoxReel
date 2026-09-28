@@ -44,6 +44,14 @@ const OBSERVED = [
  */
 const IDLE_CONFIRM_MS = 3000;
 
+/**
+ * pause 刚变成 true、eof 还没到时，这一条 tick 最多多等这么久（毫秒）再发（见 _queueTick）。
+ * 放到头 / 断流时 mpv 同一刻先推 pause、再推 eof-reached，偶尔被管道拆成两次读取
+ * （静音 mpv 实测断流 40 次里 6 次），setImmediate 等不到后一半；等这一小会儿，eof 跟上来就合成
+ * 一条「停在 eof 上」。真人按的暂停只晚这么一点才报上去。
+ */
+const PAUSE_TICK_HOLD_MS = 50;
+
 /** 打不开的原因要从 mpv 的错误日志里看，只留最近几行、每行截短。 */
 const LOAD_ERROR_LOG_LINES = 8;
 const LOAD_ERROR_LOG_CHARS = 300;
@@ -445,8 +453,10 @@ class MpvController extends EventEmitter {
     this._danmaku = { inFlight: false, visible: false };
     // pause/seek 在途的条数。这两条是用户等着看结果的命令，不能让 30Hz 的弹幕帧排在前面。
     this._cmdHold = 0;
-    // 攒着没发的 tick（见 _queueTick）
-    this._tickQueued = false;
+    // 攒着没发的 tick（见 _queueTick）：排着的那一次 {kind, handle, delay}，和「刚暂停、在等 eof」
+    this._tickPending = null;
+    this._pauseHold = false;
+    this.pauseTickHoldMs = PAUSE_TICK_HOLD_MS;
     this.idleConfirmMs = IDLE_CONFIRM_MS;
     this._resetLoadState();
   }
@@ -459,14 +469,34 @@ class MpvController extends EventEmitter {
    * 「暂停了、还没 eof」—— 同步引擎把它当成用户按了暂停，控制者广播给全房，全房停住；
    * 紧跟着的 eof 才说明那是断流或片尾。合成一条之后引擎看到的就是「停在 eof 上」。
    * 用 setImmediate 而不是只在 _onData 末尾发：一批消息被管道拆成几次读到时也能合上。
+   * 但 setImmediate 只等得到同一轮事件循环里读到的：pause 和 eof 偶尔落在前后两轮读取里
+   * （实测），所以 pause 刚变成 true、eof 还没到时改成最多等 PAUSE_TICK_HOLD_MS；
+   * eof 到了（或者又不暂停了）就不再等，马上发。
    */
-  _queueTick() {
-    if (this._tickQueued) return;
-    this._tickQueued = true;
-    setImmediate(() => {
-      this._tickQueued = false;
+  _queueTick(name, value) {
+    if (name === 'pause') this._pauseHold = value === true && this.props['eof-reached'] !== true;
+    else if (name === 'eof-reached' && value === true) this._pauseHold = false;
+    const delay = this._pauseHold ? this.pauseTickHoldMs : 0;
+    // 已经排着一条、要等的一样久：这次变化跟着它一起发。等的时长从 pause 变 true 那一刻算，不往后续
+    if (this._tickPending && this._tickPending.delay === delay) return;
+    this._cancelQueuedTick();
+    const fire = () => {
+      this._tickPending = null;
+      this._pauseHold = false;
       this.emit('tick', this.snapshot());
-    });
+    };
+    this._tickPending =
+      delay > 0
+        ? { kind: 'timeout', handle: setTimeout(fire, delay), delay }
+        : { kind: 'immediate', handle: setImmediate(fire), delay };
+  }
+
+  _cancelQueuedTick() {
+    const pending = this._tickPending;
+    if (!pending) return;
+    if (pending.kind === 'timeout') clearTimeout(pending.handle);
+    else clearImmediate(pending.handle);
+    this._tickPending = null;
   }
 
   /**
@@ -674,7 +704,7 @@ class MpvController extends EventEmitter {
       this.props[msg.name] = msg.data;
       if (msg.name === 'idle-active') this._onIdleActive(msg.data);
       this.emit('property', { name: msg.name, value: msg.data });
-      this._queueTick();
+      this._queueTick(msg.name, msg.data);
       return;
     }
 
@@ -722,11 +752,15 @@ class MpvController extends EventEmitter {
     this.pending.clear();
   }
 
-  /** 当前播放状态快照，同步引擎和 UI 都读这个。 */
+  /**
+   * 当前播放状态快照，同步引擎和 UI 都读这个。
+   * 没有 time-pos 时（片子还没载入、正在卸载 —— 关窗口时 mpv 先卸载文件再退出）position 报 null，
+   * 不报 0：报 0 的话同步引擎会当成「拖回了片头」，控制者把全房拽回 0:00。
+   */
   snapshot() {
     return {
       running: this.running,
-      position: typeof this.props['time-pos'] === 'number' ? this.props['time-pos'] : 0,
+      position: typeof this.props['time-pos'] === 'number' ? this.props['time-pos'] : null,
       paused: this.props['pause'] !== false,
       duration: typeof this.props['duration'] === 'number' ? this.props['duration'] : 0,
       streamPos: typeof this.props['stream-pos'] === 'number' ? this.props['stream-pos'] : null,

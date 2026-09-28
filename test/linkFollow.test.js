@@ -627,6 +627,9 @@ impl('手动同步的管理员按暂停：报房间的位置，不把全房拽�
   r.place('gst', { position: 40 });
   r.advance(0.2);
   r.tick('adm', { position: 25.2, paused: true }); // 在 mpv 里按了空格
+  // 在线链接里的暂停先确认不是断流（STREAM_PAUSE_CONFIRM_MS）再报出去；报的仍是按下那一刻的房间位置
+  assert.equal(syncs(r.node('adm')).length, 0, '确认之前不报');
+  await settle();
   r.flush();
   const sent = syncs(r.node('adm'));
   assert.equal(sent.length, 1);

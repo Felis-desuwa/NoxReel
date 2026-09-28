@@ -444,7 +444,9 @@ test('接线：主进程自己认「正在接收」、跳转带 dropBuffers 一�
 
   const app = read('src', 'renderer', 'app.js');
   const tickFn = app.slice(app.indexOf('function handlePlayerTick('), app.indexOf('function onPlayerExit('));
-  assert.match(tickFn, /positionToByte\(snap\.position \|\| 0, snap\.streamPos, ctx\.have\)/);
+  // G1：说不出位置（position 为 null）的 tick 不动调度器的播放位置
+  assert.match(tickFn, /if \(ctx\?\.scheduler && Number\.isFinite\(snap\.position\)\) \{/);
+  assert.match(tickFn, /positionToByte\(snap\.position, snap\.streamPos, ctx\.have\)/);
   assert.match(tickFn, /runEndBytes: prog \? prog\.runEndBytes : undefined,/);
   assert.match(app, /S\.sync\.onSeek = \(pos, opts\) => whilePlayerBusy\(applySeek\(pos, opts\)\);/);
   assert.match(app, /window\.sw\.player\.seek\(pos, dropBuffers \? \{ dropBuffers: true \} : undefined\)/);

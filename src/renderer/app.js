@@ -4675,11 +4675,13 @@ function linkLoadErrorText(error) {
  * 在线链接的每条 tick：播放器打不开（loadFailed）就记下来、说明原因。同步引擎那边已经不再把它算作
  * 「在等数据」，本机不会再挡着全房；这里负责让本人知道出了什么事，并给「重试」。
  * 又放起来了（在播放器里往回拖、重新载入）就把之前的提示收掉。
+ * 打不开的播放器会一直带着 loadFailed 推 tick（别人的卡顿一变、引擎动一下播放器就是一条）：
+ * 这一部记过一次就不再记 —— 按 seq 认，跳过了的也算（跳过之后 linkPlayFailed() 为假，不能拿它判断）。
  */
 function noteLinkPlayback(snap) {
   const failed = linkPlayFailed() ? S.linkPlayFailed : null;
   if (snap.loadFailed) {
-    if (failed?.kind === 'load') return;
+    if (S.linkPlayFailed?.seq === S.currentSeq && S.linkPlayFailed.kind === 'load') return;
     S.linkPlayFailed = { seq: S.currentSeq, kind: 'load', error: snap.loadError || null };
     log(`播放器打不开这个在线视频：${linkLoadErrorText(snap.loadError)}`, 'bad');
     renderPlaylistSoon();
@@ -8045,8 +8047,8 @@ function renderProgress(p) {
   // 中途加入的人正是在这段时间里要把带宽花在 P 附近，而不是从文件头顺着下。
   const ctx = currentFileCtx();
   if (ctx?.scheduler) {
-    const byte = snap
-      ? ctx.scheduler.positionToByte(snap.position || 0, snap.streamPos, ctx.have) || 0
+    const byte = Number.isFinite(snap?.position)
+      ? ctx.scheduler.positionToByte(snap.position, snap.streamPos, ctx.have) || 0
       : roomPlayheadByte();
     S.swarm.setPlaybackByte(ctx.slot, byte);
   }
@@ -8099,11 +8101,16 @@ function renderTransferVerdict(p) {
         // 那一段 —— 只报片头会一直显示「还差 0」；从片头起播时两段是同一段，取大的那个。
         const headLeft = Math.max(0, Math.min(HEAD_READY_BYTES, S.manifest.size) - p.contiguousBytes);
         const run = midJoin ? p.runBytes || 0 : p.contiguousBytes || 0;
-        const runLeft = Math.max(0, startRunNeeded(S.manifest.size, startByte) - run);
+        const runNeeded = startRunNeeded(S.manifest.size, startByte);
+        const runLeft = Math.max(0, runNeeded - run);
         // 起播点在片中时文件尾的索引也在门槛里，缺着的话别报「还差 0」
-        const left = Math.max(headLeft, runLeft) + (midJoin ? tailIndexMissing(currentFileCtx()) : 0);
+        const tailMissing = midJoin ? tailIndexMissing(currentFileCtx()) : 0;
+        const left = Math.max(headLeft, runLeft) + tailMissing;
         parts.push(stat(midJoin && runLeft > headLeft ? '距起播还差（当前位置附近）' : '距起播还差', fmtBytes(left)));
-        if (rate > 0) parts.push(stat('预计还需', fmtTime(left / rate)));
+        if (rate > 0) {
+          const eta = startEtaSeconds({ left, rate, midJoin, startByte, runNeeded, tailMissing });
+          parts.push(stat('预计还需', fmtTime(eta)));
+        }
       }
     }
   } else {
@@ -8167,6 +8174,70 @@ function renderTransferVerdict(p) {
     return;
   }
   replace(node, ...parts);
+}
+
+// 播放器从启动到画出第一帧大约要这么久（实测约 2 秒），距起播的「预计还需」要算上
+const PLAYER_START_SECONDS = 2;
+
+/**
+ * 可信房间距起播的「预计还需」（秒）。只拿「还差多少 ÷ 当前速度」会偏少（实测写 0:05、17 秒后才起播），
+ * 还有两块要算上：
+ *  - 已经向上游要了、还在路上、却不在起播门槛里的片（见 inflightAheadBytes）：上游按请求先后发片，
+ *    门槛里还缺的片要等它们先送完才轮得到；
+ *  - 播放器还没开时，启动到出第一帧的那一两秒。
+ */
+function startEtaSeconds({ left, rate, midJoin, startByte, runNeeded, tailMissing }) {
+  const ctx = currentFileCtx();
+  const size = S.manifest.size;
+  // 起播门槛要的字节区间 [起, 止)：和 left 的算法对应
+  const ranges = midJoin
+    ? [
+        [0, Math.min(HEAD_READY_BYTES, size)],
+        [startByte, startByte + runNeeded],
+        ...(tailMissing > 0 ? [[size - Math.min(ctx?.scheduler?.tailReserveBytes || 0, size), size]] : []),
+      ]
+    : [[0, Math.max(Math.min(HEAD_READY_BYTES, size), runNeeded)]];
+  const ahead = inflightAheadBytes(ctx, ranges);
+  return (left + ahead) / rate + (S.mpvRunning ? 0 : PLAYER_START_SECONDS);
+}
+
+/**
+ * 在路上、却不在 ranges 里的片有多少字节排在门槛要的片前面。
+ * 门槛里还有没人去要的片时，现在在路上的全都排在它前面；都要了的话，只算比门槛里最晚要的那片更早要的。
+ */
+function inflightAheadBytes(ctx, ranges) {
+  const inflight = S.swarm?.inflight;
+  const manifest = ctx?.manifest;
+  if (!inflight?.size || !manifest || !ctx.have) return 0;
+  const { size, chunkSize } = manifest;
+  const span = (i) => [i * chunkSize, Math.min(size, (i + 1) * chunkSize)];
+  const wanted = (i) => {
+    const [from, to] = span(i);
+    return ranges.some(([a, b]) => from < b && to > a);
+  };
+  const onTheWay = new Set();
+  const others = [];
+  let lastWantedAt = -Infinity;
+  for (const info of inflight.values()) {
+    if (info.slot !== ctx.slot) continue;
+    onTheWay.add(info.index);
+    if (wanted(info.index)) lastWantedAt = Math.max(lastWantedAt, info.at);
+    else others.push(info);
+  }
+  if (!others.length) return 0;
+  let unrequested = false;
+  for (const [a, b] of ranges) {
+    for (let i = Math.floor(a / chunkSize); !unrequested && i * chunkSize < Math.min(b, size); i++) {
+      if (ctx.have[i] !== 1 && !onTheWay.has(i)) unrequested = true;
+    }
+  }
+  let bytes = 0;
+  for (const info of others) {
+    if (!unrequested && !(info.at < lastWantedAt)) continue;
+    const [from, to] = span(info.index);
+    bytes += to - from;
+  }
+  return bytes;
 }
 
 /** 画分片位图。空洞在这里一眼可见 —— 「下了 90% 却播不了」就是这么来的。 */
@@ -8296,7 +8367,8 @@ function mediaBitrate() {
  */
 function roomPositionSec() {
   const snap = S.sync?.lastTick;
-  if (snap) return Math.max(0, snap.position || 0);
+  // 播放器说不出位置（还没载入完、正在卸载）时和没起来一样看房间时钟
+  if (Number.isFinite(snap?.position)) return Math.max(0, snap.position);
   return Math.max(0, S.sync?.sharedPositionNow?.() || 0);
 }
 
@@ -8321,11 +8393,12 @@ function roomPlayheadByte() {
   const snap = S.sync?.lastTick;
   const ctx = currentFileCtx();
   let byte;
-  if (!snap) byte = (S.sync?.sharedPositionNow?.() || 0) * mediaBitrate();
+  // 播放器没起来，或者说不出位置（还没载入完、正在卸载）：按房间时钟折算
+  if (!Number.isFinite(snap?.position)) byte = (S.sync?.sharedPositionNow?.() || 0) * mediaBitrate();
   // stream-pos 越过了本机已收到的内容就不是真的播放位置（见 scheduler.streamPosPlausible）
   else if (snap.streamPos > 0 && (!ctx?.scheduler || ctx.scheduler.streamPosPlausible(snap.streamPos, ctx.have))) {
     byte = snap.streamPos;
-  } else byte = (snap.position || 0) * mediaBitrate();
+  } else byte = snap.position * mediaBitrate();
   byte = Math.max(0, byte || 0);
   return size > 0 ? Math.min(size, byte) : byte;
 }
@@ -9204,8 +9277,9 @@ function handlePlayerTick(snap) {
   // 播放位置先落到调度器上再取进度：runBytes 是「从播放位置起」的长度，
   // 拿上一拍的位置算出来的那个数配不上这一拍的 snap。
   // stream-pos 要对着本机位图核对过才用：撞上已接收内容的尽头时 mpv 会把它报到文件尾（见 positionToByte）
-  if (ctx?.scheduler) {
-    const byte = ctx.scheduler.positionToByte(snap.position || 0, snap.streamPos, ctx.have) || 0;
+  // 播放器说不出位置（还没载入完、正在卸载，position 是 null）时调度器维持原来的播放位置，不当成回到了片头
+  if (ctx?.scheduler && Number.isFinite(snap.position)) {
+    const byte = ctx.scheduler.positionToByte(snap.position, snap.streamPos, ctx.have) || 0;
     S.swarm.setPlaybackByte(ctx.slot, byte);
   }
   const prog = ctx ? S.swarm.progress(ctx.slot) : null;

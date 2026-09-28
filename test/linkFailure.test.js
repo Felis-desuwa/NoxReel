@@ -555,6 +555,38 @@ test('播放器打不开在线视频：说明原因（只报一次），行内�
   assert.equal(ctx.linkPlayFailed(), false);
 });
 
+// R3-D：跳过之后 linkPlayFailed() 为假，打不开的播放器又一直带着 loadFailed 推 tick（房主每次卡顿状态变化、
+// 引擎动一下播放器就是一条），以前每一条都再记一行。按 seq 只记一次。
+test('跳过之后打不开的播放器还在推 tick：这一部只记一次；换一部再打不开照样说', async () => {
+  const { ctx, S, logs } = await linkBox();
+  const item = linkItem();
+  S.current = item;
+  S.linkInfo = { url: item.url, extractor: 'generic', resolvedAt: Date.now() };
+  S.filePath = item.url;
+  S.mpvRunning = true;
+  const failed = { position: null, idle: true, loadFailed: true, loadError: { reason: 'http', status: 403 } };
+  const lines = () => logs.filter(([t]) => t.startsWith('播放器打不开')).length;
+  ctx.noteLinkPlayback(failed);
+  assert.equal(lines(), 1);
+  S.skippedLinks.add(item.id);
+  for (let i = 0; i < 5; i++) ctx.noteLinkPlayback(failed);
+  assert.equal(lines(), 1, '跳过之后每条 tick 都再记一行');
+
+  // 先跳过、之后才打不开：记一次，之后不再记
+  S.currentSeq = 4;
+  S.current = linkItem({ id: 'bbbbbbbb' });
+  S.skippedLinks.add('bbbbbbbb');
+  for (let i = 0; i < 5; i++) ctx.noteLinkPlayback(failed);
+  assert.equal(lines(), 2);
+
+  // 换了一部（seq 变了）又打不开：新的一部照样说
+  S.currentSeq = 5;
+  S.current = linkItem({ id: 'cccccccc' });
+  ctx.noteLinkPlayback(failed);
+  ctx.noteLinkPlayback(failed);
+  assert.equal(lines(), 3);
+});
+
 test('原因文案：各种代号都有一句人话', async () => {
   const { ctx } = await linkBox();
   const text = (e) => ctx.linkLoadErrorText(e);
