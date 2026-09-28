@@ -374,6 +374,16 @@ test('H1（N6）：退避用尽那一行两端都有英文，后半句递归翻�
   assert.equal(nat, 'The direct connection to Bob did not recover after 3 attempts. When both sides are behind strict NAT, a TURN relay is needed as a fallback.');
 });
 
+test('退避中每一轮「N 秒后自动重连」那一行两端都有英文，昵称原样保留', async () => {
+  const line = '和 张三 的直连断了，4 秒后自动重连（第 2 次）';
+  const expected = 'Lost the direct connection to 张三. Reconnecting automatically in 4 seconds (attempt 2).';
+  for (const file of ['src/renderer/lib/i18n.js', 'android/app/src/main/assets/js/i18n.js']) {
+    const { translate } = await import(pathToFileURL(path.join(root, file)).href);
+    assert.equal(translate(line, 'en'), expected, file);
+    assert.equal(translate(line, 'zh-CN'), line);
+  }
+});
+
 /* ------------------------- offer 标记与 reconnected（桌面端） ------------------------- */
 
 async function signalRoom() {

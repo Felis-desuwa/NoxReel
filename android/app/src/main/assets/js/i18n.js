@@ -506,6 +506,11 @@ const PATTERNS = [
     'Direct connection to $1 failed (this happens when both sides are behind strict NAT; a TURN relay is needed as a fallback)',
   ],
   [/^和 (.+) 的直连失败了。(.*)$/, (_all, name, advice) => `Direct connection to ${name} failed. ${translate(advice, 'en')}`],
+  // 重连退避中的每一轮（同桌面端）
+  [
+    /^和 (.+) 的直连断了，(\d+) 秒后自动重连（第 (\d+) 次）$/,
+    'Lost the direct connection to $1. Reconnecting automatically in $2 seconds (attempt $3).',
+  ],
   // 重连退避用尽：后半句另有词条，递归翻（同桌面端）
   [
     /^和 (.+) 的直连试了 (\d+) 次都没恢复。(.*)$/,
