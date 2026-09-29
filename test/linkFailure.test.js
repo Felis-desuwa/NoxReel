@@ -501,6 +501,8 @@ async function linkBox({ isHost = false, inspect, localPath = null, paused = fal
     renderDrift: noop,
     updateStripTone: noop,
     updatePresence: noop,
+    scheduleOscState: noop, // mpv 控制条的状态推送另有测试（mpvOsc.test.js）
+    forgetMpvOsc: noop,
     window: {
       sw: {
         media: {

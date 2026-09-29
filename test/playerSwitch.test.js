@@ -595,6 +595,8 @@ function playerBox({ choice = 'mpv', list = null, complete = true, sourceType = 
     roomEntered: true,
     switchHintSeq: -1,
     lastMpvBanner: '',
+    forgetMpvOsc: noop, // mpv 控制条的去重缓存另有测试（mpvOsc.test.js）
+    lastOscJson: '',
     t: (s) => s,
     log: (text, kind) => logs.push([text, kind]),
     replace: (node, text) => {

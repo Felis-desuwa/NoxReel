@@ -73,7 +73,10 @@ test('层 id 不由渲染进程决定，文本长度有上限', () => {
   const adapter = read('src', 'main', 'players', 'mpvAdapter.js');
   assert.equal(OVERLAY_ROOM, 1);
   assert.match(main, /players\.setBanner\(validate\.string\(text, '覆盖层文本', \{ max: 400/);
-  assert.match(adapter, /setOverlay\(OVERLAY_ROOM, text\)/, '层 id 由适配器固定，不从渲染进程来');
+  // 适配器交给控制器的 setRoomBanner，层 id 在那里固定（控制条画得出来时改由它画成卡片）
+  assert.match(adapter, /return this\.ctl\.setRoomBanner\(text\);/, '层 id 由适配器那一侧固定，不从渲染进程来');
+  const mpv = read('src', 'main', 'mpv.js');
+  assert.match(mpv, /return this\.setOverlay\(OVERLAY_ROOM, this\._roomBanner\);/);
 });
 
 test('渲染端也去重，并在播放器重启时清零', () => {

@@ -103,8 +103,10 @@ test('房间名：房主改了记在本机，下次开房接着用；清空 = �
   let modal = null;
   const stored = {};
   const ops = [];
-  const ctx = sandbox(['openNameModal', 'openRoomRename'], {
+  const logs = [];
+  const ctx = sandbox(['openNameModal', 'openRoomRename', 'applyRoomName'], {
     S: { playlist: { roomName: '' } },
+    log: (text, tone) => logs.push([text, tone]),
     roomEntered: true,
     canEditPlaylist: () => true,
     isRoomHost: () => true,
@@ -125,6 +127,12 @@ test('房间名：房主改了记在本机，下次开房接着用；清空 = �
   assert.equal(await modal.onOk(), true);
   assert.deepEqual(JSON.parse(JSON.stringify(ops)), [{ type: 'setRoomName', name: '周五电影夜' }]);
   assert.equal(stored['sw.roomName'], '周五电影夜');
+  assert.deepEqual(logs.at(-1), ['房间名改成「周五电影夜」', 'good']);
+  // 邀请区那一栏（房主看得到的地方）走同一个函数；清空 = 不起名
+  assert.equal(await ctx.applyRoomName(''), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(ops.at(-1))), { type: 'setRoomName', name: '' });
+  assert.deepEqual(logs.at(-1), ['房间名清掉了', 'good']);
+  assert.match(fnSource('renderInvite'), /id: 'room-name-input'[\s\S]*?\$\('room-name-apply'\)\.onclick = \(\) => applyRoomName\(\$\('room-name-input'\)\.value\.trim\(\)\);/);
   assert.match(fnSource('enterRoom'), /if \(isRoomHost\(\) && !S\.playlist\.roomName\) \{\n\s+S\.playlist = \{ \.\.\.S\.playlist, roomName: cleanRoomName\(localStorage\.getItem\('sw\.roomName'\)\) \};/);
 });
 
@@ -136,22 +144,28 @@ test('行菜单：能编辑列表的人有「重命名…」，游客没有；�
   assert.match(src('onPlaylistAction'), /if \(!canEditPlaylist\(\)\) return;[\s\S]*case 'rename':\n\s+openItemRename\(id\);/, '改名在权限检查之后');
   assert.match(APP, /\$\('room-file'\)\.addEventListener\('contextmenu', \(e\) => \{\n\s+if \(!S\.current \|\| !canEditPlaylist\(\)\) return;\n\s+e\.preventDefault\(\);\n\s+openItemRename\(S\.current\.id\);/);
   assert.match(APP, /\$\('pill-room'\)\.addEventListener\('contextmenu', \(e\) => \{\n\s+if \(!roomEntered \|\| !canEditPlaylist\(\)\) return;\n\s+e\.preventDefault\(\);\n\s+openRoomRename\(\);/);
+  assert.match(APP, /\$\('pill-room'\)\.addEventListener\('click', \(\) => \{\n\s+if \(roomEntered && canEditPlaylist\(\)\) openRoomRename\(\);/, '左键点也行');
   const panel = read('src', 'renderer', 'ui', 'playlistPanel.js');
   assert.match(panel, /body\.addEventListener\('contextmenu', \(e\) => \{[\s\S]*?openMenu\(id, moreButtonOf\(id\), \{ x: e\.clientX, y: e\.clientY \}\);/);
 });
 
 test('顶栏房间标签：起了名就在前面单独一段（不翻译），后面的状态照旧整句；快照变了跟着重画', () => {
   let replaced = null;
-  const pill = { classList: { toggle() {} } };
+  const classes = new Set();
+  const pill = { classList: { toggle: (c, on) => (on ? classes.add(c) : classes.delete(c)) } };
+  const input = { value: '旧的', placeholder: '' };
   const S = { roomSecurityMode: 'trusted', roomCapacity: 6, playlist: { roomName: '周五电影夜' } };
+  let canEdit = true;
   const ctx = sandbox(['renderRoomPill'], {
     S,
-    $: () => pill,
+    $: (id) => (id === 'room-name-input' ? input : pill),
+    document: { activeElement: null },
+    roomLabel: () => '菲利斯的放映厅',
     connectedPeerCount: () => 0,
-    canEditPlaylist: () => true,
+    canEditPlaylist: () => canEdit,
     t: (s) => s,
     make: (tag, o = {}) => ({ tag, ...o }),
-    replace: (node, ...kids) => (replaced = kids.flat()),
+    replace: (node, ...kids) => (replaced = kids.flat().filter((k) => k != null)), // 和 dom.js 的 replace 一样丢掉 null
   });
   ctx.renderRoomPill();
   assert.deepEqual(
@@ -159,12 +173,23 @@ test('顶栏房间标签：起了名就在前面单独一段（不翻译），�
     [
       { tag: 'span', raw: true, className: 'pill-room-name', text: '周五电影夜' },
       { tag: 'span', text: '等人加入 · 可信房间 · 1 / 6 人' },
+      { tag: 'span', className: 'pill-edit', text: '✎', attrs: { 'aria-hidden': 'true' } },
     ]
   );
-  assert.equal(pill.title, '右键给房间起名');
+  assert.equal(pill.title, '点击给房间起名');
+  assert.equal(classes.has('editable'), true);
+  assert.equal(input.value, '周五电影夜', '邀请区那一栏跟着快照走');
+  canEdit = false;
   S.playlist.roomName = '';
   ctx.renderRoomPill();
-  assert.deepEqual(replaced, ['等人加入 · 可信房间 · 1 / 6 人']);
+  assert.deepEqual(JSON.parse(JSON.stringify(replaced)), [{ tag: 'span', text: '等人加入 · 可信房间 · 1 / 6 人' }], '游客：没有笔、点不了');
+  assert.equal(pill.title, '');
+  assert.equal(classes.has('editable'), false);
+  input.value = '正在输入';
+  ctx.document.activeElement = input;
+  S.playlist.roomName = '别人改的';
+  ctx.renderRoomPill();
+  assert.equal(input.value, '正在输入', '正在输入时不去覆盖');
   assert.match(fnSource('onPlaylistChanged'), /renderRoomPill\(\);/);
 });
 

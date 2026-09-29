@@ -39,6 +39,35 @@ const OBSERVED = [
 ];
 
 /**
+ * 播放器窗口大小记忆：这几个属性另外观察（编号从 WINDOW_OBSERVE_BASE 起），不进 tick。
+ * 大小按「占屏幕的百分比」记（osd-dimensions ÷ display-width/height）：换了分辨率、缩放比例、
+ * 换到别的显示器都照样合适；下次用 --geometry=W%xH% 开窗。全屏时不记，最大化时只记「最大化」、
+ * 不拿最大化的尺寸覆盖平时的大小。
+ */
+const WINDOW_OBSERVED = ['osd-dimensions', 'display-width', 'display-height', 'window-maximized', 'fullscreen'];
+const WINDOW_OBSERVE_BASE = 100;
+// 窗口属性一连串变（拖边框、最大化时尺寸和最大化标志先后到）：停下这么久才算定下来
+const WINDOW_SETTLE_MS = 400;
+// 比这还小的不记（最小化、拖到几乎看不见）：下次开出来找不到窗口比按片子大小开更糟
+const WINDOW_MIN_PCT = 15;
+
+/** 记下来的窗口偏好。认不出来的一律 null（照旧按片子大小开窗）。 */
+function normalizeWindowPref(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const w = Number(raw.w);
+  const h = Number(raw.h);
+  if (!(w >= WINDOW_MIN_PCT && w <= 100 && h >= WINDOW_MIN_PCT && h <= 100)) return null;
+  return { w: Math.round(w * 10) / 10, h: Math.round(h * 10) / 10, maximized: raw.maximized === true };
+}
+
+/** 开窗大小：记过就按记的开，没记过按片子大小（不超过 960×540，太大的缩到屏幕的 92%×88%）。 */
+function windowArgs(pref) {
+  const p = normalizeWindowPref(pref);
+  if (!p) return ['--autofit=960x540', '--autofit-larger=92%x88%'];
+  return [`--geometry=${p.w}%x${p.h}%`, ...(p.maximized ? ['--window-maximized=yes'] : [])];
+}
+
+/**
  * 看到 idle-active 为真、却还没见过 start-file 时，等这么久再认定是打不开：
  * mpv 启动时等脚本加载的那一下也报空闲；而片子在我们连上管道之前就已经失败了，同样只剩这一个信号。
  */
@@ -132,6 +161,28 @@ const CHAT_SCRIPT_FILE = 'noxreel-chat.lua';
 const CHAT_MESSAGE_NAME = 'noxreel-chat';
 // 同一个脚本里「同步到房主」那个快捷键回传的消息名，不带参数
 const SYNC_MESSAGE_NAME = 'noxreel-sync';
+
+/**
+ * NoxReel 自己画的控制条（替掉 mpv 自带的 osc.lua），见 resources/mpv-scripts/noxreel-osc.lua。
+ * mpv 按文件名给脚本起名（非字母数字换成下划线），script-message-to 要用这个名字。
+ * 脚本画不出来（mpv 太老、出了错）会自己把自带控制条打开，所以自带控制条的配色参数照旧带着。
+ */
+const OSC_SCRIPT_FILE = 'noxreel-osc.lua';
+const OSC_CLIENT_NAME = 'noxreel_osc';
+// 脚本报回来的消息名：ready（画得出来了）、fallback（退回自带的了）、danmaku、quality <高度>
+const OSC_MESSAGE_NAME = 'noxreel-osc';
+// 推给脚本的房间状态（JSON）上限。正常是一两 KB，收到的分段最多几十段
+const MAX_OSC_STATE = 16 * 1024;
+// 脚本把「画得出来 / 退回自带的了」也写进这个属性（ready / fallback），见 MpvController._subscribe
+const OSC_STATUS_PROP = 'user-data/noxreel_osc/status';
+const OSC_OBSERVE_ID = 200;
+
+/** 控制条用的字体：各平台自带、中文和数字都好看的那一个。 */
+function oscFont(platform = process.platform) {
+  if (platform === 'win32') return 'Microsoft YaHei UI';
+  if (platform === 'darwin') return 'PingFang SC';
+  return 'Noto Sans CJK SC';
+}
 
 /** mpv JSON IPC 一行的上限。正常的回包和事件都是几百字节，1MB 已经宽松得离谱。 */
 const MAX_IPC_LINE = 1024 * 1024;
@@ -244,6 +295,8 @@ const MPV_FALLBACK_CANDIDATES = ['C:\\mpv\\mpv.exe'];
  * mpv 的 ytdl_hook 会把 yt-dlp 给的 ftp / rtmp 地址原样交给 ffmpeg（实测会直连局域网）。
  */
 const REMOTE_PROTOCOLS = 'http,https,tls,tcp,crypto,httpproxy,data';
+// 交给 yt-dlp 的字幕语言：全要，除了那两种不是字幕的（见 networkArgs）
+const SUB_LANGS_ARG = 'sub-langs=all,-danmaku,-live_chat';
 
 /**
  * 和网络有关的启动参数。
@@ -266,6 +319,10 @@ function networkArgs({ isRemote, proxy }) {
     return args;
   }
   if (proxy) args.push(`--ytdl-raw-options-append=proxy=${proxy}`);
+  // ytdl_hook 把网站给的「字幕」全挂上。B 站的弹幕（danmaku，XML）和 YouTube 的聊天回放（live_chat，JSON）
+  // 也在里面，mpv 解不了：在控制条上点一下字幕按钮选中它，播放位置就停住不动（B 站实测，30 秒都不恢复）。
+  // 别的真字幕照旧保留
+  args.push(`--ytdl-raw-options-append=${SUB_LANGS_ARG}`);
   args.push(
     `--stream-lavf-o-append=protocol_whitelist=${REMOTE_PROTOCOLS}`,
     `--demuxer-lavf-o-append=protocol_whitelist=${REMOTE_PROTOCOLS}`
@@ -337,8 +394,12 @@ function buildLaunchArgs({
   proxy = null,
   growing = false,
   maxHeight = 0,
+  windowPref = null,
+  oscScript = null,
 } = {}) {
   const isRemote = /^https?:\/\//i.test(source);
+  // 自己画的控制条：和聊天脚本一样只认绝对路径（--load-scripts=no 仍在，别的脚本进不来）
+  const ownOsc = !!(oscScript && path.isAbsolute(oscScript));
   return [
     '--no-config',
     `--input-ipc-server=${ipcPath}`,
@@ -358,7 +419,9 @@ function buildLaunchArgs({
     '--background-color=#030711',
     '--cursor-autohide=700',
     '--input-default-bindings=yes',
-    '--osc=yes',
+    // 有自己的控制条就关掉自带的；下面那些 osc-* 参数照旧带着，自己的画不出来时退回自带的还是这套配色
+    ownOsc ? '--osc=no' : '--osc=yes',
+    ...(ownOsc ? [`--script=${oscScript}`, `--script-opt=noxreel_osc-font=${oscFont()}`] : []),
     '--script-opt=osc-layout=bottombar',
     '--script-opt=osc-seekbarstyle=bar',
     '--script-opt=osc-hidetimeout=900',
@@ -381,8 +444,8 @@ function buildLaunchArgs({
     '--script-opt=osc-windowcontrols_alignment=right',
     '--script-opt=osc-windowcontrols_title=NoxReel · ${media-title}',
     '--script-opt=osc-title=NoxReel · ${media-title}',
-    '--autofit=960x540',
-    '--autofit-larger=92%x88%',
+    // 上次的窗口大小（见 windowArgs / MpvController._onWindowProp）
+    ...windowArgs(windowPref),
     `--pause=${startPaused ? 'yes' : 'no'}`,
     // 换播放器、重开播放器时直接从房间当前位置起，省得先从片头解码一段再跳
     ...(startAt > 0 ? [`--start=${Number(startAt).toFixed(3)}`] : []),
@@ -419,21 +482,38 @@ function buildLaunchArgs({
  * 和 media.js 的 toolCandidates 一样把参数摊开，才测得到打包后的那条分支：
  * 开发机上 process.resourcesPath 是 undefined，直接断言只能测到一半。
  */
-function chatScriptCandidates({ resourcesPath = process.resourcesPath, dirname = __dirname } = {}) {
+function scriptCandidates(file, { resourcesPath = process.resourcesPath, dirname = __dirname } = {}) {
   return [
-    ...(resourcesPath ? [path.join(resourcesPath, 'mpv-scripts', CHAT_SCRIPT_FILE)] : []),
-    path.join(dirname, '..', '..', 'resources', 'mpv-scripts', CHAT_SCRIPT_FILE),
+    ...(resourcesPath ? [path.join(resourcesPath, 'mpv-scripts', file)] : []),
+    path.join(dirname, '..', '..', 'resources', 'mpv-scripts', file),
   ];
 }
 
-/** 找不到就返回 null：脚本缺了只是播放器里发不了弹幕，房间窗口里的输入框照常能用。 */
-function findChatScript(opts) {
-  for (const candidate of chatScriptCandidates(opts)) {
+function chatScriptCandidates(opts) {
+  return scriptCandidates(CHAT_SCRIPT_FILE, opts);
+}
+
+function oscScriptCandidates(opts) {
+  return scriptCandidates(OSC_SCRIPT_FILE, opts);
+}
+
+function findScript(candidates) {
+  for (const candidate of candidates) {
     try {
       if (fs.statSync(candidate).isFile()) return candidate;
     } catch {}
   }
   return null;
+}
+
+/** 找不到就返回 null：脚本缺了只是播放器里发不了弹幕，房间窗口里的输入框照常能用。 */
+function findChatScript(opts) {
+  return findScript(chatScriptCandidates(opts));
+}
+
+/** 找不到就返回 null：用 mpv 自带的控制条。 */
+function findOscScript(opts) {
+  return findScript(oscScriptCandidates(opts));
 }
 
 /** 返回 mpv 可执行文件路径，找不到返回 null。 */
@@ -469,6 +549,107 @@ class MpvController extends EventEmitter {
     this.pauseTickHoldMs = PAUSE_TICK_HOLD_MS;
     this.idleConfirmMs = IDLE_CONFIRM_MS;
     this._resetLoadState();
+    this._resetOsc();
+  }
+
+  /* ---------------------------- 自己画的控制条 ---------------------------- */
+
+  /**
+   * oscReady：控制条脚本报过 ready（画得出来）。在那之前（以及它退回自带控制条之后）
+   * 提示照旧走 show-text、横幅照旧画在覆盖层上；之后提示画成它的提示条，横幅换成它正中的卡片。
+   */
+  _resetOsc() {
+    this.oscReady = false;
+    this._oscFellBack = false;
+    // 最近一份房间状态（JSON）和真正发出去的那一份：脚本报 ready 之前推来的先攒着
+    this._oscState = null;
+    this._oscSent = null;
+    // 房间状态横幅的文字。控制条画得出来时它由控制条正中的卡片代替，退回自带控制条时要补画回去
+    this._roomBanner = '';
+  }
+
+  /** 全员暂停时的房间状态横幅（见 setOverlay）。控制条在的时候不画，由它画成正中的卡片。 */
+  setRoomBanner(text) {
+    this._roomBanner = String(text || '');
+    if (this.oscReady) return Promise.resolve();
+    return this.setOverlay(OVERLAY_ROOM, this._roomBanner);
+  }
+
+  /** 控制条要画的房间状态（片名、房间状态、在等谁缓冲、收到了哪几段……），见 noxreel-osc.lua 的 apply_state。 */
+  setOscState(state) {
+    let json;
+    try {
+      json = JSON.stringify(state || {});
+    } catch {
+      return Promise.resolve();
+    }
+    if (json.length > MAX_OSC_STATE) return Promise.resolve();
+    this._oscState = json;
+    return this._flushOscState();
+  }
+
+  _flushOscState() {
+    const json = this._oscState;
+    // renderStatus 每个 tick 都会推一次，没变就不发
+    if (!this.oscReady || json === null || json === this._oscSent) return Promise.resolve();
+    if (!this.sock || this.sock.destroyed) return Promise.resolve();
+    this._oscSent = json;
+    return this.command(['script-message-to', OSC_CLIENT_NAME, 'noxreel-state', json]).catch(() => {
+      if (this._oscSent === json) this._oscSent = null;
+    });
+  }
+
+  _onOscMessage(args) {
+    const action = args[1];
+    if (action === 'ready') {
+      // 属性和广播两条路都可能报上来，只认第一次
+      if (this.oscReady) return;
+      this.oscReady = true;
+      // 之前画在覆盖层上的横幅（卡片由状态里的 stall 来画）
+      if (this._overlays.get(OVERLAY_ROOM)) {
+        this._overlays.delete(OVERLAY_ROOM);
+        this.command(['osd-overlay', OVERLAY_ROOM, 'none', '']).catch(() => {});
+      }
+      this._oscSent = null;
+      this._flushOscState();
+      this.emit('osc-action', { action: 'ready' });
+      return;
+    }
+    if (action === 'fallback') {
+      if (this._oscFellBack) return;
+      this._oscFellBack = true;
+      this.oscReady = false;
+      this._oscSent = null;
+      // 卡片没了，横幅补画回覆盖层上
+      this.setOverlay(OVERLAY_ROOM, this._roomBanner);
+      this.emit('osc-action', { action: 'fallback' });
+      return;
+    }
+    if (action === 'danmaku') {
+      this.emit('osc-action', { action: 'danmaku' });
+      return;
+    }
+    if (action === 'quality') {
+      const value = Number(args[2]);
+      if (value === 0 || (Number.isSafeInteger(value) && value >= 144 && value <= 4320)) {
+        this.emit('osc-action', { action: 'quality', value });
+      }
+      return;
+    }
+    // 长按 → 的 2 倍速：start 开始、end 松手（带停在哪，房主 / 管理员据此把全房带过来）、cancel 换片途中收尾（不带）
+    if (action === 'speed-hold') {
+      const phase = args[2];
+      if (phase === 'start' || phase === 'cancel') {
+        this.emit('osc-action', { action: 'speed-hold', value: phase });
+      } else if (phase === 'end') {
+        const position = args[3] === '' || args[3] === undefined ? NaN : Number(args[3]);
+        this.emit('osc-action', {
+          action: 'speed-hold',
+          value: 'end',
+          position: Number.isFinite(position) && position >= 0 && position <= 10 ** 7 ? position : null,
+        });
+      }
+    }
   }
 
   /**
@@ -561,7 +742,17 @@ class MpvController extends EventEmitter {
    */
   async launch(
     filePath,
-    { startPaused = true, startAt = 0, muted = false, headers = {}, chatPrompt = '', proxy = null, growing = false, maxHeight = 0 } = {}
+    {
+      startPaused = true,
+      startAt = 0,
+      muted = false,
+      headers = {},
+      chatPrompt = '',
+      proxy = null,
+      windowPref = null,
+      maxHeight = 0,
+      growing = false,
+    } = {}
   ) {
     if (this.running) await this.quit();
 
@@ -588,16 +779,22 @@ class MpvController extends EventEmitter {
       proxy,
       growing,
       maxHeight,
+      windowPref,
+      oscScript: findOscScript(),
     });
 
     this.proc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: false, env: childEnv() });
     this.running = true;
+    // 窗口大小记忆：从这次开窗用的那份起算（最大化着开的，平时的大小还是它）
+    this._resetWindow(windowPref);
     // 上一个进程打不开的状态不能带到这一个身上
     this._resetLoadState();
     // 新进程身上没有任何覆盖层，缓存必须跟着清零，否则重开播放器后
     // setOverlay 会以为「文本没变」而不再发送，横幅再也不出现。
     this.forgetOverlays();
     this._resetDanmaku();
+    // 新进程里的控制条还没报「画得出来」，状态也得重新推给它
+    this._resetOsc();
 
     let stderr = '';
     this.proc.stderr.on('data', (d) => {
@@ -608,6 +805,8 @@ class MpvController extends EventEmitter {
       this.running = false;
       if (this._idleTimer) clearTimeout(this._idleTimer);
       this._idleTimer = null;
+      // 关窗前刚拖过的大小还在等「定下来」：马上算一次，别丢了
+      this._settleWindow();
       this.forgetOverlays();
       this._resetDanmaku();
       this._failAllPending(new Error('mpv 已退出'));
@@ -619,16 +818,26 @@ class MpvController extends EventEmitter {
     });
 
     await this._connectWithRetry(ipcPath);
-
-    for (let i = 0; i < OBSERVED.length; i++) {
-      this.command(['observe_property', i + 1, OBSERVED[i]]).catch(() => {});
-    }
-    // 打不开时的原因（HTTP 403、ytdl_hook 解析失败……）只在日志里，end-file 只说「载入失败」。
-    // 要 warn 级：ffmpeg 自己拿到的 HTTP 错误码是 warn（见 isLoadWarnLine），其余 warn 收到也不留
-    this.command(['request_log_messages', 'warn']).catch(() => {});
+    this._subscribe();
 
     this.emit('launched', { bin, filePath });
     return { bin, filePath };
+  }
+
+  /** 连上管道之后要订阅的东西：播放状态、窗口大小、控制条状态、错误日志。 */
+  _subscribe() {
+    for (let i = 0; i < OBSERVED.length; i++) {
+      this.command(['observe_property', i + 1, OBSERVED[i]]).catch(() => {});
+    }
+    for (let i = 0; i < WINDOW_OBSERVED.length; i++) {
+      this.command(['observe_property', WINDOW_OBSERVE_BASE + i, WINDOW_OBSERVED[i]]).catch(() => {});
+    }
+    // 控制条画没画得出来。脚本加载时（mpv 起来几毫秒）广播的那一声我们收不到 —— 管道要约 100ms 后才连上 ——
+    // 所以它同时写进这个属性：订阅时 mpv 马上推一次当前值，之后变了再推（见 _dispatch）
+    this.command(['observe_property', OSC_OBSERVE_ID, OSC_STATUS_PROP]).catch(() => {});
+    // 打不开时的原因（HTTP 403、ytdl_hook 解析失败……）只在日志里，end-file 只说「载入失败」。
+    // 要 warn 级：ffmpeg 自己拿到的 HTTP 错误码是 warn（见 isLoadWarnLine），其余 warn 收到也不留
+    this.command(['request_log_messages', 'warn']).catch(() => {});
   }
 
   /** mpv 起来到管道可用之间有个时间差，得重试。 */
@@ -662,6 +871,48 @@ class MpvController extends EventEmitter {
         resolve(sock);
       });
     });
+  }
+
+  /* ---------------------------- 窗口大小记忆 ---------------------------- */
+
+  _resetWindow(pref) {
+    if (this._winTimer) clearTimeout(this._winTimer);
+    this._winTimer = null;
+    this._win = {};
+    this.windowPref = normalizeWindowPref(pref);
+  }
+
+  _onWindowProp(name, value) {
+    this._win ||= {};
+    this._win[name] = value;
+    if (this._winTimer) clearTimeout(this._winTimer);
+    this._winTimer = setTimeout(() => this._settleWindow(), WINDOW_SETTLE_MS);
+    this._winTimer.unref?.();
+  }
+
+  /** 窗口属性停下来了：算出这次的偏好，和上次记的不一样才报（'geometry'，由主进程存进配置）。 */
+  _settleWindow() {
+    if (this._winTimer) clearTimeout(this._winTimer);
+    this._winTimer = null;
+    const win = this._win || {};
+    // 全屏不算：下次一开就是全屏会吓人，全屏时的尺寸也不是「窗口大小」
+    if (win.fullscreen === true) return;
+    const maximized = win['window-maximized'] === true;
+    const next = { ...(this.windowPref || {}), maximized };
+    const dims = win['osd-dimensions'];
+    const dw = Number(win['display-width']);
+    const dh = Number(win['display-height']);
+    // 最大化时的尺寸不覆盖平时的大小：还原之后回到的是平时那个
+    if (!maximized && dims && dims.w > 0 && dims.h > 0 && dw > 0 && dh > 0) {
+      next.w = (dims.w / dw) * 100;
+      next.h = (dims.h / dh) * 100;
+    }
+    const pref = normalizeWindowPref(next);
+    if (!pref) return;
+    const old = this.windowPref;
+    if (old && old.w === pref.w && old.h === pref.h && old.maximized === pref.maximized) return;
+    this.windowPref = pref;
+    this.emit('geometry', pref);
   }
 
   _wireSocket() {
@@ -712,6 +963,16 @@ class MpvController extends EventEmitter {
     }
 
     if (msg.event === 'property-change') {
+      // 控制条的状态：不进 tick，当成它报上来的消息处理
+      if (msg.name === OSC_STATUS_PROP) {
+        if (msg.data === 'ready' || msg.data === 'fallback') this._onOscMessage([OSC_MESSAGE_NAME, msg.data]);
+        return;
+      }
+      // 窗口大小那几个不进 tick（同步引擎不关心，也不该因为拖窗口多出一串 tick）
+      if (WINDOW_OBSERVED.includes(msg.name)) {
+        this._onWindowProp(msg.name, msg.data);
+        return;
+      }
       this.props[msg.name] = msg.data;
       if (msg.name === 'idle-active') this._onIdleActive(msg.data);
       this.emit('property', { name: msg.name, value: msg.data });
@@ -753,6 +1014,11 @@ class MpvController extends EventEmitter {
     // 播放器里按快捷键要求「同步到房主」（在线链接的手动同步）。只是一声招呼，不带任何内容。
     if (msg.event === 'client-message' && Array.isArray(msg.args) && msg.args[0] === SYNC_MESSAGE_NAME) {
       this.emit('sync-request', {});
+    }
+
+    // 自己画的控制条报上来的：画得出来了、退回自带的了、点了「弹幕」「清晰度」
+    if (msg.event === 'client-message' && Array.isArray(msg.args) && msg.args[0] === OSC_MESSAGE_NAME) {
+      this._onOscMessage(msg.args);
     }
 
     if (msg.event) this.emit('mpv-event', msg);
@@ -840,9 +1106,17 @@ class MpvController extends EventEmitter {
     return this.command(['get_property', name]);
   }
 
-  /** 在 mpv 画面上打一行字，用来告诉用户「在等谁」。转瞬即逝，用于对某个动作的即时回应。 */
-  osd(text, durationMs = 2000) {
-    return this.command(['show-text', text, durationMs]).catch(() => {});
+  /**
+   * 在 mpv 画面上打一行字，用来告诉用户「在等谁」。转瞬即逝，用于对某个动作的即时回应。
+   * 控制条在的时候画成它顶部的提示条（tone：ok 带盾牌、warn 带警告、其余不带图标）；
+   * 它关掉了 mpv 自带的 OSD 文字（osd-level=0），show-text 带上级别 0 才照样显示。
+   */
+  osd(text, durationMs = 2000, tone = 'info') {
+    if (this.oscReady) {
+      const kind = tone === 'ok' || tone === 'warn' ? tone : 'info';
+      return this.command(['script-message-to', OSC_CLIENT_NAME, 'noxreel-toast', String(text), String(durationMs), kind]).catch(() => {});
+    }
+    return this.command(['show-text', text, durationMs, 0]).catch(() => {});
   }
 
   /**
@@ -961,6 +1235,13 @@ module.exports = {
   findMpv,
   findChatScript,
   chatScriptCandidates,
+  findOscScript,
+  oscScriptCandidates,
+  oscFont,
+  OSC_CLIENT_NAME,
+  OSC_MESSAGE_NAME,
+  MAX_OSC_STATE,
+  OSC_STATUS_PROP,
   OBSERVED,
   buildLaunchArgs,
   buildAssEvent,
@@ -980,6 +1261,10 @@ module.exports = {
   REMOTE_CACHE_PAUSE_WAIT,
   MAX_IPC_LINE,
   REMOTE_PROTOCOLS,
+  normalizeWindowPref,
+  windowArgs,
+  WINDOW_OBSERVED,
+  SUB_LANGS_ARG,
   networkArgs,
   youtubeArgs,
   qualityArgs,

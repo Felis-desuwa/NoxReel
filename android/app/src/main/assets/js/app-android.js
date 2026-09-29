@@ -703,7 +703,8 @@ function initSwarmAndSync() {
   localStorage.setItem('sw.securityMode', S.securityMode);
   $('security-mode').disabled = true;
 
-  S.swarm = new Swarm({ peerId: S.peerId, name: S.name, securityMode: S.securityMode, platform: 'android' });
+  // caps：手机能当同步目标（会报自己放到哪）、跟得上房主换人；当不了房主（见 protocol.js 的 CAPS）
+  S.swarm = new Swarm({ peerId: S.peerId, name: S.name, securityMode: S.securityMode, platform: 'android', caps: ['leader', 'follow-host'] });
   S.sync = new SyncEngine({
     peerId: S.peerId,
     name: S.name,
@@ -738,12 +739,25 @@ function initSwarmAndSync() {
   S.sync.on('drift', renderDrift);
   // 在线链接断在半路（不是放完了）：提示本人、给「重试」（和桌面端 onLinkStreamCut 一样）
   S.sync.on('stream-cut', (e) => onLinkStreamCut(e));
-  S.sync.on('drift-correct', ({ seconds }) => log(`和房主差了 ${Math.abs(seconds).toFixed(1)} 秒，自动对齐`));
+  S.sync.on('drift-correct', ({ seconds }) => log(`和${syncRefName()}差了 ${Math.abs(seconds).toFixed(1)} 秒，自动对齐`));
+  // 房主换人了（转让，或者原房主替现在的房主作保）：改认新房主。发给原房主、还没等到回执的列表操作结束掉；
+  // 向新房主要一份现状（列表、兜底地址、聊天历史）—— 他那份可能比作保先到，被当成不是房主发的丢了
+  S.sync.on('host-changed', ({ hostId, from }) => {
+    S.hostId = hostId;
+    for (const settle of [...S.pendingOps.values()]) settle({ ok: false, reason: '房主换人了，没成的请再试一次' });
+    log(`${memberName(from)}把房主转给了${memberName(hostId)}`, 'good');
+    const host = S.swarm?.peers.get(hostId);
+    if (host?.authenticated) host.send({ t: MSG.HOST_SYNC });
+    renderRole();
+  });
   S.sync.on('duration', (d) => {
     if (S.session?.slot != null) S.swarm.setDuration(S.session.slot, d);
   });
-  // 房主分配的角色变了 → 更新「我是游客还是管理员」的界面（游客禁用拖动条）
-  S.sync.on('roles', renderRole);
+  // 房主分配的角色变了 → 更新「我是游客还是管理员」的界面（游客禁用拖动条）；同步目标换了说一声
+  S.sync.on('roles', () => {
+    noteLeaderChange();
+    renderRole();
+  });
   // 游客拖了进度被拦下：把滑块弹回、给个提示
   S.sync.on('denied', ({ action }) => {
     if (action === 'seek') {
@@ -2368,7 +2382,7 @@ function renderMembers() {
     const role = S.sync?.roleOf(peerId) || 'guest';
     return ROLE_LABEL[role] ? role : 'guest';
   };
-  const row = (name, platform, role, self) => {
+  const row = (name, platform, role, self, peerId) => {
     const key = normalizePlatform(platform);
     let rename = null;
     if (self) {
@@ -2380,6 +2394,8 @@ function renderMembers() {
       self ? el('span', { className: 'mb-role', text: '（你）' }) : null,
       el('span', { className: `mb-os ${key}`, text: PLATFORM_LABEL[key] }),
       el('span', { className: 'mb-role', text: ROLE_LABEL[role] }),
+      // 房主指定的同步目标：大家跟着他的画面走
+      S.sync?.leaderId === peerId ? el('span', { className: 'mb-role mb-leader', text: '同步目标' }) : null,
       rename,
     ]);
   };
@@ -2389,8 +2405,8 @@ function renderMembers() {
     .map((p) => ({ p, role: roleOf(p.peerId) }))
     .sort((a, b) => (a.role === 'host' ? -1 : b.role === 'host' ? 1 : 0));
   body.replaceChildren(
-    renameRowNode || row(names.get(S.peerId) || S.name || '', 'android', S.sync?.myRole() || 'guest', true),
-    ...others.map(({ p, role }) => row(names.get(p.peerId) || p.name || '', p.platform, role, false))
+    renameRowNode || row(names.get(S.peerId) || S.name || '', 'android', S.sync?.myRole() || 'guest', true, S.peerId),
+    ...others.map(({ p, role }) => row(names.get(p.peerId) || p.name || '', p.platform, role, false, p.peerId))
   );
 }
 
@@ -3404,10 +3420,35 @@ function renderWaiting() {
 
 /* ------------------------ 在线链接的跟随方式 ------------------------ */
 
-/** 「你比房主慢 12 秒」。seconds 是本机减房间，负数是落后。 */
+/** 成员的显示名（重名带编号）；自己是「你」。 */
+function memberName(peerId) {
+  if (peerId === S.peerId) return '你';
+  return roomDisplayNames().get(peerId) || S.swarm?.peers.get(peerId)?.name || '对方';
+}
+
+/** 大家跟谁对齐：房主指定了同步目标就是他（昵称），否则是房主。 */
+function syncRefName() {
+  const leader = S.sync?.followingLeader() ? S.sync.leaderId : null;
+  return leader ? memberName(leader) : '房主';
+}
+
+// 上一次知道的同步目标：变了才说一句
+let knownLeader = null;
+
+function noteLeaderChange() {
+  const leader = S.sync?.leaderId || null;
+  if (leader === knownLeader) return;
+  knownLeader = leader;
+  if (leader === S.peerId) log('你被设为同步目标：大家跟着你的画面走', 'good', { toast: true });
+  else if (leader) log(`${memberName(leader)}被设为同步目标：大家跟着他的画面走`, 'good');
+  else log('同步目标取消了，大家回到跟房间进度');
+  renderMembers();
+}
+
+/** 「你比房主慢 12 秒」（跟着同步目标时是他的昵称）。seconds 是本机减对齐标准，负数是落后。 */
 function driftText(seconds) {
   const n = Math.abs(Math.round(seconds));
-  return `你比房主${seconds < 0 ? '慢' : '快'} ${n} 秒`;
+  return `你比${syncRefName()}${seconds < 0 ? '慢' : '快'} ${n} 秒`;
 }
 
 // 上一次画出来的样子。每秒都会调到这里，没变就不碰 DOM —— 否则自动翻译每秒都要把中文再换一遍
@@ -3419,8 +3460,9 @@ function renderDrift() {
   const d = S.sync?.driftStatus();
   // 这一部放不了（断流停在半路）时差多少秒没有意义，那一条让给「重试」
   const failed = !!S.playIssue && S.playIssue.seq === S.currentSeq;
-  const shown = link && !!S.playerTimer && !!d && d.streaming && d.state !== 'ok' && !failed;
-  const key = `${link}|${S.linkSync}|${shown ? `${d.state}|${d.seconds}` : ''}`;
+  // 在线链接一直核对；本地片子只在跟着同步目标时核对（见 syncEngine 的 checkDrift）
+  const shown = !!S.playerTimer && !!d && (link ? d.streaming : !!d.leader) && d.state !== 'ok' && !failed;
+  const key = `${link}|${S.linkSync}|${shown ? `${d.state}|${d.seconds}|${syncRefName()}` : ''}`;
   if (key === driftKey) return;
   driftKey = key;
   show($('btn-follow'), link);
@@ -3446,7 +3488,9 @@ $('btn-follow').addEventListener('click', () => {
 });
 
 $('drift-sync').addEventListener('click', () => {
-  if (S.sourceType === 'link' && S.sync?.syncToRoom()) log('已同步到房主的进度', 'good', { toast: true });
+  if ((S.sourceType === 'link' || S.sync?.followingLeader()) && S.sync?.syncToRoom()) {
+    log(syncRefName() === '房主' ? '已同步到房主的进度' : `已同步到 ${syncRefName()} 的进度`, 'good', { toast: true });
+  }
 });
 
 // 这一部放不了时顶栏下面那一条上的「重试」（见 retryPlayback）
@@ -3454,7 +3498,12 @@ $('play-retry').addEventListener('click', () => retryPlayback());
 
 // 每秒核对一次和房主差多少（播放器静止时位置不变，差距在变大只能靠这个看出来），顺手刷新那一条
 setInterval(() => {
-  if (S.sync && S.sourceType === 'link' && S.playerTimer) S.sync.checkDrift();
+  if (S.sync && S.playerTimer) {
+    // 我是同步目标：报一下自己实际放到哪（引擎自己按间隔发）
+    S.sync.beaconTick();
+    // 在线链接一直核对；本地片子只在跟着同步目标时核对
+    if (S.sourceType === 'link' || S.sync.followingLeader()) S.sync.checkDrift();
+  }
   renderDrift();
 }, 1000);
 

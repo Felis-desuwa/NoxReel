@@ -297,6 +297,97 @@ const EN = new Map(Object.entries({
   '同步到房主': 'Sync to host',
   '同步到房间进度': 'Sync to the room',
   '自动同步没跟上': 'Auto-sync could not keep up',
+  // mpv 里的控制条（noxreel-osc.lua）：右上角的房间状态、按钮说明、菜单、全员暂停时正中的卡片
+  '同步中': 'In sync',
+  '等人缓冲': 'Waiting for buffering',
+  '缓冲中': 'Buffering',
+  '没对上': 'Out of sync',
+  '独立观看': 'Watching on your own',
+  '房间': 'Room',
+  '最高（自动）': 'Best (auto)',
+  '后退 10 秒': 'Back 10 s',
+  '前进 10 秒': 'Forward 10 s',
+  '静音': 'Mute',
+  '取消静音': 'Unmute',
+  '关闭弹幕': 'Hide danmaku',
+  '打开弹幕': 'Show danmaku',
+  '字幕': 'Subtitles',
+  '关闭字幕': 'Subtitles off',
+  '这一部没有字幕': 'No subtitles for this one',
+  '音轨': 'Audio track',
+  '只有一条音轨': 'Only one audio track',
+  '退出全屏': 'Exit full screen',
+  '最小化': 'Minimize',
+  '最大化': 'Maximize',
+  '还原': 'Restore',
+  '关闭': 'Close',
+  '只影响你自己': 'Only affects you',
+  '正在打开…': 'Opening…',
+  '正在缓冲': 'Buffering',
+  '音量': 'Volume',
+  '已静音': 'Muted',
+  '倍速': 'Speed',
+  // 成员表：同步目标、转让房主
+  '同步目标': 'Sync target',
+  '设为同步目标': 'Make sync target',
+  '取消同步目标': 'Clear sync target',
+  '转让房主': 'Transfer host',
+  '转让': 'Transfer',
+  '对方': 'them',
+  '现在设不了同步目标': 'Can’t set a sync target right now',
+  '现在转不了房主': 'Can’t transfer host right now',
+  '只有房主能指定同步目标': 'Only the host can choose a sync target',
+  '先把他设为管理员：同步目标得是能控场的人': 'Make them a moderator first: the sync target has to be someone who can control playback',
+  '他用的 NoxReel 版本太旧，报不了自己放到哪，先让他升级': 'Their NoxReel is too old to report where they are; ask them to update first',
+  '只有房主能转让房主': 'Only the host can transfer host',
+  '一对一邀请的房间是星型连接，其他人只连着你，房主转不过去': 'One-to-one invite rooms are star-shaped — everyone is connected only to you, so host can’t be transferred',
+  '先把他设为管理员': 'Make them a moderator first',
+  '他现在没连着': 'They aren’t connected right now',
+  '手机上的 NoxReel 当不了房主': 'NoxReel on a phone can’t be the host',
+  '他用的 NoxReel 版本太旧，接不了房主，先让他升级': 'Their NoxReel is too old to take over as host; ask them to update first',
+  '排片、设管理员、在线视频的地址、聊天中转都交给他，你变成管理员。':
+    'The playlist, moderators, online-video links and chat relay all go to them, and you become a moderator.',
+  '房间链接和邀请还在你这里：新人照旧从原来的邀请进来。你离开之后，已经在房里的人照常看，但新人就进不来了。':
+    'The room link and invites stay with you: newcomers still join through the original invite. After you leave, people already here keep watching, but newcomers can’t get in.',
+  '房间链接和邀请还在开房的人那里，他离开之后新人就进不来了。':
+    'The room link and invites stay with whoever opened the room; once they leave, newcomers can’t get in.',
+  '房主换人了，没成的请再试一次': 'The host changed; if it didn’t go through, try again',
+  '你被设为同步目标：大家跟着你的画面走': 'You are the sync target: everyone follows your playback',
+  '同步目标取消了，大家回到跟房间进度': 'The sync target was cleared; everyone follows the room again',
+  '房主是转给你的，邀请还是从开房的人那里发：他在线时，新人从原来的房间链接进来，会自动认你当房主。':
+    'You were made host, but invites still come from whoever opened the room: while they’re online, newcomers joining through the original room link will recognise you as host.',
+  '想让大家接着看，走之前在成员表里把房主转给一个管理员。':
+    'To let everyone keep watching, transfer host to a moderator in the member list before you leave.',
+  // mpv 控制条的快捷键：按钮说明后面的键名、长按 → 快进的提示、? 键的一览
+  '空格': 'Space',
+  '长按 →': 'Hold →',
+  '2 倍速快进中': 'Fast-forwarding at 2×',
+  '松开后全房跟到这里': 'the room jumps here when you let go',
+  '一起看时不能改倍速，长按 → 可以临时 2 倍速快进': 'Speed can’t be changed while watching together — hold → to fast-forward at 2×',
+  '弹幕已打开': 'Danmaku on',
+  '弹幕已关闭': 'Danmaku off',
+  '已经和房主同步': 'Already in sync with the host',
+  '快捷键': 'Keyboard shortcuts',
+  '跳转、快进会同步给全房；游客只能暂停自己': 'Seeking and fast-forwarding move the whole room; guests can only pause themselves',
+  '播放 / 暂停': 'Play / pause',
+  '后退 / 前进 5 秒': 'Back / forward 5 s',
+  '2 倍速快进，松开恢复': 'Fast-forward at 2× while held',
+  '后退 / 前进 30 秒': 'Back / forward 30 s',
+  '全屏 / 退出全屏': 'Toggle full screen',
+  '上一章 / 下一章': 'Previous / next chapter',
+  '发弹幕': 'Send danmaku',
+  '开关弹幕': 'Toggle danmaku',
+  '选字幕': 'Choose subtitles',
+  '选音轨': 'Choose audio track',
+  '看一眼进度': 'Show progress',
+  '快捷键一览': 'Show shortcuts',
+  '关闭播放器': 'Close the player',
+  '轨道': 'Track',
+  '全员暂停中，缓冲够了就一起继续': 'Everyone is paused; playback resumes together once there is enough buffer',
+  '不用操作，缓冲够了会自动开始': 'Nothing to do — playback resumes automatically',
+  '缓冲不足，只暂停你自己': 'Buffer low — only your playback is paused',
+  '房间照常播放': 'The room keeps playing',
+  '缓冲够了会自动接着放': 'Playback continues once there is enough buffer',
   '网速跟不上的话，可以把同步方式改成「手动同步」': 'If your connection cannot keep up, switch the sync mode to “Manual sync”',
   // 在线链接上只有自己在等数据（不再往自己的 mpv 画面上写「等待 你 缓冲」）
   '正在缓冲…': 'Buffering…',
@@ -984,6 +1075,8 @@ const EN = new Map(Object.entries({
   'Discord：不写名字': 'Discord: no names',
   '点一下在片名和房间名之间切换': 'Click to switch between the title and the room name',
   '右键给房间起名': 'Right-click to name the room',
+  '点击给房间起名': 'Click to name the room',
+  '房间名清掉了': 'Room name cleared',
   '右键改片名': 'Right-click to rename',
   '重命名…': 'Rename…',
   '改片名': 'Rename title',
@@ -1058,6 +1151,9 @@ const EN = new Map(Object.entries({
 const trimEnd = (text) => String(text).replace(/[.。]+$/, '');
 
 /** 等待名单：只把我们自己的「你」这个标记翻过去，别人的昵称原样保留。 */
+/** 「和谁对齐」：房主、房间进度照翻，同步目标的昵称原样。 */
+const syncRefEn = (ref) => (ref === '房主' ? 'the host' : ref === '房间进度' ? 'the room' : ref);
+
 const joinWaiting = (list) =>
   String(list)
     .split('、')
@@ -1119,16 +1215,26 @@ const INVALID_LABELS = {
 };
 
 const EN_PATTERNS = [
-  // 在线链接的跟随方式：差多少秒
+  // 在线链接的跟随方式：差多少秒。跟的可以是房主、房间进度，或者房主指定的同步目标（昵称原样）
   [
-    /^你比(房主|房间进度)(慢|快) (\d+) 秒$/,
+    /^你比(.+?)(慢|快) (\d+) 秒$/,
     (_all, ref, dir, n) =>
-      `You are ${n} ${n === '1' ? 'second' : 'seconds'} ${dir === '慢' ? 'behind' : 'ahead of'} ${ref === '房主' ? 'the host' : 'the room'}`,
+      `You are ${n} ${n === '1' ? 'second' : 'seconds'} ${dir === '慢' ? 'behind' : 'ahead of'} ${syncRefEn(ref)}`,
   ],
   [
-    /^和(房主|房间进度)差了 ([\d.]+) 秒，自动对齐$/,
-    (_all, ref, n) => `${n} seconds off from ${ref === '房主' ? 'the host' : 'the room'}; realigned automatically`,
+    /^和(.+?)差了 ([\d.]+) 秒，自动对齐$/,
+    (_all, ref, n) => `${n} seconds off from ${syncRefEn(ref)}; realigned automatically`,
   ],
+  // 同步目标、转让房主
+  [/^同步到 (.+)$/, 'Sync to $1'],
+  [/^已同步到 (.+) 的进度$/, 'Synced to $1'],
+  [/^(.+)被设为同步目标：大家跟着他的画面走$/, '$1 is now the sync target: everyone follows their playback'],
+  [/^把房主转给 (.+)？$/, 'Transfer host to $1?'],
+  [/^(.+)把房主转给了你：排片、设管理员、在线视频的地址都归你管了$/, '$1 made you the host: the playlist, moderators and online-video links are yours now'],
+  [/^你把房主转给了(.+)，你现在是管理员$/, 'You transferred host to $1; you are a moderator now'],
+  [/^(.+)把房主转给了(.+)$/, '$1 transferred host to $2'],
+  [/^房里还有人用的是旧版本（(.+)），转过去他们的播放列表会卡住，先让他们升级$/, 'Some people here are on an old version ($1); their playlist would freeze after a transfer, so ask them to update first'],
+  [/^你把房主转给了(.+)。你走了以后，已经在房里的人照常看，但新人就没法用原来的链接进房了。$/, 'You transferred host to $1. After you leave, people already here keep watching, but newcomers can no longer join through the original link.'],
   // 0.7.5 加固
   [/^(.+) 被停止供片后仍在持续发送数据，已断开连接$/, '$1 kept sending data after being cut off as a source and was disconnected'],
   [/^(.+) 送来的分片多次校验失败，已停止向他要片$/, 'Chunks from $1 failed verification repeatedly; no longer requesting chunks from them'],
@@ -1621,6 +1727,11 @@ const EN_PATTERNS = [
       `${state === '已连接' ? 'Connected' : 'Waiting for people'} · ${mode === '可信房间' ? 'Trusted room' : 'Safe mode'} · ${n} / ${max} people`,
   ],
   [/^第 (\d+) \/ (\d+) 部$/, 'Item $1 of $2'],
+  // mpv 控制条：右上角「同步中 · 4 人在看」的后半截、全员暂停卡片上的几行
+  [/^(\d+) 人在看$/, '$1 watching'],
+  [/^等待 (.+) 缓冲$/, (_all, who) => `Waiting for ${joinWaiting(who)} to buffer`],
+  [/^已缓冲 ([\d.]+) \/ (\d+) 秒$/, 'Buffered $1 / $2 s'],
+  [/^约 (.+) 后继续$/, 'Resuming in about $1'],
   [/^播放到 (.+)$/, 'Playing at $1'],
   [/^不用等还能放 (.+)$/, '$1 playable without waiting'],
   [/^从当前位置可连续播放 (.+)$/, 'Continuous from here: $1'],
@@ -1686,6 +1797,7 @@ const EN_PATTERNS = [
   ],
   [/^在看《(.+)》$/, 'Watching “$1”'],
   [/^在「(.+)」一起看片$/, 'Watching together in “$1”'],
+  [/^房间名改成「(.+)」$/, 'Room name set to “$1”'],
   [/^(.+)的放映厅$/, '$1’s screening room'],
   [/^房间 (\d+)\/(\d+) 人$/, 'Room $1/$2'],
 ];

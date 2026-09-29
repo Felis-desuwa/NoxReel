@@ -5,6 +5,7 @@ import { MSG, PROTOCOL_VERSION, normalizePlatform, platformOfOs, randomId } from
 import { encodeCode, decodeCode, shareLink, WsSignaling, randomRoomId, randomPeerId } from './lib/signaling.js';
 import { RelaySignaling, DEFAULT_RELAYS, newRoomSecret } from './lib/relaySignaling.js';
 import { currentLocale, setLocale, startI18n, translate as t } from './lib/i18n.js';
+import { haveRanges } from './lib/oscState.js';
 import {
   applyOp,
   catalogOf,
@@ -1675,7 +1676,9 @@ async function startHostLink(rawUrl) {
 
 /* ---------------------------- 播放列表与当前项 ---------------------------- */
 
-const isRoomHost = () => S.role === 'host' && S.hostId === S.peerId;
+// 我是不是房主（排片、设管理员、在线视频地址、聊天中转归我）。S.role === 'host' 说的是「房间是我开的」——
+// 房间入口（房间链接、信令房间、邀请）归开房的人；房主可以转给管理员（S.hostTakenOver），入口不跟着走
+const isRoomHost = () => S.hostId === S.peerId && (S.role === 'host' || S.hostTakenOver === true);
 const PLAYLIST_OP_TIMEOUT_MS = 45_000;
 const MANIFEST_RETRY_MS = 5000;
 // 缓存位置用不了（盘拔了）时隔多久再试一次
@@ -2758,6 +2761,7 @@ function retirePlayer() {
   S.playerQuit = Promise.all([S.playerQuit, quitting]).then(() => {});
   S.mpvRunning = false;
   lastMpvBanner = '';
+  forgetMpvOsc();
   S.danmaku?.setActive(false);
   S.sync?.forgetPlayerState?.();
   return quitting;
@@ -4931,6 +4935,8 @@ function initSwarmAndSync() {
     securityMode: S.roomSecurityMode || S.settings.securityMode,
     // HELLO 里报给别人：成员表上显示你用什么设备（Windows / macOS / Linux）
     platform: myPlatform(),
+    // 能当同步目标、跟得上房主换人、能接手当房主（见 protocol.js 的 CAPS）
+    caps: ['leader', 'follow-host', 'host'],
   });
   S.sync = new SyncEngine({
     peerId: S.peerId,
@@ -4993,11 +4999,8 @@ function initSwarmAndSync() {
       // 顺序是契约：角色表 → 播放列表（和链接的兜底地址）→ 同步状态
       beforeSync: () => {
         if (!isRoomHost()) return;
-        S.swarm.sendLarge(peer, { t: MSG.PLAYLIST, state: S.playlist });
-        if (S.nowLink?.seq === S.playlist.seq) peer.send({ t: MSG.NOW_LINK, ...S.nowLink });
-        refreshNowLink();
         // 顺序是契约：角色表 → 播放列表（和链接兜底地址）→ 聊天历史 → 同步状态
-        S.swarm.sendLarge(peer, { t: MSG.CHAT_HISTORY, items: S.chat.history.snapshot() });
+        sendHostState(peer);
       },
     });
     if (peer.peerId === S.hostId && (S.hostGone || S.hostLink)) {
@@ -5073,7 +5076,8 @@ function initSwarmAndSync() {
       // OSD 文本走 IPC 交给 mpv 渲染，不进 DOM —— 自动翻译的 MutationObserver
       // 碰不到它，必须在这里显式过一遍 t()。字典里本来就为这几条写了英文，
       // 只是调用点漏了，那些词条一直是死的。
-      window.sw.player.osd(guestSelf ? t('缓冲不足，暂停你自己…') : t(`等待 ${who} 缓冲…`), 3000);
+      // mpv 控制条在的时候正中那张卡片已经在说同一件事，不再叠一条提示
+      if (!mpvOscReady) window.sw.player.osd(guestSelf ? t('缓冲不足，暂停你自己…') : t(`等待 ${who} 缓冲…`), 3000);
     } else {
       log(`${who}缓冲够了`, 'good');
     }
@@ -5104,8 +5108,12 @@ function initSwarmAndSync() {
     log(`和${driftRefName()}差了 ${Math.abs(seconds).toFixed(1)} 秒，自动对齐`);
   });
 
+  // 房主换人了（转让，或者新人经原房主进来、原房主替现在的房主作保）
+  S.sync.on('host-changed', (e) => onHostChanged(e));
+
   // 角色变化：重画成员列表（含标签/切换按钮）、更新我自己的身份提示。
   S.sync.on('roles', () => {
+    noteLeaderChange();
     renderPeersSoon();
     renderMyRole();
     // 升降管理员会改变能不能编辑列表
@@ -5161,7 +5169,7 @@ function initSwarmAndSync() {
     const detail = e?.message || String(e);
     log(`写入接收缓存失败：${detail}`, 'bad');
     // 看片时 NoxReel 窗口多半压在播放器下面，日志没人看：在播放器画面上也提一句
-    if (S.mpvRunning) window.sw.player.osd(t('写入接收缓存失败，磁盘可能已满'), 4000);
+    if (S.mpvRunning) window.sw.player.osd(t('写入接收缓存失败，磁盘可能已满'), 4000, 'warn');
   });
   // 接收进度是 stall 评估的第二个驱动源。全员暂停后 mpv 不再发 tick，
   // 只剩这条路能把「缓冲攒够了」告诉同步引擎。只看正在播放的那一部。
@@ -5256,6 +5264,13 @@ function onRoomCtrl(msg, peer) {
       break;
     case MSG.CHAT_HISTORY:
       onChatHistory(msg, peer);
+      break;
+    case MSG.HOST_SYNC:
+      // 刚改认我当房主的人要一份现状（见 onHostChanged）。每人每 10 秒最多回一次，不然谁都能让我反复整包发列表
+      if (isRoomHost() && Date.now() - (hostSyncAnsweredAt.get(peer.peerId) || 0) > 10_000) {
+        hostSyncAnsweredAt.set(peer.peerId, Date.now());
+        sendHostState(peer);
+      }
       break;
     default:
       S.sync?.onCtrl(msg, peer);
@@ -5713,6 +5728,8 @@ function ensureDanmakuControls() {
       saveDanmakuSettings(next);
       S.danmaku.setSettings(next);
       S.danmaku.setEnabled(next.enabled !== false);
+      // mpv 控制条上的「弹」按钮跟着变（暂停时没有 tick 替它推）
+      scheduleOscState();
     },
   });
   return danmakuControls;
@@ -6647,7 +6664,7 @@ function maybeLaunchPlayer(p) {
     }
     S.mediaSafety.status = 'trusted-streaming';
     log('可信房间已达到片头缓冲，正在边接收边播放；完整接收后仍会执行安全扫描。', 'warn');
-    launchPlayer().then(() => window.sw.player.osd(t('可信房间 · 边下边播风险较高'), 3500));
+    launchPlayer().then(() => window.sw.player.osd(t('可信房间 · 边下边播风险较高'), 3500, 'warn'));
     return;
   }
   if (p.complete && S.mediaSafety.status === 'clean') launchPlayer();
@@ -6812,14 +6829,14 @@ async function applyScanResult(session, result, before) {
       'good'
     );
     if (open) await launchPlayer();
-    window.sw.player.osd(t(kept ? '安全扫描通过 · 已存进长期缓存文件夹' : '安全扫描通过 · 缓存关软件时清掉'), 2500);
+    window.sw.player.osd(t(kept ? '安全扫描通过 · 已存进长期缓存文件夹' : '安全扫描通过 · 缓存关软件时清掉'), 2500, 'ok');
     return;
   }
 
   // 扫描器没跑起来，而这是可信房间：这一场本来就是不等扫描就播的，只警告，不打断。
   if (outcome.status === 'unscanned') {
     log(`${result.message}。可信房间不因此中断播放，但这份文件始终没有经过本机扫描 —— 请自行确认片源可信。`, 'warn');
-    window.sw.player.osd(t('未经本机扫描 · 请自行确认片源'), 4000);
+    window.sw.player.osd(t('未经本机扫描 · 请自行确认片源'), 4000, 'warn');
     renderStatus();
     return;
   }
@@ -6830,7 +6847,7 @@ async function applyScanResult(session, result, before) {
   const reason = result.message || '安全扫描没能完成';
   if (S.roomSecurityMode === 'trusted') {
     log(`${reason}。可信房间不因此中断播放，但这份文件没有扫完 —— 可以点「重新扫描」再来一遍。`, 'warn');
-    window.sw.player.osd(t(stopped ? '扫描已停止 · 文件仍在' : '扫描没做完 · 文件仍在'), 4000);
+    window.sw.player.osd(t(stopped ? '扫描已停止 · 文件仍在' : '扫描没做完 · 文件仍在'), 4000, 'warn');
   } else if (result.status === 'unavailable') {
     // 这一种有明确的下一步：Defender 被第三方杀软接管停用是最常见的诱因。
     // 房间模式由房主定、双方必须一致 —— 游客只改本机设置的话，下次连这个房间都进不来，得说全
@@ -6947,6 +6964,7 @@ async function launchPlayer({ startAt = null, relaunch = false } = {}) {
   const ticket = playerGate.begin();
   S.mpvRunning = true; // 先占位，防止 progress 事件密集时重复拉起
   lastMpvBanner = ''; // 新进程身上没有覆盖层，去重缓存要跟着清零
+  forgetMpvOsc();
   let info = null;
   try {
     info = await window.sw.player.launch({
@@ -6991,6 +7009,8 @@ async function launchPlayer({ startAt = null, relaunch = false } = {}) {
     // 启动期间推过去的横幅可能没送到（主进程那边播放器还没连上管道，或者还在等旧的退出），
     // 这里的去重缓存却已经记下了：清掉，下一次 renderStatus 重推，否则文本不变就再也不会发
     lastMpvBanner = '';
+    // 控制条的状态同理（控制条报没报 ready 不在这里清：它可能比这个回包先到）
+    lastOscJson = '';
     // 这一代在回包之前就推过来的事件（先记下了），现在补上
     if (early.tick) handlePlayerTick(early.tick);
     if (early.exit && playerGate.acceptExit(early.exit)) handlePlayerExit(early.exit);
@@ -7354,6 +7374,7 @@ function detachFromPlayer(gen = playerGate.gen) {
   S.playerQuit = Promise.all([S.playerQuit, releasing]).then(() => {});
   S.mpvRunning = false;
   lastMpvBanner = '';
+  forgetMpvOsc();
   S.danmaku?.setActive(false);
   S.sync?.playerGone?.();
   // 他在自己的窗口里看别的片：供片的 progress 不许再给这一部拉起一个新窗口，等他点「重新打开」
@@ -7430,7 +7451,18 @@ async function renderInvite() {
   const box = $('invite-body');
 
   if (S.role !== 'host') {
-    replace(box, make('p', { text: '你是通过邀请加入的。要拉更多人进来，让发起者再生成一个邀请码。' }));
+    if (isRoomHost()) {
+      // 房主是转给我的：房间入口（房间链接的签名、信令房间的凭据）还在开房的人那里，我开不了新的邀请。
+      // 房间链接谁都能转发，新人从它进来，开房的人替我作保
+      const copy = S.roomLink ? make('button', { className: 'ghost small', text: '复制房间链接' }) : null;
+      replace(box, [
+        make('p', { text: '房主是转给你的，邀请还是从开房的人那里发：他在线时，新人从原来的房间链接进来，会自动认你当房主。' }),
+        copy,
+      ]);
+      if (copy) copy.onclick = () => copyCode(S.roomLink, copy, '复制房间链接');
+    } else {
+      replace(box, make('p', { text: '你是通过邀请加入的。要拉更多人进来，让发起者再生成一个邀请码。' }));
+    }
     renderInviteArea();
     return;
   }
@@ -7451,6 +7483,17 @@ async function renderInvite() {
           ? '当前：可信房间（边下边播，风险较高）。加入者也必须在本机选择可信房间。'
           : '当前：安全模式。成员完整接收并扫描通过后才播放。',
       }),
+      // 房间名：全房看到、Discord 状态里用（顶栏的房间标签点一下也能改）
+      make('div', { className: 'capacity-row' }, [
+        make('label', { text: '房间名', attrs: { for: 'room-name-input' } }),
+        make('input', {
+          id: 'room-name-input',
+          className: 'room-name-input',
+          attrs: { type: 'text', maxlength: MAX_ROOM_NAME, placeholder: roomLabel() },
+          props: { value: S.playlist.roomName || '' },
+        }),
+        make('button', { className: 'ghost tiny', id: 'room-name-apply', text: '保存' }),
+      ]),
       make('div', { className: 'capacity-row' }, [
         make('label', { text: '房间人数上限', attrs: { for: 'room-capacity' } }),
         capacityInput,
@@ -7469,6 +7512,10 @@ async function renderInvite() {
   // 会被当成 notice 原样渲染成「[object PointerEvent]」贴在邀请区顶上。
   $('inv-manual').onclick = () => inviteViaManual();
   $('capacity-apply').onclick = applyRoomCapacity;
+  $('room-name-apply').onclick = () => applyRoomName($('room-name-input').value.trim());
+  $('room-name-input').onkeydown = (e) => {
+    if (e.key === 'Enter') applyRoomName($('room-name-input').value.trim());
+  };
   renderCapacityStatus();
   renderInviteArea();
   // 默认给房间链接：一条链接发到群里谁点谁进。连不上公共中继时它自己会退回一对一邀请。
@@ -7552,10 +7599,22 @@ function renderRoomPill(others = connectedPeerCount()) {
   const status = `${others ? '已连接' : '等人加入'} · ${mode} · ${others + 1} / ${S.roomCapacity} 人`;
   // 房间名是用户内容：单独一段、不翻译；后面那段状态照旧整句翻译
   const name = S.playlist?.roomName;
-  replace(pill, name ? [make('span', { raw: true, className: 'pill-room-name', text: name }), make('span', { text: status })] : status);
-  // 能改名的人右键它起名：悬停时说一声
-  pill.title = canEditPlaylist() ? t('右键给房间起名') : '';
+  const editable = canEditPlaylist();
+  replace(pill, [
+    name ? make('span', { raw: true, className: 'pill-room-name', text: name }) : null,
+    make('span', { text: status }),
+    // 能改名的人点它起名（右键也行）：带个笔，看得出能点
+    editable ? make('span', { className: 'pill-edit', text: '✎', attrs: { 'aria-hidden': 'true' } }) : null,
+  ]);
+  pill.title = editable ? t('点击给房间起名') : '';
+  pill.classList.toggle('editable', editable);
   pill.classList.toggle('waiting', !others);
+  // 邀请区那一栏跟着快照走（别人改了、或者从对话框改的）；正在输入时不去覆盖
+  const input = $('room-name-input');
+  if (input && document.activeElement !== input) {
+    input.value = name || '';
+    input.placeholder = roomLabel();
+  }
 }
 
 function renderCapacityStatus() {
@@ -8097,6 +8156,8 @@ function legendItem(kind, text) {
 
 function renderProgress(p) {
   if (!p) return;
+  // 边收边播时 mpv 控制条的进度条上画「已收到」的几段（每收一片才变，见 oscRanges）
+  scheduleOscState();
 
   if (S.sourceType === 'link') {
     $('buf-have').style.width = '100%';
@@ -8525,13 +8586,18 @@ function openRoomRename() {
     placeholder: roomLabel(),
     max: MAX_ROOM_NAME,
     hintText: '全房看到的都是这个名字，Discord 状态选「房间名」时显示它。清空再保存就不起名。',
-    onSave: async (name) => {
-      const res = await runPlaylistOp({ type: 'setRoomName', name });
-      // 当房主时记下来，下次开房直接用
-      if (res.ok !== false && isRoomHost()) localStorage.setItem('sw.roomName', name);
-      return res.ok !== false;
-    },
+    onSave: (name) => applyRoomName(name),
   });
+}
+
+/** 改房间名（对话框和邀请区那一栏共用）。成功返回 true；当房主时记下来，下次开房直接用。 */
+async function applyRoomName(name) {
+  if (!roomEntered || !canEditPlaylist()) return false;
+  const res = await runPlaylistOp({ type: 'setRoomName', name });
+  if (res.ok === false) return false;
+  if (isRoomHost()) localStorage.setItem('sw.roomName', name);
+  log(name ? `房间名改成「${name}」` : '房间名清掉了', 'good');
+  return true;
 }
 
 // 右键片名：给正在放的这一部改名；右键顶栏的房间标签：给房间起名。不能改的人右键没反应（照常弹系统菜单也没有）
@@ -8544,6 +8610,10 @@ $('pill-room').addEventListener('contextmenu', (e) => {
   if (!roomEntered || !canEditPlaylist()) return;
   e.preventDefault();
   openRoomRename();
+});
+// 顶栏的房间标签左键点也能起名：只有右键的话没人发现得了
+$('pill-room').addEventListener('click', () => {
+  if (roomEntered && canEditPlaylist()) openRoomRename();
 });
 
 /** 成员名后面那个设备标记。平台是对端自己报的，只拿来显示；标记单独一个元素，不拼进昵称。 */
@@ -8841,6 +8911,324 @@ function pushMpvBanner(text) {
   window.sw.player.overlay(next ? t(next) : '').catch(() => {});
 }
 
+/* ------------------------------ mpv 控制条 ------------------------------ */
+// mpv 里画的是 NoxReel 自己的控制条（resources/mpv-scripts/noxreel-osc.lua）：片名、房间状态、全员暂停时
+// 正中的卡片、进度条上收到了哪几段、和房主差多少、弹幕开没开、清晰度……都由这里算好推过去。
+// 它不进 DOM，自动翻译碰不到，文字都得自己过一遍 t()。外部播放器没有这一项，主进程直接丢掉。
+
+// 控制条报过「画得出来」（见 onOscAction）。之后差开时那句一分钟一次的提示就不用发了：它顶上常驻一条
+let mpvOscReady = false;
+// 上一次推过去的状态（JSON）。主进程那边也去重，这里再挡一层是因为 renderStatus 每个 tick 都跑
+let lastOscJson = '';
+let oscPushTimer = null;
+// 「已收到」那几段按位图算，每收一片才变：按收到的片数缓存
+let oscRangesKey = '';
+let oscRangesCache = null;
+
+// 控制条自己的字（按钮说明、菜单标题……），按界面语言翻好一起推过去
+const OSC_LABEL_TEXT = {
+  play: '播放',
+  pause: '暂停',
+  back: '后退 10 秒',
+  fwd: '前进 10 秒',
+  mute: '静音',
+  unmute: '取消静音',
+  danmakuOn: '关闭弹幕',
+  danmakuOff: '打开弹幕',
+  subs: '字幕',
+  subsOff: '关闭字幕',
+  noSubs: '这一部没有字幕',
+  audio: '音轨',
+  noAudio: '只有一条音轨',
+  fullscreen: '全屏',
+  exitFullscreen: '退出全屏',
+  minimize: '最小化',
+  maximize: '最大化',
+  restore: '还原',
+  close: '关闭',
+  quality: '清晰度',
+  qualityNote: '只影响你自己',
+  opening: '正在打开…',
+  buffering: '正在缓冲',
+  guestSeek: '游客不能跳转进度',
+  volume: '音量',
+  muted: '已静音',
+  speed: '倍速',
+  track: '轨道',
+  // 快捷键：按钮说明后面的键名、长按 → 快进时顶部那一条、? 键的一览（见 noxreel-osc.lua 的「快捷键」一节）
+  keySpace: '空格',
+  keyHold: '长按 →',
+  speedHold: '2 倍速快进中',
+  speedHoldNote: '松开后全房跟到这里',
+  noSpeed: '一起看时不能改倍速，长按 → 可以临时 2 倍速快进',
+  danmakuShown: '弹幕已打开',
+  danmakuHidden: '弹幕已关闭',
+  inSync: '已经和房主同步',
+  helpTitle: '快捷键',
+  helpNote: '跳转、快进会同步给全房；游客只能暂停自己',
+  hPlay: '播放 / 暂停',
+  hSeek: '后退 / 前进 5 秒',
+  hHold: '2 倍速快进，松开恢复',
+  hSeekLong: '后退 / 前进 30 秒',
+  hVolume: '音量',
+  hMute: '静音',
+  hFullscreen: '全屏 / 退出全屏',
+  hChapter: '上一章 / 下一章',
+  hSend: '发弹幕',
+  hToggleDanmaku: '开关弹幕',
+  hSync: '同步到房主',
+  hSubs: '选字幕',
+  hAudio: '选音轨',
+  hProgress: '看一眼进度',
+  hHelp: '快捷键一览',
+  hClose: '关闭播放器',
+};
+let oscLabelsCache = null;
+
+/**
+ * 按字数截短（按码点，不把 emoji 劈成两半）。主进程的 oscState 校验对每一项都有字数上限，
+ * 超了整份状态就被拒、这一路从此推不过去（比如等好几个长昵称的人时卡片标题），所以这里先截好。
+ */
+function clipText(text, max) {
+  const s = String(text ?? '');
+  if (s.length <= max) return s;
+  // 上限按 UTF-16 长度算（主进程校验就是这么数的），逐个码点加，不劈开 emoji
+  let out = '';
+  for (const ch of s) {
+    if (out.length + ch.length > max - 1) break;
+    out += ch;
+  }
+  return `${out}…`;
+}
+
+/** 每一项截到主进程 oscState 校验的上限以内（两边的数字要对上，见 security.js）。 */
+function clipOscState(s) {
+  const out = { ...s, title: clipText(s.title, 300), subtitle: clipText(s.subtitle, 300) };
+  if (s.chip) out.chip = { ...s.chip, text: clipText(s.chip.text, 120) };
+  if (s.stall) {
+    out.stall = { ...s.stall, title: clipText(s.stall.title, 200) };
+    for (const [key, max] of [['sub', 200], ['left', 80], ['right', 80], ['note', 160]]) {
+      if (s.stall[key] !== undefined) out.stall[key] = clipText(s.stall[key], max);
+    }
+  }
+  if (s.drift) out.drift = { text: clipText(s.drift.text, 120), button: clipText(s.drift.button, 40), key: s.drift.key };
+  if (s.quality) {
+    out.quality = {
+      ...s.quality,
+      label: clipText(s.quality.label, 40),
+      options: s.quality.options.map((o) => ({ h: o.h, label: clipText(o.label, 40) })),
+    };
+  }
+  out.labels = Object.fromEntries(Object.entries(s.labels || {}).map(([k, v]) => [k, clipText(v, 80)]));
+  return out;
+}
+
+function oscLabels() {
+  const locale = currentLocale();
+  if (oscLabelsCache?.locale !== locale) {
+    oscLabelsCache = { locale, labels: Object.fromEntries(Object.entries(OSC_LABEL_TEXT).map(([k, v]) => [k, t(v)])) };
+  }
+  // 进度条上那个小旗子：房主自己跟的是房间时钟
+  const leader = followedLeader();
+  return { ...oscLabelsCache.labels, host: leader ? nameOfPeer(leader) : t(isRoomHost() ? '房间' : '房主') };
+}
+
+/** 新起的（或退掉的）播放器：它还没报 ready，推过的状态也得重推。 */
+function forgetMpvOsc() {
+  mpvOscReady = false;
+  lastOscJson = '';
+  S.speedHold = false;
+}
+
+/** 右上角那一小块：房间现在什么状态、几个人在看。房里只有自己时不画。 */
+function oscChip(st, streamSelfOnly) {
+  const count = connectedPeerCount() + 1;
+  if (count < 2) return null;
+  let tone = 'sync';
+  let label = '同步中';
+  if (st.stalled && !streamSelfOnly) {
+    tone = 'wait';
+    label = S.sync.roomStalled ? '等人缓冲' : '缓冲中';
+  } else if (driftShown()) {
+    const manual = linkFollowMode() === 'manual';
+    tone = manual ? 'manual' : 'wait';
+    label = S.sync.driftStatus().state === 'failed' ? '自动同步没跟上' : manual ? '手动同步' : '没对上';
+  } else if (st.paused) {
+    tone = 'paused';
+    label = '已暂停';
+  } else if (!S.sync.canIControl()) {
+    tone = 'guest';
+    label = '独立观看';
+  }
+  return { tone, text: `${t(label)} · ${t(`${count} 人在看`)}` };
+}
+
+/** 片名下面那一行：房间名 · 第几部。 */
+function oscSubtitle() {
+  const played = S.playlist?.history?.length || 0;
+  const total = played + (S.playlist?.queue?.length || 0);
+  const parts = [];
+  if (S.sourceType === 'link') parts.push(t('在线视频'));
+  parts.push(roomLabel());
+  if (S.current && total > 1) parts.push(t(`第 ${played + 1} / ${total} 部`));
+  return parts.join(' · ');
+}
+
+/** 进度条上的「已收到」：只在边收边播时有意义，收完的、做种的、在线视频（控制条自己画缓存）都不给。 */
+function oscRanges() {
+  if (S.sourceType !== 'file') return null;
+  const ctx = currentFileCtx();
+  if (!ctx || ctx.complete || ctx.isSeeder) return null;
+  const key = `${ctx.slot}:${ctx.haveCount}`;
+  if (key !== oscRangesKey) {
+    oscRangesKey = key;
+    oscRangesCache = haveRanges(ctx.have, ctx.manifest);
+  }
+  return oscRangesCache;
+}
+
+/** 本机卡着时缓冲攒到哪了（秒）：卡片上那根进度条。算不出来（码率未知、在线视频）就不给。 */
+function myBufferGauge() {
+  if (!S.sync?.localStalled || S.sourceType !== 'file') return null;
+  const ctx = currentFileCtx();
+  const bitrate = mediaBitrate();
+  const need = S.sync.resumeThresholdBytes || 0;
+  if (!ctx || !(bitrate > 0) || !(need > 0)) return null;
+  const run = Math.max(0, S.swarm.progress(ctx.slot).runBytes || 0);
+  return { have: run / bitrate, need: need / bitrate };
+}
+
+/** 全员暂停（或只暂停自己）时画面正中那张卡片。和横幅是同一个条件，见 renderStatus 里的 pushMpvBanner。 */
+function oscStall(st, streamSelfOnly) {
+  if (!st.stalled || streamSelfOnly) return null;
+  const wait = stallWaitSeconds({ room: S.sync.roomStalled });
+  const gauge = myBufferGauge();
+  const card = {
+    progress: gauge ? Math.min(1, gauge.have / gauge.need) : undefined,
+    left: gauge ? t(`已缓冲 ${gauge.have.toFixed(1)} / ${Math.round(gauge.need)} 秒`) : undefined,
+    right: wait ? t(`约 ${fmtTime(wait)} 后继续`) : undefined,
+  };
+  if (S.sync.roomStalled) {
+    // 名单里的「你」由 t() 统一翻译（i18n 的 joinWaiting），别人的昵称原样
+    const who = stallWaitingNames().join('、');
+    return {
+      ...card,
+      title: t(`等待 ${who} 缓冲`),
+      sub: t('全员暂停中，缓冲够了就一起继续'),
+      note: t('不用操作，缓冲够了会自动开始'),
+    };
+  }
+  return { ...card, title: t('缓冲不足，只暂停你自己'), sub: t('房间照常播放'), note: t('缓冲够了会自动接着放') };
+}
+
+/** 在线视频和房主差开了：顶部正中那一条，带「同步到房主」按钮（点了和 Ctrl+Shift+S 一样）。 */
+function oscDrift() {
+  if (!driftShown()) return null;
+  const d = S.sync.driftStatus();
+  return {
+    text: t(driftText(d.seconds)),
+    button: t(syncButtonText()),
+    key: 'Ctrl+Shift+S',
+  };
+}
+
+/** 差开时进度条上标出房主（房间时钟）在哪。控制条收到之后自己按经过的时间往后推。 */
+function oscHost(st) {
+  if (!driftShown()) return null;
+  const pos = S.sync.referencePositionNow?.();
+  return Number.isFinite(pos) ? { pos: Math.round(Math.max(0, pos) * 10) / 10, playing: !st.paused } : null;
+}
+
+/** 清晰度按钮和它的菜单：和房间窗口里那个下拉框同一个条件、同几档（见 renderQualityControl）。 */
+function oscQuality() {
+  if (!linkQualityApplies() || S.switchingPlayer) return null;
+  const current = S.settings.linkQuality;
+  const options = [{ h: 0, label: t('最高（自动）') }, ...linkQualityOptions().map((h) => ({ h, label: `${h}P` }))];
+  return { current, label: current ? `${current}P` : t('最高'), options: options.slice(0, 12) };
+}
+
+function mpvOscState() {
+  const st = S.sync.status();
+  // 和 renderStatus 同一个判断：在线链接上只有自己在等数据时 mpv 自己转圈，不画卡片
+  const streamSelfOnly = S.sourceType === 'link' && S.sync.localStalled && S.sync.stalledPeers.size === 0;
+  return clipOscState({
+    title: currentTitle(),
+    subtitle: oscSubtitle(),
+    chip: oscChip(st, streamSelfOnly),
+    ranges: oscRanges(),
+    danmaku: S.danmakuSettings.enabled !== false,
+    canSeek: S.sync.canIControl(),
+    stall: oscStall(st, streamSelfOnly),
+    drift: oscDrift(),
+    host: oscHost(st),
+    quality: oscQuality(),
+    labels: oscLabels(),
+  });
+}
+
+/** 推一份新状态给控制条。合并同一小段时间里的多次调用，没变就不发。 */
+function scheduleOscState() {
+  if (oscPushTimer) return;
+  oscPushTimer = setTimeout(() => {
+    oscPushTimer = null;
+    if (!S.sync || !S.mpvRunning || !roomEntered) return;
+    let state;
+    try {
+      state = mpvOscState();
+    } catch (error) {
+      console.warn('算控制条状态出错', error);
+      return;
+    }
+    const json = JSON.stringify(state);
+    if (json === lastOscJson) return;
+    lastOscJson = json;
+    Promise.resolve(window.sw.player.oscState?.(state)).catch(() => {
+      if (lastOscJson === json) lastOscJson = '';
+    });
+  }, 150);
+}
+
+/** 控制条上点「弹幕」：和房间窗口里那个开关是同一份本机设置。 */
+function setDanmakuEnabled(enabled) {
+  const next = { ...S.danmakuSettings, enabled: enabled !== false };
+  S.danmakuSettings = next;
+  saveDanmakuSettings(next);
+  S.danmaku.setSettings(next);
+  S.danmaku.setEnabled(next.enabled);
+  danmakuControls?.render(next);
+  scheduleOscState();
+}
+
+window.sw.player.onOscAction?.((payload) => {
+  const action = payload?.action;
+  // 和 tick 一样只认当前这一代：旧播放器退场途中在路上的一条，不能把新播放器标成就绪、也不能再换一次清晰度。
+  // 代号还没确认（launch 回包之前）时新播放器的 ready 照收
+  if (playerGate.gen !== null && Number.isInteger(payload?.gen) && payload.gen !== playerGate.gen) return;
+  if (action === 'ready') {
+    mpvOscReady = true;
+    lastOscJson = '';
+    scheduleOscState();
+    return;
+  }
+  if (action === 'fallback') {
+    mpvOscReady = false;
+    return;
+  }
+  // 在 mpv 里长按 →：按住期间只有自己在 2 倍速（在线视频的自动对齐先停一停，不然两秒后就被拽回去）；
+  // 松手时房主 / 管理员把全房带到自己这里，和拖进度条松手一样。游客那边控制条就不让快进
+  if (action === 'speed-hold') {
+    S.speedHold = payload.value === 'start';
+    if (payload.value === 'end' && roomEntered && Number.isFinite(payload.position) && S.sync?.canIControl()) {
+      S.sync.userSeek(payload.position);
+    }
+    return;
+  }
+  if (!roomEntered) return;
+  if (action === 'danmaku') setDanmakuEnabled(S.danmakuSettings.enabled === false);
+  // 正在换播放器（上一次换清晰度、换播放器还没完）：房间窗口里的下拉框这时是禁用的，这里同样不收
+  else if (action === 'quality' && !S.switchingPlayer) setLinkQuality(payload.value);
+});
+
 /**
  * 房主面板：文件码率、上行带宽、当前上传，以及按码率算出的「最多能流畅供几个人」
  * 和「现在有几个人会卡」。成员面板只看得到自己，能对全房拿主意的只有房主。
@@ -8952,8 +9340,9 @@ function selfPeerRow(waiting, names = roomDisplayNames()) {
       platformChip(S.swarm?.platform || myPlatform()),
       make('span', { className: 'peer-platform', text: '（你）' }),
     ]),
-    make('div', { attrs: { role: 'cell' } }, [
+    make('div', { className: 'peer-role', attrs: { role: 'cell' } }, [
       make('span', { className: `role-badge ${role}`, text: ROLE_LABEL[role] || '' }),
+      leaderBadge(S.peerId),
     ]),
     make('div', { className: 'peer-state', attrs: { role: 'cell' } }, [
       make('div', { className: tone ? `peer-forecast ${tone}` : 'peer-forecast', text: state }),
@@ -9017,6 +9406,18 @@ function renderPeers(list) {
               attrs: { 'data-peer': peer.peerId, 'data-next': role === 'admin' ? 'guest' : 'admin' },
             })
           : null;
+      // 管理员那几行，房主还有两个按钮：设为同步目标（大家跟他的画面走）、转让房主
+      const hostControls =
+        iAmHost && role === 'admin'
+          ? [
+              make('button', {
+                className: 'leader-toggle',
+                text: S.sync?.leaderId === peer.peerId ? '取消同步目标' : '设为同步目标',
+                attrs: { 'data-peer': peer.peerId },
+              }),
+              make('button', { className: 'host-transfer', text: '转让房主', attrs: { 'data-peer': peer.peerId } }),
+            ]
+          : [];
 
       let stateNodes;
       let speed = '—';
@@ -9063,12 +9464,13 @@ function renderPeers(list) {
           // 每个人用什么设备加入的（Windows / Android …）。昵称是用户输入，标记单独一个元素，别拼进去
           platformChip(peer.platform),
         ]),
-        make('div', { attrs: { role: 'cell' } }, [
+        make('div', { className: 'peer-role', attrs: { role: 'cell' } }, [
           make('span', { className: `role-badge ${role}`, text: ROLE_LABEL[role] }),
+          leaderBadge(peer.peerId),
         ]),
         make('div', { className: 'peer-state', attrs: { role: 'cell' } }, stateNodes),
         make('div', { className: speedTone ? `peer-speed ${speedTone}` : 'peer-speed', attrs: { role: 'cell' }, text: speed }),
-        make('div', { className: 'peer-act', attrs: { role: 'cell' } }, roleControl ? [roleControl] : []),
+        make('div', { className: 'peer-act', attrs: { role: 'cell' } }, [...(roleControl ? [roleControl] : []), ...hostControls]),
       ]);
     }),
   ]);
@@ -9090,14 +9492,187 @@ function renderPeersSoon() {
   }, PEERS_RENDER_MS);
 }
 
-// 房主点「设为管理员/游客」—— 事件委托，省得每次重画都重新接线。
+// 房主点「设为管理员/游客」「设为同步目标」「转让房主」—— 事件委托，省得每次重画都重新接线。
 $('peer-list').addEventListener('click', (e) => {
   // 自己那一行的「改名」
   if (e.target.closest('.peer-rename')) return openRenameModal();
+  if (S.sync?.myRole() !== 'host') return;
+  const leader = e.target.closest('.leader-toggle');
+  if (leader) return toggleLeader(leader.dataset.peer);
+  const transfer = e.target.closest('.host-transfer');
+  if (transfer) return confirmTransferHost(transfer.dataset.peer);
   const btn = e.target.closest('.role-toggle');
-  if (!btn || S.sync?.myRole() !== 'host') return;
+  if (!btn) return;
   S.sync.setRole(btn.dataset.peer, btn.dataset.next);
 });
+
+/* ---------------------------- 同步目标、转让房主 ---------------------------- */
+// 房主在成员表上对管理员有两个按钮：
+//  - 设为同步目标：大家（包括房主）跟着他实际的画面走，房主的权限不变（syncEngine 的 setLeader / beaconTick）；
+//  - 转让房主：排片、设管理员、在线视频的地址、聊天中转都交给他，自己变成管理员（syncEngine 的 transferHost）。
+// 房间入口搬不走 —— 房间链接由开房的人的签名密钥担保，信令服务器上的房主凭据也在他手里：新人照旧从原来的邀请
+// 进来、先认开房的人，由他替现在的房主作保（syncEngine 的 _handedOver）。开房的人一走，已经在房里的人照常看，
+// 新人就进不来了。一对一邀请的房间是星型连接（其他人只连着房主），转不过去。
+
+// 刚改认我当房主的人来要现状（MSG.HOST_SYNC），每人上一次回复的时刻
+const hostSyncAnsweredAt = new Map();
+
+function peerCaps(peerId) {
+  return S.swarm?.peers.get(peerId)?.caps || [];
+}
+
+function nameOfPeer(peerId) {
+  if (peerId === S.peerId) return '你';
+  return roomDisplayNames().get(peerId) || S.swarm?.peers.get(peerId)?.name || '对方';
+}
+
+/** 成员表上「同步目标」的标记：谁是大家对齐的人，人人都看得到。 */
+function leaderBadge(peerId) {
+  return S.sync?.leaderId === peerId ? make('span', { className: 'role-badge leader', text: '同步目标' }) : null;
+}
+
+/** 设为同步目标做不了的原因（做得了是空串）。 */
+function leaderBlocker(peerId) {
+  if (S.sync?.myRole() !== 'host') return '只有房主能指定同步目标';
+  if (S.sync.roleOf(peerId) !== 'admin') return '先把他设为管理员：同步目标得是能控场的人';
+  if (!peerCaps(peerId).includes('leader')) return '他用的 NoxReel 版本太旧，报不了自己放到哪，先让他升级';
+  return '';
+}
+
+/** 转让房主做不了的原因（做得了是空串）。 */
+function transferBlocker(peerId) {
+  if (!isRoomHost()) return '只有房主能转让房主';
+  if (S.mode !== 'server') return '一对一邀请的房间是星型连接，其他人只连着你，房主转不过去';
+  if (S.sync.roleOf(peerId) !== 'admin') return '先把他设为管理员';
+  const peer = S.swarm?.peers.get(peerId);
+  if (!peer?.authenticated) return '他现在没连着';
+  if (!peerCaps(peerId).includes('host')) {
+    return peer.platform === 'android' ? '手机上的 NoxReel 当不了房主' : '他用的 NoxReel 版本太旧，接不了房主，先让他升级';
+  }
+  const old = [...S.swarm.peers.values()].filter((p) => p.authenticated && !(p.caps || []).includes('follow-host'));
+  if (old.length) {
+    const who = old.map((p) => nameOfPeer(p.peerId)).join('、');
+    return `房里还有人用的是旧版本（${who}），转过去他们的播放列表会卡住，先让他们升级`;
+  }
+  return '';
+}
+
+function explainBlocked(title, why) {
+  return openModal({ title, body: [hint(why)], okText: '知道了' }).done;
+}
+
+/** 房主点「设为同步目标 / 取消同步目标」。 */
+function toggleLeader(peerId) {
+  if (S.sync?.leaderId === peerId) {
+    S.sync.setLeader(null);
+    return;
+  }
+  const why = leaderBlocker(peerId);
+  if (why) return explainBlocked('现在设不了同步目标', why);
+  S.sync.setLeader(peerId);
+}
+
+// 上一次知道的同步目标：变了才在日志里说一句
+let knownLeader = null;
+
+/** 同步目标换了：日志里说清楚现在大家跟谁走，跟随方式、差值那一行跟着变。 */
+function noteLeaderChange() {
+  const leader = S.sync?.leaderId || null;
+  if (leader === knownLeader) return;
+  knownLeader = leader;
+  S.sync.setFollow({ mode: linkFollowMode() });
+  if (leader === S.peerId) log('你被设为同步目标：大家跟着你的画面走', 'good');
+  else if (leader) log(`${nameOfPeer(leader)}被设为同步目标：大家跟着他的画面走`, 'good');
+  else log('同步目标取消了，大家回到跟房间进度');
+  renderStatus();
+}
+
+/** 房主点「转让房主」：先说清楚交出去什么、入口留在哪，再转。 */
+async function confirmTransferHost(peerId) {
+  const why = transferBlocker(peerId);
+  if (why) return explainBlocked('现在转不了房主', why);
+  const ok = await openModal({
+    title: `把房主转给 ${nameOfPeer(peerId)}？`,
+    body: [
+      hint('排片、设管理员、在线视频的地址、聊天中转都交给他，你变成管理员。'),
+      hint(
+        S.role === 'host'
+          ? '房间链接和邀请还在你这里：新人照旧从原来的邀请进来。你离开之后，已经在房里的人照常看，但新人就进不来了。'
+          : '房间链接和邀请还在开房的人那里，他离开之后新人就进不来了。'
+      ),
+    ],
+    okText: '转让',
+  }).done;
+  if (ok) await transferHostTo(peerId);
+}
+
+async function transferHostTo(peerId) {
+  // 手上的列表操作先做完，再把最新的列表发一遍：同一条通道是有序的，他先拿到最新的列表、再收到转让
+  await playlistOpChain;
+  const why = transferBlocker(peerId);
+  if (why) return explainBlocked('现在转不了房主', why);
+  S.swarm.broadcastLarge({ t: MSG.PLAYLIST, state: S.playlist });
+  S.sync.transferHost(peerId);
+}
+
+/** 房主给刚认下他的人的现状：播放列表、在线视频的兜底地址、聊天历史（greet 和 MSG.HOST_SYNC 共用）。 */
+function sendHostState(peer) {
+  S.swarm.sendLarge(peer, { t: MSG.PLAYLIST, state: S.playlist });
+  if (S.nowLink?.seq === S.playlist.seq) peer.send({ t: MSG.NOW_LINK, ...S.nowLink });
+  refreshNowLink();
+  S.swarm.sendLarge(peer, { t: MSG.CHAT_HISTORY, items: S.chat.history.snapshot() });
+}
+
+/**
+ * 房主换人了（syncEngine 的 host-changed）：改认新房主。
+ * 发给原房主、还没等到回执的列表操作结束掉（他已经不管列表了）；我成了房主就接手；
+ * 别人改认新房主时向他要一份现状 —— 新人经原房主进来时，新房主那份列表可能比作保先到，被当成不是房主发的丢了。
+ */
+function onHostChanged({ hostId, from }) {
+  S.hostId = hostId;
+  S.hostGone = false;
+  S.hostLink = null;
+  S.hostTakenOver = hostId === S.peerId && S.role !== 'host';
+  for (const settle of [...S.pendingOps.values()]) {
+    settle({ ok: false, reason: '房主换人了，没成的请再试一次', uncertain: true });
+  }
+  if (hostId === S.peerId) {
+    log(`${nameOfPeer(from)}把房主转给了你：排片、设管理员、在线视频的地址都归你管了`, 'good');
+    takeOverAsHost();
+  } else if (from === S.peerId) {
+    log(`你把房主转给了${nameOfPeer(hostId)}，你现在是管理员`, 'good');
+  } else {
+    log(`${nameOfPeer(from)}把房主转给了${nameOfPeer(hostId)}`);
+    const host = S.swarm?.peers.get(hostId);
+    if (host?.authenticated) host.send({ t: MSG.HOST_SYNC });
+  }
+  S.sync.setFollow({ mode: linkFollowMode() });
+  renderPeersSoon();
+  renderMyRole();
+  renderInviteArea();
+  if (roomEntered) {
+    renderPlaylist();
+    renderStatus();
+  }
+}
+
+/** 我刚接手当房主：聊天中转要有历史（之前只在各自的列表里），在线视频的兜底地址由我来发。 */
+function takeOverAsHost() {
+  if (!S.chat.history.list().length) {
+    for (const e of S.chat.entries) {
+      if (e.kind === 'msg') S.chat.history.add({ id: e.key, text: e.text, origin: e.from, name: e.name, ts: e.ts || Date.now() });
+    }
+  }
+  // 手机只认房主给的播放地址：本机解析出来的这一份发给大家（本地缓存的不算，那是本机的文件）
+  if (S.sourceType === 'link' && S.linkInfo && !S.linkInfo.local && S.currentSeq === S.playlist.seq) {
+    S.nowLink = { seq: S.currentSeq, playback: S.linkInfo.playback || null, resolvedAt: S.linkInfo.resolvedAt || Date.now() };
+    for (const p of S.swarm.peers.values()) {
+      if (p.authenticated) p.send({ t: MSG.NOW_LINK, ...S.nowLink });
+    }
+  }
+  refreshSources();
+  maybeAutoStart();
+}
 
 /* ------------------------------ 实时速率 ------------------------------ */
 
@@ -9315,6 +9890,8 @@ function renderStatus() {
   updateStripTone();
   // 每个播放器 tick 都会跑到这里：updatePresence 自己比对，没变就不发
   updatePresence();
+  // mpv 控制条上的房间状态同理：攒一小会儿、没变就不发
+  scheduleOscState();
 }
 
 /** 片名上面那一行：「正在播放 / 即将开始 / 已暂停」+「第 2 / 4 部」（已播放的也算进去）。 */
@@ -9360,12 +9937,36 @@ function updateStripTone() {
 
 /** 本机实际用的跟随方式。房主是参照，没得选，按完全同步走；其他人按自己在本机选的。 */
 function linkFollowMode() {
-  return isRoomHost() ? 'full' : S.settings.linkSync;
+  return amSyncReference() ? 'full' : S.settings.linkSync;
+}
+
+/**
+ * 我是不是大家对齐的那个人：房主指定了同步目标时是他，否则是房主。他的画面就是标准，
+ * 没有跟随方式可选、不核对差值。指定了别人时房主也和大家一样跟。
+ */
+function amSyncReference() {
+  // 引擎还没建（进房之前）时按房主算
+  const ref = S.sync?.referenceId?.();
+  return ref ? ref === S.peerId : isRoomHost();
+}
+
+/** 在跟的同步目标（不是我自己）；没指定、指定的是我时是 null。 */
+function followedLeader() {
+  return S.sync?.followingLeader?.() ? S.sync.leaderId : null;
 }
 
 /** 差值是跟谁比的。房主自己跟的是房间时钟（管理员的操作也会改它）。 */
 function driftRefName() {
+  const leader = followedLeader();
+  if (leader) return nameOfPeer(leader);
   return isRoomHost() ? '房间进度' : '房主';
+}
+
+/** 「同步到房主」那个按钮上写什么。 */
+function syncButtonText() {
+  const leader = followedLeader();
+  if (leader) return `同步到 ${nameOfPeer(leader)}`;
+  return isRoomHost() ? '同步到房间进度' : '同步到房主';
 }
 
 /** 「你比房主慢 12 秒」。seconds 是本机减房间，负数是落后。 */
@@ -9377,7 +9978,8 @@ function driftText(seconds) {
 /** 这一刻要不要把「没对上」摆出来：在线链接、播放器开着、引擎报了没对上或同步失败。 */
 function driftShown() {
   const d = S.sync?.driftStatus();
-  return !!d && d.streaming && d.state !== 'ok' && S.sourceType === 'link' && !!S.mpvRunning;
+  // 在线链接一直核对；本地片子只在跟着同步目标时核对（见 syncEngine 的 checkDrift）
+  return !!d && (d.streaming ? S.sourceType === 'link' : !!d.leader) && d.state !== 'ok' && !!S.mpvRunning;
 }
 
 // 上一次画出来的样子（没变就不碰 DOM：renderStatus 每个 tick 都会调到这里）。null = 还没画过
@@ -9396,7 +9998,7 @@ function renderDrift() {
   if (!row || !btn) return;
   const shown = driftShown();
   const d = S.sync?.driftStatus();
-  const key = shown ? `${d.state}|${d.seconds}|${isRoomHost()}` : '';
+  const key = shown ? `${d.state}|${d.seconds}|${driftRefName()}` : '';
   if (key === driftKey) return;
   driftKey = key;
   row.classList.toggle('hidden', !shown);
@@ -9411,17 +10013,18 @@ function renderDrift() {
     row,
     make('b', { text: failed ? '自动同步没跟上' : '手动同步' }),
     make('span', { text: driftText(d.seconds) }),
-    ...(failed && !isRoomHost()
+    ...(failed && !amSyncReference() && S.sourceType === 'link'
       ? [make('span', { className: 'fine', text: '网速跟不上的话，可以把同步方式改成「手动同步」' })]
       : [])
   );
-  btn.textContent = isRoomHost() ? '同步到房间进度' : '同步到房主';
+  btn.textContent = syncButtonText();
   // mpv 是独立窗口，全屏看片时房间窗口整个看不见。OSD 不进 DOM，得自己过一遍 t()
   const now = Date.now();
   if (d.state !== driftOsdState || now - driftOsdAt >= DRIFT_OSD_REPEAT_MS) {
     driftOsdState = d.state;
     driftOsdAt = now;
-    window.sw.player.osd(`${t(driftText(d.seconds))} · ${t('按 Ctrl+Shift+S 同步')}`, 4000).catch(() => {});
+    // mpv 控制条顶上常驻一条「你比房主慢 N 秒 [同步到房主]」，不用再弹一句
+    if (!mpvOscReady) window.sw.player.osd(`${t(driftText(d.seconds))} · ${t('按 Ctrl+Shift+S 同步')}`, 4000).catch(() => {});
   }
 }
 
@@ -9429,7 +10032,7 @@ function renderDrift() {
 function renderSyncModeControl() {
   const box = $('sync-mode-box');
   if (!box) return;
-  box.classList.toggle('hidden', !(roomEntered && S.sourceType === 'link' && !isRoomHost()));
+  box.classList.toggle('hidden', !(roomEntered && S.sourceType === 'link' && !amSyncReference()));
   const select = $('sync-mode');
   if (select && select.value !== S.settings.linkSync) select.value = S.settings.linkSync;
 }
@@ -9530,8 +10133,9 @@ $('link-quality').onchange = () => setLinkQuality($('link-quality').value);
 
 /** 「同步到房主」按钮和 mpv 里的 Ctrl+Shift+S。 */
 function syncToHost() {
-  if (!roomEntered || S.sourceType !== 'link' || !S.sync?.syncToRoom()) return;
-  const text = isRoomHost() ? '已同步到房间进度' : '已同步到房主的进度';
+  if (!roomEntered || (S.sourceType !== 'link' && !followedLeader()) || !S.sync?.syncToRoom()) return;
+  const leader = followedLeader();
+  const text = leader ? `已同步到 ${nameOfPeer(leader)} 的进度` : isRoomHost() ? '已同步到房间进度' : '已同步到房主的进度';
   log(text, 'good');
   window.sw.player.osd(t(text), 2000).catch(() => {});
 }
@@ -9542,8 +10146,15 @@ window.sw.player.onSyncRequest?.(() => syncToHost());
 
 // 在线链接：每秒核对一次和房主差多少。播放器静止时不推 tick，差距在变大只能靠这个看出来
 function driftTick() {
-  if (!S.sync || S.sourceType !== 'link' || !S.mpvRunning || S.switchingMedia) return;
+  if (!S.sync || !S.mpvRunning || S.switchingMedia) return;
+  // 我是同步目标：报一下自己实际放到哪（引擎自己按间隔发）
+  S.sync.beaconTick?.();
+  // 在线链接一直核对；本地片子只在跟着同步目标时核对。
+  // 长按 → 快进中：本机有意跑在房间前面，松手时会把全房带过来，这期间不核对
+  if ((S.sourceType !== 'link' && !followedLeader()) || S.speedHold) return;
   S.sync.checkDrift();
+  // 差开时控制条进度条上的「房主」小旗子跟着房间时钟走
+  scheduleOscState();
 }
 setInterval(driftTick, 1000);
 
@@ -9606,6 +10217,7 @@ window.sw.player.onExit(onPlayerExit);
 function handlePlayerExit({ code }) {
   S.mpvRunning = false;
   lastMpvBanner = '';
+  forgetMpvOsc();
   S.danmaku?.setActive(false);
   // 必须把上一条 tick 忘掉。留着的话，重开播放器后新 mpv 的第一条 tick
   // （position=0、paused=true）会被 syncEngine 当成「用户拖了进度条 / 按了暂停」，
@@ -9886,6 +10498,14 @@ function leaveRoomLosses() {
           S.mode === 'manual'
             ? '他们都是经一对一邀请连到你这里的：你一走，所有人一起断开，这一场就结束了。'
             : '你一走这一场就没有房主了：播放列表停止更新，经一对一邀请进来的人会直接断开。',
+      })
+    );
+    if (S.mode === 'server') lines.push(make('p', { text: '想让大家接着看，走之前在成员表里把房主转给一个管理员。' }));
+  } else if (S.role === 'host' && S.hostId && S.hostId !== S.peerId && others > 0) {
+    // 房间是我开的、房主已经转出去了：入口还在我这里
+    lines.push(
+      make('p', {
+        text: `你把房主转给了${nameOfPeer(S.hostId)}。你走了以后，已经在房里的人照常看，但新人就没法用原来的链接进房了。`,
       })
     );
   }

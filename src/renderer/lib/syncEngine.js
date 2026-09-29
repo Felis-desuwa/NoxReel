@@ -158,6 +158,10 @@ const MAX_SEEN_IDS = 256;
 // 有人换着身份反复进出就能把表撑大，大到 ROLE 超过单条消息上限发不出去，新人再也拿不到角色表。
 // 超了先挤掉最早登记的游客：游客本来就是默认角色，挤掉不改变任何人的权限。
 const MAX_ROLE_ENTRIES = 128;
+// 同步目标（房主指定的某个管理员，见 setLeader）多久报一次自己实际放到哪，以及报的位置多久不来就不信了
+// （他断了、卡住了、客户端没这个能力）—— 退回跟房间进度
+const BEACON_INTERVAL_MS = 2000;
+const BEACON_STALE_MS = 6000;
 const clampName = (v) => (typeof v === 'string' ? v.slice(0, MAX_NAME) : '');
 
 /** 按插入顺序封顶的 Map.set：超了挤掉最早的。 */
@@ -187,6 +191,15 @@ export class SyncEngine extends Emitter {
     // 只有房主或明确授予的管理员可以发出全房控制指令。
     this.hostId = hostId || null;
     this.roles = new Map();
+    // 同步目标：房主指定的一个管理员，大家（包括房主）跟着他实际的画面走（见 setLeader / checkDrift）。
+    // null = 没指定，照旧跟房间进度。随 ROLE 一起由房主发，老版本不看这个字段
+    this.leaderId = null;
+    // 同步目标最近一次报的位置 {position, moving, lamport, at}，见 _onBeacon
+    this._beacon = null;
+    this._beaconSentAt = -Infinity;
+    // 我把房主转给了别人（transferHost）。房间入口（房间链接的签名、信令服务器的房主凭据）还在我这里，
+    // 新人照旧从我这儿进来、只认我 —— greet 时我替现在的房主作保（发一条带新 hostId 的 ROLE）
+    this._handedOver = false;
 
     // 时钟可注入，测试里用假时钟
     this.now = () => performance.now();
@@ -328,6 +341,8 @@ export class SyncEngine extends Emitter {
     this._clearLead();
     this._streamCut = false;
     this._dropPendingPause();
+    // 同步目标报的是上一部的位置
+    this._beacon = null;
     // 跳转提前量是按这一部的网站学的，换一部从头学。跟随方式不动，由上层按新的当前项重新设
     this._seekLead = 0;
     this._resetDrift();
@@ -601,29 +616,105 @@ export class SyncEngine extends Emitter {
     if (this.myRole() !== 'host' || peerId === this.hostId) return;
     this.roles.set(peerId, role === 'admin' ? 'admin' : 'guest');
     const released = !this.isController(peerId) && this.stalledPeers.delete(peerId);
+    // 同步目标被降成游客：不再是目标，大家回到跟房间进度
+    if (peerId === this.leaderId && role !== 'admin') this._setLeaderLocal(null);
     this._syncClock();
     if (released) this._reconcile();
     this._broadcastRoles();
     this.emit('roles', this.roleSnapshot());
   }
 
+  _roleMessage() {
+    return { t: MSG.ROLE, hostId: this.hostId, roles: [...this.roles.entries()], leader: this.leaderId };
+  }
+
   _broadcastRoles() {
-    this.emit('outbound', {
-      t: MSG.ROLE,
-      hostId: this.hostId,
-      roles: [...this.roles.entries()],
-    });
+    this.emit('outbound', this._roleMessage());
+  }
+
+  /* --------------------------- 同步目标 --------------------------- */
+
+  /**
+   * 大家跟谁对齐：房主指定了同步目标（还是管理员）就是他，否则是房主（房主自己也跟着房间进度走）。
+   */
+  referenceId() {
+    return this.leaderId && this.roles.get(this.leaderId) === 'admin' ? this.leaderId : this.hostId;
+  }
+
+  /** 我是不是那个大家对齐的人：他不做手动同步、不自动对齐（他的画面就是标准）。 */
+  _isReference() {
+    return !!this.peerId && this.referenceId() === this.peerId;
+  }
+
+  /** 正在跟同步目标（指定了、而且不是我自己）。 */
+  followingLeader() {
+    return !!this.leaderId && this.leaderId !== this.peerId && this.roles.get(this.leaderId) === 'admin';
+  }
+
+  _setLeaderLocal(peerId) {
+    const next = peerId || null;
+    if (next === this.leaderId) return false;
+    this.leaderId = next;
+    this._beacon = null;
+    this._resetDrift();
+    this.emit('drift', this.driftStatus());
+    return true;
+  }
+
+  /**
+   * 房主调用：把某个管理员设为同步目标（传 null 或房主自己 = 取消）。他每 2 秒报一次自己实际放到哪，
+   * 其他人（包括房主）按他的位置核对、自动对齐（本地片子也算，见 checkDrift）。房主的权限不变。
+   * 只能指定管理员：游客的播放只管他自己，跟着他走就等于让游客控场。
+   */
+  setLeader(peerId) {
+    if (this.myRole() !== 'host') return false;
+    const target = !peerId || peerId === this.hostId ? null : peerId;
+    if (target && this.roles.get(target) !== 'admin') return false;
+    if (!this._setLeaderLocal(target)) return false;
+    this._broadcastRoles();
+    this.emit('roles', this.roleSnapshot());
+    return true;
+  }
+
+  /**
+   * 房主调用：把房主转给一个管理员，自己变成管理员。权限锚点（谁定角色、谁管播放列表）跟着走 ——
+   * 收到这条 ROLE 的人都认原房主，所以认得下新房主（见 applyRoles）。
+   * 房间入口没法跟着走：房间链接由原房主的签名密钥担保，信令服务器上的房主凭据也在原房主手里，
+   * 新人照旧从原房主这里进来、只认原房主，所以之后 greet 时由我替新房主作保（_handedOver）。
+   * 同步目标清掉：新房主就是大家对齐的人。
+   */
+  transferHost(peerId) {
+    if (this.myRole() !== 'host' || !peerId || peerId === this.peerId || this.roles.get(peerId) !== 'admin') return false;
+    const from = this.peerId;
+    this.roles.delete(peerId);
+    this.roles.set(from, 'admin');
+    this.hostId = peerId;
+    this._handedOver = true;
+    this._setLeaderLocal(null);
+    this._broadcastRoles();
+    this.emit('roles', this.roleSnapshot());
+    this.emit('host-changed', { hostId: peerId, from });
+    return true;
   }
 
   /** 收到房主的角色表（onCtrl 里已校验来自 hostId 才会进来）。 */
-  applyRoles(entries, hostId) {
+  applyRoles(entries, hostId, leader = null) {
     const wasController = this.canIControl();
+    const prevHost = this.hostId;
     if (hostId) this.hostId = hostId;
     this.roles = new Map(
       (Array.isArray(entries) ? entries : []).filter(
-        (entry) => Array.isArray(entry) && typeof entry[0] === 'string' && ['admin', 'guest'].includes(entry[1])
+        (entry) =>
+          Array.isArray(entry) &&
+          typeof entry[0] === 'string' &&
+          entry[0] !== this.hostId &&
+          ['admin', 'guest'].includes(entry[1])
       )
     );
+    // 同步目标只认表里的管理员；房主自己、不认识的人都当没指定
+    this._setLeaderLocal(typeof leader === 'string' && this.roles.get(leader) === 'admin' ? leader : null);
+    // 房主换人了（原房主转让，或者原房主替现在的房主作保）：上层据此改认新房主
+    if (prevHost && prevHost !== this.hostId) this.emit('host-changed', { hostId: this.hostId, from: prevHost });
     // 已被降级为游客的人不再拖累全员，从 stall 名单里清掉
     let changed = false;
     for (const id of [...this.stalledPeers.keys()]) {
@@ -1120,6 +1211,7 @@ export class SyncEngine extends Emitter {
     if (msg.t === MSG.STALL) return this._onRemoteStall(msg, fromPeer);
     if (msg.t === MSG.ROLE) return this._onRole(msg, fromPeer);
     if (msg.t === MSG.READY) return this._onRemoteReady(msg, fromPeer);
+    if (msg.t === MSG.BEACON) return this._onBeacon(msg, fromPeer);
     return false;
   }
 
@@ -1144,8 +1236,80 @@ export class SyncEngine extends Emitter {
     if (this.hostId && this.hostId === this.peerId) return true;
     const known = !!this.hostId;
     if (known ? from !== this.hostId : from !== msg.hostId) return true;
-    this.applyRoles(msg.roles, msg.hostId);
+    // 房主可以把 hostId 换成别人（转让房主，或者原房主替现在的房主作保）：信的是发信人 —— 我认的房主 ——
+    // 不是消息里写的 hostId。换成的人只能是一个 peerId 字符串，不能是我自己以外的空值
+    const nextHost = typeof msg.hostId === 'string' && msg.hostId ? msg.hostId : null;
+    this.applyRoles(msg.roles, nextHost, msg.leader);
     return true;
+  }
+
+  /* ------------------------ 同步目标的位置 ------------------------ */
+
+  /**
+   * 同步目标由上层每秒调一次：每 BEACON_INTERVAL_MS 报一次自己实际放到哪。
+   * 带上自己已经落下的房间状态的 Lamport —— 收端据此丢掉「报的是这次操作之前的位置」的那一条
+   * （别人刚拖了进度条，我的播放器还没跟过去时报的位置）。跳转途中、播放器说不出位置时不报。
+   */
+  beaconTick() {
+    if (this.leaderId !== this.peerId || !this.started || this.applying) return;
+    const t = this.lastTick;
+    if (!t || t.seeking) return;
+    const position = this.playerPositionNow();
+    if (position === null) return;
+    const now = this.now();
+    if (now - this._beaconSentAt < BEACON_INTERVAL_MS) return;
+    this._beaconSentAt = now;
+    this.emit('outbound', {
+      t: MSG.BEACON,
+      seq: this.seq,
+      lamport: Math.max(0, this.shared.lamport),
+      position,
+      moving: this._advancing(t),
+    });
+  }
+
+  _onBeacon(msg, fromPeer) {
+    const from = this._originOf(msg, fromPeer);
+    if (!from || from.origin !== this.leaderId || from.origin === this.peerId) return true;
+    if (
+      msg.seq !== this.seq ||
+      !Number.isFinite(msg.position) ||
+      msg.position < 0 ||
+      typeof msg.moving !== 'boolean' ||
+      !Number.isSafeInteger(msg.lamport)
+    ) {
+      return true;
+    }
+    // 星型拓扑下其他人只连着房主，由房主转过去
+    this._relay(msg, from);
+    // 报的是房间最近一次操作之前的位置（我已经跟过去了、他还没有）：不信
+    if (msg.lamport < this.shared.lamport) return true;
+    this._beacon = { position: msg.position, moving: msg.moving, lamport: msg.lamport, at: this.now() };
+    return true;
+  }
+
+  /** 同步目标最近报的位置还新鲜：拿来当对齐的标准。 */
+  _freshBeacon() {
+    const b = this._beacon;
+    if (!this.followingLeader() || !b || b.lamport < this.shared.lamport) return null;
+    return this.now() - b.at <= BEACON_STALE_MS ? b : null;
+  }
+
+  /**
+   * 大家对齐的位置：跟着同步目标时是他此刻实际放到的地方（按他报的位置外推），
+   * 否则（没指定、他好几秒没报了）是房间进度。
+   */
+  referencePositionNow() {
+    const b = this._freshBeacon();
+    if (!b) return this.sharedPositionNow();
+    let pos = b.position + (b.moving ? Math.max(0, this.now() - b.at) / 1000 : 0);
+    if (this.duration > 0) pos = Math.min(pos, this.duration);
+    return Math.max(0, pos);
+  }
+
+  _referenceRunning() {
+    const b = this._freshBeacon();
+    return b ? b.moving : this._clockRunning();
   }
 
   _onRemoteSync(msg, fromPeer) {
@@ -1253,9 +1417,12 @@ export class SyncEngine extends Emitter {
     return Math.abs(position - roomBefore) > SEEK_DETECT_JUMP ? position : null;
   }
 
-  /** 本机现在是不是「在线链接 + 手动同步」。房主是参照，没有手动同步这回事。 */
+  /**
+   * 本机现在是不是「在线链接 + 手动同步」。大家对齐的那个人（没指定同步目标时是房主，指定了是他）
+   * 没有手动同步这回事；指定了别人时房主也和大家一样选跟随方式。
+   */
   _manual() {
-    return this.streaming && this.followMode === 'manual' && this.myRole() !== 'host';
+    return this.streaming && this.followMode === 'manual' && !this._isReference();
   }
 
   /**
@@ -1423,6 +1590,8 @@ export class SyncEngine extends Emitter {
       if (key.endsWith(`:${peerId}`)) this._stash.delete(key);
     }
     const host = this.myRole() === 'host';
+    // 同步目标断了：马上回到跟房间进度。指定不取消 —— 他多半一会儿就重连回来，回来接着报位置就又跟上了
+    if (peerId === this.leaderId) this._beacon = null;
     let dropped = false;
     for (const [id, entry] of [...this.stalledPeers]) {
       // 经这条连接得知的卡顿，从此没人能告诉我它解除了（经房主转发来的，房主一断就是这样）。
@@ -1766,22 +1935,29 @@ export class SyncEngine extends Emitter {
     this.emit('drift', this.driftStatus());
   }
 
-  /** 供 UI：{state: 'ok'|'out'|'failed', seconds（本机减房间，负数是落后）, mode, streaming} */
+  /**
+   * 供 UI：{state: 'ok'|'out'|'failed', seconds（本机减对齐标准，负数是落后）, mode, streaming,
+   * leader（在跟的同步目标，没有是 null）}
+   */
   driftStatus() {
     return {
       state: this._drift.state,
       seconds: this._drift.seconds,
       mode: this.followMode,
       streaming: this.streaming,
+      ...(this.followingLeader() ? { leader: this.leaderId } : {}),
     };
   }
 
   /**
-   * 核对本机和房间差多少秒。由上层每秒调一次 —— 播放器静止时不推 tick，光靠 tick 看不出差距在变大。
-   * 房间的进度就是房间时钟（房主和管理员的指令定下的，房主自己也跟着它走）。
+   * 核对本机和对齐标准差多少秒。由上层每秒调一次 —— 播放器静止时不推 tick，光靠 tick 看不出差距在变大。
+   * 标准是房间进度（房主和管理员的指令定下的，房主自己也跟着它走）；房主指定了同步目标时是他实际放到的地方，
+   * 这时本地片子也核对（没指定时本地片子不核对：大家的播放器都按房间时钟走，差不开）。
+   * 同步目标自己不核对：他的画面就是标准。
    */
   checkDrift() {
-    if (!this.streaming || !this.started) return;
+    if (!this.started || !(this.streaming || this.followingLeader())) return;
+    if (this.leaderId === this.peerId) return;
     const t = this.lastTick;
     // 正在跳转、缓冲、重新起播，或者放到头了：此刻的位置说明不了什么，维持上一次的判断。
     // 打不开的播放器也不去拽它（跳转发给一个 idle 的 mpv 什么都不会发生）；说不出位置的（还没载入完、正在卸载）同理
@@ -1793,7 +1969,7 @@ export class SyncEngine extends Emitter {
       this._setDrift('ok', 0);
       return;
     }
-    const room = this.sharedPositionNow();
+    const room = this.referencePositionNow();
     // 房间时钟到片尾就封顶了，再往后的差值没有意义
     if (this.duration > 0 && room >= this.duration - DRIFT_OUT_SECONDS) return;
     const drift = this.playerPositionNow() - room;
@@ -1803,7 +1979,7 @@ export class SyncEngine extends Emitter {
     const probe = this._leadProbe;
     if (probe && now - probe.at >= 1000) {
       this._leadProbe = null;
-      if (probe.running && this._clockRunning() && now - probe.at < DRIFT_LEAD_PROBE_MS) {
+      if (probe.running && this._referenceRunning() && now - probe.at < DRIFT_LEAD_PROBE_MS) {
         this._seekLead = Math.min(DRIFT_LEAD_MAX_SECONDS, Math.max(0, this._seekLead - drift));
       }
     }
@@ -1859,7 +2035,7 @@ export class SyncEngine extends Emitter {
    * 自己单独按过的暂停也一并回到房间的状态。两种跟随方式都能用。
    */
   syncToRoom() {
-    if (!this.streaming || !this.started || !this.lastTick) return false;
+    if (!(this.streaming || this.followingLeader()) || !this.started || !this.lastTick) return false;
     this._dropPendingPause();
     this.intendedPaused = this.shared.paused;
     this._corrections = [];
@@ -1871,8 +2047,8 @@ export class SyncEngine extends Emitter {
   }
 
   _correctToRoom() {
-    const running = this._clockRunning();
-    let target = this.sharedPositionNow() + (running ? this._seekLead : 0);
+    const running = this._referenceRunning();
+    let target = this.referencePositionNow() + (running ? this._seekLead : 0);
     if (this.duration > 0) target = Math.min(target, this.duration);
     this._correctAt = this.now();
     this._driftOver = 0;
@@ -1953,7 +2129,11 @@ export class SyncEngine extends Emitter {
     // 房主：先把权威角色表发给新人，他才知道该信谁、自己是什么身份。
     if (host) {
       this.hostEnsureKnown(peer.peerId);
-      peer.send({ t: MSG.ROLE, hostId: this.hostId, roles: [...this.roles.entries()] });
+      peer.send(this._roleMessage());
+    } else if (this._handedOver && this.hostId) {
+      // 我把房主转出去了，但新人还是从我这儿进来的（房间链接、信令房间都认我）：他只信我，
+      // 现在的房主发的角色表他不收。替现在的房主作保 —— 他认下之后，改认现在的房主
+      peer.send(this._roleMessage());
     }
     beforeSync?.();
     // 位置要报「现在」的：shared.position 是最后一次有人操作时的位置，

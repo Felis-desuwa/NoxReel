@@ -12,6 +12,7 @@ import {
   chunkLengthAt,
   isSlot,
   normalizePlatform,
+  normalizeCaps,
   BITFIELD_CHUNKS_PER_PART,
 } from './protocol.js';
 import { Scheduler } from './scheduler.js';
@@ -287,12 +288,14 @@ function encodeBits(bytes) {
 }
 
 export class Swarm extends Emitter {
-  constructor({ peerId, name, securityMode = 'safe', platform = 'desktop' }) {
+  constructor({ peerId, name, securityMode = 'safe', platform = 'desktop', caps = [] }) {
     super();
     this.peerId = peerId;
     this.name = name;
     this.securityMode = securityMode === 'trusted' ? 'trusted' : 'safe';
     this.platform = normalizePlatform(platform);
+    // 本机支持的新能力，随 HELLO 报给对方（见 protocol.js 的 CAPS）
+    this.caps = normalizeCaps(caps);
     /** @type {Map<string, import('./peer.js').Peer>} */
     this.peers = new Map();
 
@@ -601,7 +604,7 @@ export class Swarm extends Emitter {
       // 版本和模式协商是数据通道上的第一步；通过前不发清单、控制消息或媒体数据。
       // 记下 HELLO 里报的名字：握手完成前改的名，setName 发不到这条连接上，认证时要补一条 NAME
       peer.helloName = this.name;
-      peer.hello(this.peerId, this.name, this.securityMode, this.platform);
+      peer.hello(this.peerId, this.name, this.securityMode, this.platform, this.caps);
       this.emit('peers', this.peerList());
     });
 
@@ -762,6 +765,7 @@ export class Swarm extends Emitter {
       peerId: peer.peerId,
       name: peer.name,
       platform: peer.platform || 'desktop',
+      caps: peer.caps || [],
       state: peer.pc.iceConnectionState,
       rtt: peer.rtt ? Math.round(peer.rtt) : null,
       downRate: peer.downRate || 0,
@@ -971,6 +975,7 @@ export class Swarm extends Emitter {
     }
 
     peer.platform = normalizePlatform(msg.platform);
+    peer.caps = normalizeCaps(msg.caps);
     peer.authenticated = true;
     // HELLO 发出去之后、对方认证之前改的名，setName 发不到这条连接（只发给已认证的）：现在补一条
     if (peer.helloName !== undefined && peer.helloName !== this.name) peer.send({ t: MSG.NAME, name: this.name });

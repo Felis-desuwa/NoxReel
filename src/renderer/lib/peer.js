@@ -72,6 +72,7 @@ export class Peer extends Emitter {
     this.ctrl = null;
     this.data = null;
     this.platform = null; // HELLO 里对方报的平台：windows / mac / linux / android，老电脑端是 desktop
+    this.caps = []; // HELLO 里对方报的能力（protocol.js 的 CAPS），老版本是空的
     // 对方每个文件槽位上有哪些分片：slot -> { have: Uint8Array }
     this.remote = new Map();
     this.inflight = new Set(); // 我方已向该 peer 请求、还没收齐的分片，键是 "槽位:下标"
@@ -406,8 +407,9 @@ export class Peer extends Emitter {
     return true;
   }
 
-  hello(peerId, name, securityMode = 'safe', platform = 'desktop') {
-    this.send({ t: MSG.HELLO, peerId, name, ver: PROTOCOL_VERSION, securityMode, platform });
+  // caps：本机支持的新能力（见 protocol.js 的 CAPS），老版本不看这个字段
+  hello(peerId, name, securityMode = 'safe', platform = 'desktop', caps = []) {
+    this.send({ t: MSG.HELLO, peerId, name, ver: PROTOCOL_VERSION, securityMode, platform, ...(caps.length ? { caps } : {}) });
   }
 
   ping() {

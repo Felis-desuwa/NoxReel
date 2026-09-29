@@ -143,8 +143,11 @@ contextBridge.exposeInMainWorld('sw', {
     setPause: (paused) => ipcRenderer.invoke('player:setPause', paused),
     // dropBuffers：先丢掉播放器缓存里的旧数据再跳（只有 mpv 认）
     seek: (seconds, opts) => ipcRenderer.invoke('player:seek', seconds, { dropBuffers: opts?.dropBuffers === true }),
-    osd: (text, duration = 2000) => ipcRenderer.invoke('player:osd', { text, duration }),
+    // tone：ok / warn，mpv 控制条上的提示条据此配图标（盾牌 / 警告），不传就是普通提示
+    osd: (text, duration = 2000, tone = 'info') => ipcRenderer.invoke('player:osd', { text, duration, tone }),
     overlay: (text) => ipcRenderer.invoke('player:overlay', { text }),
+    // mpv 控制条要画的房间状态（见 main.js 的 player:oscState）。外部播放器没有这一项，主进程静默忽略
+    oscState: (state) => ipcRenderer.invoke('player:oscState', state),
     // 一帧弹幕 {w, h, gen?, items:[{text, x, y, fontSize?, opacity?, outline?}]}。
     // resolve 成 true 表示真画出去了，false 表示这一帧被丢掉（上一帧在途、暂停跳转在途、
     // 播放器没开或者代际不对）。调用方每秒发 30 次，reject 一定要接住。
@@ -161,6 +164,9 @@ contextBridge.exposeInMainWorld('sw', {
     onChatInput: on('player:chat-input'),
     // 用户在 mpv 窗口里按 Ctrl+Shift+S 要求「同步到房主」：{ gen, kind }，不带别的内容
     onSyncRequest: on('player:sync-request'),
+    // mpv 控制条上点的按钮里要 NoxReel 办的事：{ action: 'danmaku' } 开关弹幕、
+    // { action: 'quality', value } 换清晰度（0 = 最高），外加 gen、kind
+    onOscAction: on('player:osc-action'),
     // 播放器侧的提示：{ code }，目前有 exclusive-fullscreen（独占全屏看不到弹幕）、
     // hotkey-taken（快捷键被别的程序占了）、chat-unavailable（这会儿弹不出输入条）
     onNotice: on('player:notice'),

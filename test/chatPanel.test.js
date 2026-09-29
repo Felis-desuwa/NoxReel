@@ -1092,13 +1092,16 @@ test('app.js：聊天历史只认房主那条连接、只收一次，落地时�
   assert.doesNotMatch(history, /showDanmaku/, '历史只进聊天列表，不上弹幕');
   assert.match(history, /S\.chat\.gate\.remember\(it\.id\)/);
 
-  // 握手完成时房主按契约顺序发：角色表 → 播放列表 → 聊天历史 → 同步状态
+  // 握手完成时房主按契约顺序发：角色表 → 播放列表 → 聊天历史 → 同步状态。
+  // 房主给的现状在 sendHostState 里（greet 的 beforeSync 和 MSG.HOST_SYNC 共用）
   const greet = app.slice(app.indexOf("S.swarm.on('peer-authenticated'"), app.indexOf("S.swarm.on('peer-gone'"));
+  assert.match(greet, /beforeSync: \(\) => \{\n\s+if \(!isRoomHost\(\)\) return;\n[^\n]*\n\s+sendHostState\(peer\);/);
+  const state = fnOf('sendHostState');
   assert.ok(
-    greet.indexOf('t: MSG.PLAYLIST') < greet.indexOf('t: MSG.CHAT_HISTORY'),
+    state.indexOf('t: MSG.PLAYLIST') < state.indexOf('t: MSG.CHAT_HISTORY'),
     'CHAT_HISTORY 要排在 PLAYLIST 之后'
   );
-  assert.match(greet, /S\.swarm\.sendLarge\(peer, \{ t: MSG\.CHAT_HISTORY, items: S\.chat\.history\.snapshot\(\) \}\)/);
+  assert.match(state, /S\.swarm\.sendLarge\(peer, \{ t: MSG\.CHAT_HISTORY, items: S\.chat\.history\.snapshot\(\) \}\)/);
 });
 
 test('app.js：加入、离开、换片、谁按了暂停都在聊天流里留一行，事件日志照常保留', () => {

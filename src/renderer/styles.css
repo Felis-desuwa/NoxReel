@@ -1551,7 +1551,7 @@ select:disabled {
 .peer-head,
 .peer {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 76px minmax(0, 1.3fr) 104px 92px;
+  grid-template-columns: minmax(0, 1fr) 76px minmax(0, 1.3fr) 104px 104px;
   gap: 12px;
   align-items: center;
   padding: 0 12px;
@@ -1654,6 +1654,8 @@ select:disabled {
 }
 .peer-act {
   display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
   justify-content: flex-end;
 }
 .peer-empty {
@@ -1705,10 +1707,20 @@ select:disabled {
 .role-badge.guest {
   color: var(--muted);
 }
+/* 房主指定的同步目标：大家跟着他的画面走 */
+.role-badge.leader {
+  color: #e3b341;
+  border-color: #6b5a24;
+}
 .peer-role {
   display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
 }
 .role-toggle,
+.leader-toggle,
+.host-transfer,
 .peer-rename {
   font-size: 11px;
   padding: 3px 9px;
@@ -1717,6 +1729,8 @@ select:disabled {
   border: 1px solid var(--line);
 }
 .role-toggle:hover,
+.leader-toggle:hover,
+.host-transfer:hover,
 .peer-rename:hover {
   color: var(--text);
   border-color: var(--accent-dim);
@@ -2107,6 +2121,23 @@ select:disabled {
 .pill-room-name + span::before {
   content: '· ';
   font-weight: 400;
+}
+/* 房主 / 管理员能点它起房间名 */
+.room-pill.editable {
+  cursor: pointer;
+}
+.room-pill.editable:hover {
+  border-color: var(--accent-dim);
+}
+.pill-edit {
+  opacity: 0.6;
+}
+.room-pill.editable:hover .pill-edit {
+  opacity: 1;
+}
+/* 邀请区底下那一栏的房间名输入框：比人数框宽（得压过 .invite-settings .capacity-row input 的 58px） */
+.invite-settings .capacity-row input.room-name-input {
+  width: 180px;
 }
 .room-pill::before {
   content: '';

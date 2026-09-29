@@ -817,14 +817,15 @@ function driftUi({ drift, host = false, mpvRunning = true, sourceType = 'link', 
     sync: { driftStatus: () => ({ ...drift }) },
   };
   const sources = [
-    ...['driftKey', 'driftOsdState', 'driftOsdAt', 'DRIFT_OSD_REPEAT_MS'].map(declSource),
-    ...['renderDrift', 'renderSyncModeControl', 'driftShown', 'driftRefName', 'driftText', 'linkFollowMode'].map(fnSource),
+    ...['driftKey', 'driftOsdState', 'driftOsdAt', 'DRIFT_OSD_REPEAT_MS', 'mpvOscReady'].map(declSource),
+    ...['renderDrift', 'renderSyncModeControl', 'driftShown', 'driftRefName', 'driftText', 'linkFollowMode', 'amSyncReference', 'followedLeader', 'syncButtonText'].map(fnSource),
   ];
   const ctx = { S, $, roomEntered: true, Date };
   Object.assign(ctx, {
     isRoomHost: () => host,
     updateStripTone: () => {},
     renderQualityControl: () => {}, // 清晰度下拉框另有测试（linkQuality.test.js）
+    scheduleOscState: () => {}, // mpv 控制条的状态推送另有测试（mpvOsc.test.js）
     t: (s) => `«${s}»`,
     make: (tag, o = {}) => ({ tag, ...o }),
     replace: (node, ...kids) => rows.push({ node: node.id, kids: kids.map((k) => k.text) }),
@@ -896,7 +897,7 @@ test('改同步方式：存进本机、交给引擎；房主永远是完全同�
     renderProgress: () => {},
   };
   vm.createContext(ctx);
-  vm.runInContext(['setLinkSyncMode', 'linkFollowMode'].map(fnSource).join('\n\n'), ctx);
+  vm.runInContext(['setLinkSyncMode', 'linkFollowMode', 'amSyncReference'].map(fnSource).join('\n\n'), ctx);
   ctx.setLinkSyncMode('manual');
   assert.equal(S.settings.linkSync, 'manual');
   assert.equal(store.get('sw.linkSync'), 'manual');
@@ -922,9 +923,9 @@ test('换片后把「是不是在线链接」和跟随方式交给引擎；每�
 
   const calls = [];
   const S = { sync: { checkDrift: () => calls.push(1) }, sourceType: 'link', mpvRunning: true, switchingMedia: false };
-  const ctx = { S };
+  const ctx = { S, scheduleOscState: () => {} };
   vm.createContext(ctx);
-  vm.runInContext(fnSource('driftTick'), ctx);
+  vm.runInContext(['driftTick', 'followedLeader'].map(fnSource).join('\n\n'), ctx);
   ctx.driftTick();
   S.mpvRunning = false;
   ctx.driftTick();
@@ -949,7 +950,7 @@ test('「同步到房主」按钮和 Ctrl+Shift+S 走同一个入口，只对在
     window: { sw: { player: { osd: (text) => (osd.push(text), Promise.resolve()) } } },
   };
   vm.createContext(ctx);
-  vm.runInContext(fnSource('syncToHost'), ctx);
+  vm.runInContext(['syncToHost', 'followedLeader'].map(fnSource).join('\n\n'), ctx);
   ctx.syncToHost();
   assert.equal(synced, 1);
   assert.deepEqual(logs, ['已同步到房主的进度']);
@@ -1031,7 +1032,8 @@ test('安卓：换片后交出跟随方式，快照的 buffering 当 paused-for-
   assert.match(APP_ANDROID, /if \(S\.sync\.streaming\) S\.sync\._evaluateStreamStall\(S\.sync\.lastTick\);\s*else \{\s*S\.sync\._evaluateStall\(/);
   assert.match(APP_ANDROID, /linkSync: localStorage\.getItem\('sw\.linkSync'\) === 'manual' \? 'manual' : 'full'/);
   assert.match(APP_ANDROID, /S\.sync\.on\('drift', renderDrift\)/);
-  assert.match(APP_ANDROID, /if \(S\.sync && S\.sourceType === 'link' && S\.playerTimer\) S\.sync\.checkDrift\(\);/);
+  // 在线链接一直核对；本地片子只在跟着同步目标时核对。每秒顺带让同步目标报一次位置
+  assert.match(APP_ANDROID, /if \(S\.sync && S\.playerTimer\) \{\n[^\n]*\n\s+S\.sync\.beaconTick\(\);\n[^\n]*\n\s+if \(S\.sourceType === 'link' \|\| S\.sync\.followingLeader\(\)\) S\.sync\.checkDrift\(\);/);
 });
 
 function androidFn(name) {
@@ -1062,6 +1064,8 @@ test('安卓：顶栏按钮只在在线链接出现，差开时那一条带「�
   const S = { sourceType: 'link', playerTimer: 1, linkSync: 'manual', sync: { driftStatus: () => drift } };
   const ctx = { S, $, show: (node, on) => (node.style.display = on ? '' : 'none') };
   vm.createContext(ctx);
+  // 没指定同步目标：跟的是房主（syncRefName 另有测试，见 syncLeader.test.js）
+  ctx.syncRefName = () => '房主';
   vm.runInContext(['let driftKey = null;', androidFn('driftText'), androidFn('renderDrift')].join('\n\n'), ctx);
   ctx.renderDrift();
   assert.equal($('btn-follow').style.display, '');
@@ -1087,7 +1091,8 @@ test('安卓：顶栏按钮只在在线链接出现，差开时那一条带「�
 test('安卓：切换方式存本机、交给引擎；「同步到房主」只对在线链接', () => {
   assert.match(APP_ANDROID, /localStorage\.setItem\('sw\.linkSync', S\.linkSync\);\s*S\.sync\?\.setFollow\(\{ mode: S\.linkSync \}\);/);
   // 第三个参数让这句成功提示也在房间里亮出来（大厅的日志区进房后看不见，见 app-android.js 的 roomNote）
-  assert.match(APP_ANDROID, /if \(S\.sourceType === 'link' && S\.sync\?\.syncToRoom\(\)\) log\('已同步到房主的进度', 'good'(, \{ toast: true \})?\);/);
+  // 在线链接，或者跟着房主指定的同步目标（本地片子也核对）
+  assert.match(APP_ANDROID, /if \(\(S\.sourceType === 'link' \|\| S\.sync\?\.followingLeader\(\)\) && S\.sync\?\.syncToRoom\(\)\) \{\n\s+log\(syncRefName\(\) === '房主' \? '已同步到房主的进度'/);
   const html = read(ANDROID, 'assets', 'index.html');
   assert.match(html, /<button id="btn-follow" style="display:none"/);
   assert.match(html, /<div id="drift" style="display:none">/);

@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links — now with a playlist for the whole evening, danmaku comments over the picture, and your own preferred player.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.9-7C5CFF?style=for-the-badge" alt="Version 0.7.9">
+    <img src="https://img.shields.io/badge/version-0.7.10-7C5CFF?style=for-the-badge" alt="Version 0.7.10">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -38,6 +38,7 @@
 
 - **Playlist:** a table on the right side of the room where **list order = playback order = transfer order**. The host and moderators can add local videos or links, drag to reorder, play an item immediately, remove items, and toggle autoplay; guests can only watch. Dragging a later item to the top switches the transfer right away. Once playback has started it asks first, then moves the previous video to the next position, remembers its progress, and resumes it from where it stopped. Autoplay waits until everyone is ready, and the host or a moderator can still press “Start anyway”. Finished videos move into a “Played” section (up to 30) and can be played again at any time.
 - **Danmaku chat:** the chat panel sits at the bottom right, and every message also flies across the picture. **Press `Ctrl+Shift+D` inside the player window to send one** without switching back to the room. Messages are capped at 200 characters and rate-limited by a token bucket; the host keeps the last 50 and replays them to newcomers (history goes to the chat list only, never on screen as danmaku). The danmaku toggle, opacity, font size, and display area are local to you. Joining, leaving, media changes, and who pressed pause appear as grey lines in the same chat stream.
+- **Sync target and host transfer:** in the member list, the host sees two buttons on each moderator's row. “Set as sync target” makes the whole room follow where that moderator actually is (for links and local files alike; the member list marks them as “Sync target”). “Transfer host” hands over the playlist, role assignment, and the rest of the host's powers; you become a moderator. Transfer only works in rooms opened with a room link or a signaling server (a one-to-one invite room is a star, so it can't move), and everyone in the room must be on desktop 0.7.10 or later (phones can follow a new host but can't become one). The invite link stays with whoever opened the room: after they leave, people already inside keep watching, but newcomers can't join.
 - **Switchable player:** a dropdown on the control bar switches between mpv, PotPlayer, and MPC-BE. The change takes effect immediately and carries the playback position and pause state across — no need to leave the room. See [Player support](#player-support).
 - **Joining mid-playback does not stall the room:** a late joiner first receives the part the room is currently at, so a missing first half no longer pauses everyone else. Every member's buffer margin is measured from their own playback position.
 - **No file size limit:** MP4, MOV, M4V, and MKV local videos; receivers check free disk space first and evict caches from the played section when space runs short.
@@ -65,6 +66,9 @@
 - **Two security modes:** Trusted room is the default: playback starts once about 8 MB of the file header and enough continuous data for a dozen or so seconds have arrived, and the video is still scanned once it is complete. Safe mode remains available and plays only after complete receipt and a Microsoft Defender scan.
 - **Version and mode handshake:** invite codes and the P2P data channel both verify the protocol version and the selected room mode. A mismatch disconnects before media manifests, room controls, or video data are exchanged.
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
+
+> [!NOTE]
+> `v0.7.10` gives the built-in mpv a **new control bar**: the seek bar shows which parts have arrived, and the title, room status, the “waiting for someone to buffer” card, and how far you are from the host are drawn right on the picture; subtitles, audio tracks, quality, and the danmaku toggle are all one click away. It also adds **shortcuts made for watching together**: hold `→` to fast-forward at 2× (when you let go, the room jumps to your position), `Enter` for fullscreen, `D` to send a danmaku, `B` to toggle danmaku, `S` to sync to the host, and `?` to list them all; keys that would throw the whole room around (`Home` back to the start, speed changes, and so on) are gone. The host can now **set a moderator as the sync target** (the whole room follows where that moderator actually is) or **transfer host** to them from the member list. Also fixed: Bilibili videos freezing after you clicked the subtitle button (danmaku were being loaded as subtitles); the room name now has a visible setting; and the mpv window remembers its last size. **The P2P protocol is unchanged and works with 0.7.x**; transferring host requires everyone in the room to be on desktop 0.7.10 or later.
 
 > [!NOTE]
 > `v0.7.9` makes links from sites like **Bilibili** playable. Bilibili serves audio and video as two separate streams, so parsing used to conclude there was “no playable format” and marked the whole link unusable; now mpv merges the two streams itself (1080p tested fine). **Manual caching and download while watching** also work for such sites (ffmpeg must be installed to merge the download into one file; if it is missing, you are told so). New **online video quality** control: “Quality” on the control bar lists the levels the video actually has; each member picks their own, it affects only them, and changing it while playing reopens the player at the current position. Also, when only you are buffering an online video (the first seconds after opening or seeking), your own mpv no longer shows “Waiting for you to buffer…”. **Titles and the room can be renamed with a right-click** (host and moderators; everyone sees the same names, display only), and **your Discord status can show either the title or the room name**, with a one-click switch in the room — no more raw file names like “10002-1071_0bc37….f0” on Discord. **The P2P protocol is unchanged and works with 0.7.x**; Android cannot play sites that only serve separate audio and video streams yet.
@@ -103,8 +107,8 @@
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.9.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.9.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.9.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.9.exe) |
+| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.10.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.10.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.10.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.10.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -153,10 +157,24 @@ While an online video plays, “Quality” appears on the control bar with the l
 
 | Player | Where it comes from | Progressive playback | Danmaku | Send danmaku in the player |
 |---|---|:---:|---|---|
-| **mpv** (default) | Bundled with the installer | ✅ Supported | The player's own overlay | ✅ `Ctrl+Shift+D` |
+| **mpv** (default) | Bundled with the installer | ✅ Supported | The player's own overlay | ✅ `D` or `Ctrl+Shift+D` |
 | **PotPlayer** | Your own installation | ❌ Fully received files only | Transparent overlay window | ✅ `Ctrl+Shift+D` |
 | **MPC-BE** | Your own installation | ❌ Fully received files only | Transparent overlay window | ✅ `Ctrl+Shift+D` |
 
+- **Keyboard shortcuts in mpv** (press `?` or `F1` in the player for the list; hovering a button shows its key too):
+
+  | Key | Action | Key | Action |
+  |---|---|---|---|
+  | Space | Play / pause | `D` | Send danmaku |
+  | `←` `→` | Back / forward 5 s | `B` | Toggle danmaku |
+  | **Hold `→`** | Fast-forward at 2× while held | `S` | Sync to host (online video, manual sync) |
+  | `Shift` + `←` `→` | Back / forward 30 s | `C` / `A` | Choose subtitles / audio track |
+  | `↑` `↓` | Volume | `O` | Show progress |
+  | `M` | Mute | `?` / `F1` | Show shortcuts |
+  | `Enter` / `F` | Toggle full screen | `Q` | Close the player |
+  | `PgUp` `PgDn` | Previous / next chapter | | |
+
+  Seeking moves the whole room, so while you hold `→` only you fast-forward; when you let go (as host or moderator) the room jumps to your position. Guests can't seek, so they can't fast-forward either. Changing the speed (`[` `]`) would drift you away from the room, so those keys only show a hint; `Home` (back to the start) and `1`–`8` (picture adjustments) are disabled too.
 - **Switch at any time:** the control-bar dropdown lists what is installed locally, and anything missing offers “Set path…”. Switching takes effect immediately and carries the position and pause state across.
 - **Why external players are not progressive:** in testing, PotPlayer and MPC-BE both seek away and stop when opening a file that is still growing. mpv therefore covers the progressive part of a Trusted room, and once the file is complete the control bar and the player OSD offer a one-click “Fully received · switch to PotPlayer”. Nothing switches by itself mid-playback.
 - **Danmaku is invisible under exclusive fullscreen:** danmaku for external players is painted on a click-through transparent overlay window, and an exclusive-fullscreen picture is scanned out by the GPU directly, so no window can sit above it. NoxReel detects this and suggests switching the player to borderless fullscreen.

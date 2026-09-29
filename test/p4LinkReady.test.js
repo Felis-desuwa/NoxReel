@@ -184,6 +184,8 @@ async function linkRoom({ peerId = 'victim-peer', inspect, isHost = false, pause
     S,
     URL,
     updatePresence: () => {}, // Discord 状态显示：这里不关心
+    scheduleOscState: () => {}, // mpv 控制条：这里不关心
+    forgetMpvOsc: () => {},
     // 在线链接和房主差多少秒：这里不关心（linkFollow.test.js 专门测）
     renderDrift: () => {},
     driftShown: () => false,
@@ -302,7 +304,9 @@ test('房主只换同一 id 的网址：整张快照拒收（正常操作不会�
 });
 
 test('房主给晚到的成员补发兜底地址时，顺手检查它是不是该重新解析了', () => {
-  const src = fnSource('initSwarmAndSync');
+  // greet 的 beforeSync 交给 sendHostState（MSG.HOST_SYNC 也用它）
+  assert.match(fnSource('initSwarmAndSync'), /sendHostState\(peer\);/);
+  const src = fnSource('sendHostState');
   const m = /if \(S\.nowLink\?\.seq === S\.playlist\.seq\) peer\.send\([^\n]*\n\s*refreshNowLink\(\);/.exec(src);
   assert.ok(m, 'greet 里补发 NOW_LINK 之后要调 refreshNowLink()，否则晚到的人永远只拿得到那条老地址');
 });
@@ -937,6 +941,7 @@ test('stall-change：在线链接上自己在等数据不弹 OSD，房里有别�
     connectedPeerCount: () => others,
     log: (text, kind) => logs.push([text, kind]),
     window: { sw: { player: { osd: (text, ms) => osd.push([text, ms]) } } },
+    mpvOscReady: false, // mpv 控制条没起来：照旧走提示（起来了由正中的卡片说，见 mpvOsc.test.js）
   });
   // 处理函数挂在 initSwarmAndSync 里（S.sync.on('stall-change', …)），把那一段原样取出来跑
   const head = "  S.sync.on('stall-change', ";

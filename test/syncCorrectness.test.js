@@ -485,6 +485,7 @@ async function statusRoom({ role, safe = false }) {
     renderDrift: noop,
     updateStripTone: noop,
     updatePresence: noop,
+    scheduleOscState: noop,
   };
   vm.createContext(ctx);
   vm.runInContext(
@@ -573,6 +574,7 @@ test('GG3-2 桌面端按房间模式给同步引擎开「收完才播」', () =>
       renderPlaylistSoon: noop,
       renderStatus: noop,
       renderDrift: noop,
+      scheduleOscState: noop,
       renderPeers: noop,
       renderPeersSoon: noop,
       maybeLaunchPlayer: noop,

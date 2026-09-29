@@ -23,7 +23,9 @@ local DEFAULT_PROMPT = '弹幕：'
 -- 同一个物理组合键（Ctrl+Shift+D）在 mpv 里可能报成三种写法：Shift 保留而字母不变、
 -- Shift 保留而字母被提成大写、Shift 被折进字母里只剩 Ctrl+D。三种都注册，
 -- 一次按键只会命中其中一条，不会发三遍。Ctrl+D 在 mpv 默认键位里是空的，不抢别人的。
-local BINDING_KEYS = { 'Ctrl+Shift+d', 'Ctrl+Shift+D', 'Ctrl+D' }
+-- 单按 D 也能发（mpv 播放器里的快捷键，见 noxreel-osc.lua；mpv 自带的 d 是切去隔行，用不上）。
+-- 输入框开着时按键都归输入框，打字打到 d 不会再开一个。
+local BINDING_KEYS = { 'Ctrl+Shift+d', 'Ctrl+Shift+D', 'Ctrl+D', 'd' }
 
 -- 在线链接选了「手动同步」、和房主差开了的时候，按 Ctrl+Shift+S 同步到房主。
 -- 这个键不需要 mp.input，所以注册在版本检查前面，旧版 mpv 上也能用。

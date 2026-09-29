@@ -32,7 +32,7 @@ const linkMedia = require('./linkMedia');
 const browserMediaResolver = require('./browserMediaResolver');
 const geo = require('./geo');
 const uplink = require('./uplink');
-const { findMpv } = require('./mpv');
+const { findMpv, normalizeWindowPref } = require('./mpv');
 const { PlayerManager } = require('./players');
 const { discoverPlayers, isAllowedExe, kindOfExe } = require('./players/discover');
 const { findBridge, sharedBridge, closeSharedBridge, BRIDGE_MISSING_MESSAGE } = require('./players/bridge');
@@ -95,6 +95,9 @@ const DEFAULT_CACHE_ROOT = path.join(app.getPath('temp'), 'NoxReel');
 // 连启动都还没启动，localStorage 读不到。所以只有这一个键放在主进程侧的配置里。
 const USER_DATA_DIR = app.getPath('userData');
 const mainConfig = settings.read(USER_DATA_DIR);
+// mpv 窗口上次的大小（占屏幕的百分比、是否最大化），见 mpv.js 的 windowArgs；用户拖过窗口就更新
+let mpvWindowPref = normalizeWindowPref(mainConfig.mpvWindow);
+let mpvWindowSaveTimer = null;
 let cacheChoice = settings.resolveCacheRoot({ config: mainConfig, defaultRoot: DEFAULT_CACHE_ROOT });
 // 缓存目录换过之后，旧盘上可能还躺着没清干净的东西。不记着就再也没人回收了。
 let cacheKnownRoots = settings.knownRoots(mainConfig, cacheChoice.root);
@@ -494,6 +497,17 @@ players.on('window', (state) => {
   setChatHotkey(Boolean(state && state.alive && state.foreground));
 });
 players.on('banner', ({ text }) => overlay.frame({ banner: text }));
+// mpv 窗口大小记忆：内存里马上换（下一次开窗就用），落盘攒一秒（拖边框时一连串变化只写一次）
+players.on('geometry', (pref) => {
+  const next = normalizeWindowPref(pref);
+  if (!next) return;
+  mpvWindowPref = next;
+  clearTimeout(mpvWindowSaveTimer);
+  mpvWindowSaveTimer = setTimeout(() => {
+    settings.write(USER_DATA_DIR, { mpvWindow: mpvWindowPref }).catch(() => {});
+  }, 1000);
+  mpvWindowSaveTimer.unref?.();
+});
 players.on('gone', () => {
   setChatHotkey(false);
   playerWindow = null;
@@ -707,6 +721,12 @@ async function cleanup() {
     // 顺序是定死的：外部播放器先退干净（它还攥着缓存文件），再关桥接程序（关了就发不出
     // WM_CLOSE 了），然后销毁覆盖窗，最后才关会话删缓存。
     await players.quit().catch(() => {});
+    // mpv 窗口大小还攒着没落盘（刚拖完窗口就退出；mpv 退出时也会再报一次）：先写掉
+    if (mpvWindowSaveTimer) {
+      clearTimeout(mpvWindowSaveTimer);
+      mpvWindowSaveTimer = null;
+      if (mpvWindowPref) await settings.write(USER_DATA_DIR, { mpvWindow: mpvWindowPref }).catch(() => {});
+    }
     await closeSharedBridge().catch(() => {});
     await closeSharedProxy();
     overlay.destroy();
@@ -1275,7 +1295,7 @@ secureHandle('player:launch', async (payload) => {
     // 还没收完的接收文件（可信房间边收边播）由主进程自己认，不听渲染进程的：mpv 要关掉缓存，
     // 否则它会把稀疏文件里还没收到的零读进去、在打开那一刻的水位线报 eof（见 mpv.js 的 cacheArg）
     const growing = !remote && store.isReceivingFile(source);
-    return await players.launch('mpv', { source, startPaused, startAt: start, headers: safeHeaders, muted: TEST_MUTE, chatPrompt: prompt, proxy: proxy && proxy.url, maxHeight: remote ? heightCap : 0, growing }, ticket);
+    return await players.launch('mpv', { source, startPaused, startAt: start, headers: safeHeaders, muted: TEST_MUTE, chatPrompt: prompt, proxy: proxy && proxy.url, windowPref: mpvWindowPref, maxHeight: remote ? heightCap : 0, growing }, ticket);
   } catch (error) {
     throw withPlayerCode(error);
   }
@@ -1294,12 +1314,18 @@ secureHandle('player:seek', async (seconds, opts) => {
 });
 
 secureHandle('player:osd', async (payload) => {
-  const { text, duration } = validate.plainObject(payload, '播放器提示参数');
+  const { text, duration, tone } = validate.plainObject(payload, '播放器提示参数');
+  // tone 只决定 mpv 控制条上的提示条配哪个图标，认不出来的一律当普通提示
   return players.osd(
     validate.string(text, '提示文本', { max: 1000, allowEmpty: true }),
-    validate.integer(duration, '提示时长', { min: 0, max: 60_000 })
+    validate.integer(duration, '提示时长', { min: 0, max: 60_000 }),
+    tone === 'ok' || tone === 'warn' ? tone : 'info'
   );
 });
+
+// mpv 控制条要画的房间状态（片名、房间状态、在等谁缓冲、收到了哪几段……）。
+// renderStatus 每个 tick 都会推一次，去重在 MpvController 里做；外部播放器没有这一项
+secureHandle('player:oscState', async (state) => players.setOscState(validate.oscState(state)));
 
 // 常驻横幅。全屏看片时 Electron 窗口整个看不见，这是把房间状态送到用户眼前的唯一通道。
 // 层 id 不让渲染进程自己定，由各播放器适配器固定占房间状态那一层。

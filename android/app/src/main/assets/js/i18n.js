@@ -183,6 +183,11 @@ const EN = new Map(Object.entries({
   '同步到房主': 'Sync to host',
   '自动同步没跟上': 'Auto-sync could not keep up',
   '已同步到房主的进度': 'Synced to the host’s position',
+  '同步目标': 'Sync target',
+  '对方': 'them',
+  '房主换人了，没成的请再试一次': 'The host changed; if it didn’t go through, try again',
+  '你被设为同步目标：大家跟着你的画面走': 'You are the sync target: everyone follows your playback',
+  '同步目标取消了，大家回到跟房间进度': 'The sync target was cleared; everyone follows the room again',
   '完全同步：一直跟房主对齐，差开了自动跳过去。手动同步：只跟房主的播放、暂停和跳转，差开了提示差多少秒，由你点「同步到房主」。':
     'Full sync: stay aligned with the host and jump back automatically when you drift. Manual sync: follow only the host’s play, pause, and seek; when you drift you are told by how many seconds, then tap “Sync to host”.',
   '改成手动同步：缓冲慢了不再把你拽走，和房主差开时提示差多少秒':
@@ -493,12 +498,17 @@ const PATTERNS = [
     /^⏳ 等待缓冲：(.*)$/,
     (_all, who) => `⏳ Waiting for buffer: ${who.split('、').map((name) => (name === '你' ? 'you' : name)).join(', ')}`,
   ],
-  // 在线链接和房主差多少秒
+  // 在线链接和房主差多少秒。跟的也可以是房主指定的同步目标（昵称原样）
   [
-    /^你比房主(慢|快) (\d+) 秒$/,
-    (_all, dir, n) => `You are ${n} ${n === '1' ? 'second' : 'seconds'} ${dir === '慢' ? 'behind' : 'ahead of'} the host`,
+    /^你比(.+?)(慢|快) (\d+) 秒$/,
+    (_all, ref, dir, n) =>
+      `You are ${n} ${n === '1' ? 'second' : 'seconds'} ${dir === '慢' ? 'behind' : 'ahead of'} ${ref === '房主' ? 'the host' : ref}`,
   ],
-  [/^和房主差了 ([\d.]+) 秒，自动对齐$/, '$1 seconds off from the host; realigned automatically'],
+  [/^和(.+?)差了 ([\d.]+) 秒，自动对齐$/, (_all, ref, n) => `${n} seconds off from ${ref === '房主' ? 'the host' : ref}; realigned automatically`],
+  // 同步目标、房主换人
+  [/^已同步到 (.+) 的进度$/, 'Synced to $1'],
+  [/^(.+)被设为同步目标：大家跟着他的画面走$/, '$1 is now the sync target: everyone follows their playback'],
+  [/^(.+)把房主转给了(.+)$/, '$1 transferred host to $2'],
   [/^信令断开，(\d+) 秒后重连（已建立的直连不受影响）$/, 'Signaling disconnected. Reconnecting in $1 seconds.'],
   [/^和 (.+) 的连接迟迟没建起来，重新协商$/, 'The connection to $1 is taking too long to come up; negotiating again'],
   [

@@ -302,6 +302,7 @@ test('在线链接的进度条整条画满、起点归零：从本地片子换�
     stat: () => null,
     kv: () => null,
     connectionModeLabel: () => '',
+    scheduleOscState: () => {},
   });
   ctx.renderProgress({});
   assert.equal($('buf-safe').style.left, '0%', '起点还停在 37.5% 的话，再画 100% 宽就伸出边框');

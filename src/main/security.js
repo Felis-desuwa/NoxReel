@@ -220,6 +220,93 @@ function danmakuFrame(value) {
   return data;
 }
 
+const OSC_TONES = new Set(['sync', 'wait', 'paused', 'manual', 'guest']);
+const OSC_LABEL_KEY = /^[A-Za-z]{1,24}$/;
+
+/**
+ * mpv 控制条要画的房间状态（见 resources/mpv-scripts/noxreel-osc.lua 的 apply_state）。
+ *
+ * 里面有别人的昵称（「等待 小林 缓冲」）、片名、房间名，最后拼进一条 ASS：转义在脚本里做
+ * （花括号、反斜杠一律丢掉，和 escapeAss 同一个做法），这里管「形」和「量」—— 只留认得的字段，
+ * 字数、条数、数字范围全部卡住，返回的是重新拼的对象，多出来的字段一律扔掉。
+ */
+function oscState(value) {
+  const data = plainObject(value, '控制条状态');
+  const text = (v, label, max) => (v === undefined || v === null ? undefined : string(v, label, { max, allowEmpty: true }));
+  const object = (v, label) => (v === undefined || v === null ? null : plainObject(v, label));
+  const out = {
+    title: text(data.title, '控制条片名', 300),
+    subtitle: text(data.subtitle, '控制条副标题', 300),
+    canSeek: data.canSeek !== false,
+  };
+  if (data.danmaku !== undefined && data.danmaku !== null) {
+    if (typeof data.danmaku !== 'boolean') fail('控制条弹幕开关');
+    out.danmaku = data.danmaku;
+  }
+  const chip = object(data.chip, '控制条房间状态');
+  if (chip) {
+    if (!OSC_TONES.has(chip.tone)) fail('控制条房间状态');
+    out.chip = { tone: chip.tone, text: string(chip.text, '控制条房间状态', { max: 120 }) };
+  }
+  if (data.ranges !== undefined && data.ranges !== null) {
+    if (!Array.isArray(data.ranges) || data.ranges.length > 64) fail('控制条已收到的分段');
+    out.ranges = data.ranges.map((r) => {
+      if (!Array.isArray(r) || r.length !== 2) fail('控制条已收到的分段');
+      const a = finiteNumber(r[0], '控制条已收到的分段', { min: 0, max: 1 });
+      const b = finiteNumber(r[1], '控制条已收到的分段', { min: 0, max: 1 });
+      if (b < a) fail('控制条已收到的分段');
+      return [a, b];
+    });
+  }
+  const stall = object(data.stall, '控制条等待卡片');
+  if (stall) {
+    out.stall = { title: string(stall.title, '控制条等待卡片', { max: 200 }) };
+    for (const [key, max] of [['sub', 200], ['left', 80], ['right', 80], ['note', 160]]) {
+      const v = text(stall[key], '控制条等待卡片', max);
+      if (v !== undefined) out.stall[key] = v;
+    }
+    if (stall.progress !== undefined && stall.progress !== null) {
+      out.stall.progress = finiteNumber(stall.progress, '控制条缓冲进度', { min: 0, max: 1 });
+    }
+  }
+  const drift = object(data.drift, '控制条同步提示');
+  if (drift) {
+    out.drift = {
+      text: string(drift.text, '控制条同步提示', { max: 120 }),
+      button: text(drift.button, '控制条同步按钮', 40) || '',
+      key: text(drift.key, '控制条快捷键', 30) || '',
+    };
+  }
+  const host = object(data.host, '控制条房主位置');
+  if (host) {
+    if (typeof host.playing !== 'boolean') fail('控制条房主位置');
+    out.host = { pos: finiteNumber(host.pos, '控制条房主位置', { min: 0, max: 10 ** 7 }), playing: host.playing };
+  }
+  const quality = object(data.quality, '控制条清晰度');
+  if (quality) {
+    if (!Array.isArray(quality.options) || quality.options.length === 0 || quality.options.length > 12) fail('控制条清晰度');
+    out.quality = {
+      current: integer(quality.current, '控制条清晰度', { min: 0, max: 4320 }),
+      label: text(quality.label, '控制条清晰度', 40) || '',
+      options: quality.options.map((o) => {
+        const item = plainObject(o, '控制条清晰度');
+        return { h: integer(item.h, '控制条清晰度', { min: 0, max: 4320 }), label: string(item.label, '控制条清晰度', { max: 40 }) };
+      }),
+    };
+  }
+  const labels = object(data.labels, '控制条文字');
+  if (labels) {
+    const entries = Object.entries(labels);
+    if (entries.length > 96) fail('控制条文字');
+    out.labels = {};
+    for (const [key, v] of entries) {
+      if (!OSC_LABEL_KEY.test(key)) fail('控制条文字');
+      out.labels[key] = string(v, '控制条文字', { max: 80 });
+    }
+  }
+  return out;
+}
+
 /**
  * 要塞进 mpv --script-opt 的值（目前只有播放器内输入框的提示语，由界面按语言给）。
  *
@@ -301,6 +388,7 @@ module.exports = {
   linkMaxHeight,
   manifest,
   mediaHeaders,
+  oscState,
   plainObject,
   playerId,
   publicHttpUrl,

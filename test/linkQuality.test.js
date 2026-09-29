@@ -237,3 +237,13 @@ test('清晰度的文案都有英文', async () => {
   assert.equal(en('换清晰度失败：切换播放器失败：boom'), 'Could not change quality: Could not switch player: boom');
   assert.notEqual(en('在线视频的清晰度：不超过所选这一档，这一档没有就用低一档。只影响你自己，手动缓存和边下边播也按它下。'), '在线视频的清晰度：不超过所选这一档，这一档没有就用低一档。只影响你自己，手动缓存和边下边播也按它下。');
 });
+
+test('在线链接：不让 yt-dlp 把 B 站弹幕、YouTube 聊天回放当字幕挂上（mpv 解不了，点字幕按钮选中它就卡住）', () => {
+  const { buildLaunchArgs, SUB_LANGS_ARG } = require('../src/main/mpv');
+  assert.equal(SUB_LANGS_ARG, 'sub-langs=all,-danmaku,-live_chat', '别的真字幕照旧全要');
+  const flag = `--ytdl-raw-options-append=${SUB_LANGS_ARG}`;
+  const remote = buildLaunchArgs({ ipcPath: 'x', source: 'https://www.bilibili.com/video/BV1/' });
+  assert.ok(remote.includes(flag));
+  assert.ok(remote.indexOf(flag) < remote.indexOf('--'));
+  assert.equal(buildLaunchArgs({ ipcPath: 'x', source: 'D:/片子.mkv' }).includes(flag), false, '本地文件不走 ytdl');
+});

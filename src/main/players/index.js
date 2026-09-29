@@ -126,9 +126,16 @@ class PlayerManager extends EventEmitter {
       'sync-request',
       fromCurrent(() => this.send('player:sync-request', { gen, kind }))
     );
+    // mpv 控制条上点的「弹幕」「清晰度」。同样只认当前这一代：换清晰度会重开播放器，上一代迟到的一下不能再换一次
+    adapter.on(
+      'osc-action',
+      fromCurrent((payload) => this.send('player:osc-action', { ...payload, gen, kind }))
+    );
     // 下面两条只给主进程自己（覆盖窗）用，不转发给渲染进程。
     adapter.on('window', fromCurrent((state) => this.emit('window', { ...state, gen, kind })));
     adapter.on('banner', fromCurrent(({ text }) => this.emit('banner', { text, gen, kind })));
+    // mpv 窗口大小记忆（主进程存进配置）。只是本机偏好，不分哪一代：退场途中最后那一下也照收
+    adapter.on('geometry', (pref) => this.emit('geometry', pref));
 
     try {
       const info = await adapter.launch(launchOptions);
@@ -225,12 +232,18 @@ class PlayerManager extends EventEmitter {
   }
 
   /** 提示和横幅是锦上添花，播放器没开时静默忽略。 */
-  osd(text, durationMs) {
-    if (this.current) return this.current.adapter.osd(text, durationMs);
+  osd(text, durationMs, tone) {
+    if (this.current) return this.current.adapter.osd(text, durationMs, tone);
   }
 
   setBanner(text) {
     if (this.current) return this.current.adapter.setBanner(text);
+  }
+
+  /** mpv 控制条要画的房间状态。外部播放器没有这一项，静默忽略。 */
+  setOscState(state) {
+    const adapter = this.current?.adapter;
+    if (adapter && typeof adapter.setOscState === 'function') return adapter.setOscState(state);
   }
 
   /**

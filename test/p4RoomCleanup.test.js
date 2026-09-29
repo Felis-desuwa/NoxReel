@@ -206,6 +206,7 @@ function playerBox({ leaving }) {
     reportLaunchFailure: (error) => calls.push(`log:启动 mpv 失败：${error?.message || error}`),
     handlePlayerTick: () => {},
     handlePlayerExit: () => {},
+    forgetMpvOsc: () => {}, // mpv 控制条的去重缓存另有测试（mpvOsc.test.js）
     window: {
       sw: {
         player: {
@@ -939,6 +940,8 @@ test('后台扫的片切成当前项后，扫描已用时间会自己走起来',
     S,
     $,
     updatePresence: () => {}, // Discord 状态显示：这里不关心
+    scheduleOscState: () => {}, // mpv 控制条：这里不关心
+    forgetMpvOsc: () => {},
     renderDrift: () => {}, // 在线链接和房主差多少秒：这里不关心
     driftShown: () => false,
     t: (s) => s,
@@ -993,6 +996,7 @@ test('本机已经能播、只是播放器没开着：横幅说「播放器没�
       S,
       $,
       updatePresence: () => {},
+      scheduleOscState: () => {},
       renderDrift: () => {},
       driftShown: () => false,
       t: (s) => s,

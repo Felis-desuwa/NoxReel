@@ -53,7 +53,27 @@ export const MSG = {
   PART: 'part',
   PING: 'ping',
   PONG: 'pong',
+  // 同步目标每 2 秒报一次自己实际放到哪：{ seq, position, moving }（见 syncEngine 的 beaconTick）。
+  // 老版本不认这个类型，照旧跟房间进度
+  BEACON: 'beacon',
+  // 转让房主之后，成员向新房主要一份现状（播放列表、在线视频地址、聊天历史）：{}。
+  // 新人经原房主进房时，新房主那份列表先到、被当成不是房主发的丢了，认下新房主后靠它补上
+  HOST_SYNC: 'host-sync',
 };
+
+/**
+ * HELLO 里报的能力（caps）。老版本不带、也不看，所以只能拿来判断「这个人能不能做某件新事」：
+ *  - leader：能当同步目标（会报自己放到哪，见 MSG.BEACON）
+ *  - follow-host：房主换人之后界面跟得上（播放列表、聊天、在线视频地址改认新房主）
+ *  - host：能接手当房主（安卓只能跟，不能当）
+ * 房里有人不带 follow-host 就不能转让房主 —— 他的界面还认原房主，列表会就此卡住。
+ */
+export const CAPS = ['leader', 'follow-host', 'host'];
+
+export function normalizeCaps(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((c) => CAPS.includes(c)))];
+}
 
 /**
  * HELLO 里报的平台（成员表上标「这人用什么设备」）。只认这几个值；0.7.7 之前的电脑端报的是
