@@ -133,7 +133,7 @@ async function settingsBox({ settings = {}, form = {}, cfTurnState = null, cfTur
     },
     name: '我',
     role: null,
-    discord: { enabled: false, showTitle: false, showJoin: true },
+    discord: { enabled: false, show: 'none', showJoin: true },
     cfTurn: null,
     cfTurnState,
     cfTurnUsage,
@@ -159,6 +159,7 @@ async function settingsBox({ settings = {}, form = {}, cfTurnState = null, cfTur
     'set-capacity': '4',
     'set-stun': S.settings.stun,
     'set-cache-mode': 'auto',
+    'set-discord-show': 'none',
   };
   const checks = {
     'set-turn-source-cf': S.settings.turnSource === 'cloudflare',
@@ -166,7 +167,6 @@ async function settingsBox({ settings = {}, form = {}, cfTurnState = null, cfTur
     'set-relay-only': S.settings.relayOnly,
     'set-download': false,
     'set-discord-on': false,
-    'set-discord-title': false,
     'set-discord-join': true,
   };
   for (const [id, value] of Object.entries(values)) $(id).value = value;
@@ -471,7 +471,7 @@ test('手填 TURN 的密码框遮住（type=password），「显示」能切换'
 
 test('Discord：总开关关着时两个子选项置灰，打开总开关就能勾', () => {
   const ctx = {
-    S: { settings: { language: 'zh-CN', securityMode: 'trusted', signalUrl: '', relays: '', stun: '' }, discord: { enabled: false, showTitle: true, showJoin: true }, role: null, env: {} },
+    S: { settings: { language: 'zh-CN', securityMode: 'trusted', signalUrl: '', relays: '', stun: '' }, discord: { enabled: false, show: 'title', showJoin: true }, role: null, env: {} },
     roomEntered: false,
     make: fakeEl,
     field: (label, ...children) => fakeEl('div', { className: 'field' }, [fakeEl('label', { text: label }), ...children]),
@@ -503,11 +503,11 @@ test('Discord：总开关关着时两个子选项置灰，打开总开关就能�
   assert.ok(typeof ctx.settingsApplied?.add === 'function' && ctx.settingsApplied.size === 0, '打开设置时从头记');
   assert.equal(ctx.relayOnlyWarned, false);
   const on = findId(body, 'set-discord-on');
-  const title = findId(body, 'set-discord-title');
+  const title = findId(body, 'set-discord-show');
   const join = findId(body, 'set-discord-join');
   assert.equal(title.disabled, true);
   assert.equal(join.disabled, true);
-  assert.equal(title.checked, true, '偏好照样保留');
+  assert.equal(title.value, 'title', '偏好照样保留');
   on.checked = true;
   on.onchange();
   assert.equal(title.disabled, false);

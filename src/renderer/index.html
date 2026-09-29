@@ -123,7 +123,11 @@
                   <div class="film-name"><span id="room-file" data-i18n-skip></span></div>
                   <div class="film-meta" id="room-meta"></div>
                 </div>
-                <span class="role-badge" id="my-role"></span>
+                <div class="now-side">
+                  <!-- Discord 状态开着时：一键切换 Discord 上显示片名还是房间名 -->
+                  <button class="ghost tiny hidden" id="btn-discord-show" type="button"></button>
+                  <span class="role-badge" id="my-role"></span>
+                </div>
               </div>
               <div class="status-strip" id="status-strip" data-tone="info" role="status">
                 <span class="strip-dot" aria-hidden="true"></span>

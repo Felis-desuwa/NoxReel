@@ -17,6 +17,9 @@ export const MAX_HISTORY = 30;
 export const MAX_NAME = 200;
 export const MAX_URL = 2048;
 export const MAX_ADDER_NAME = 40;
+// 房主 / 管理员给的名字：一部片的显示名（label）和房间名（roomName）。只是显示用，不参与任何判断
+export const MAX_LABEL = 100;
+export const MAX_ROOM_NAME = 40;
 export const HEAD_READY_BYTES = 8 * 1024 * 1024;
 
 const ITEM_ID_RE = /^[a-f0-9]{8,32}$/;
@@ -28,11 +31,38 @@ const MAX_SLOT = 0xffffffff;
 const isSlot = (v) => Number.isSafeInteger(v) && v >= 0 && v <= MAX_SLOT;
 const isCount = (v) => Number.isSafeInteger(v) && v >= 1;
 const clampText = (v, max) => (typeof v === 'string' ? v.slice(0, max) : '');
+// 手填的名字（片名、房间名）会被原样显示在每个人的列表、日志和 Discord 状态里：去掉控制字符、
+// 零宽和双向覆盖字符（能把后面的字倒过来显示），空白并成一个；先截短再清洗，免得对几十 KB 的串跑正则
+const LABEL_STRIP_RE = /[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠-⁤⁦-⁩﻿]/g;
+const cleanLabel = (v, max) =>
+  typeof v === 'string'
+    ? v
+        .slice(0, max * 4)
+        // 先把换行、制表这些空白并成空格（「第一集⏎第二集」是两个词），再去掉剩下的控制字符
+        .replace(/\s+/g, ' ')
+        .replace(LABEL_STRIP_RE, '')
+        .replace(/ {2,}/g, ' ')
+        .trim()
+        .slice(0, max)
+        .replace(/[\ud800-\udbff]$/, '')
+        .trim()
+    : '';
 // RegExp.test 会先把参数转成字符串：['abc'] 和 12345678 都能蒙混过关，所以先查类型
 const matches = (re, v) => typeof v === 'string' && re.test(v);
 
 export function createPlaylist() {
-  return { rev: 0, seq: 0, queue: [], history: [], started: false, autoplay: true, nextSlot: 1 };
+  return { rev: 0, seq: 0, queue: [], history: [], started: false, autoplay: true, nextSlot: 1, roomName: '' };
+}
+
+/** 房间名清洗（本机存着的上次那个也要过一遍：localStorage 可以被手改）。 */
+export function cleanRoomName(raw) {
+  return cleanLabel(raw, MAX_ROOM_NAME);
+}
+
+/** 一部片显示成什么：房主 / 管理员改过名（label）就用改过的，否则链接用标题（没有就网址），本地片用文件名。 */
+export function itemLabel(item) {
+  if (!item) return '';
+  return item.label || (item.kind === 'link' ? item.title || item.url : item.name) || '';
 }
 
 export function currentItem(state) {
@@ -127,6 +157,8 @@ function normalizeItem(raw) {
     id: raw.id,
     ...base,
     ...(base.kind === 'file' ? { slot: raw.slot } : {}),
+    // 旧版本房主发来的快照没有这一项，当没改过名
+    label: cleanLabel(raw.label, MAX_LABEL),
     addedBy: matches(PEER_ID_RE, raw.addedBy) ? raw.addedBy : '',
     addedByName: clampText(raw.addedByName, MAX_ADDER_NAME),
     sourceId: matches(PEER_ID_RE, raw.sourceId) ? raw.sourceId : '',
@@ -171,6 +203,7 @@ export function validateSnapshot(raw) {
     started: raw.started === true && queue.length > 0,
     autoplay: raw.autoplay !== false,
     nextSlot,
+    roomName: cleanLabel(raw.roomName, MAX_ROOM_NAME),
   };
 }
 
@@ -241,6 +274,7 @@ export function applyOp(state, op, ctx) {
         id,
         ...fields,
         ...(fields.kind === 'file' ? { slot: slotFor(next, fields.fileId) } : {}),
+        label: '',
         addedBy: ctx.actor,
         addedByName: clampText(ctx.actorName, MAX_ADDER_NAME),
         // 本地文件由添加者供片；链接谁都不用供
@@ -346,6 +380,29 @@ export function applyOp(state, op, ctx) {
       if (typeof op.on !== 'boolean') return fail(state, '无效的操作');
       if (next.autoplay === op.on) return { ok: true, state, unchanged: true };
       next.autoplay = op.on;
+      next.rev += 1;
+      return { ok: true, state: next };
+    }
+
+    // 给一部片改显示名（列表、日志、Discord 状态里用它）。空串 = 改回原来的名字。
+    // 只改显示：文件名、清单、网址都不动，传输和校验照旧按原来的来
+    case 'rename': {
+      if (typeof op.label !== 'string') return fail(state, '无效的操作');
+      const found = findItem(next, op.id);
+      if (!found) return fail(state, '列表里没有这一项');
+      const label = cleanLabel(op.label, MAX_LABEL);
+      if ((found.item.label || '') === label) return { ok: true, state, unchanged: true };
+      next[found.where][found.index] = { ...found.item, label };
+      next.rev += 1;
+      return { ok: true, state: next };
+    }
+
+    // 房间名：成员表、顶栏、Discord 状态里显示。空串 = 不起名（显示「房主的放映厅」）
+    case 'setRoomName': {
+      if (typeof op.name !== 'string') return fail(state, '无效的操作');
+      const roomName = cleanLabel(op.name, MAX_ROOM_NAME);
+      if ((next.roomName || '') === roomName) return { ok: true, state, unchanged: true };
+      next.roomName = roomName;
       next.rev += 1;
       return { ok: true, state: next };
     }

@@ -115,7 +115,7 @@ const roundTrip = (s) => JSON.parse(JSON.stringify(s));
 impl('createPlaylist 的默认值，且每次都是独立的新对象', async (dir) => {
   const P = await load(dir);
   const a = P.createPlaylist();
-  assert.deepEqual(a, { rev: 0, seq: 0, queue: [], history: [], started: false, autoplay: true, nextSlot: 1 });
+  assert.deepEqual(a, { rev: 0, seq: 0, queue: [], history: [], started: false, autoplay: true, nextSlot: 1, roomName: '' });
   // 两个房间如果共用同一个默认对象，一边加片另一边也会冒出来
   const b = P.createPlaylist();
   a.queue.push('x');
@@ -171,6 +171,7 @@ impl('add 文件：规范化字段，丢掉调用方夹带的字段', async (dir
     chunkCount: 6,
     durationSec: 600,
     slot: 1,
+    label: '',
     addedBy: 'host',
     addedByName: '房主',
     sourceId: 'host',
@@ -254,6 +255,7 @@ impl('add 链接：地址规范化，标题截断，不占槽位也没有片源'
     url: 'https://example.com/a%20b?x=1',
     title: '题'.repeat(199),
     durationSec: 90,
+    label: '',
     addedBy: 'host',
     addedByName: '房主',
     // 链接谁都不用供片，传了 sourceId 也不认
@@ -1399,4 +1401,84 @@ test('reorderIds 和 applyOp 的 move 给出同一个顺序', async () => {
   const copy = ids.slice();
   reorderIds(ids, ids[2], ids[0]);
   assert.deepEqual(ids, copy);
+});
+
+/* ------------------------------ 改片名、房间名 ------------------------------ */
+
+impl('rename：只改显示名（label），文件名、网址、槽位都不动；空串改回原名；已播放区里的也能改', async (dir) => {
+  const P = await load(dir);
+  const ctx = makeCtx();
+  let s = build(P, ctx, [fileItem(1), linkItem(2)]);
+  const [file, link] = s.queue;
+  s = ok(P, s, { type: 'rename', id: file.id, label: '  第一集\n  ' }, ctx);
+  assert.equal(s.queue[0].label, '第一集', '空白并成一个、去头尾');
+  assert.equal(s.queue[0].name, '片1.mkv');
+  assert.equal(s.queue[0].fileId, file.fileId);
+  assert.equal(s.queue[0].slot, file.slot);
+  assert.equal(P.itemLabel(s.queue[0]), '第一集');
+  assert.equal(s.rev, 3);
+  assert.equal(s.seq, 1, '改名不换当前项');
+  unchanged(P, s, { type: 'rename', id: file.id, label: '第一集' }, ctx);
+  s = ok(P, s, { type: 'rename', id: file.id, label: '' }, ctx);
+  assert.equal(P.itemLabel(s.queue[0]), '片1.mkv', '空串 = 改回原名');
+  assert.equal(P.itemLabel(link), '链接2');
+  assert.equal(P.itemLabel({ kind: 'link', url: 'https://x.example/', title: '' }), 'https://x.example/');
+
+  // 放完进已播放区：名字跟着走；已播放区里的也能改
+  s = ok(P, s, { type: 'rename', id: file.id, label: '第一集' }, ctx);
+  s = ok(P, s, { type: 'ended', seq: s.seq }, ctx);
+  assert.equal(s.history[0].label, '第一集');
+  s = ok(P, s, { type: 'rename', id: file.id, label: '第一集（完）' }, ctx);
+  assert.equal(s.history[0].label, '第一集（完）');
+});
+
+impl('rename / setRoomName：控制字符、零宽、双向覆盖字符去掉，截到上限；没权限、不认识的参数一律拒', async (dir) => {
+  const P = await load(dir);
+  const ctx = makeCtx();
+  let s = build(P, ctx, [fileItem(1)]);
+  const id = s.queue[0].id;
+  s = ok(P, s, { type: 'rename', id, label: 'a‮b​c\u0007d' }, ctx);
+  assert.equal(s.queue[0].label, 'abcd');
+  s = ok(P, s, { type: 'rename', id, label: '长'.repeat(500) }, ctx);
+  assert.equal(s.queue[0].label, '长'.repeat(P.MAX_LABEL));
+  rejected(P, s, { type: 'rename', id, label: 42 }, ctx, '无效的操作');
+  rejected(P, s, { type: 'rename', id: 'ffffffffffff', label: 'x' }, ctx, '列表里没有这一项');
+  rejected(P, s, { type: 'rename', id, label: 'x' }, makeCtx({ actor: 'guest' }), NO_PERMISSION);
+
+  s = ok(P, s, { type: 'setRoomName', name: ' 周五\t电影夜 ' }, ctx);
+  assert.equal(s.roomName, '周五 电影夜');
+  unchanged(P, s, { type: 'setRoomName', name: '周五 电影夜' }, ctx);
+  s = ok(P, s, { type: 'setRoomName', name: '房'.repeat(100) }, ctx);
+  assert.equal(s.roomName, '房'.repeat(P.MAX_ROOM_NAME));
+  s = ok(P, s, { type: 'setRoomName', name: '' }, ctx);
+  assert.equal(s.roomName, '');
+  rejected(P, s, { type: 'setRoomName', name: ['x'] }, ctx, '无效的操作');
+  rejected(P, s, { type: 'setRoomName', name: 'x' }, makeCtx({ actor: 'guest' }), NO_PERMISSION);
+  assert.equal(P.cleanRoomName('‮周五'), '周五', '本机存着的上次那个也过一遍');
+});
+
+impl('快照：label 和 roomName 走一趟网络照样在，清洗同一套；旧版本房主的快照没有这两项就当没改过名', async (dir) => {
+  const P = await load(dir);
+  const ctx = makeCtx();
+  let s = build(P, ctx, [fileItem(1), linkItem(2)]);
+  s = ok(P, s, { type: 'rename', id: s.queue[1].id, label: '预告' }, ctx);
+  s = ok(P, s, { type: 'setRoomName', name: '周五电影夜' }, ctx);
+  const got = P.validateSnapshot(roundTrip(s));
+  assert.equal(got.roomName, '周五电影夜');
+  assert.equal(got.queue[1].label, '预告');
+  assert.equal(got.queue[0].label, '');
+
+  const raw = roundTrip(s);
+  delete raw.roomName;
+  for (const it of raw.queue) delete it.label;
+  const old = P.validateSnapshot(raw);
+  assert.equal(old.roomName, '');
+  assert.deepEqual(old.queue.map((it) => it.label), ['', '']);
+
+  const evil = roundTrip(s);
+  evil.roomName = '‮' + 'x'.repeat(5000);
+  evil.queue[0].label = { toString: () => 'x' };
+  const cleaned = P.validateSnapshot(evil);
+  assert.equal(cleaned.roomName, 'x'.repeat(P.MAX_ROOM_NAME));
+  assert.equal(cleaned.queue[0].label, '', '不是字符串的一律当没改过名');
 });

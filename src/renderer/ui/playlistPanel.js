@@ -287,7 +287,8 @@ export function createPlaylistPanel({ body, onAction, onMove, onDropFiles }) {
     if (refocus && anchor && body.contains(anchor)) anchor.focus();
   }
 
-  function openMenu(id, anchor) {
+  /** at：右键打开时的鼠标位置（这时菜单开在鼠标那儿，不贴着 ⋯）。 */
+  function openMenu(id, anchor, at = null) {
     const row = findRow(id);
     closeMenu();
     if (!row?.menu?.length) return;
@@ -304,14 +305,14 @@ export function createPlaylistPanel({ body, onAction, onMove, onDropFiles }) {
       )
     );
     document.body.append(el);
-    const rect = anchor.getBoundingClientRect();
+    const rect = at ? { left: at.x, right: at.x, top: at.y, bottom: at.y } : anchor.getBoundingClientRect();
     const box = el.getBoundingClientRect();
-    const left = Math.max(8, Math.min(window.innerWidth - box.width - 8, rect.right - box.width));
-    const below = rect.bottom + 4;
+    const left = Math.max(8, Math.min(window.innerWidth - box.width - 8, at ? rect.left : rect.right - box.width));
+    const below = rect.bottom + (at ? 0 : 4);
     const top = below + box.height > window.innerHeight - 8 ? Math.max(8, rect.top - box.height - 4) : below;
     el.style.left = `${left}px`;
     el.style.top = `${top}px`;
-    anchor.setAttribute('aria-expanded', 'true');
+    anchor?.setAttribute('aria-expanded', 'true');
     menu = { el, id, anchor };
     el.querySelector('button:not([disabled])')?.focus();
   }
@@ -331,6 +332,16 @@ export function createPlaylistPanel({ body, onAction, onMove, onDropFiles }) {
     const { act, id } = item.dataset;
     closeMenu({ refocus: true });
     onAction(act, id);
+  });
+
+  // 右键一行：在鼠标那儿打开同一份菜单（改名、移除……都在里面）。菜单是空的就不拦系统菜单
+  body.addEventListener('contextmenu', (e) => {
+    const rowEl = e.target.closest?.('.pl-row[data-id]');
+    if (!rowEl || !body.contains(rowEl)) return;
+    const id = rowEl.dataset.id;
+    if (!findRow(id)?.menu?.length) return;
+    e.preventDefault();
+    openMenu(id, moreButtonOf(id), { x: e.clientX, y: e.clientY });
   });
 
   body.addEventListener('click', (e) => {

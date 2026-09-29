@@ -972,6 +972,27 @@ const EN = new Map(Object.entries({
   '进入房间后会显示': 'Shown once you’re in a room',
   '没有打开': 'Off',
   '和朋友一起看片': 'Watching with friends',
+  // Discord 上写片名还是房间名；片名、房间名右键改
+  'Discord 上显示': 'Shown on Discord',
+  '只写「和朋友一起看片」': 'Only “Watching with friends”',
+  '正在放的片名': 'The title that is playing',
+  '房间名': 'Room name',
+  '片名和房间名可以右键改（房主和管理员）；房间里片名旁边有个按钮能随时在片名和房间名之间切换。':
+    'The host and moderators can right-click to rename the title or the room; in the room, a button next to the title switches between the title and the room name at any time.',
+  'Discord：显示房间名': 'Discord: room name',
+  'Discord：显示片名': 'Discord: title',
+  'Discord：不写名字': 'Discord: no names',
+  '点一下在片名和房间名之间切换': 'Click to switch between the title and the room name',
+  '右键给房间起名': 'Right-click to name the room',
+  '右键改片名': 'Right-click to rename',
+  '重命名…': 'Rename…',
+  '改片名': 'Rename title',
+  '显示成': 'Show as',
+  '原名：': 'Original: ',
+  '全房看到的都是这个名字，Discord 状态里也用它。清空再保存就改回原名；文件名和网址不会变。':
+    'Everyone in the room sees this name, and your Discord status uses it too. Clear it and save to go back to the original; the file name and URL do not change.',
+  '全房看到的都是这个名字，Discord 状态选「房间名」时显示它。清空再保存就不起名。':
+    'Everyone in the room sees this name, and Discord shows it when set to “Room name”. Clear it and save to remove the name.',
   '还有人要来？同一条链接接着发就行，不用重新生成。': 'More people coming? Just send the same link again; no need to make a new one.',
   '还有人要来？这个邀请码接着发就行，不用重新生成。': 'More people coming? Just send the same invite code again; no need to make a new one.',
   '等待开播': 'Waiting to start',
@@ -1664,6 +1685,8 @@ const EN_PATTERNS = [
     'These relay addresses are not recognised: $1. Use the form wss://relay.example.com',
   ],
   [/^在看《(.+)》$/, 'Watching “$1”'],
+  [/^在「(.+)」一起看片$/, 'Watching together in “$1”'],
+  [/^(.+)的放映厅$/, '$1’s screening room'],
   [/^房间 (\d+)\/(\d+) 人$/, 'Room $1/$2'],
 ];
 

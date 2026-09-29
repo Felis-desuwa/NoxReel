@@ -1473,7 +1473,8 @@ test('Discord 状态：变化再频繁也按最短间隔发，关掉立刻生效
   let members = 1;
   const g = {
     roomEntered: true,
-    S: { leaving: false, discord: { enabled: true, showTitle: false, showJoin: true } },
+    S: { leaving: false, discord: { enabled: true, show: 'none', showJoin: true } },
+    renderDiscordShowToggle: () => {}, // 片名旁边那个切换按钮：这里不关心
     buildActivity,
     activityKey,
     t: (s) => s,

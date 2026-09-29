@@ -26,7 +26,7 @@ import {
 } from './ice.js';
 import { RelayUsageMeter, cloudflareRelayPairs, isCloudflareTurnUrl, onlyCloudflareRelays } from './turnUsage.js';
 import { MSG, PROTOCOL_VERSION, normalizePlatform } from './protocol.js';
-import { catalogOf, createPlaylist, currentItem, findItem, reorderIds, validateSnapshot } from './playlist.js';
+import { catalogOf, createPlaylist, currentItem, findItem, itemLabel, reorderIds, validateSnapshot } from './playlist.js';
 import { BURST_TOKENS, ChatGate, ChatSender, clampName, numberDuplicateNames, parseHistory, trustsRelay } from './chat.js';
 import { AREAS, DanmakuEngine, DEFAULT_SETTINGS as DANMAKU_BASE } from './danmaku.js';
 import { currentLocale, setLocale, SKIP_ATTR, startI18n, translate as t } from './i18n.js';
@@ -1087,7 +1087,7 @@ const playLink = (seq, opts) => tryPlayLink(seq, opts).catch((e) => console.warn
 async function tryPlayLink(seq, { force = false } = {}) {
   const item = S.current;
   if (!item || item.kind !== 'link' || S.currentSeq !== seq || S.playerStarted) return;
-  S.linkInfo = { title: item.title || '在线视频', duration: item.durationSec || 0, playback: null };
+  S.linkInfo = { title: item.label || item.title || '在线视频', duration: item.durationSec || 0, playback: null };
   renderFilmInfo();
   renderStatus(S.prog);
   const now = S.nowLink?.seq === seq ? S.nowLink : null;
@@ -2416,7 +2416,8 @@ function renderRole() {
 
 /* ---------------------------- 播放列表面板 ---------------------------- */
 
-const itemName = (item) => (item ? (item.kind === 'link' ? item.title || item.url : item.name) || '' : '');
+// 房主 / 管理员给这一部改过名就用改过的（见 playlist.js 的 itemLabel）
+const itemName = (item) => itemLabel(item);
 
 const PLAYLIST_TAG = { now: '正在播放', next: '待播', done: '已播放' };
 

@@ -245,7 +245,7 @@ const base = (o = {}) => ({
 
 test('默认值：总开关关着就什么也不显示；打开后默认不带片名', async () => {
   const { buildActivity, PRESENCE_DEFAULTS, loadPresenceSettings } = await import(UI);
-  assert.deepEqual(PRESENCE_DEFAULTS, { enabled: false, showTitle: false, showJoin: true });
+  assert.deepEqual(PRESENCE_DEFAULTS, { enabled: false, show: 'none', showJoin: true });
   assert.equal(buildActivity(base(), PRESENCE_DEFAULTS), null);
   const a = buildActivity(base(), { ...PRESENCE_DEFAULTS, enabled: true });
   assert.equal(a.details, '和朋友一起看片');
@@ -253,12 +253,12 @@ test('默认值：总开关关着就什么也不显示；打开后默认不带�
   // 读不到或读坏了一律当默认（也就是不显示）
   assert.deepEqual(loadPresenceSettings({ getItem: () => '{bad' }), PRESENCE_DEFAULTS);
   assert.deepEqual(loadPresenceSettings({ getItem: () => { throw new Error('denied'); } }), PRESENCE_DEFAULTS);
-  assert.deepEqual(loadPresenceSettings(null), { enabled: false, showTitle: false, showJoin: true });
+  assert.deepEqual(loadPresenceSettings(null), { enabled: false, show: 'none', showJoin: true });
 });
 
 test('显示片名：去掉扩展名；播放中带起止时间，暂停和没开播时不带', async () => {
   const { buildActivity } = await import(UI);
-  const on = { enabled: true, showTitle: true, showJoin: true };
+  const on = { enabled: true, show: 'title', showJoin: true };
   const playing = buildActivity(base(), on);
   assert.equal(playing.details, '在看《Some.Movie.2019》');
   assert.equal(playing.state, '房间 3/8 人');
@@ -275,7 +275,7 @@ test('显示片名：去掉扩展名；播放中带起止时间，暂停和没�
 
 test('「加入放映」按钮：只有房间链接时才有，排第一；另一个是下载', async () => {
   const { buildActivity, RELEASES_URL } = await import(UI);
-  const on = { enabled: true, showTitle: false, showJoin: true };
+  const on = { enabled: true, show: 'none', showJoin: true };
   assert.deepEqual(buildActivity(base(), on).buttons, [
     { label: '加入放映', url: ROOM },
     { label: '下载 NoxReel', url: RELEASES_URL },
@@ -289,7 +289,7 @@ test('「加入放映」按钮：只有房间链接时才有，排第一；另�
 
 test('比对键：进度按 10 秒粗化，播放中每个 tick 不会都算「变了」', async () => {
   const { buildActivity, activityKey } = await import(UI);
-  const on = { enabled: true, showTitle: false, showJoin: true };
+  const on = { enabled: true, show: 'none', showJoin: true };
   const a = activityKey(buildActivity(base({ position: 60, now: 1_750_000_100_000 }), on));
   const b = activityKey(buildActivity(base({ position: 61, now: 1_750_000_101_000 }), on));
   assert.equal(a, b);
@@ -328,4 +328,41 @@ test('新文案都有英文', async () => {
   }
   // 按钮文字过了翻译也不能超过 Discord 的 32 字上限
   for (const label of ['加入放映', '下载 NoxReel']) assert.ok(Array.from(en(label)).length <= 32);
+});
+
+test('显示房间名：写「在「房间名」一起看片」；没有房间名、没有片名时退回「和朋友一起看片」', async () => {
+  const { buildActivity } = await import(UI);
+  const room = { enabled: true, show: 'room', showJoin: true };
+  assert.equal(buildActivity(base({ roomName: '周五电影夜' }), room).details, '在「周五电影夜」一起看片');
+  assert.ok(!JSON.stringify(buildActivity(base({ roomName: '周五电影夜' }), room)).includes('Some.Movie'), '选了房间名就不带片名');
+  assert.equal(buildActivity(base({ roomName: '  ' }), room).details, '和朋友一起看片');
+  const title = { enabled: true, show: 'title', showJoin: true };
+  assert.equal(buildActivity(base({ roomName: '周五电影夜' }), title).details, '在看《Some.Movie.2019》', '选了片名就不带房间名');
+  assert.equal(buildActivity(base({ title: '' }), title).details, '和朋友一起看片');
+});
+
+test('设置：0.7.9 之前勾过「显示片名」的当成显示片名；存的时候也留一份 showTitle 给旧版本', async () => {
+  const { loadPresenceSettings, savePresenceSettings } = await import(UI);
+  const store = (raw) => ({ getItem: () => JSON.stringify(raw) });
+  assert.equal(loadPresenceSettings(store({ enabled: true, showTitle: true })).show, 'title');
+  assert.equal(loadPresenceSettings(store({ enabled: true, showTitle: false })).show, 'none');
+  assert.equal(loadPresenceSettings(store({ enabled: true, show: 'room', showTitle: true })).show, 'room', '新值优先');
+  assert.equal(loadPresenceSettings(store({ show: 'everything' })).show, 'none', '认不出的值当不显示');
+  const saved = {};
+  const target = { setItem: (k, v) => (saved[k] = JSON.parse(v)) };
+  savePresenceSettings({ enabled: true, show: 'title', showJoin: false }, target);
+  assert.deepEqual(saved['sw.discord'], { enabled: true, show: 'title', showTitle: true, showJoin: false });
+  savePresenceSettings({ enabled: true, show: 'room', showJoin: true }, target);
+  assert.equal(saved['sw.discord'].showTitle, false, '旧版本不认房间名：退回去时就不带名字');
+  savePresenceSettings({ enabled: true, show: '<script>' }, target);
+  assert.equal(saved['sw.discord'].show, 'none');
+});
+
+test('新文案都有英文', async () => {
+  const { translate } = await import('../src/renderer/lib/i18n.js');
+  assert.equal(translate('在「周五电影夜」一起看片', 'en'), 'Watching together in “周五电影夜”');
+  assert.equal(translate('小明的放映厅', 'en'), '小明’s screening room');
+  for (const zh of ['只写「和朋友一起看片」', '正在放的片名', '房间名', 'Discord：显示房间名', 'Discord：显示片名', 'Discord：不写名字', '点一下在片名和房间名之间切换', '右键给房间起名', '右键改片名', '重命名…', '改片名', '显示成', '原名：', 'Discord 上显示']) {
+    assert.notEqual(translate(zh, 'en'), zh, zh);
+  }
 });

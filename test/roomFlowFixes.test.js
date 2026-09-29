@@ -268,6 +268,9 @@ async function makeRoom({ fns, stubs = {}, sync } = {}) {
     cancelPrepJob: noop,
     manifestCandidates: () => [],
     activateLinkItem: async () => {},
+    // 片名、房间名（改名功能）：这些测试只要原名
+    itemLabel: (item) => (item ? item.label || (item.kind === 'link' ? item.title || item.url : item.name) : ''),
+    canEditPlaylist: () => false,
     // 边下边播（另存一份到下载位置）：这些测试不关心
     wantDownload: noop,
     maybeSaveDownload: noop,
@@ -587,6 +590,7 @@ const OPTOUT_FNS = [
   'trackClosing',
   'newSession',
   'renderFilmInfo',
+  'currentTitle',
 ];
 
 /** 管理员 A 和房主 H 两台引擎，A 的出站消息直接送进 H。 */

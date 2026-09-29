@@ -4,14 +4,16 @@
  * 纯函数，不碰 DOM、不碰 IPC —— app.js 负责取状态、比对有没有变、交给主进程。
  * 主进程还会再校验一遍（src/main/discordPresence.js 的 sanitizeActivity）。
  *
- * 隐私默认值是保守的：总开关默认关；片名默认不显示（所有 Discord 好友都看得到）；
+ * 隐私默认值是保守的：总开关默认关；默认不显示片名和房间名（所有 Discord 好友都看得到）；
  * 「加入放映」按钮只在有房间链接（谁点谁进）时出现 —— 一对一邀请本来就只能给一个人。
  */
 
 const STORAGE_KEY = 'sw.discord';
 export const RELEASES_URL = 'https://github.com/Felis-desuwa/NoxReel/releases/latest';
 
-export const PRESENCE_DEFAULTS = Object.freeze({ enabled: false, showTitle: false, showJoin: true });
+// show：Discord 上那一行写什么 —— 'none' 只写「和朋友一起看片」，'title' 写正在放的片名，'room' 写房间名
+export const PRESENCE_SHOW = Object.freeze(['none', 'title', 'room']);
+export const PRESENCE_DEFAULTS = Object.freeze({ enabled: false, show: 'none', showJoin: true });
 
 /** 读设置。坏值、读不到（隐私模式、存储被清）都退回默认 —— 默认就是「不显示」。 */
 export function loadPresenceSettings(storage = globalThis.localStorage) {
@@ -19,7 +21,8 @@ export function loadPresenceSettings(storage = globalThis.localStorage) {
     const raw = JSON.parse(storage?.getItem(STORAGE_KEY) || '{}');
     return {
       enabled: raw.enabled === true,
-      showTitle: raw.showTitle === true,
+      // 0.7.9 之前只有「显示片名」一个勾：勾过的当成显示片名
+      show: PRESENCE_SHOW.includes(raw.show) ? raw.show : raw.showTitle === true ? 'title' : 'none',
       showJoin: raw.showJoin !== false,
     };
   } catch {
@@ -31,7 +34,13 @@ export function savePresenceSettings(settings, storage = globalThis.localStorage
   try {
     storage?.setItem(
       STORAGE_KEY,
-      JSON.stringify({ enabled: !!settings.enabled, showTitle: !!settings.showTitle, showJoin: settings.showJoin !== false })
+      JSON.stringify({
+        enabled: !!settings.enabled,
+        show: PRESENCE_SHOW.includes(settings.show) ? settings.show : 'none',
+        // 退回旧版本时它只认这一个：显示片名的照旧显示
+        showTitle: settings.show === 'title',
+        showJoin: settings.showJoin !== false,
+      })
     );
   } catch {}
 }
@@ -45,7 +54,8 @@ function tidyTitle(title) {
 
 /**
  * @param {object} st  房间状态
- * @param {string} [st.title]      当前片名（用户内容，原样显示、不翻译）
+ * @param {string} [st.title]      当前片名（用户内容，原样显示、不翻译；改过名的是改过的）
+ * @param {string} [st.roomName]   房间名（用户内容；没起名时是「X的放映厅」，已经翻译好）
  * @param {boolean} st.paused
  * @param {boolean} st.started     这一部开播过没有（没开播时是「等待开播」，不是「已暂停」）
  * @param {number} [st.position]   秒
@@ -62,7 +72,13 @@ function tidyTitle(title) {
 export function buildActivity(st, settings, t = (s) => s) {
   if (!settings?.enabled || !st) return null;
   const title = tidyTitle(st.title);
-  const details = settings.showTitle && title ? t(`在看《${title}》`) : t('和朋友一起看片');
+  const roomName = String(st.roomName || '').trim();
+  const details =
+    settings.show === 'title' && title
+      ? t(`在看《${title}》`)
+      : settings.show === 'room' && roomName
+      ? t(`在「${roomName}」一起看片`)
+      : t('和朋友一起看片');
 
   const members = Math.max(1, Math.round(Number(st.members) || 1));
   const capacity = Math.max(members, Math.round(Number(st.capacity) || members));

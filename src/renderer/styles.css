@@ -545,6 +545,13 @@ select:disabled {
   flex: 1;
   min-width: 0;
 }
+/* 右上角：Discord 显示切换 + 自己的角色 */
+.now-side {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
 .now-kicker {
   display: flex;
   align-items: center;
@@ -2087,6 +2094,18 @@ select:disabled {
   align-items: center;
   gap: 6px;
   margin-left: 6px;
+  font-weight: 400;
+}
+/* 房间名（房主 / 管理员右键顶栏的房间标签起的）：加粗、太长就省略，后面的状态照旧 */
+.pill-room-name {
+  font-weight: 600;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pill-room-name + span::before {
+  content: '· ';
   font-weight: 400;
 }
 .room-pill::before {

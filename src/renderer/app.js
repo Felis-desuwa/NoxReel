@@ -8,12 +8,16 @@ import { currentLocale, setLocale, startI18n, translate as t } from './lib/i18n.
 import {
   applyOp,
   catalogOf,
+  cleanRoomName,
   createPlaylist,
   currentItem,
   findItem,
   isItemReady,
+  itemLabel,
   markSources,
   markStarted,
+  MAX_LABEL,
+  MAX_ROOM_NAME,
   referencedFileIds,
   reorderIds,
   transferOrder,
@@ -2316,6 +2320,8 @@ function onPlaylistChanged() {
     renderPlaylist();
     // 当前项的内容变了，横幅也得跟着变；不然它能一直停在上一份快照写的网站上
     renderStatus();
+    // 房间名也在快照里
+    renderRoomPill();
   }
 }
 
@@ -2385,7 +2391,7 @@ async function switchCurrent(item) {
     return;
   }
   if (roomEntered) {
-    const playing = `现在放：${item.kind === 'link' ? item.title || item.url : item.name}`;
+    const playing = `现在放：${itemLabel(item)}`;
     log(playing, 'good');
     S.chat?.note(playing);
   }
@@ -5268,6 +5274,10 @@ async function enterRoom() {
   joinAttempt.cleanups.length = 0;
 
   initSwarmAndSync();
+  // 房主上次起过的房间名这次接着用（在列表快照里，进来的人都看得到；成员的会被房主发来的快照盖掉）
+  if (isRoomHost() && !S.playlist.roomName) {
+    S.playlist = { ...S.playlist, roomName: cleanRoomName(localStorage.getItem('sw.roomName')) };
+  }
 
   show('view-room');
 
@@ -5304,7 +5314,36 @@ let presenceSentAt = 0;
 let presenceTimer = null;
 
 /** 现在该在 Discord 上显示什么；没变就什么也不发。主进程那边另有 15 秒限频。 */
+/**
+ * 片名旁边的「Discord：片名 / 房间名」按钮：Discord 状态开着时才出现，点一下在两者之间切换
+ * （存本机、马上更新状态）。设置里还有第三种「不写名字」，从那儿选过的，点一下回到片名。
+ */
+function renderDiscordShowToggle() {
+  const btn = $('btn-discord-show');
+  if (!btn) return;
+  const on = roomEntered && !!window.sw?.discord && S.discord.enabled;
+  btn.classList.toggle('hidden', !on);
+  if (!on) return;
+  const text =
+    S.discord.show === 'room' ? 'Discord：显示房间名' : S.discord.show === 'title' ? 'Discord：显示片名' : 'Discord：不写名字';
+  if (btn.dataset.show !== S.discord.show) {
+    btn.dataset.show = S.discord.show;
+    replace(btn, text);
+    btn.title = t('点一下在片名和房间名之间切换');
+  }
+}
+
+function toggleDiscordShow() {
+  S.discord = { ...S.discord, show: S.discord.show === 'title' ? 'room' : 'title' };
+  savePresenceSettings(S.discord);
+  renderDiscordShowToggle();
+  updatePresence();
+}
+
+$('btn-discord-show').onclick = toggleDiscordShow;
+
 function updatePresence() {
+  renderDiscordShowToggle();
   if (!window.sw?.discord) return;
   const inRoom = roomEntered && !S.leaving;
   const activity = inRoom ? buildActivity(presenceState(), S.discord, t) : null;
@@ -5331,7 +5370,9 @@ function presenceState() {
   const st = S.sync?.status?.() || {};
   S.presenceParty ||= randomPeerId(); // 这个房间的随机标识，不含任何能拿来进房的东西
   return {
-    title: S.sourceType === 'link' ? S.linkInfo?.title || S.current?.title : S.manifest?.name || S.current?.name,
+    // 改过名的用改过的（见 currentTitle）；房间名没起的是「房主的放映厅」
+    title: currentTitle(),
+    roomName: roomLabel(),
     // 看的是全房的状态，不是游客自己那一路的暂停
     paused: S.sync?.shared?.paused !== false,
     started: S.playlist?.started === true,
@@ -5742,12 +5783,17 @@ function renderPlaylist() {
   renderReady();
 }
 
-const itemName = (item) => (item.kind === 'link' ? item.title || item.url : item.name);
+// 房主 / 管理员改过名的用改过的（见 playlist.js 的 itemLabel）
+const itemName = (item) => itemLabel(item);
+/** 没改过名时这一部叫什么：链接用标题（没有就网址），本地片用文件名。 */
+const originalName = (item) => (item.kind === 'link' ? item.title || item.url : item.name);
 const pct = (ratio) => `${Math.floor(Math.max(0, Math.min(1, ratio || 0)) * 100)}%`;
 
 /** 第二行：谁加的 · 时长 · 大小（链接是网站）。昵称和网站原样显示，不翻译。 */
 function itemMeta(item) {
   const parts = [];
+  // 改过名的，原来叫什么还得看得到（下载下来的文件、网站上的标题都还是原名）
+  if (item.label) parts.push({ label: '原名：', raw: originalName(item) });
   if (item.addedByName) parts.push({ label: '添加者：', raw: item.addedByName });
   if (item.durationSec > 0) parts.push(fmtTime(item.durationSec));
   if (item.kind === 'file') parts.push({ text: fmtBytes(item.size), className: 'pl-size' });
@@ -6073,6 +6119,7 @@ function queueMenu(item, index, canEdit) {
     menu.push(index > 0 ? { key: 'play-now', label: '立即播放' } : { key: 'skip', label: '跳过这一部' });
     if (index > 0) menu.push({ key: 'move-up', label: '上移' });
     if (index < last) menu.push({ key: 'move-down', label: '下移' });
+    menu.push({ key: 'rename', label: '重命名…' });
     menu.push({ key: 'remove', label: '移除', danger: true });
   }
   return [...menu, ...localMenu(item)];
@@ -6085,6 +6132,7 @@ function historyMenu(item, canEdit) {
     const cached = item.kind === 'link' || S.sessions.has(item.fileId);
     menu.push({ key: 'requeue', label: cached ? '再放一次' : '再放一次（需重新传输）' });
     menu.push({ key: 'play-now', label: '立即播放' });
+    menu.push({ key: 'rename', label: '重命名…' });
     menu.push({ key: 'remove', label: '从已播放中移除', danger: true });
   }
   return [...menu, ...localMenu(item)];
@@ -6186,6 +6234,9 @@ async function onPlaylistAction(key, id) {
     // 菜单里点「立即播放」是明说要换，不再二次确认
     case 'play-now':
       await runPlaylistOp({ type: 'playNow', id });
+      return;
+    case 'rename':
+      openItemRename(id);
       return;
     case 'skip':
       // 菜单打开之后当前项可能已经换了，别跳错
@@ -6510,12 +6561,25 @@ function refreshMediaUi() {
  * 而 enterRoom 有个只跑一次的守卫。放在里面的话，观众进房时 manifest 还是 null，
  * 等清单到了又被守卫挡回去，结果房间头部永远是空的。
  */
+/**
+ * 正在放的这一部叫什么：房主 / 管理员改过名的用改过的；链接用解析出的标题（还没解析好就用列表里的），
+ * 本地片用清单里的文件名（清单还在路上就用列表里的）。
+ */
+function currentTitle() {
+  const cur = S.current;
+  if (cur?.label) return cur.label;
+  if (S.sourceType === 'link') return S.linkInfo?.title || cur?.title || '';
+  return S.manifest?.name || cur?.name || '';
+}
+
 function renderFilmInfo() {
   const mode = S.roomSecurityMode === 'trusted' ? '可信房间 · 边下边播' : '安全模式 · 扫描后播放';
+  // 能改名的人右键片名改（见 openItemRename）：悬停时说一声
+  $('room-file').title = S.current && canEditPlaylist() ? t('右键改片名') : '';
   if (S.sourceType === 'link') {
     const info = S.linkInfo;
     // 片名是用户内容，标题栏不走自动翻译；兜底文案自己翻
-    $('room-file').textContent = info?.title || S.current?.title || t('在线视频');
+    $('room-file').textContent = currentTitle() || t('在线视频');
     if (!info) {
       $('room-meta').textContent = `视频链接 · 正在解析… · ${mode}`;
       return;
@@ -6527,7 +6591,7 @@ function renderFilmInfo() {
   if (!S.manifest) {
     if (S.current?.kind === 'file') {
       // 列表已经告诉我放哪部了，清单还在路上
-      $('room-file').textContent = S.current.name;
+      $('room-file').textContent = currentTitle();
       $('room-meta').textContent = S.blockedFiles.has(S.current.fileId)
         ? `${fmtBytes(S.current.size)} · ${mode} · 这部片已被拒绝接收`
         : S.diskFull.has(S.current.fileId)
@@ -6539,7 +6603,7 @@ function renderFilmInfo() {
     }
     return;
   }
-  $('room-file').textContent = S.manifest.name;
+  $('room-file').textContent = currentTitle();
   $('room-meta').textContent = `${fmtBytes(S.manifest.size)} · ${S.manifest.chunkCount} 片 × ${fmtBytes(
     S.manifest.chunkSize
   )} · ${mode} · ${S.isSeeder ? '你是片源' : '接收中'}`;
@@ -7485,7 +7549,12 @@ function renderRoomPill(others = connectedPeerCount()) {
   const pill = $('pill-room');
   if (!pill) return;
   const mode = S.roomSecurityMode === 'trusted' ? '可信房间' : '安全模式';
-  pill.textContent = `${others ? '已连接' : '等人加入'} · ${mode} · ${others + 1} / ${S.roomCapacity} 人`;
+  const status = `${others ? '已连接' : '等人加入'} · ${mode} · ${others + 1} / ${S.roomCapacity} 人`;
+  // 房间名是用户内容：单独一段、不翻译；后面那段状态照旧整句翻译
+  const name = S.playlist?.roomName;
+  replace(pill, name ? [make('span', { raw: true, className: 'pill-room-name', text: name }), make('span', { text: status })] : status);
+  // 能改名的人右键它起名：悬停时说一声
+  pill.title = canEditPlaylist() ? t('右键给房间起名') : '';
   pill.classList.toggle('waiting', !others);
 }
 
@@ -8398,6 +8467,84 @@ function openRenameModal() {
   });
   setTimeout(() => input.focus?.(), 0);
 }
+
+/* ------------------------------ 片名、房间名 ------------------------------ */
+// 房主 / 管理员可以给一部片改个显示名、给房间起个名字（右键片名、列表里的一行、顶栏的房间标签）。
+// 两样都记在房主发的播放列表快照里（playlist.js 的 rename / setRoomName），全房看到的一样；
+// 只是显示用，文件名、网址、清单都不动。旧版本收到快照会忽略这两项，照旧显示原名。
+
+/** 房间叫什么：起过名就用起的名，没起就是「房主昵称的放映厅」。 */
+function roomLabel() {
+  if (S.playlist?.roomName) return S.playlist.roomName;
+  const host = isRoomHost() ? S.name : roomDisplayNames().get(S.hostId) || '';
+  return host ? t(`${host}的放映厅`) : 'NoxReel';
+}
+
+/** 起名 / 改名的小对话框。空着保存 = 改回默认；onSave 返回 false 就留在对话框里。 */
+function openNameModal({ title, label, value, placeholder, max, hintText, onSave }) {
+  const input = make('input', { attrs: { type: 'text', maxlength: max, placeholder }, props: { value } });
+  openModal({
+    title,
+    body: [field(label, input), hint(hintText)],
+    okText: '保存',
+    onOk: () => onSave(input.value.trim()),
+  });
+  setTimeout(() => {
+    input.focus?.();
+    input.select?.();
+  }, 0);
+}
+
+/** 给列表里的一部片改显示名。只有能编辑播放列表的人（房主、管理员）能改。 */
+function openItemRename(id) {
+  const found = findItem(S.playlist, id);
+  if (!found || !canEditPlaylist()) return;
+  const { item } = found;
+  openNameModal({
+    title: '改片名',
+    label: '显示成',
+    value: item.label || originalName(item),
+    placeholder: originalName(item),
+    max: MAX_LABEL,
+    hintText: '全房看到的都是这个名字，Discord 状态里也用它。清空再保存就改回原名；文件名和网址不会变。',
+    onSave: async (text) => {
+      const label = text === originalName(item) ? '' : text;
+      const res = await runPlaylistOp({ type: 'rename', id, label });
+      return res.ok !== false;
+    },
+  });
+}
+
+/** 给房间起名。只有房主、管理员能改。 */
+function openRoomRename() {
+  if (!roomEntered || !canEditPlaylist()) return;
+  openNameModal({
+    title: '房间名',
+    label: '房间名',
+    value: S.playlist.roomName || '',
+    placeholder: roomLabel(),
+    max: MAX_ROOM_NAME,
+    hintText: '全房看到的都是这个名字，Discord 状态选「房间名」时显示它。清空再保存就不起名。',
+    onSave: async (name) => {
+      const res = await runPlaylistOp({ type: 'setRoomName', name });
+      // 当房主时记下来，下次开房直接用
+      if (res.ok !== false && isRoomHost()) localStorage.setItem('sw.roomName', name);
+      return res.ok !== false;
+    },
+  });
+}
+
+// 右键片名：给正在放的这一部改名；右键顶栏的房间标签：给房间起名。不能改的人右键没反应（照常弹系统菜单也没有）
+$('room-file').addEventListener('contextmenu', (e) => {
+  if (!S.current || !canEditPlaylist()) return;
+  e.preventDefault();
+  openItemRename(S.current.id);
+});
+$('pill-room').addEventListener('contextmenu', (e) => {
+  if (!roomEntered || !canEditPlaylist()) return;
+  e.preventDefault();
+  openRoomRename();
+});
 
 /** 成员名后面那个设备标记。平台是对端自己报的，只拿来显示；标记单独一个元素，不拼进昵称。 */
 function platformChip(platform) {
@@ -10446,11 +10593,16 @@ $('btn-settings').onclick = () => {
       // Discord 的两个子选项跟着总开关：总开关关着时勾了也不起作用，就别让它能勾
       // （偏好照样保留、照样保存，打开总开关时生效）
       const discordOn = make('input', { id: 'set-discord-on', attrs: { type: 'checkbox' }, props: { checked: S.discord.enabled } });
-      const discordTitle = make('input', {
-        id: 'set-discord-title',
-        attrs: { type: 'checkbox' },
-        props: { checked: S.discord.showTitle, disabled: !S.discord.enabled },
-      });
+      const discordTitle = make(
+        'select',
+        { id: 'set-discord-show', props: { disabled: !S.discord.enabled }, attrs: { 'aria-label': 'Discord 上显示' } },
+        [
+          make('option', { attrs: { value: 'none' }, text: '只写「和朋友一起看片」' }),
+          make('option', { attrs: { value: 'title' }, text: '正在放的片名' }),
+          make('option', { attrs: { value: 'room' }, text: '房间名' }),
+        ]
+      );
+      discordTitle.value = S.discord.show;
       const discordJoin = make('input', {
         id: 'set-discord-join',
         attrs: { type: 'checkbox' },
@@ -10554,10 +10706,11 @@ $('btn-settings').onclick = () => {
         make('div', { className: 'field' }, [
           make('label', { text: 'Discord 状态' }),
           make('label', { className: 'check' }, [discordOn, '在 Discord 上显示我在放映']),
-          make('label', { className: 'check sub-check' }, [discordTitle, '显示片名']),
+          make('label', { className: 'check sub-check' }, ['显示', discordTitle]),
           make('label', { className: 'check sub-check' }, [discordJoin, '显示「加入放映」按钮（用房间链接时）']),
           hint(
             '你所有的 Discord 好友都能在你的资料上看到，点「加入放映」就能进房。',
+            '片名和房间名可以右键改（房主和管理员）；房间里片名旁边有个按钮能随时在片名和房间名之间切换。',
             '需要电脑上开着 Discord 客户端，网页版不行。'
           ),
           make('p', { className: 'fine', id: 'set-discord-status', text: discordStatusText() }),
@@ -10743,7 +10896,7 @@ $('btn-settings').onclick = () => {
       localStorage.setItem('sw.relays', S.settings.relays);
       S.discord = {
         enabled: $('set-discord-on').checked,
-        showTitle: $('set-discord-title').checked,
+        show: $('set-discord-show').value,
         showJoin: $('set-discord-join').checked,
       };
       savePresenceSettings(S.discord);
