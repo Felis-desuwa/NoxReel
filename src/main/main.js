@@ -185,6 +185,8 @@ const linkCache = new LinkCache({
     };
   },
   childEnv: () => linkMedia.childEnv(),
+  // B 站这类只给分开音视频流的网站，下载完要 ffmpeg 合成一个文件（没装就说清楚要装）
+  findFfmpeg: () => media.findFfmpeg(),
 });
 linkCache.on('update', (view) => send('linkCache:update', view));
 const remuxOutputs = new Map();
@@ -1234,7 +1236,12 @@ secureHandle('player:launch', async (payload) => {
   // 必须在第一个 await 之前当场领号：下面的校验要等 realpath / DNS，先发的请求可能后校验完。
   // 号码按请求到达的先后排，过期的启动由 PlayerManager 拒掉，不会覆盖后来者拉起的播放器。
   const ticket = players.reserve();
-  const { filePath, startPaused, headers, startAt = 0, chatPrompt = '', kind = 'mpv' } = validate.plainObject(payload, '播放器启动参数');
+  const { filePath, startPaused, headers, startAt = 0, chatPrompt = '', kind = 'mpv', maxHeight = 0 } = validate.plainObject(
+    payload,
+    '播放器启动参数'
+  );
+  // 在线视频的清晰度上限（本人自己选的，只影响本机这一路）
+  const heightCap = validate.linkMaxHeight(maxHeight);
   // 只认登记过的 id：这个字符串最终会变成 new ADAPTERS[kind]()
   const want = validate.playerId(kind, players.kinds);
   // 先卡类型再跑正则：正则会把任意对象 String() 一遍，一个巨大的数组就能白白吃掉一大块内存
@@ -1268,7 +1275,7 @@ secureHandle('player:launch', async (payload) => {
     // 还没收完的接收文件（可信房间边收边播）由主进程自己认，不听渲染进程的：mpv 要关掉缓存，
     // 否则它会把稀疏文件里还没收到的零读进去、在打开那一刻的水位线报 eof（见 mpv.js 的 cacheArg）
     const growing = !remote && store.isReceivingFile(source);
-    return await players.launch('mpv', { source, startPaused, startAt: start, headers: safeHeaders, muted: TEST_MUTE, chatPrompt: prompt, proxy: proxy && proxy.url, growing }, ticket);
+    return await players.launch('mpv', { source, startPaused, startAt: start, headers: safeHeaders, muted: TEST_MUTE, chatPrompt: prompt, proxy: proxy && proxy.url, maxHeight: remote ? heightCap : 0, growing }, ticket);
   } catch (error) {
     throw withPlayerCode(error);
   }
@@ -1496,9 +1503,10 @@ secureHandle('download:saveSession', async (sessionId) => {
  * （进度走 linkCache:update，purpose=download）。
  */
 secureHandle('download:saveLink', async (payload) => {
-  const { url, title = '' } = validate.plainObject(payload, '下载参数');
+  const { url, title = '', maxHeight = 0 } = validate.plainObject(payload, '下载参数');
   const safeUrl = await validate.publicHttpUrl(url, '视频链接');
   if (typeof title !== 'string') throw new TypeError('无效的标题');
+  const heightCap = validate.linkMaxHeight(maxHeight);
   const key = `link:${safeUrl}`;
   const done = (saved) => ({ url: safeUrl, purpose: 'download', title, state: 'done', ...saved });
   const existing = await downloadSaver.existing(key);
@@ -1511,7 +1519,7 @@ secureHandle('download:saveLink', async (payload) => {
       /* 缓存那份拿不到：照常另下一份 */
     }
   }
-  return linkCache.start({ url: safeUrl, title: title.slice(0, 300), purpose: 'download' });
+  return linkCache.start({ url: safeUrl, title: title.slice(0, 300), purpose: 'download', maxHeight: heightCap });
 });
 
 linkCache.on('update', (view) => {
@@ -1541,10 +1549,11 @@ secureHandle('linkCache:list', async () => {
 });
 
 secureHandle('linkCache:start', async (payload) => {
-  const { url, title = '' } = validate.plainObject(payload, '缓存参数');
+  const { url, title = '', maxHeight = 0 } = validate.plainObject(payload, '缓存参数');
   const safeUrl = await validate.publicHttpUrl(url, '视频链接');
   if (typeof title !== 'string') throw new TypeError('无效的标题');
-  return linkCache.start({ url: safeUrl, title: title.slice(0, 300), purpose: 'cache' });
+  const heightCap = validate.linkMaxHeight(maxHeight);
+  return linkCache.start({ url: safeUrl, title: title.slice(0, 300), purpose: 'cache', maxHeight: heightCap });
 });
 
 secureHandle('linkCache:cancel', async (payload) => {

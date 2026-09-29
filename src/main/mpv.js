@@ -280,6 +280,14 @@ function networkArgs({ isRemote, proxy }) {
  */
 const YOUTUBE_EXTRACTOR_ARGS = 'youtube:player_client=android_vr';
 
+/**
+ * 在线视频的清晰度上限：交给 ytdl_hook 里的 yt-dlp 一个 `-S res:N`（不超过 N 的最高一档，一档都没有才用最低的），
+ * 不动 mpv 默认的 bestvideo+bestaudio —— 分开的两条流照样由 mpv 自己合。0 = 不限。
+ */
+function qualityArgs(maxHeight) {
+  return Number.isSafeInteger(maxHeight) && maxHeight > 0 ? [`--ytdl-raw-options-append=format-sort=res:${maxHeight}`] : [];
+}
+
 function youtubeArgs(source) {
   let youtube = false;
   try {
@@ -328,6 +336,7 @@ function buildLaunchArgs({
   chatPrompt = '',
   proxy = null,
   growing = false,
+  maxHeight = 0,
 } = {}) {
   const isRemote = /^https?:\/\//i.test(source);
   return [
@@ -388,6 +397,7 @@ function buildLaunchArgs({
     ...(isRemote ? [`--cache-pause-wait=${REMOTE_CACHE_PAUSE_WAIT}`] : []),
     ...(ytDlp ? [`--script-opt=ytdl_hook-ytdl_path=${ytDlp}`] : []),
     ...(isRemote ? youtubeArgs(source) : []),
+    ...(isRemote ? qualityArgs(maxHeight) : []),
     ...(isRemote
       ? Object.entries(headers).map(([name, value]) => `--http-header-fields-append=${name}: ${value}`)
       : []),
@@ -551,7 +561,7 @@ class MpvController extends EventEmitter {
    */
   async launch(
     filePath,
-    { startPaused = true, startAt = 0, muted = false, headers = {}, chatPrompt = '', proxy = null, growing = false } = {}
+    { startPaused = true, startAt = 0, muted = false, headers = {}, chatPrompt = '', proxy = null, growing = false, maxHeight = 0 } = {}
   ) {
     if (this.running) await this.quit();
 
@@ -577,6 +587,7 @@ class MpvController extends EventEmitter {
       chatPrompt,
       proxy,
       growing,
+      maxHeight,
     });
 
     this.proc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: false, env: childEnv() });
@@ -971,6 +982,7 @@ module.exports = {
   REMOTE_PROTOCOLS,
   networkArgs,
   youtubeArgs,
+  qualityArgs,
   YOUTUBE_EXTRACTOR_ARGS,
   classifyLoadFailure,
   isLoadWarnLine,

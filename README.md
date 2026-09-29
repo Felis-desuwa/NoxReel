@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析；一整晚的片单、飘过画面的弹幕和你自己惯用的播放器都在里面。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.8-7C5CFF?style=for-the-badge" alt="Version 0.7.8">
+    <img src="https://img.shields.io/badge/version-0.7.9-7C5CFF?style=for-the-badge" alt="Version 0.7.9">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -60,10 +60,13 @@
 - **中英双语**：桌面端与 Android 观众端均可在设置中切换简体中文或 English；昵称、片名和聊天内容永远原样显示，不会被翻译。
 - **缓存怎么清由你定**（设置 → 缓存清理）：默认「自动」—— 收到的片放在缓存里，换片、退房都不删，这次运行里再放同一部直接用，关软件时清掉；改成「手动」则放进长期缓存文件夹（跟着缓存位置走，默认在本机应用数据目录，不会被系统的磁盘清理删掉），从不自动删，以后再放同一部直接用（逐片核对哈希，对不上的片照常重新接收）。设置里能列出缓存的片子勾选删除。异常残留会在下次启动时回收。
 - **在线视频手动缓存**：播放列表里在线视频的「…」菜单有「开始手动缓存」，可以同时缓存好几部；经本机过滤代理下进缓存（跟着上面的清理方式走），下次轮到这一部时从本地播。
-- **边下边播**（设置里，默认关）：边看边另存一份到下载位置（默认「视频NoxReel」，可以换）。只存你放到的片：P2P 的片收完并通过扫描后存（可信房间没扫出威胁就存），在线视频在后台另下一份，缓存过的直接复制。存下来的是你自己的文件，缓存清理不碰；它不改变什么时候开始播。
+- **边下边播**（设置里，默认关）：边看边另存一份到下载位置（默认「视频\NoxReel」，可以换）。只存你放到的片：P2P 的片收完并通过扫描后存（可信房间没扫出威胁就存），在线视频在后台另下一份，缓存过的直接复制。存下来的是你自己的文件，缓存清理不碰；它不改变什么时候开始播。
 - **双模式安全门槛**：可信房间为默认，片头约 8 MB 到了、并且连续数据够放十几秒就边收边播，收完后仍补做扫描；也可切换安全模式，完整接收并通过 Microsoft Defender 扫描后才播放。
 - **模式握手**：邀请码和 P2P 数据通道都会核对协议版本和房间模式；任一项不一致会在媒体清单、控制消息和视频数据传输前断开。
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
+
+> [!NOTE]
+> `v0.7.9` 让**哔哩哔哩**这类网站的链接能放了：B 站只给分开的音频和视频两条流，以前解析时认定「没有能播的格式」，整条链接显示没法用；现在交给 mpv 自己把两条流合起来放，1080p 实测正常。**手动缓存和边下边播**也能下这类网站了（需要本机装了 ffmpeg，下完合成一个文件；没装会说清楚要装）。新增**在线视频清晰度**：控制条上的「清晰度」列出这个视频实际有的几档，每个人各选各的，只影响自己，放着的时候换会在当前位置重开播放器。另外，放在线视频时只有你自己在缓冲（刚打开、跳转之后那几秒），不再在你自己的 mpv 画面上写「等待 你 缓冲…」。**P2P 协议没变，和 0.7.x 互通**；手机端暂时还放不了 B 站这类只给分开音视频流的网站。
 
 > [!NOTE]
 > `v0.7.8` 是一次大修：逐条审查加三轮真机实测，修掉了**一百四十多处**问题，最严重的一处是可信房间从片头边收边播时，成员的播放器会误以为片子已经放完。新功能有**缓存清理方式**（自动 / 手动；手动的放进长期缓存文件夹，下次放同一部直接复用）、在线视频**手动缓存**、**边下边播**（边看边另存一份到下载位置）、进房后**改昵称**。连接更稳：房间链接和信令服务器断线后自己恢复；信令服务器重启后，房间按原来的房主和人数上限恢复（服务器和客户端都要是新版）。设置弹窗统一成「点保存才生效」。**协议版本没变，和 0.7.x 互通**。
@@ -99,8 +102,8 @@
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.8.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.8.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.8.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.8.exe) |
+| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.9.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.9.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.9.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.9.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -140,6 +143,10 @@
 房主和管理员跳转之后，网络流要重新缓冲几秒，这段时间全房会等房主（和选了完全同步的管理员）起播再一起走。
 
 房主是参照，没有这个选项。手机端在播放画面顶栏点「完全同步 / 手动同步」切换。本地视频走 P2P 分片，照旧是全员暂停联动，不受这个选项影响。
+
+### 在线视频的清晰度
+
+放在线视频时，控制条上会出现「清晰度」，列出这个视频实际有的几档（比如「最高 / 1080p / 720p / 480p」）。选的是上限：用不超过这一档的最高画质，这一档没有就用低一档。每个人都是自己连网站，所以各选各的、只影响自己，选择只存在本机；放着的时候换，会在当前位置重开播放器（重新缓冲几秒）。手动缓存和边下边播也按它下。已经缓存到本地的、房主给的临时播放地址只有一条，没有这一项；手机端也没有。
 
 ## 播放器支持
 

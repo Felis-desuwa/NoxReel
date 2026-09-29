@@ -35,8 +35,9 @@ class MpvAdapter extends EventEmitter {
 
   // proxy：主进程那个只放行公网目标的本机过滤代理，见 publicProxy.js / mpv.js 的 networkArgs
   // growing：本地文件还在接收（可信房间边收边播），关掉 mpv 的缓存，见 mpv.js 的 cacheArg
-  launch({ source, startPaused = true, startAt = 0, headers = {}, muted = false, chatPrompt = '', proxy = null, growing = false }) {
-    return this.ctl.launch(source, { startPaused, startAt, headers, muted, chatPrompt, proxy, growing });
+  // maxHeight：在线视频的清晰度上限，见 mpv.js 的 qualityArgs
+  launch({ source, startPaused = true, startAt = 0, headers = {}, muted = false, chatPrompt = '', proxy = null, growing = false, maxHeight = 0 }) {
+    return this.ctl.launch(source, { startPaused, startAt, headers, muted, chatPrompt, proxy, maxHeight, growing });
   }
 
   setPause(paused) {

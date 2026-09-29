@@ -892,3 +892,80 @@ test('「…」菜单：只有在线视频有「开始手动缓存」，在缓�
   const file = { id: 'f', kind: 'file', fileId: 'x', slot: 1, name: 'a.mkv', size: 1 };
   assert.equal(ctx.localMenu(file).some((m) => m.key === 'start-cache'), false, '本地片子没有这一项');
 });
+
+/* ============ 在线链接上只有自己在等数据：不在自己的 mpv 画面上写「等待 你 缓冲」 ============ */
+
+test('在线链接上只有自己在等数据：不往自己的 mpv 画面推「在等 你」横幅，房间窗口也不说「全员暂停」', async () => {
+  const { ctx, S, dom, banners } = await linkRoom({ paused: false });
+  S.current = linkItem();
+  S.linkInfo = { url: S.current.url, title: 't' };
+  S.mpvRunning = true;
+  S.sync.status = () => ({ stalled: true, paused: false, intendedPaused: false, position: 0, duration: 0, waitingFor: ['你'] });
+  S.sync.localStalled = true;
+  S.sync.roomStalled = true;
+  S.sync.stalledPeers = new Map();
+  ctx.connectedPeerCount = () => 0;
+  ctx.stallWaitingNames = () => ['小明'];
+  ctx.renderStatus();
+  assert.equal(banners.at(-1), '', 'mpv 自己停着转圈，画面上看得见');
+  assert.equal(dom.$('status-banner').textContent, '正在缓冲…', '房里没别人：没人在等');
+  ctx.connectedPeerCount = () => 2;
+  ctx.renderStatus();
+  assert.equal(dom.$('status-banner').textContent, '正在缓冲，大家在等你');
+  assert.equal(banners.at(-1), '');
+
+  // 别人也在卡：照旧把「在等谁」推到 mpv 上（这时画面是被同步引擎停住的，得说为什么）
+  S.sync.stalledPeers = new Map([['p2', { name: '小明' }]]);
+  ctx.renderStatus();
+  assert.equal(banners.at(-1), '卡住了');
+  // 本地文件上自己卡：播放器是被引擎按停的，照旧推
+  S.sync.stalledPeers = new Map();
+  S.sourceType = 'file';
+  ctx.renderStatus();
+  assert.equal(banners.at(-1), '卡住了');
+});
+
+test('stall-change：在线链接上自己在等数据不弹 OSD，房里有别人时日志记一行；别人卡、本地文件自己卡照旧提示', () => {
+  const osd = [];
+  const logs = [];
+  const S = { sourceType: 'link', sync: { canIControl: () => true } };
+  let others = 0;
+  const ctx = sandbox([], {
+    S,
+    t: (s) => s,
+    roomDisplayNames: () => new Map([['p2', '小明']]),
+    connectedPeerCount: () => others,
+    log: (text, kind) => logs.push([text, kind]),
+    window: { sw: { player: { osd: (text, ms) => osd.push([text, ms]) } } },
+  });
+  // 处理函数挂在 initSwarmAndSync 里（S.sync.on('stall-change', …)），把那一段原样取出来跑
+  const head = "  S.sync.on('stall-change', ";
+  const at = APP.indexOf(head);
+  assert.ok(at > 0, '没找到 stall-change 的处理函数');
+  const end = APP.indexOf('\n  });\n', at);
+  const handler = APP.slice(at + head.length, end + 4);
+  vm.runInContext(`globalThis.onStallChange = ${handler};`, ctx);
+  ctx.onStallChange({ who: 'me', name: '我', stalled: true, self: true });
+  ctx.onStallChange({ who: 'me', name: '我', stalled: false, self: true });
+  assert.deepEqual(osd, []);
+  assert.deepEqual(logs, [], '房里没别人：什么都不说');
+  others = 1;
+  ctx.onStallChange({ who: 'me', name: '我', stalled: true, self: true });
+  ctx.onStallChange({ who: 'me', name: '我', stalled: false, self: true });
+  assert.deepEqual(osd, []);
+  assert.deepEqual(logs, [
+    ['你在缓冲，大家在等你', 'warn'],
+    ['你缓冲好了', 'good'],
+  ]);
+
+  ctx.onStallChange({ who: 'p2', name: 'x', stalled: true, self: false });
+  assert.deepEqual(osd, [['等待 小明 缓冲…', 3000]], '别人卡了照旧说是谁');
+  S.sourceType = 'file';
+  ctx.onStallChange({ who: 'me', name: '我', stalled: true, self: true });
+  assert.deepEqual(osd.at(-1), ['等待 你 缓冲…', 3000], '本地文件上自己卡：播放器是被引擎按停的，得说为什么');
+});
+
+test('只有自己在等数据时的几句文案有英文', async () => {
+  const { translate } = await load('i18n.js');
+  for (const zh of ['正在缓冲…', '正在缓冲，大家在等你', '你在缓冲，大家在等你', '你缓冲好了']) assert.notEqual(translate(zh, 'en'), zh, zh);
+});

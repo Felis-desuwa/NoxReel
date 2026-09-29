@@ -298,6 +298,17 @@ const EN = new Map(Object.entries({
   '同步到房间进度': 'Sync to the room',
   '自动同步没跟上': 'Auto-sync could not keep up',
   '网速跟不上的话，可以把同步方式改成「手动同步」': 'If your connection cannot keep up, switch the sync mode to “Manual sync”',
+  // 在线链接上只有自己在等数据（不再往自己的 mpv 画面上写「等待 你 缓冲」）
+  '正在缓冲…': 'Buffering…',
+  '正在缓冲，大家在等你': 'Buffering; everyone is waiting for you',
+  '你在缓冲，大家在等你': 'You are buffering; everyone is waiting for you',
+  '你缓冲好了': 'You finished buffering',
+  // 在线视频的清晰度（1080p 这类档位不用翻）
+  '清晰度': 'Quality',
+  '最高': 'Best',
+  '在线视频的清晰度：不超过所选这一档，这一档没有就用低一档。只影响你自己，手动缓存和边下边播也按它下。':
+    'Online video quality: the best stream no higher than the selected level, or the next lower one if that level is missing. It affects only you; manual caching and download-while-watching use it too.',
+  '在线视频的清晰度改成最高': 'Online video quality set to best',
   '按 Ctrl+Shift+S 同步': 'Press Ctrl+Shift+S to sync',
   '播放中，但你和房主没对上': 'Playing, but you are out of sync with the host',
   '播放中，但你和房间进度没对上': 'Playing, but you are out of sync with the room',
@@ -423,6 +434,8 @@ const EN = new Map(Object.entries({
   '缓存排队中': 'Queued for caching',
   '缓存失败': 'Caching failed',
   '没找到 yt-dlp，下载不了网页视频': 'yt-dlp was not found, so web videos cannot be downloaded',
+  '这个网站的音频和视频是分开的两条流，下载后要用 ffmpeg 合成一个文件；装上 ffmpeg 后再试':
+    'This site serves audio and video as separate streams, which need ffmpeg to be merged into one file after downloading; install ffmpeg and try again',
   // 边下边播：看的片另存一份到下载位置
   '边下边播': 'Download while watching',
   '边看边另存一份到下载位置': 'Save a copy of what you watch to the download folder',
@@ -1356,6 +1369,8 @@ const EN_PATTERNS = [
   ],
   [/^已收完 · 切换到 (.+)$/, 'Fully received · switch to $1'],
   [/^切换播放器失败：(.*)$/, (_all, detail) => `Could not switch player: ${translate(detail, 'en')}`],
+  [/^换清晰度失败：(.*)$/, (_all, detail) => `Could not change quality: ${translate(detail, 'en')}`],
+  [/^在线视频的清晰度改成不超过 (\d+)p$/, 'Online video quality capped at $1p'],
   [/^指定播放器路径失败：(.*)$/, (_all, detail) => `Could not set the player path: ${translate(detail, 'en')}`],
   [/^已指定 (.+) 的路径$/, 'Path set for $1'],
   // 下拉框里那一项：「PotPlayer（未找到）」。原因是枚举出来的那几个，不会误伤别的括号文案。

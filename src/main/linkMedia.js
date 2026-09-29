@@ -28,6 +28,15 @@ const PARSE_TIMEOUT_MS = 60_000;
 // （只有全部格式都没音轨、或都没画面时，yt-dlp 才退到其中最好的一条 —— 那本来就是片子的全部）。
 const MUXED_FORMAT =
   'best[protocol^=http][vcodec!=none][acodec!=none]/best[protocol^=m3u8][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/b';
+// 网站只给分开的音、视频流时（B 站全站都是 DASH：视频一条、音频一条，一个音画合一的格式都没有），
+// 上面那串一项都选不中，yt-dlp 报「Requested format is not available」—— 以前就此判成解析失败，
+// 再退到隔离浏览器（B 站用 MSE 放分段，也抓不到），整条链接「没法用」。
+// 桌面端的 mpv 自己能把两条流合起来放（ytdl_hook 默认 bestvideo+bestaudio；B 站 1080p 实测正常），
+// 所以解析时在音画合一的后面接上分开的两条流：yt-dlp 在同一次运行里按顺序回退，有音画合一的照旧选它，
+// 没有才选两条，一次就拿到标题、时长。只解析不合并，不需要 ffmpeg。
+// 选中两条时没有一条能单独播放的地址，playback 为 null：只认单条地址的安卓成员放不了（会照实说）。
+const SPLIT_FORMAT = 'bv*+ba/b';
+const PARSE_FORMAT = `${MUXED_FORMAT}/${SPLIT_FORMAT}`;
 const SAFE_PLAYBACK_HEADERS = new Set(['accept', 'accept-language', 'origin', 'referer', 'user-agent']);
 const YOUTUBE_HOST_RE = /(^|\.)(?:youtube\.com|youtube-nocookie\.com|youtu\.be)$/i;
 const MAX_REDIRECT_HOPS = 5;
@@ -286,8 +295,9 @@ function ytDlpArgs(url, extractorArgs = null, proxy = null) {
   // 解析出的 IP 判定，私网一律 403。这才是真正堵住 SSRF 的那一道，下面的跳转链预检只是提前报错。
   if (proxy) args.push('--proxy', proxy);
   if (extractorArgs) args.push('--extractor-args', extractorArgs);
-  // 音画合一的格式（见 MUXED_FORMAT）。桌面端仍可以把原始页面地址交给 mpv。
-  args.push('--format', MUXED_FORMAT, '--', url);
+  // 先要音画合一的格式（见 MUXED_FORMAT），网站没有时才要分开的（见 SPLIT_FORMAT）。
+  // 桌面端交给 mpv 的始终是原始页面地址。
+  args.push('--format', PARSE_FORMAT, '--', url);
   return args;
 }
 
@@ -295,11 +305,28 @@ function isYouTubeUrl(url) {
   return YOUTUBE_HOST_RE.test(new URL(url).hostname);
 }
 
+/**
+ * 这一页有哪几档清晰度，从高到低，给界面上的「清晰度」下拉框用。按短边量（竖屏视频也对），
+ * 和 yt-dlp 的 `-S res:N` 同一个量法。只看有画面的格式，报不出尺寸的不算。
+ */
+function videoHeights(info) {
+  const seen = new Set();
+  for (const f of Array.isArray(info?.formats) ? info.formats : []) {
+    if (!f || typeof f !== 'object' || f.vcodec === 'none') continue;
+    const w = Number(f.width);
+    const h = Number(f.height);
+    const side = w > 0 && h > 0 ? Math.min(w, h) : h;
+    if (Number.isSafeInteger(side) && side >= 100 && side <= 4320) seen.add(side);
+  }
+  return [...seen].sort((a, b) => b - a).slice(0, 12);
+}
+
 function resultFromInfo(info, url) {
   if (info?._type === 'playlist' || Array.isArray(info?.entries)) {
     throw new Error('当前只支持单个视频链接，不支持播放列表或频道页面');
   }
 
+  // 选中的是分开的两条流（见 SPLIT_FORMAT）时顶层没有 url，playback 就是 null
   const playback = playbackFromInfo(info, looksLikeDirectMedia(url) ? url : null);
   return {
     url,
@@ -308,13 +335,26 @@ function resultFromInfo(info, url) {
     extractor: String(info?.extractor_key || info?.extractor || 'generic').slice(0, 80),
     direct: looksLikeDirectMedia(url) || info?.extractor === 'generic',
     playback,
+    ...(!playback && Array.isArray(info?.requested_formats) ? { split: true } : {}),
+    heights: videoHeights(info),
     resolvedAt: Date.now(),
   };
 }
 
-async function inspectLink(rawUrl, { browserFallback, proxy = null } = {}) {
+/**
+ * @param {string} rawUrl
+ * @param {object} [opts]
+ * @param {Function} [opts.browserFallback]  yt-dlp 解析不了时用隔离浏览器抓媒体地址
+ * @param {string|null} [opts.proxy]  本机过滤代理
+ * @param {Function} [opts.runJsonImpl]  测试注入
+ * @param {string|null} [opts.ytDlp]  测试注入：yt-dlp 路径
+ * @param {Function} [opts.redirectCheck]  测试注入：跳转链预检
+ */
+async function inspectLink(
+  rawUrl,
+  { browserFallback, proxy = null, runJsonImpl = runJson, ytDlp = findYtDlp(), redirectCheck = assertRedirectChainIsPublic } = {}
+) {
   const url = normalizeHttpUrl(rawUrl);
-  const ytDlp = findYtDlp();
 
   // 直链即使没有 yt-dlp 也能交给 mpv；页面链接则必须先确认可解析。
   if (!ytDlp && looksLikeDirectMedia(url)) {
@@ -345,7 +385,7 @@ async function inspectLink(rawUrl, { browserFallback, proxy = null } = {}) {
   // 本机过滤代理（proxy，见 publicProxy.js）：yt-dlp 的每个请求都经过它，
   // 在连接那一刻按解析出的 IP 判定。这里保留预检，只是为了在常见情况下
   // 给出一句「跳转到了内网地址」，而不是 yt-dlp 那句笼统的 HTTP 403。
-  await assertRedirectChainIsPublic(url);
+  await redirectCheck(url);
 
   const attempts = isYouTubeUrl(url)
     // YouTube 当前逐步要求 PO Token。android_vr 客户端仍可匿名返回普通公开
@@ -355,7 +395,7 @@ async function inspectLink(rawUrl, { browserFallback, proxy = null } = {}) {
   let lastError;
   for (const extractorArgs of attempts) {
     try {
-      return resultFromInfo(await runJson(ytDlp, ytDlpArgs(url, extractorArgs, proxy)), url);
+      return resultFromInfo(await runJsonImpl(ytDlp, ytDlpArgs(url, extractorArgs, proxy)), url);
     } catch (error) {
       lastError = error;
     }
@@ -397,9 +437,12 @@ module.exports = {
   sanitizePlaybackHeaders,
   playbackFromInfo,
   isYouTubeUrl,
+  videoHeights,
   ytDlpArgs,
   runJson,
   MUXED_FORMAT,
+  SPLIT_FORMAT,
+  PARSE_FORMAT,
   toolStatus,
   hostIsPublic,
   headOnce,

@@ -824,6 +824,7 @@ function driftUi({ drift, host = false, mpvRunning = true, sourceType = 'link', 
   Object.assign(ctx, {
     isRoomHost: () => host,
     updateStripTone: () => {},
+    renderQualityControl: () => {}, // 清晰度下拉框另有测试（linkQuality.test.js）
     t: (s) => `«${s}»`,
     make: (tag, o = {}) => ({ tag, ...o }),
     replace: (node, ...kids) => rows.push({ node: node.id, kids: kids.map((k) => k.text) }),

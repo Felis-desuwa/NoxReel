@@ -247,6 +247,15 @@ function playerId(value, allowed) {
   return id;
 }
 
+/**
+ * 在线视频的清晰度上限（像素，按短边算，和 yt-dlp 的 `-S res:N` 一个意思）。0 = 不限。
+ * 最终拼进 yt-dlp 的参数里，所以只收整数、卡在常见范围里。
+ */
+function linkMaxHeight(value) {
+  if (value === undefined || value === null || value === 0) return 0;
+  return integer(value, '清晰度', { min: 144, max: 4320 });
+}
+
 function externalUrl(value) {
   return httpUrl(value, '外部链接');
 }
@@ -289,6 +298,7 @@ module.exports = {
   finiteNumber,
   httpUrl,
   integer,
+  linkMaxHeight,
   manifest,
   mediaHeaders,
   plainObject,

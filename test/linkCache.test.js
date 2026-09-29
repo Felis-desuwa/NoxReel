@@ -428,6 +428,67 @@ test('中文片名：强制 UTF-8 输出；报回来的路径被控制台编码�
   assert.equal(args[args.indexOf('--encoding') + 1], 'utf-8');
 });
 
+test('只给分开音视频流的网站（B 站）：有 ffmpeg 就退到两条流、由它合成 MP4/MKV，进度两条接着算不掉回 0', async (t) => {
+  const { FORMAT, MERGE_FORMAT } = require('../src/main/linkCache');
+  const { SPLIT_FORMAT } = require('../src/main/linkMedia');
+  assert.equal(MERGE_FORMAT, `${FORMAT}/${SPLIT_FORMAT}`, '音画合一的照旧优先');
+  const { cache, updates, calls } = await setup(t, {
+    findFfmpeg: () => 'C:/tools/ffmpeg.exe',
+    progressEveryMs: 0, // 每行进度都报出来，才看得到换流那一下
+    behave: async (args, child) => {
+      const file = outputOf(args).replace('%(ext)s', 'mp4');
+      // 先视频、后音频，各自从 0 报起
+      child.stdout.write('NRPROG 500 1000 NA 100026\n');
+      child.stdout.write('NRPROG 1000 1000 NA 100026\n');
+      child.stdout.write('NRPROG 50 100 NA 30280\n');
+      child.stdout.write('NRPROG 100 100 NA 30280\n');
+      await fsp.writeFile(file, Buffer.alloc(1100, 1));
+      child.stdout.write(`NRFILE ${file}\n`);
+      child.stdout.end();
+      setImmediate(() => child.emit('close', 0));
+    },
+  });
+  cache.start({ url: 'https://www.bilibili.com/video/BV1/', title: '久留美', purpose: 'download' });
+  await until(() => ['done', 'failed'].includes(cache.status()[0]?.state), '下完');
+  assert.equal(cache.status()[0].state, 'done', cache.status()[0].error);
+  const { args } = calls[0];
+  assert.equal(args[args.indexOf('--format') + 1], MERGE_FORMAT);
+  assert.equal(args[args.indexOf('--ffmpeg-location') + 1], 'C:/tools/ffmpeg.exe');
+  assert.equal(args[args.indexOf('--merge-output-format') + 1], 'mp4/mkv', '合成的只要能从本地播的容器');
+  assert.match(args[args.indexOf('--progress-template') + 1], /%\(info\.format_id\)s$/);
+  // 换到音频那条时垫上视频的大小：进度只增不减
+  const progress = updates.filter((u) => u.state === 'downloading' && u.total > 0).map((u) => [u.downloaded, u.total]);
+  assert.deepEqual(progress, [
+    [500, 1000],
+    [1000, 1000],
+    [1050, 1100],
+    [1100, 1100],
+  ]);
+});
+
+test('只给分开音视频流的网站、本机没有 ffmpeg：不带合并参数，失败时说要装 ffmpeg，不甩 yt-dlp 的英文', async (t) => {
+  const { FORMAT, NEEDS_FFMPEG_MESSAGE } = require('../src/main/linkCache');
+  const { cache, calls } = await setup(t, {
+    behave: (args, child) => {
+      child.stderr.write('ERROR: [BiliBili] BV1: Requested format is not available. Use --list-formats for a list of available formats\n');
+      child.stdout.end();
+      setImmediate(() => child.emit('close', 1));
+    },
+    // 解析兜底也只拿到分开的两条流（playback 为 null）：不能拿它另下
+    resolve: async () => ({ title: 'x', playback: null, split: true }),
+  });
+  cache.start({ url: 'https://www.bilibili.com/video/BV1/' });
+  await until(() => cache.status()[0]?.state === 'failed', '失败');
+  assert.equal(cache.status()[0].error, NEEDS_FFMPEG_MESSAGE);
+  const { args } = calls[0];
+  assert.equal(args[args.indexOf('--format') + 1], FORMAT);
+  assert.equal(args.includes('--ffmpeg-location'), false);
+  assert.equal(calls.length, 1, '没有能单独下载的地址，不再下第二次');
+  const { pathToFileURL } = require('node:url');
+  const { translate } = await import(pathToFileURL(path.join(__dirname, '../src/renderer/lib/i18n.js')).href);
+  assert.match(translate(`《久留美》缓存失败：${NEEDS_FFMPEG_MESSAGE}`, 'en'), /^Could not cache “久留美”: This site serves audio and video as separate streams/);
+});
+
 test('启动时清掉上次没下完留下的工作目录（只认自己那个目录名，几个目录都清）', async (t) => {
   const { cache, keptDir, downloadDir } = await setup(t);
   for (const dir of [keptDir, downloadDir]) {

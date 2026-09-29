@@ -285,6 +285,8 @@ const S = {
     relayOnly: localStorage.getItem('sw.relayOnly') === '1',
     // 在线链接怎么跟房主：'full' 完全同步（默认），'manual' 手动同步。每个成员自己选，只存在本机
     linkSync: localStorage.getItem('sw.linkSync') === 'manual' ? 'manual' : 'full',
+    // 在线视频的清晰度上限（按短边的像素，0 = 最高）。每个成员自己选，只存在本机
+    linkQuality: normalizeLinkQuality(localStorage.getItem('sw.linkQuality')),
     // 边下边播：放到的每一部另存一份到下载位置（和缓存是两回事）。默认关，只存在本机
     downloadWhileWatching: localStorage.getItem('sw.downloadWhileWatching') === '1',
   },
@@ -5050,6 +5052,13 @@ function initSwarmAndSync() {
     const who = self ? t('你') : roomDisplayNames().get(peerId) || name;
     // 游客的缓冲不足只暂停自己，别喊「全员暂停」误导人。
     const guestSelf = self && !S.sync.canIControl();
+    // 在线链接上自己在等数据（刚打开链接、跳转、换清晰度之后那几秒，或者网速跟不上）：mpv 自己停着转圈，
+    // 本来就看得见；同步引擎也不去按你的暂停（见 syncEngine 的 effectivePaused）。在自己的画面上再写一句
+    // 「等待 你 缓冲…」只是添乱，每打开一部都冒一次。房里有别人时日志里记一行（他们确实在等你），没人就什么都不说。
+    if (self && S.sourceType === 'link') {
+      if (connectedPeerCount() > 0 && !guestSelf) log(stalled ? '你在缓冲，大家在等你' : '你缓冲好了', stalled ? 'warn' : 'good');
+      return;
+    }
     if (stalled) {
       log(
         guestSelf ? '你的缓冲不够，先暂停你自己（不影响他人）' : `${who}的缓冲跟不上了，全员暂停等待`,
@@ -5871,7 +5880,7 @@ window.sw.linkCache?.onUpdate?.(onLinkCacheUpdate);
 
 async function startLinkCache(item) {
   try {
-    const view = await window.sw.linkCache.start(item.url, item.title || '');
+    const view = await window.sw.linkCache.start(item.url, item.title || '', S.settings.linkQuality);
     onLinkCacheUpdate(view);
     if (view.state !== 'done') log(`开始缓存《${item.title || siteHost(item.url)}》`, 'good');
   } catch (error) {
@@ -5918,7 +5927,7 @@ async function saveLinkDownload(item) {
   const current = linkDownloadOf(item);
   if (linkCacheBusy(current) || current?.state === 'done') return;
   try {
-    const view = await window.sw.download.saveLink(item.url, item.title || '');
+    const view = await window.sw.download.saveLink(item.url, item.title || '', S.settings.linkQuality);
     onLinkCacheUpdate(view);
     // 请求还在路上时本人点了「跳过」：那时还没有任务可取消，这里补上
     if (!linkDownloadConsented(item) && linkCacheBusy(view)) cancelLinkDownload(item);
@@ -6888,6 +6897,8 @@ async function launchPlayer({ startAt = null, relaunch = false } = {}) {
           : {},
       // 播放器里按快捷键发弹幕时那个输入框的提示语。主进程不做翻译，按界面语言在这儿定。
       chatPrompt: t('弹幕：'),
+      // 在线视频的清晰度上限（本机自己选的），见 renderQualityControl
+      maxHeight: S.sourceType === 'link' ? S.settings.linkQuality : 0,
     });
     // 认下这一代之后只收它的 tick / exit。seq 变了或票据作废，就不登记这一代
     const early = seq === S.currentSeq ? playerGate.confirm(info?.gen, ticket) : null;
@@ -9077,11 +9088,20 @@ function renderStatus() {
   // 安全模式收完才播：房间在播、本机还在收（播放器没开，也还不许开）的人不参与卡顿，
   // 横幅不能说「播放中」，要走到最后说他在等什么
   const receivingOnly = !st.paused && cur?.kind === 'file' && !S.mpvRunning && !playbackAllowed();
+  // 在线链接上只有自己在等数据：mpv 自己停着转圈，画面上看得见，不再往 mpv 上推「在等 你」的横幅；
+  // 房间窗口里也别说「全员暂停」—— 房里没别人时根本没人在等（见 stall-change 那边同样的处理）
+  const streamSelfOnly = S.sourceType === 'link' && S.sync.localStalled && S.sync.stalledPeers.size === 0;
 
   if (st.stalled) {
     banner.className = 'status-banner waiting';
     // 有人卡着不一定是全员暂停：游客自己缓冲不足只停他自己，房间照常播放（roomStalled 为假）
-    banner.textContent = S.sync.roomStalled ? stallBannerText(stallWaitingNames()) : selfStallBannerText();
+    banner.textContent = streamSelfOnly
+      ? connectedPeerCount() > 0
+        ? '正在缓冲，大家在等你'
+        : '正在缓冲…'
+      : S.sync.roomStalled
+      ? stallBannerText(stallWaitingNames())
+      : selfStallBannerText();
   } else if (!st.paused && !linkWaiting && !receivingOnly) {
     // 在播但本机和房主没对上：用提醒的黄色，别亮「一切正常」的绿
     banner.className = driftShown() ? 'status-banner waiting' : 'status-banner playing';
@@ -9136,7 +9156,7 @@ function renderStatus() {
   $('btn-skip-current').classList.toggle('hidden', !(S.sync.canIControl() && currentUnavailable()));
 
   // 全屏看片时上面这块横幅整个看不见 —— mpv 是独立窗口。把同一句话推到 mpv 画面上。
-  pushMpvBanner(st.stalled ? banner.textContent : '');
+  pushMpvBanner(st.stalled && !streamSelfOnly ? banner.textContent : '');
 
   $('btn-playpause').textContent = st.intendedPaused ? '播放' : '暂停';
   // 按钮上只画图标（文字留给读屏和翻译），画哪一个看这个属性
@@ -9220,9 +9240,10 @@ let driftOsdState = 'ok';
 let driftOsdAt = 0;
 const DRIFT_OSD_REPEAT_MS = 60_000;
 
-/** 状态带里那一行「你比房主慢 12 秒」+「同步到房主」按钮，以及控制条上的同步方式。 */
+/** 状态带里那一行「你比房主慢 12 秒」+「同步到房主」按钮，以及控制条上的同步方式和清晰度。 */
 function renderDrift() {
   renderSyncModeControl();
+  renderQualityControl();
   const row = $('drift-row');
   const btn = $('btn-sync-now');
   if (!row || !btn) return;
@@ -9280,6 +9301,85 @@ function setLinkSyncMode(value) {
   renderStatus();
   renderProgress(S.swarm?.progress());
 }
+
+/* ------------------------------ 在线视频的清晰度 ------------------------------ */
+// 每个人都是自己连网站、自己解析（见 linkMedia.js），清晰度只影响本机这一路：选的是上限（按短边的像素，
+// 和 yt-dlp 的 -S res:N 一个意思）—— 不超过它的最高一档，一档都没有才用最低的。0 = 最高。
+// 手动缓存和边下边播的下载也按它下（见 startLinkCache / saveLinkDownload）。
+
+// 没解析出有哪几档时（网站不报尺寸）给这几档常见的
+const LINK_QUALITY_DEFAULTS = [2160, 1440, 1080, 720, 480, 360];
+
+function normalizeLinkQuality(raw) {
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= 144 && n <= 4320 ? n : 0;
+}
+
+/**
+ * 这一部能不能选清晰度：在线链接、交给 mpv 的是网页地址（由它里面的 yt-dlp 挑格式）。
+ * 本地缓存、房主给的临时地址、隔离浏览器抓来的直链都只有一条，选了也没用，不摆出来。
+ */
+function linkQualityApplies() {
+  return roomEntered && S.sourceType === 'link' && !!S.linkInfo && !S.linkInfo.local && S.filePath === S.linkInfo.url;
+}
+
+/** 下拉框里的几档：这一页实际有的（解析时报的），加上本人选过的那一档（这一页没有也留着，免得显示成别的）。 */
+function linkQualityOptions() {
+  const known = Array.isArray(S.linkInfo?.heights) && S.linkInfo.heights.length ? S.linkInfo.heights : LINK_QUALITY_DEFAULTS;
+  const want = S.settings.linkQuality;
+  return [...new Set([...known, ...(want ? [want] : [])])].filter((h) => normalizeLinkQuality(h)).sort((a, b) => b - a);
+}
+
+// 上一次画出来的样子（没变就不碰 DOM：renderStatus 每个 tick 都会调到这里）
+let qualityKey = null;
+
+/** 控制条上的「清晰度 [最高 / 1080p / 720p …]」：只在能选的在线链接上出现。 */
+function renderQualityControl() {
+  const box = $('quality-box');
+  const select = $('link-quality');
+  if (!box || !select) return;
+  const shown = linkQualityApplies();
+  const heights = shown ? linkQualityOptions() : [];
+  const key = shown ? `${heights.join(',')}|${S.settings.linkQuality}|${!!S.switchingPlayer}` : '';
+  if (key === qualityKey) return;
+  qualityKey = key;
+  box.classList.toggle('hidden', !shown);
+  if (!shown) return;
+  replace(select, [
+    make('option', { text: '最高', attrs: { value: '0' } }),
+    ...heights.map((h) => make('option', { text: `${h}p`, attrs: { value: String(h) } })),
+  ]);
+  select.value = String(S.settings.linkQuality);
+  select.disabled = !!S.switchingPlayer;
+}
+
+/** 本人换了清晰度：记在本机；正在放的这一部原位重开一次播放器，按新的清晰度重新挑格式。 */
+async function setLinkQuality(value) {
+  const quality = normalizeLinkQuality(value);
+  if (quality === S.settings.linkQuality) return;
+  S.settings.linkQuality = quality;
+  localStorage.setItem('sw.linkQuality', String(quality));
+  log(quality ? `在线视频的清晰度改成不超过 ${quality}p` : '在线视频的清晰度改成最高', 'good');
+  if (!S.mpvRunning || !linkQualityApplies() || S.switchingPlayer) {
+    renderQualityControl();
+    return;
+  }
+  // 和换播放器同一套：位置取本机的（和房间差不多时）或房间的，旧窗口退干净再起新的
+  S.switchingPlayer = true;
+  renderPlayerControls();
+  renderQualityControl();
+  try {
+    await relaunchWithPlayer();
+  } catch (error) {
+    log(`换清晰度失败：${errText(error)}`, 'bad');
+  } finally {
+    S.switchingPlayer = false;
+    renderPlayerControls();
+    renderQualityControl();
+  }
+}
+
+$('link-quality').onchange = () => setLinkQuality($('link-quality').value);
 
 /** 「同步到房主」按钮和 mpv 里的 Ctrl+Shift+S。 */
 function syncToHost() {

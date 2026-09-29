@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links — now with a playlist for the whole evening, danmaku comments over the picture, and your own preferred player.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.8-7C5CFF?style=for-the-badge" alt="Version 0.7.8">
+    <img src="https://img.shields.io/badge/version-0.7.9-7C5CFF?style=for-the-badge" alt="Version 0.7.9">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -60,10 +60,13 @@
 - **Chinese and English UI:** switch between Simplified Chinese and English from Settings on both desktop and the Android viewer. Nicknames, video titles, and chat text are always shown verbatim and are never translated.
 - **You choose how the cache is cleaned** (Settings → Cache cleanup): by default it is *Automatic* — received videos stay in the cache, switching videos or leaving the room does not delete them, the same video is reused during the session, and they are cleared when NoxReel closes. *Manual* keeps them in a long-term cache folder (it follows the cache location and defaults to the local app data directory, so system disk cleanup does not delete it), never deletes anything automatically, and reuses the same video later (verified chunk by chunk; mismatched chunks are received again). Settings lists the cached videos so you can tick and delete them. Crash leftovers are reclaimed on the next launch.
 - **Cache online videos yourself:** the “…” menu of an online video in the playlist has “Start caching”, and several can cache at once. Downloads go through the local filtering proxy into the cache (following the cleanup mode above), and the video plays from disk the next time it comes up.
-- **Download while watching** (in Settings, off by default): saves a copy of what you watch to the download folder (“VideosNoxReel” by default, changeable). Only videos you actually play are saved: P2P videos once fully received and scanned (in trusted rooms, as long as no threat is found); online videos are downloaded in the background, or copied if already cached. Saved copies are your own files, cache cleanup never touches them, and this does not change when playback starts.
+- **Download while watching** (in Settings, off by default): saves a copy of what you watch to the download folder (“Videos\NoxReel” by default, changeable). Only videos you actually play are saved: P2P videos once fully received and scanned (in trusted rooms, as long as no threat is found); online videos are downloaded in the background, or copied if already cached. Saved copies are your own files, cache cleanup never touches them, and this does not change when playback starts.
 - **Two security modes:** Trusted room is the default: playback starts once about 8 MB of the file header and enough continuous data for a dozen or so seconds have arrived, and the video is still scanned once it is complete. Safe mode remains available and plays only after complete receipt and a Microsoft Defender scan.
 - **Version and mode handshake:** invite codes and the P2P data channel both verify the protocol version and the selected room mode. A mismatch disconnects before media manifests, room controls, or video data are exchanged.
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
+
+> [!NOTE]
+> `v0.7.9` makes links from sites like **Bilibili** playable. Bilibili serves audio and video as two separate streams, so parsing used to conclude there was “no playable format” and marked the whole link unusable; now mpv merges the two streams itself (1080p tested fine). **Manual caching and download while watching** also work for such sites (ffmpeg must be installed to merge the download into one file; if it is missing, you are told so). New **online video quality** control: “Quality” on the control bar lists the levels the video actually has; each member picks their own, it affects only them, and changing it while playing reopens the player at the current position. Also, when only you are buffering an online video (the first seconds after opening or seeking), your own mpv no longer shows “Waiting for you to buffer…”. **The P2P protocol is unchanged and works with 0.7.x**; Android cannot play sites that only serve separate audio and video streams yet.
 
 > [!NOTE]
 > `v0.7.8` is a big fix-up release: a line-by-line review plus three rounds of end-to-end testing on real builds fixed **more than 140 issues**. The worst was in trusted rooms playing from the start while still receiving: members’ players could decide the video had already ended. New: a **cache cleanup mode** (Automatic / Manual — Manual keeps videos in a long-term cache folder and reuses them next time), **manual caching** of online videos, **download while watching** (saves a copy to your download folder as you watch), and **renaming yourself** after joining. Connections recover on their own after relay or signaling-server drops, and after a signaling-server restart rooms come back with the original host and member limit (both server and clients must be on the new version). The Settings dialog now applies changes only when you click Save. **The protocol is unchanged and works with 0.7.x.**
@@ -99,8 +102,8 @@
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.8.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.8.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.8.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.8.exe) |
+| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.9.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.9.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.9.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.9.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -140,6 +143,10 @@ With a video link, every member streams from the original site, so connection sp
 After the host or a moderator seeks, the stream needs a few seconds to buffer again; the room waits for the host (and for moderators on full sync) to start playing before everyone continues.
 
 The host is the reference and has no such option. On Android, tap “Full sync / Manual sync” in the top bar of the player to switch. Local videos travel as P2P chunks and keep the room-wide pause-for-buffering behavior regardless of this setting.
+
+### Online video quality
+
+While an online video plays, “Quality” appears on the control bar with the levels the video actually has (for example “Best / 1080p / 720p / 480p”). The choice is a cap: the best stream no higher than that level, or the next lower one if the level is missing. Every member connects to the site themselves, so each picks their own; it affects only them and is stored on that PC. Changing it while playing reopens the player at the current position (a few seconds of buffering). Manual caching and download while watching use it too. Videos already cached locally and temporary playback addresses from the host have only one stream, so there is no choice there; Android has none either.
 
 ## Player support
 

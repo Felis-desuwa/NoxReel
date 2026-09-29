@@ -533,6 +533,8 @@ function playerBox({ choice = 'mpv', list = null, complete = true, sourceType = 
     filePath: sourceType === 'link' ? 'https://cdn.example/x.mp4' : 'C:/cache/x.mkv',
     sourceType,
     linkInfo: sourceType === 'link' ? { playback: { url: 'https://cdn.example/x.mp4', headers: {} } } : null,
+    // 在线视频的清晰度上限（0 = 最高），launchPlayer 会带给主进程
+    settings: { linkQuality: 0 },
     roomSecurityMode: 'trusted',
     mediaSafety: { status: 'clean' },
     currentSeq: 3,

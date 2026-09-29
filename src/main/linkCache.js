@@ -27,13 +27,19 @@ const readline = require('readline');
 const { EventEmitter } = require('events');
 const { spawn } = require('child_process');
 const { killTree } = require('./processTree');
-const { MUXED_FORMAT } = require('./linkMedia');
+const { MUXED_FORMAT, PARSE_FORMAT } = require('./linkMedia');
 
 const MAX_PARALLEL = 3;
 // 长期缓存文件夹、下载文件夹里放半截文件的子目录名（启动时按这个名字清残留）
 const WORK_DIR = '.noxreel-downloading';
 // 和解析（linkMedia.inspectLink）同一个格式串：优先音画合一，最后那个 /b 不能省（直链 mp4 报不出编码）
 const FORMAT = MUXED_FORMAT;
+// 本机有 ffmpeg 时，没有音画合一格式的网站（B 站全站、YouTube 的高画质）退到分开的两条流、下完由 yt-dlp
+// 调 ffmpeg 合成一个文件（和解析用的是同一串）。合成的容器只要 MP4 / MKV：别的扩展名（webm……）从本地播时不会被核准
+const MERGE_FORMAT = PARSE_FORMAT;
+const MERGE_CONTAINERS = 'mp4/mkv';
+const FORMAT_UNAVAILABLE_RE = /Requested format is not available/i;
+const NEEDS_FFMPEG_MESSAGE = '这个网站的音频和视频是分开的两条流，下载后要用 ffmpeg 合成一个文件；装上 ffmpeg 后再试';
 // 取消后等 yt-dlp 整棵进程树退出、管道关上最多等这么久；再等不到就不等了，名额先还回去
 const CANCEL_GRACE_MS = 10_000;
 const PURPOSES = ['cache', 'download'];
@@ -164,6 +170,7 @@ class LinkCache extends EventEmitter {
    *   下到哪儿：workDir 是放半截文件的目录；finish(file, meta) 挪到位并登记，返回最终路径；abort() 收拾残局
    * @param {(url: string, purpose: string) => boolean} [deps.alreadyDone]  已经有了就不再下（手动缓存查登记表）
    * @param {() => object} [deps.childEnv]  子进程环境（去掉 no_proxy）
+   * @param {() => string|null} [deps.findFfmpeg]  有它才下得了只给分开音视频流的网站（见 MERGE_FORMAT）
    */
   constructor({
     findYtDlp,
@@ -172,10 +179,12 @@ class LinkCache extends EventEmitter {
     placement,
     alreadyDone = () => false,
     childEnv = () => process.env,
+    findFfmpeg = () => null,
     spawnImpl = spawn,
     killTreeImpl = killTree,
     cancelGraceMs = CANCEL_GRACE_MS,
     maxParallel = MAX_PARALLEL,
+    progressEveryMs = PROGRESS_EVERY_MS,
   }) {
     super();
     this.findYtDlp = findYtDlp;
@@ -184,10 +193,12 @@ class LinkCache extends EventEmitter {
     this.placement = placement;
     this.alreadyDone = alreadyDone;
     this.childEnv = childEnv;
+    this.findFfmpeg = findFfmpeg;
     this.spawnImpl = spawnImpl;
     this.killTree = killTreeImpl;
     this.cancelGraceMs = cancelGraceMs;
     this.maxParallel = maxParallel;
+    this.progressEveryMs = progressEveryMs;
     this.jobs = new Map(); // jobKey -> job
     this.running = 0;
   }
@@ -233,7 +244,8 @@ class LinkCache extends EventEmitter {
   }
 
   /** 开始一个下载。同一个链接同一种用途在下 / 在排队的直接返回它；已经有了的不再下。 */
-  start({ url, title = '', purpose = 'cache' }) {
+  /** maxHeight：清晰度上限（按短边，0 = 不限），见 _args 里的 -S res:N。 */
+  start({ url, title = '', purpose = 'cache', maxHeight = 0 }) {
     if (!PURPOSES.includes(purpose)) throw new TypeError('无效的下载用途');
     const key = jobKey(purpose, url);
     const current = this.jobs.get(key);
@@ -246,6 +258,7 @@ class LinkCache extends EventEmitter {
       url,
       purpose,
       title: String(title || '').slice(0, 300),
+      maxHeight: Number.isSafeInteger(maxHeight) && maxHeight > 0 ? maxHeight : 0,
       state: 'queued',
       downloaded: 0,
       total: 0,
@@ -322,6 +335,7 @@ class LinkCache extends EventEmitter {
   async _run(job) {
     const ytDlp = this.findYtDlp();
     if (!ytDlp) throw new Error('没找到 yt-dlp，下载不了网页视频');
+    job.ffmpeg = this.findFfmpeg() || null;
     const proxy = await this.proxyInfo();
     const place = await this.placement(job);
     job.workDir = place.workDir;
@@ -374,14 +388,19 @@ class LinkCache extends EventEmitter {
       // 本机过滤代理：每个请求、每一跳跳转都在连接那一刻按解析出的 IP 判定，私网一律拒绝
       '--proxy',
       proxy.url,
-      '--format',
-      FORMAT,
+      // 有 ffmpeg 才允许退到分开的两条流（见 MERGE_FORMAT）；合并只在本机做，不联网
+      ...(job.ffmpeg
+        ? ['--format', MERGE_FORMAT, '--ffmpeg-location', job.ffmpeg, '--merge-output-format', MERGE_CONTAINERS]
+        : ['--format', FORMAT]),
+      // 清晰度上限：不超过 N 的最高一档，一档都没有才用最低的（和播放器那一路同一个写法，见 mpv.js 的 qualityArgs）
+      ...(job.maxHeight ? ['--format-sort', `res:${job.maxHeight}`] : []),
       '--output',
       path.join(job.workDir, name),
       // 下面的 --print 隐含 --quiet，而 quiet 连进度也不报（实测一行 NRPROG 都没有，界面一直 0%）：显式要进度
       '--progress',
       '--progress-template',
-      `download:${PROGRESS_TAG} %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s`,
+      // 最后一项是正在下的那条流：分开的音视频是先后两条，各自从 0 报起（见 _download 里的累加）
+      `download:${PROGRESS_TAG} %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s %(info.format_id)s`,
       '--print',
       `after_move:${FILE_TAG} %(filepath)s`,
       ...(YOUTUBE_HOST_RE.test(host) ? ['--extractor-args', 'youtube:player_client=android_vr'] : []),
@@ -432,16 +451,27 @@ class LinkCache extends EventEmitter {
       };
       let file = null;
       let stderr = '';
+      const progress = { stream: null, base: 0, done: 0, total: 0 };
       readline.createInterface({ input: child.stdout }).on('line', (line) => {
         // 取消之后进程树退干净之前还会漏几行进度：不再报，「已取消」要等收完尾（工作目录删掉）才报
         if (job.state === 'canceled') return;
         if (line.startsWith(`${PROGRESS_TAG} `)) {
-          const [done, total, estimate] = line.slice(PROGRESS_TAG.length + 1).split(' ').map(Number);
-          if (Number.isFinite(done)) job.downloaded = done;
+          const [doneRaw, totalRaw, estimateRaw, stream = ''] = line.slice(PROGRESS_TAG.length + 1).split(' ');
+          const [done, total, estimate] = [doneRaw, totalRaw, estimateRaw].map(Number);
           const whole = Number.isFinite(total) && total > 0 ? total : Number.isFinite(estimate) && estimate > 0 ? estimate : 0;
-          if (whole) job.total = Math.round(whole);
+          // 分开的音视频先后下两条，各自从 0 报起：换了一条就把上一条的大小垫在底下，进度条不会掉回 0
+          if (stream !== progress.stream) {
+            if (progress.stream !== null) progress.base += progress.total || progress.done;
+            progress.stream = stream;
+            progress.done = 0;
+            progress.total = 0;
+          }
+          if (Number.isFinite(done)) progress.done = done;
+          if (whole) progress.total = Math.round(whole);
+          job.downloaded = progress.base + progress.done;
+          if (progress.total) job.total = progress.base + progress.total;
           const now = Date.now();
-          if (now - job.lastEmit >= PROGRESS_EVERY_MS) {
+          if (now - job.lastEmit >= this.progressEveryMs) {
             job.lastEmit = now;
             this._emit(job);
           }
@@ -458,6 +488,8 @@ class LinkCache extends EventEmitter {
         if (job.state === 'canceled') return settle(reject, new Error('已取消'));
         job.stop = null;
         const failed = () => {
+          // 网站只有分开的音视频流、本机又没有 ffmpeg 合并：说人话，别把 yt-dlp 那句英文原样甩给人
+          if (!job.ffmpeg && FORMAT_UNAVAILABLE_RE.test(stderr)) return settle(reject, new Error(NEEDS_FFMPEG_MESSAGE));
           const detail = stderr.trim().split(/\r?\n/).slice(-2).join(' ');
           settle(reject, new Error(`下载失败${detail ? `：${detail}` : ''}`));
         };
@@ -477,6 +509,8 @@ module.exports = {
   workDirIn,
   WORK_DIR,
   FORMAT,
+  MERGE_FORMAT,
+  NEEDS_FFMPEG_MESSAGE,
   MAX_PARALLEL,
   PURPOSES,
 };

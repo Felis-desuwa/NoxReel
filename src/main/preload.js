@@ -60,12 +60,12 @@ contextBridge.exposeInMainWorld('sw', {
     // P2P 收完的片（接收会话）
     saveSession: (sessionId) => ipcRenderer.invoke('download:saveSession', sessionId),
     // 在线视频：缓存里有就放一份过去，没有就在后台另下（进度走 linkCache.onUpdate，purpose=download）
-    saveLink: (url, title) => ipcRenderer.invoke('download:saveLink', { url, title }),
+    saveLink: (url, title, maxHeight = 0) => ipcRenderer.invoke('download:saveLink', { url, title, maxHeight }),
   },
   // 在线视频下到本机：手动缓存（purpose=cache，之后同一个链接直接从本地播）和边下边播的下载
   linkCache: {
     list: () => ipcRenderer.invoke('linkCache:list'),
-    start: (url, title) => ipcRenderer.invoke('linkCache:start', { url, title }),
+    start: (url, title, maxHeight = 0) => ipcRenderer.invoke('linkCache:start', { url, title, maxHeight }),
     cancel: (url, purpose = 'cache') => ipcRenderer.invoke('linkCache:cancel', { url, purpose }),
     localPath: (url) => ipcRenderer.invoke('linkCache:localPath', url),
     onUpdate: on('linkCache:update'),
@@ -132,8 +132,9 @@ contextBridge.exposeInMainWorld('sw', {
     // chatPrompt 是播放器内弹幕输入框的提示语：主进程不做翻译，由渲染进程按界面语言传下来。
     // kind 是播放器 id（mpv / pot / mpc），主进程只认它登记过的那几个；
     // exe 路径永远不从这里走 —— 那是一道授权，只能由主进程自己的对话框收。
-    launch: ({ filePath, startPaused = true, headers = {}, startAt = 0, chatPrompt = '', kind = 'mpv' }) =>
-      ipcRenderer.invoke('player:launch', { filePath, startPaused, headers, startAt, chatPrompt, kind }),
+    // maxHeight：在线视频的清晰度上限（0 = 不限），只对在线链接生效
+    launch: ({ filePath, startPaused = true, headers = {}, startAt = 0, chatPrompt = '', kind = 'mpv', maxHeight = 0 }) =>
+      ipcRenderer.invoke('player:launch', { filePath, startPaused, headers, startAt, chatPrompt, kind, maxHeight }),
     // 有哪些播放器、能不能用、不能用是为什么（原因只有代号，文字在渲染进程这边生成）
     list: () => ipcRenderer.invoke('player:list'),
     select: (id) => ipcRenderer.invoke('player:select', id),

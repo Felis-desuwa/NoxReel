@@ -181,6 +181,15 @@
                     <option value="manual">手动同步</option>
                   </select>
                 </span>
+                <!-- 在线链接：清晰度上限。每个人自己选，只影响自己这一路（每个人都是自己连网站） -->
+                <span
+                  class="sync-mode-box hidden"
+                  id="quality-box"
+                  title="在线视频的清晰度：不超过所选这一档，这一档没有就用低一档。只影响你自己，手动缓存和边下边播也按它下。"
+                >
+                  <span class="ctl-label">清晰度</span>
+                  <select class="player-pick" id="link-quality" aria-label="清晰度"></select>
+                </span>
                 <span class="ctl-label">播放器</span>
                 <div class="controls-slot" id="player-slot"></div>
                 <button class="ghost tiny hidden" id="btn-switch-player"></button>
