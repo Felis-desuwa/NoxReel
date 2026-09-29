@@ -42,6 +42,33 @@
   .row { display:flex; align-items:center; gap:12px; }
   #pp { width:52px; height:44px; padding:0; font-size:18px; }
   #seek { flex:1; }
+  #seek-wrap { flex:1; position:relative; display:flex; align-items:center; min-width:0; }
+  #seek-wrap #seek { width:100%; }
+  /* 共享标记：进度条上方的小菱形（左右各留出滑块半径，大致对上位置） */
+  #seek-marks { position:absolute; left:8px; right:8px; top:-4px; height:8px; pointer-events:none; }
+  #seek-marks i { position:absolute; top:0; width:7px; height:7px; margin-left:-3.5px; transform:rotate(45deg);
+                  border-radius:1.5px; background:#e3b341; }
+  #btn-react { width:44px; height:44px; padding:0; font-size:20px; }
+  /* 表情和「标记」那一排 */
+  #react-pop { display:none; justify-content:space-between; gap:4px; margin-bottom:8px; padding:6px;
+               background:#000c; border-radius:12px; }
+  #react-pop.on { display:flex; }
+  #react-pop button { flex:1; min-width:0; padding:6px 0; font-size:20px; background:transparent; border:0; }
+  #react-pop button.mark { flex:1.6; font-size:13px; border:1px solid #e3b341; color:#e3b341; border-radius:8px; }
+  /* 飘起来的表情 */
+  #react-float { position:absolute; right:16px; bottom:110px; width:80px; height:260px; overflow:hidden;
+                 pointer-events:none; z-index:3; }
+  .react-pop { position:absolute; bottom:0; display:flex; flex-direction:column; align-items:center;
+               animation:react-rise 2.6s ease-out forwards; }
+  .react-pop .glyph { font-size:30px; line-height:1; }
+  .react-pop .who { max-width:78px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px;
+                    color:#fff; text-shadow:0 1px 2px #000c; }
+  @keyframes react-rise {
+    0% { transform:translateY(0) scale(.6); opacity:0; }
+    10% { transform:translateY(-10px) scale(1); opacity:1; }
+    60% { opacity:1; }
+    100% { transform:translateY(-230px) scale(1); opacity:0; }
+  }
   #time { font-size:12px; color:var(--dim); min-width:92px; text-align:right; font-variant-numeric: tabular-nums; }
   #waiting { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#000b; border:1px solid var(--warn);
              color:var(--warn); padding:14px 20px; border-radius:12px; font-size:14px; display:none; text-align:center; max-width:80%; }
@@ -342,12 +369,22 @@
       <div id="room-toast"></div>
     </div>
 
+    <!-- 飘起来的表情（从画面右边往上飘，不吃触摸） -->
+    <div id="react-float" aria-hidden="true"></div>
+
     <div id="botbar" class="bar">
+      <!-- 点底栏的 😊 弹出来的一排：表情和「标记这一刻」 -->
+      <div id="react-pop"></div>
       <div id="buf"><i></i></div>
       <div class="row">
         <button id="pp">▶</button>
-        <input id="seek" type="range" min="0" max="1000" value="0" />
+        <!-- 进度条上方画着大家标过的地方（只看，不能点） -->
+        <div id="seek-wrap">
+          <div id="seek-marks"></div>
+          <input id="seek" type="range" min="0" max="1000" value="0" />
+        </div>
         <div id="time">0:00 / 0:00</div>
+        <button id="btn-react" aria-label="发表情、标记">😊</button>
       </div>
     </div>
 

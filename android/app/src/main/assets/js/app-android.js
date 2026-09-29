@@ -29,6 +29,7 @@ import { MSG, PROTOCOL_VERSION, normalizePlatform } from './protocol.js';
 import { catalogOf, createPlaylist, currentItem, findItem, itemLabel, reorderIds, validateSnapshot } from './playlist.js';
 import { BURST_TOKENS, ChatGate, ChatSender, clampName, numberDuplicateNames, parseHistory, trustsRelay } from './chat.js';
 import { AREAS, DanmakuEngine, DEFAULT_SETTINGS as DANMAKU_BASE } from './danmaku.js';
+import { MarkBook, MomentGate, REACTIONS, createMark, createReaction } from './moments.js';
 import { currentLocale, setLocale, SKIP_ATTR, startI18n, translate as t } from './i18n.js';
 
 startI18n();
@@ -136,6 +137,11 @@ const S = {
     acks: new Map(),
     historyShown: false,
     notice: '',
+  },
+  // 共享标记和表情反应（lib/moments.js，和桌面端同一份）：gate 是收端闸门，book 是这个房间里大家标过的地方
+  moments: {
+    gate: new MomentGate(),
+    book: new MarkBook(),
   },
   // 本机弹幕设置（开关、不透明度、字号、速度、显示区域），存 localStorage，只影响自己。
   // 真正的值在下面弹幕那一节补上：loadDanmakuSettings 要用到那边的 const，这里读会撞上 TDZ。
@@ -830,6 +836,8 @@ function initSwarmAndSync() {
     else if (msg.t === MSG.NOW_LINK) onNowLink(msg, peer);
     else if (msg.t === MSG.CHAT) onChatMessage(msg, peer);
     else if (msg.t === MSG.CHAT_HISTORY) onChatHistory(msg, peer);
+    else if (msg.t === MSG.MARK || msg.t === MSG.REACT) onMomentMessage(msg, peer);
+    else if (msg.t === MSG.MARKS) onMarksSnapshot(msg, peer);
     else S.sync.onCtrl(msg, peer);
   });
 
@@ -1044,8 +1052,24 @@ function receiveFailed(item, manifest, e) {
 
 /* ----------------------- 网页/直链媒体 ----------------------- */
 function safePlaybackFromMessage(msg) {
-  const playback = msg && msg.playback;
-  if (!playback || typeof playback.url !== 'string' || playback.url.length > 16384) return null;
+  return safeTrack(msg && msg.playback);
+}
+
+/**
+ * 分开音视频流的网站（B 站）：房主给的一对直链 { video, audio }，各自照 safeTrack 查，
+ * 任何一条不过关就当没有（老版本的房主不发这一项）。
+ */
+function safeSplitFromMessage(msg) {
+  const split = msg && msg.split;
+  if (!split || typeof split !== 'object' || Array.isArray(split)) return null;
+  const video = safeTrack(split.video);
+  const audio = safeTrack(split.audio);
+  return video && audio ? { video, audio } : null;
+}
+
+/** 一条播放地址（带请求头）：只认 http(s)、不带用户名密码，请求头只留那五种。 */
+function safeTrack(playback) {
+  if (!playback || typeof playback !== 'object' || typeof playback.url !== 'string' || playback.url.length > 16384) return null;
   try {
     const parsed = new URL(playback.url);
     if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return null;
@@ -1079,16 +1103,24 @@ function onNowLink(msg, peer) {
   // 解析时间只能往前不能往后：填个未来时间就能让过期的地址一直算新鲜。没填的按刚解析出来算（旧版房主）
   const resolvedAt = Number.isSafeInteger(msg.resolvedAt) ? Math.min(msg.resolvedAt, Date.now()) : Date.now();
   const playback = safePlaybackFromMessage(msg);
-  S.nowLink = { seq: msg.seq, playback, resolvedAt };
+  // 只给分开音视频流的网站：没有 playback，另有一对直链（见 tryPlayLink）
+  const split = playback ? null : safeSplitFromMessage(msg);
+  S.nowLink = { seq: msg.seq, playback, split, resolvedAt };
   if (msg.seq !== S.currentSeq) return;
   // 这一部断流了、房主正好发来一条新地址：换上重来。正常在放的不中途换源（和桌面端一样）；
   // 打不开的那种播放器已经退了，下面的 playLink 会直接拿新地址起播
   const issue = playIssue();
-  if (issue?.kind === 'cut' && playback && playback.url !== issue.url) {
+  const fresh = linkKeyOf(S.nowLink);
+  if (issue?.kind === 'cut' && fresh && fresh !== issue.url) {
     retryPlayback();
     return;
   }
   playLink(msg.seq);
+}
+
+/** 房主给的这一部按哪条地址认：单条的就是它，一对直链的按视频那条。 */
+function linkKeyOf(nowLink) {
+  return nowLink?.playback?.url || nowLink?.split?.video?.url || '';
 }
 
 /** tryPlayLink 的发射后不管版本：异常只进控制台，不往调用点抛。 */
@@ -1110,16 +1142,20 @@ async function tryPlayLink(seq, { force = false } = {}) {
   // 本人拒绝过这个网站：房主补发的地址不再追着问，要看就点「重试」
   if (issue?.kind === 'denied' && !force) return;
   const playback = now.playback;
-  if (!playback) {
+  // 分开音视频流的网站（B 站）：房主给的是一对直链，原生层用 MergingMediaSource 合成一路
+  const split = playback ? null : now.split;
+  if (!playback && !split) {
     if (issue?.kind !== 'no-direct') notePlayIssue('no-direct', '房主分享的是网页链接，但没有可供 Android 播放的安全直链', 'bad');
     return;
   }
+  // 这一部用哪条地址认（失败过的、过期的都按它记）：一对直链的按视频那条
+  const key = linkKeyOf(now);
   // 同一条地址已经在手机上失败过：等房主发新的，或者等本人点「重试」
-  if (!force && issue?.url === playback.url && FAILED_ISSUES.has(issue.kind)) return;
+  if (!force && issue?.url === key && FAILED_ISSUES.has(issue.kind)) return;
   if (!force && Date.now() - now.resolvedAt > LINK_INFO_TTL_MS) {
     if (issue?.kind !== 'stale') {
       notePlayIssue('stale', '房主给的播放地址已经放了很久，多半过期了，正在等房主发新的；也可以点「重试」直接试这一条', 'warn', {
-        url: playback.url,
+        url: key,
       });
     }
     return;
@@ -1133,8 +1169,15 @@ async function tryPlayLink(seq, { force = false } = {}) {
 
   // 同一个网站在这个房间里只问一次。用页面里的对话框，不用 window.confirm ——
   // WebView 的原生弹窗会把整个 JS 线程堵住（心跳、收片、同步全停），样式也不归我们管。
-  let origin = '';
-  try { origin = new URL(playback.url).origin; } catch {}
+  // 一对直链的两条可能在不同的主机上（CDN 镜像），各问各的，一次问一个
+  const origins = (playback ? [playback.url] : [split.video.url, split.audio.url]).map((u) => {
+    try {
+      return new URL(u).origin;
+    } catch {
+      return '';
+    }
+  });
+  const origin = origins.find((o) => !S.approvedSites.has(o)) ?? origins[0];
   if (!S.approvedSites.has(origin)) {
     if (S.askingSite) return; // 已经弹着一个了，别叠第二个
     S.askingSite = true;
@@ -1158,11 +1201,14 @@ async function tryPlayLink(seq, { force = false } = {}) {
     return tryPlayLink(seq, { force });
   }
 
-  S.linkInfo.playback = playback;
-  const started = window.swPlayer.loadUrl(playback.url, playback.headers);
+  // 失败、断流都按 key 认（一对直链的按视频那条），所以 linkInfo.playback 的 url 也用它
+  S.linkInfo.playback = playback || { url: split.video.url, headers: split.video.headers, split: true };
+  const started = playback
+    ? window.swPlayer.loadUrl(playback.url, playback.headers)
+    : window.swPlayer.loadSplit(split.video.url, split.video.headers, split.audio.url, split.audio.headers);
   S.playerGen = started;
   if (!started) {
-    notePlayIssue('rejected', 'Android 拒绝或无法打开这个播放地址', 'bad', { url: playback.url });
+    notePlayIssue('rejected', 'Android 拒绝或无法打开这个播放地址', 'bad', { url: key });
     return;
   }
   S.playIssue = null;
@@ -3060,6 +3106,126 @@ function onChatMessage(msg, peer) {
   // 手机不是房主，不做转发中枢
 }
 
+/* --------------------------- 共享标记、表情反应 --------------------------- */
+// 和桌面端同一套线缆消息（lib/moments.js）。手机不是房主，只收、只发，不转发。
+// 标记画在进度条上方（只看，不能点：手指点不准那么小的点），聊天里记一行；表情从画面右边往上飘。
+
+function markLine(name, pos, note) {
+  return `${name}标记了 ${fmtTime(pos)}${note ? `：${note}` : ''}`;
+}
+
+function onMomentMessage(msg, peer) {
+  const res = S.moments.gate.accept(msg, {
+    senderId: peer.peerId,
+    senderName: peer.name,
+    hostId: S.hostId || S.sync?.hostId,
+    selfId: S.peerId,
+  });
+  if (!res.ok) return;
+  const v = res.value;
+  if (res.kind === 'react') {
+    floatReaction(v.e, v.name);
+  } else if (res.kind === 'mark') {
+    if (S.moments.book.add(v)) {
+      chatSystem(markLine(v.name, v.pos, v.note));
+      renderMarks();
+    }
+  } else if (res.kind === 'unmark') {
+    const mark = S.moments.book.get(v.target);
+    // 只有标的人自己和控制者删得掉
+    if (mark && (mark.origin === v.origin || S.sync?.isController?.(v.origin))) {
+      S.moments.book.remove(v.target);
+      renderMarks();
+    }
+  }
+}
+
+/** 房主给的整张标记表（进房时）。只认房主。 */
+function onMarksSnapshot(msg, peer) {
+  if (!fromHost(peer) || !Array.isArray(msg.items)) return;
+  if (S.moments.book.load(msg.items)) renderMarks();
+}
+
+/** 发一个表情反应（第几个）。发得太快的连自己这边也不飘。 */
+function sendReaction(e) {
+  const wire = createReaction(e);
+  if (!wire || !S.swarm || !S.moments.gate.allowOwn('react', S.peerId)) return;
+  S.moments.gate.remember(wire.id);
+  for (const p of chatPeers()) p.send(wire);
+  floatReaction(e, S.name);
+}
+
+/** 标记这一刻（手机上不写备注）。 */
+function sendMark() {
+  const item = S.current;
+  if (!item || !S.swarm) return;
+  const wire = createMark({ item: item.id, pos: roomPositionSec() });
+  if (!wire) return;
+  if (!S.moments.gate.allowOwn('mark', S.peerId)) {
+    log('标记得太快了，过几秒再标', 'warn', { toast: true });
+    return;
+  }
+  S.moments.gate.remember(wire.id);
+  S.moments.book.add({ ...wire, origin: S.peerId, name: S.name });
+  for (const p of chatPeers()) p.send(wire);
+  chatSystem(markLine('你', wire.pos, ''));
+  log(`已标记 ${fmtTime(wire.pos)}`, 'good', { toast: true });
+  renderMarks();
+}
+
+function floatReaction(e, name) {
+  const layer = $('react-float');
+  if (!layer || !REACTIONS[e]) return;
+  while (layer.children.length >= 10) layer.firstChild.remove();
+  const pop = el('div', { className: 'react-pop' }, [
+    el('span', { className: 'glyph', raw: true, text: REACTIONS[e] }),
+    el('span', { className: 'who', raw: true, text: name }),
+  ]);
+  pop.style.left = `${4 + ((layer.children.length * 19) % 40)}px`;
+  layer.appendChild(pop);
+  setTimeout(() => pop.remove(), 2700);
+}
+
+let marksKey = '';
+
+/** 进度条上方的标记（正在放的这一部上的）。没变就不重画（每条播放器读数都会叫它）。 */
+function renderMarks() {
+  const box = $('seek-marks');
+  if (!box) return;
+  const dur = S.sync?.duration || S.current?.durationSec || 0;
+  const marks = dur > 0 && S.current ? S.moments.book.list(S.current.id) : [];
+  const key = `${S.current?.id || ''}|${Math.round(dur)}|${marks.map((m) => m.id).join(',')}`;
+  if (key === marksKey) return;
+  marksKey = key;
+  box.textContent = '';
+  for (const m of marks) {
+    const dot = el('i');
+    dot.style.left = `${Math.min(100, (m.pos / dur) * 100)}%`;
+    box.appendChild(dot);
+  }
+}
+
+/** 底栏的表情按钮：点开一排表情（最后一个是「标记」），点一个发出去、收起来。 */
+function setupReactions() {
+  const pop = $('react-pop');
+  if (!pop || pop.childElementCount) return;
+  REACTIONS.forEach((glyph, i) => {
+    const b = el('button', { raw: true, text: glyph });
+    b.onclick = () => {
+      sendReaction(i);
+      pop.classList.remove('on');
+    };
+    pop.appendChild(b);
+  });
+  const mark = el('button', { className: 'mark', text: '标记' });
+  mark.onclick = () => {
+    sendMark();
+    pop.classList.remove('on');
+  };
+  pop.appendChild(mark);
+  $('btn-react').onclick = () => pop.classList.toggle('on');
+}
+
 /** 自己那条被房主转回来了：「发送中」「未送达」改成「已送达」。 */
 function markChatDelivered(id) {
   clearTimeout(S.chat.acks.get(id));
@@ -3392,6 +3558,8 @@ function renderPlayback(snap) {
   const paused = S.sync ? S.sync.effectivePaused : snap.paused;
   $('pp').textContent = paused ? '▶' : '⏸';
   syncUiAutoHide(paused);
+  // 片长、当前这一部变了，标记跟着挪（没变就不重画）
+  renderMarks();
 }
 
 /**
@@ -3589,6 +3757,8 @@ $('btn-chat').addEventListener('click', () => toggleSheet('chat-sheet'));
 $('btn-danmaku').addEventListener('click', () => toggleSheet('danmaku-sheet'));
 for (const id of ['playlist-close', 'chat-close', 'danmaku-close', 'members-close']) $(id).addEventListener('click', () => setSheet(''));
 $('peers').addEventListener('click', () => toggleSheet('members-sheet'));
+// 底栏的表情按钮：一排表情和「标记」
+setupReactions();
 // 点画面：收起 ↔ 亮出（捕获阶段，先于按钮自己的处理，只管计时和显隐，不拦事件）
 document.addEventListener('click', (e) => onStageTap(e.target), true);
 // 整页重载（退房、换语言）之前可能正藏着系统栏：一加载就还原

@@ -140,8 +140,12 @@
                   <div class="role-hint hidden" id="role-hint"></div>
                   <!-- 在线链接：本机和房主没对上时差多少秒 -->
                   <div class="drift-row hidden" id="drift-row"></div>
+                  <!-- 房主：这一部上次看到哪了（本机记的），问一句要不要接着看 -->
+                  <div class="resume-row hidden" id="resume-row"></div>
                 </div>
                 <div class="status-actions">
+                  <button class="ghost tiny hidden" id="btn-resume">接着看</button>
+                  <button class="ghost tiny hidden" id="btn-resume-no">从头看</button>
                   <button class="ghost tiny hidden" id="btn-sync-now">同步到房主</button>
                   <button class="ghost tiny hidden" id="btn-force-start">仍然开始</button>
                   <button class="ghost tiny hidden" id="btn-reopen">重新打开播放器</button>
@@ -165,6 +169,8 @@
                   <canvas class="buf-map" id="buf-map"></canvas>
                   <div class="buf-safe" id="buf-safe"></div>
                   <div class="buf-head" id="buf-head"></div>
+                  <!-- 共享标记：大家标的地方，点一下跳过去（控制者），右键删掉（自己标的或控制者） -->
+                  <div class="buf-marks" id="buf-marks"></div>
                 </div>
                 <div class="buffer-legend" id="buffer-stats"></div>
                 <div class="buffer-verdict hidden" id="buf-verdict"></div>
@@ -172,6 +178,15 @@
               <div class="controls">
                 <button class="play-btn" id="btn-playpause" data-state="play" disabled>播放</button>
                 <div class="time" id="time-display">0:00 / 0:00</div>
+                <button
+                  class="ghost tiny"
+                  id="btn-mark"
+                  type="button"
+                  disabled
+                  title="标记这一刻：大家的进度条上都看得到，可以写一句（播放器里按 K，Shift+K 先写一句）"
+                >
+                  标记
+                </button>
                 <div class="controls-spacer"></div>
                 <!-- 在线链接：每个成员自己选怎么跟房主（房主是参照，看不到这一项） -->
                 <span
@@ -292,6 +307,9 @@
                 <div class="controls-slot dm-slot" id="danmaku-slot"></div>
               </header>
               <div class="chat-body" id="chat-body"></div>
+              <!-- 表情反应：点一下全房飘一个（播放器里按 1–8 也行）。飘的那一层盖在聊天上 -->
+              <div class="reaction-float" id="reaction-float" aria-hidden="true"></div>
+              <div class="reaction-bar" id="reaction-bar"></div>
               <div class="chat-foot" id="chat-foot"></div>
               <div class="chat-hint">在播放器里按 Ctrl+Shift+D 也能直接发弹幕</div>
             </section>

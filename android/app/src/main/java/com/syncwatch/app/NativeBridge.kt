@@ -161,21 +161,43 @@ class NativeBridge(
             val url = requirePublicHttpUrl(rawUrl)
             // 合法的请求头最多五条、每条 2KB，整串不可能比这长；超长的不去解析
             require(headersJson.length <= MAX_HEADERS_JSON_CHARS)
-            val headersObject = JSONObject(headersJson.ifBlank { "{}" })
-            val allowed = setOf("accept", "accept-language", "origin", "referer", "user-agent")
-            val headers = mutableMapOf<String, String>()
-            headersObject.keys().forEach { rawName ->
-                val name = rawName.trim().lowercase()
-                val value = headersObject.optString(rawName, "")
-                require(name in allowed && value.isNotBlank() && value.length <= 2048)
-                require(!value.contains('\r') && !value.contains('\n'))
-                headers[name] = value
-            }
-            player.loadRemote(url, headers)
+            player.loadRemote(url, parseHeaders(headersJson))
         } catch (e: Exception) {
             Log.e(TAG, "playerLoadUrl 失败", e)
             0
         }
+    }
+
+    /**
+     * 分开音视频流的网站（B 站）：房主给的一对直链，视频、音频各一条，各带各的请求头。
+     * 两条都过和 [playerLoadUrl] 一样的检查，任何一条不过关就整个不播。
+     */
+    @JavascriptInterface
+    fun playerLoadSplit(videoUrl: String, videoHeadersJson: String, audioUrl: String, audioHeadersJson: String): Int {
+        return try {
+            val video = requirePublicHttpUrl(videoUrl)
+            val audio = requirePublicHttpUrl(audioUrl)
+            require(videoHeadersJson.length <= MAX_HEADERS_JSON_CHARS && audioHeadersJson.length <= MAX_HEADERS_JSON_CHARS)
+            player.loadRemoteSplit(video, parseHeaders(videoHeadersJson), audio, parseHeaders(audioHeadersJson))
+        } catch (e: Exception) {
+            Log.e(TAG, "playerLoadSplit 失败", e)
+            0
+        }
+    }
+
+    /** 房主给的请求头：只认五种、每条 2KB 以内、不许换行。有一条不对就整个不要（抛出去）。 */
+    private fun parseHeaders(headersJson: String): Map<String, String> {
+        val headersObject = JSONObject(headersJson.ifBlank { "{}" })
+        val allowed = setOf("accept", "accept-language", "origin", "referer", "user-agent")
+        val headers = mutableMapOf<String, String>()
+        headersObject.keys().forEach { rawName ->
+            val name = rawName.trim().lowercase()
+            val value = headersObject.optString(rawName, "")
+            require(name in allowed && value.isNotBlank() && value.length <= 2048)
+            require(!value.contains('\r') && !value.contains('\n'))
+            headers[name] = value
+        }
+        return headers
     }
 
     @JavascriptInterface

@@ -118,7 +118,9 @@ function configureCache(manager) {
  *  - manual：收的片写进长期保留的缓存文件夹（keptDir，不在运行目录里、也不在系统临时目录里）——
  *    没收完之前在它下面的工作目录（.noxreel-downloading/<号>/）里，收完关会话时才挪成正式片名；
  *    收完的登记下来跨重启复用，从不自动删；磁盘不够就报出来，由用户自己去清理。
- * 两种模式下，没收完的片在关会话时都删掉（没有断点续传，留着也用不上）。
+ * 两种模式下，没收完的片关会话时都留着、登记成「没收完」（断点续传）：下次同一部片再来时走复用那条路，
+ * 逐片核对，对得上的不再下。自动模式的留到关软件为止（跟着运行目录走）；手动模式的在工作目录里，
+ * 开会话时就登记，关机、崩溃、断电之后照样接着收。一片都没收到的、扫出威胁的照旧删掉。
  */
 let library = null;
 let policy = { mode: 'auto', keptDir: null };
@@ -270,6 +272,8 @@ class Session {
     // 复用本机副本：后台还在逐片核对（见 tryReuse）。关会话时要先等它停下来再关文件句柄
     this.verifyPromise = null;
     this.verifyDone = true;
+    // 接着上次没收完的片收（断点续传）
+    this.resumed = false;
   }
 
   /** 这场接收还要从磁盘上吃掉多少字节。整块预分配的文件已经占好了，是 0。 */
@@ -644,6 +648,9 @@ async function openLeech(manifest, { onReuse = null } = {}) {
     await markSparse(filePath);
     await session.fh.truncate(manifest.size);
     session.unallocatedAtOpen = await unallocatedBytes(session.fh, manifest.size);
+    // 手动模式：开会话时就登记成「没收完」—— 关机、崩溃、断电时关会话那一步跑不到，
+    // 不登记的话下次启动工作目录被当成残留回收，收到的全白收了
+    if (manual) await library?.addFile({ manifest, filePath, partial: true }).catch(() => {});
     sessions.set(id, session);
     return session.state();
   } catch (error) {
@@ -735,6 +742,7 @@ async function tryReuse(manifest, onReuse) {
   }
   // 临时条目交给会话：用着的时候磁盘不够的清理不会把它删掉；会话关的时候再登记回去
   if (!persistent) library.takeTemp(entry.id);
+  const partial = !!entry.partial;
   const session = new Session({
     id: nextId('leech'),
     manifest,
@@ -744,8 +752,30 @@ async function tryReuse(manifest, onReuse) {
   });
   session.persistent = persistent;
   session.fh = fh;
-  // 复用的文件早就整个在盘上了，不会再吃新的空间
-  session.unallocatedAtOpen = 0;
+  session.resumed = partial;
+  if (partial) {
+    // 没收完的片（稀疏文件）：没写过的地方还没占到盘上，接着收还要这么多空间，照新收一样先查余量
+    session.unallocatedAtOpen = await unallocatedBytes(fh, manifest.size);
+    try {
+      const dir = path.dirname(entry.path);
+      if (persistent) await ensureFreeSpace(dir, session.unallocatedAtOpen, reservedDiskBytes);
+      else await ensureFreeSpaceWithEviction(dir, session.unallocatedAtOpen);
+    } catch (error) {
+      await fh.close().catch(() => {});
+      // 登记还回去：盘腾出地方以后照样能接着收
+      if (!persistent) library.addTempFile({ manifest, filePath: entry.path, ownedDir: entry.ownedDir, partial: true });
+      throw error;
+    }
+    // 手动模式的工作目录（.noxreel-downloading/<号>/）里的：收完关会话时照样挪成正式片名
+    const work = path.dirname(entry.path);
+    if (persistent && path.basename(path.dirname(work)) === WORK_DIR) {
+      session.workDir = work;
+      session.keptDir = path.dirname(path.dirname(work));
+    }
+  } else {
+    // 收完的文件早就整个在盘上了，不会再吃新的空间
+    session.unallocatedAtOpen = 0;
+  }
   const report = reuseReporter(session, onReuse);
   const buf = Buffer.allocUnsafe(manifest.chunkSize);
   const total = manifest.chunkCount;
@@ -760,6 +790,11 @@ async function tryReuse(manifest, onReuse) {
   session._advanceContiguous();
   if (!matched) {
     await fh.close().catch(() => {});
+    // 没收完的片在我们自己的工作目录里，对不上就连文件删掉（留着下次启动也是当残留回收）
+    if (session.workDir) {
+      await fsp.unlink(entry.path).catch(() => {});
+      await removeWorkDir(session.workDir);
+    }
     await dropReuse(entry, persistent, { taken: true });
     report('done', { done: total, matched: 0 });
     return null;
@@ -790,11 +825,35 @@ function reuseReporter(session, onReuse) {
   const { manifest } = session;
   return (stage, extra = {}) => {
     try {
-      onReuse?.({ stage, fileId: manifest.fileId, name: manifest.name, total: manifest.chunkCount, ...extra });
+      onReuse?.({
+        stage,
+        fileId: manifest.fileId,
+        name: manifest.name,
+        total: manifest.chunkCount,
+        // 接着上次没收完的收（界面据此换说法：不是「本机已有」，对不上的片也是意料之中）
+        partial: session.resumed,
+        ...extra,
+      });
     } catch {
       /* 报进度失败不影响核对 */
     }
   };
+}
+
+let zeroBuffer = null;
+const zeroDigests = new Map();
+
+function zeroChunk(len) {
+  if (!zeroBuffer) zeroBuffer = Buffer.alloc(CHUNK_SIZE);
+  return zeroBuffer.subarray(0, len);
+}
+
+/** 长度为 len 的全 0 分片的哈希（一部片里只有最后一片长度不同，记住就行）。 */
+async function zeroDigest(len) {
+  if (!zeroDigests.has(len)) {
+    zeroDigests.set(len, Buffer.from(await crypto.webcrypto.subtle.digest('SHA-256', zeroChunk(len))).toString('hex'));
+  }
+  return zeroDigests.get(len);
 }
 
 /**
@@ -811,6 +870,9 @@ async function verifyChunk(session, i, buf) {
     const { bytesRead } = await session.fh.read(buf, 0, len, i * manifest.chunkSize);
     if (bytesRead !== len) return 'mismatch';
     const chunk = buf.subarray(0, len);
+    // 没收完的片里还没收到的地方（稀疏文件的空洞）读出来全是 0：比一下就知道，不用算哈希
+    // （除非这一片本来就全是 0，那就照常往下核对）
+    if (chunk.equals(zeroChunk(len)) && manifest.hashes[i] !== (await zeroDigest(len))) return 'mismatch';
     const digest = Buffer.from(await crypto.webcrypto.subtle.digest('SHA-256', chunk)).toString('hex');
     if (digest !== manifest.hashes[i]) return 'mismatch';
     if (i === 0 && !validateMediaHeader(manifest.name, chunk).ok) return 'mismatch';
@@ -1011,12 +1073,19 @@ async function settleFile(session) {
     if (session.ownedDir && cacheManager) await cacheManager.removeOwned(session.ownedDir).catch(() => {});
     return;
   }
-  const keep = session.complete && !session.discard;
+  const complete = session.complete;
+  const keep = complete && !session.discard;
+  // 没收完、也不是扫出威胁：收到的片留着，下次同一部片接着收（断点续传）。一片都没收到的不留
+  const resumable = !complete && !session.discard && session.haveCount > 0;
   if (session.persistent) {
     if (keep) {
       const filePath = await publishKept(session);
+      // 挪成了正式片名：工作目录里那条「没收完」的登记换成正式的
+      if (filePath !== session.filePath) await library?.forgetPath(session.filePath).catch(() => {});
       await library?.addFile({ manifest: session.manifest, filePath }).catch(() => {});
-    } else if (session.discard || session.createdFresh) {
+    } else if (resumable) {
+      await library?.addFile({ manifest: session.manifest, filePath: session.filePath, partial: true }).catch(() => {});
+    } else if (session.discard || session.createdFresh || (session.resumed && session.workDir)) {
       await fsp.unlink(session.filePath).catch(() => {});
       await library?.forgetPath(session.filePath).catch(() => {});
       if (session.workDir) await removeWorkDir(session.workDir);
@@ -1026,8 +1095,15 @@ async function settleFile(session) {
   if (!session.ownedDir || !cacheManager) return;
   // 复用来的临时副本还没核对完就关了（换片、退房）：里面的片多半还是好的，登记回去，下次照样核对着用
   const unverified = !session.verifyDone && !session.discard;
-  if ((keep || unverified) && library) {
-    library.addTempFile({ manifest: session.manifest, filePath: session.filePath, ownedDir: session.ownedDir });
+  if ((keep || unverified || resumable) && library) {
+    const id = library.addTempFile({
+      manifest: session.manifest,
+      filePath: session.filePath,
+      ownedDir: session.ownedDir,
+      partial: !complete,
+    });
+    // 同一部片已经有收完的一份登记着：没收完的这份用不上了
+    if (id === null) await cacheManager.removeOwned(session.ownedDir).catch(() => {});
   } else {
     await cacheManager.removeOwned(session.ownedDir).catch(() => {});
   }

@@ -78,6 +78,10 @@ window.swPlayer = {
   loadUrl(url, headers = {}) {
     return Number(Native.playerLoadUrl(url, JSON.stringify(headers))) || 0;
   },
+  // 分开音视频流的网站（B 站）：视频、音频各一条直链，原生层合成一路播
+  loadSplit(videoUrl, videoHeaders = {}, audioUrl, audioHeaders = {}) {
+    return Number(Native.playerLoadSplit(videoUrl, JSON.stringify(videoHeaders), audioUrl, JSON.stringify(audioHeaders))) || 0;
+  },
   setPause(paused) {
     Native.playerSetPause(!!paused);
   },

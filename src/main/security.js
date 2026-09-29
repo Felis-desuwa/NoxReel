@@ -222,6 +222,8 @@ function danmakuFrame(value) {
 
 const OSC_TONES = new Set(['sync', 'wait', 'paused', 'manual', 'guest']);
 const OSC_LABEL_KEY = /^[A-Za-z]{1,24}$/;
+// 控制条上最多画几个共享标记（渲染进程 clipOscState 用同一个数）
+const OSC_MAX_MARKS = 40;
 
 /**
  * mpv 控制条要画的房间状态（见 resources/mpv-scripts/noxreel-osc.lua 的 apply_state）。
@@ -293,6 +295,14 @@ function oscState(value) {
         return { h: integer(item.h, '控制条清晰度', { min: 0, max: 4320 }), label: string(item.label, '控制条清晰度', { max: 40 }) };
       }),
     };
+  }
+  // 共享标记（这一部上大家标的地方）：秒数 + 「谁：一句话」
+  if (data.marks !== undefined && data.marks !== null) {
+    if (!Array.isArray(data.marks) || data.marks.length > OSC_MAX_MARKS) fail('控制条标记');
+    out.marks = data.marks.map((m) => {
+      const item = plainObject(m, '控制条标记');
+      return { t: finiteNumber(item.t, '控制条标记', { min: 0, max: 10 ** 7 }), n: string(item.n, '控制条标记', { max: 120, allowEmpty: true }) };
+    });
   }
   const labels = object(data.labels, '控制条文字');
   if (labels) {

@@ -99,6 +99,7 @@ function leaveRoomBox({ prepDrainMs = 300 } = {}) {
   const ctx = sandbox(fns('leaveRoom', 'cancelPrepJob', 'removePrepJob', 'trackPending', 'trackClosing'), {
     S,
     events,
+    flushWatchProgress: () => {},
     PREP_DRAIN_MS: prepDrainMs,
     DRAIN_ROUNDS: 10,
     delay: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -207,6 +208,10 @@ function playerBox({ leaving }) {
     handlePlayerTick: () => {},
     handlePlayerExit: () => {},
     forgetMpvOsc: () => {}, // mpv 控制条的去重缓存另有测试（mpvOsc.test.js）
+    renderResumeOffer: () => {},
+    flushWatchProgress: () => {},
+    offerResume: () => {},
+    recordWatchProgress: () => {},
     window: {
       sw: {
         player: {
@@ -942,6 +947,10 @@ test('后台扫的片切成当前项后，扫描已用时间会自己走起来',
     updatePresence: () => {}, // Discord 状态显示：这里不关心
     scheduleOscState: () => {}, // mpv 控制条：这里不关心
     forgetMpvOsc: () => {},
+    renderResumeOffer: () => {},
+    flushWatchProgress: () => {},
+    offerResume: () => {},
+    recordWatchProgress: () => {},
     renderDrift: () => {}, // 在线链接和房主差多少秒：这里不关心
     driftShown: () => false,
     t: (s) => s,
@@ -997,6 +1006,7 @@ test('本机已经能播、只是播放器没开着：横幅说「播放器没�
       $,
       updatePresence: () => {},
       scheduleOscState: () => {},
+      renderResumeOffer: () => {},
       renderDrift: () => {},
       driftShown: () => false,
       t: (s) => s,

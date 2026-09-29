@@ -38,6 +38,17 @@ for i, key in ipairs(SYNC_KEYS) do
   end)
 end
 
+-- 共享标记：k 直接标记这一刻，K（Shift+k）先写一句再标。位置取按下那一刻的（写字要花时间）。
+-- k 不需要 mp.input，注册在版本检查前面；mpv 默认键位里 k / K 都是空的。
+local MARK_MESSAGE_NAME = 'noxreel-mark'
+local function mark_pos()
+  local pos = mp.get_property_number('time-pos')
+  return pos and string.format('%.2f', pos) or ''
+end
+mp.add_key_binding('k', MARK_MESSAGE_NAME .. '-now', function()
+  mp.commandv('script-message', MARK_MESSAGE_NAME, mark_pos(), '')
+end)
+
 local ok, input = pcall(require, 'mp.input')
 if not ok or type(input) ~= 'table' or type(input.get) ~= 'function' then
   msg.warn('这个 mpv 没有 mp.input（需要 0.38 以上），播放器内发弹幕已停用')
@@ -93,3 +104,23 @@ end
 for i, key in ipairs(BINDING_KEYS) do
   mp.add_key_binding(key, MESSAGE_NAME .. '-' .. i, openInput)
 end
+
+-- 界面只有简体中文和英文两种：弹幕输入框的提示语是渲染进程按界面语言给的，
+-- 里面有汉字就用中文的标记提示，否则用英文的（省得为这一句再从启动参数里多带一项）
+local MARK_NOTE_LIMIT = 60
+local function markPrompt()
+  if promptText():find('[\228-\233]') then return '标记这一刻，写一句（可以不写）：' end
+  return 'Mark this moment, add a note (optional): '
+end
+
+mp.add_key_binding('K', MARK_MESSAGE_NAME .. '-note', function()
+  local pos = mark_pos()
+  input.get({
+    prompt = markPrompt(),
+    submit = function(text)
+      input.terminate()
+      if type(text) ~= 'string' then text = '' end
+      mp.commandv('script-message', MARK_MESSAGE_NAME, pos, truncate(text, MARK_NOTE_LIMIT))
+    end,
+  })
+end)

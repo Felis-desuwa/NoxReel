@@ -246,6 +246,24 @@ class PlayerManager extends EventEmitter {
     if (adapter && typeof adapter.setOscState === 'function') return adapter.setOscState(state);
   }
 
+  /** 飘一个表情反应（只有 mpv 画得出来，外部播放器静默忽略）。 */
+  showReaction(e, name) {
+    const adapter = this.current?.adapter;
+    if (adapter && typeof adapter.showReaction === 'function') return adapter.showReaction(e, name);
+  }
+
+  /** 当前播放器能不能加载本机字幕（只有 mpv 能）。 */
+  canAddSubtitle() {
+    return typeof this.current?.adapter?.addSubtitle === 'function';
+  }
+
+  /** 加载一条本机字幕。播放器不是 mpv、或者已经关了，抛出去让调用方说清楚。 */
+  async addSubtitle(filePath) {
+    const adapter = this.current?.adapter;
+    if (!adapter || typeof adapter.addSubtitle !== 'function') throw new Error('播放器没开着，或者不是 mpv');
+    return adapter.addSubtitle(filePath);
+  }
+
   /**
    * 一帧弹幕。带了 gen 就只认那一代 —— 换播放器、重开播放器之后，上一代还在 IPC 路上的
    * 那一帧不能画到新播放器身上：那是属于上一部片的一屏字，而且新播放器可能刚起来还在片头。

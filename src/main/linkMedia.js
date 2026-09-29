@@ -321,6 +321,46 @@ function videoHeights(info) {
   return [...seen].sort((a, b) => b - a).slice(0, 12);
 }
 
+/** 短边（竖屏视频也对），和 videoHeights 同一个量法。报不出尺寸的是 0。 */
+function shortSide(f) {
+  const w = Number(f?.width);
+  const h = Number(f?.height);
+  return w > 0 && h > 0 ? Math.min(w, h) : h > 0 ? h : 0;
+}
+
+/**
+ * 只给分开音视频流的网站（B 站全站是 DASH）：挑一条视频、一条音频的直链，给安卓成员的 ExoPlayer 自己合
+ * （MergingMediaSource）。桌面成员照旧拿网页地址交给 mpv，用不上这一对。
+ * 挑法照顾手机的解码能力：yt-dlp 默认按 AV1 > VP9 > HEVC > H.264 挑，而不少手机解不动 AV1 ——
+ * 视频优先 H.264（avc1），其次 H.265，都不超过 1080p；音频优先 AAC（mp4a）。挑不出来才用 yt-dlp 选中的那一对。
+ * 只要整个文件一条地址的（protocol 是 http/https）：m3u8、分片式的 dash 这一路读不了。
+ * 每条格式自带的请求头优先（B 站的 CDN 不带 Referer 就 403），没有就用顶层的。
+ * @returns {{video: object, audio: object} | null}
+ */
+function splitPlaybackFromInfo(info) {
+  const formats = Array.isArray(info?.formats) ? info.formats : [];
+  const plain = (f) => !!f && typeof f === 'object' && typeof f.url === 'string' && /^https?$/i.test(String(f.protocol || 'https'));
+  const hasVideo = (f) => typeof f.vcodec === 'string' && f.vcodec !== 'none';
+  const hasAudio = (f) => typeof f.acodec === 'string' && f.acodec !== 'none';
+  const videoOnly = formats.filter((f) => plain(f) && hasVideo(f) && !hasAudio(f));
+  const audioOnly = formats.filter((f) => plain(f) && hasAudio(f) && !hasVideo(f));
+  const bitrate = (f) => Number(f.tbr) || Number(f.vbr) || Number(f.abr) || 0;
+  const pickVideo = (re) =>
+    videoOnly
+      .filter((f) => re.test(f.vcodec) && shortSide(f) <= 1080)
+      .sort((a, b) => shortSide(b) - shortSide(a) || bitrate(b) - bitrate(a))[0];
+  const requested = Array.isArray(info?.requested_formats) ? info.requested_formats : [];
+  const video = pickVideo(/^avc1/i) || pickVideo(/^(hvc1|hev1|h265|hevc)/i) || requested.find((f) => plain(f) && hasVideo(f));
+  const audio =
+    audioOnly.filter((f) => /^mp4a/i.test(f.acodec)).sort((a, b) => bitrate(b) - bitrate(a))[0] ||
+    requested.find((f) => plain(f) && hasAudio(f) && !hasVideo(f));
+  if (!video || !audio) return null;
+  const withHeaders = (f) => (f.http_headers ? f : { ...f, http_headers: info?.http_headers });
+  const v = playbackFromInfo(withHeaders(video), null);
+  const a = playbackFromInfo(withHeaders(audio), null);
+  return v && a ? { video: v, audio: a } : null;
+}
+
 function resultFromInfo(info, url) {
   if (info?._type === 'playlist' || Array.isArray(info?.entries)) {
     throw new Error('当前只支持单个视频链接，不支持播放列表或频道页面');
@@ -328,6 +368,8 @@ function resultFromInfo(info, url) {
 
   // 选中的是分开的两条流（见 SPLIT_FORMAT）时顶层没有 url，playback 就是 null
   const playback = playbackFromInfo(info, looksLikeDirectMedia(url) ? url : null);
+  const split = !playback && Array.isArray(info?.requested_formats);
+  const splitPlayback = split ? splitPlaybackFromInfo(info) : null;
   return {
     url,
     title: String(info?.title || info?.fulltitle || new URL(url).hostname).slice(0, 240),
@@ -335,7 +377,10 @@ function resultFromInfo(info, url) {
     extractor: String(info?.extractor_key || info?.extractor || 'generic').slice(0, 80),
     direct: looksLikeDirectMedia(url) || info?.extractor === 'generic',
     playback,
-    ...(!playback && Array.isArray(info?.requested_formats) ? { split: true } : {}),
+    ...(split ? { split: true } : {}),
+    // 给安卓成员的一对直链（见 splitPlaybackFromInfo）；playback 照旧是 null ——
+    // 放进 playback 的话，老版本的安卓和桌面成员的兜底会拿没声音的视频流去放
+    ...(splitPlayback ? { splitPlayback } : {}),
     heights: videoHeights(info),
     resolvedAt: Date.now(),
   };
@@ -436,6 +481,7 @@ module.exports = {
   looksLikeDirectMedia,
   sanitizePlaybackHeaders,
   playbackFromInfo,
+  splitPlaybackFromInfo,
   isYouTubeUrl,
   videoHeights,
   ytDlpArgs,

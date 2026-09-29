@@ -349,6 +349,22 @@ export function applyOp(state, op, ctx) {
       return { ok: true, state: next };
     }
 
+    // 「接着看」：这一部还没开播时把起播点定在上次看到的地方。
+    // 起播点只在换片时定（resetMedia），所以要当成换了一次片（seq 加一），大家从新的起播点重来一遍；
+    // 老版本的成员也认 resumeAt（「回头接着放」一直是这么走的）
+    case 'resume': {
+      if (!cur || op.id !== cur.id) return fail(state, '只能给正在放的这一部定起播点');
+      if (state.started) return fail(state, '已经开播了，直接拖进度条吧');
+      const at = Number(op.at);
+      if (!Number.isFinite(at) || at < 0 || at > 86400) return fail(state, '无效的操作');
+      if (cur.durationSec > 0 && at >= cur.durationSec) return fail(state, '起播点超过了片长');
+      if (at === cur.resumeAt) return { ok: true, state, unchanged: true };
+      next.queue[0] = { ...cur, resumeAt: at };
+      advanceSeq(next);
+      next.rev += 1;
+      return { ok: true, state: next };
+    }
+
     case 'requeue': {
       const hi = next.history.findIndex((it) => it.id === op.id);
       if (hi === -1) return fail(state, '已播放区里没有这一项');

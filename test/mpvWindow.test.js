@@ -19,8 +19,10 @@ test('记下来的偏好只收 15%–100% 的宽高，保留一位小数；认�
 
 test('开窗参数：没记过按片子大小（autofit）；记过就 --geometry=W%xH%，最大化的再加 --window-maximized', () => {
   assert.deepEqual(windowArgs(null), ['--autofit=960x540', '--autofit-larger=92%x88%']);
-  assert.deepEqual(windowArgs({ w: 60, h: 55.5 }), ['--geometry=60%x55.5%']);
-  assert.deepEqual(windowArgs({ w: 60, h: 55.5, maximized: true }), ['--geometry=60%x55.5%', '--window-maximized=yes']);
+  // mpv 的 --geometry 只认整数：记下的 55.5% 交给 mpv 时取整（带小数的话 mpv 解析参数就退出，再也开不了播放器）
+  assert.deepEqual(windowArgs({ w: 60, h: 55.5 }), ['--geometry=60%x56%']);
+  assert.deepEqual(windowArgs({ w: 60, h: 55.5, maximized: true }), ['--geometry=60%x56%', '--window-maximized=yes']);
+  for (const w of [15, 37.5, 37.4, 99.9, 100]) assert.match(windowArgs({ w, h: w })[0], /^--geometry=\d+%x\d+%$/, String(w));
   const args = buildLaunchArgs({ ipcPath: 'x', source: 'D:/a.mkv', windowPref: { w: 70, h: 60 } });
   assert.ok(args.includes('--geometry=70%x60%'));
   assert.equal(args.some((a) => a.startsWith('--autofit')), false, '按记的开就不再按片子大小缩放');
@@ -82,4 +84,28 @@ test('接线：观察这几个属性；主进程存进配置、下次开窗带�
   assert.match(main, /await players\.quit\(\)\.catch\(\(\) => \{\}\);\n\s+\/\/ mpv 窗口大小还攒着没落盘[\s\S]*?settings\.write\(USER_DATA_DIR, \{ mpvWindow: mpvWindowPref \}\)/);
   assert.match(read('src', 'main', 'players', 'index.js'), /adapter\.on\('geometry', \(pref\) => this\.emit\('geometry', pref\)\);/);
   assert.match(read('src', 'main', 'players', 'mpvAdapter.js'), /this\.ctl\.on\('geometry', \(pref\) => this\.emit\('geometry', pref\)\);/);
+});
+
+/**
+ * 0.7.10 的真 bug：记下的窗口大小带小数（2560×1440 屏上默认 960×540 正好是 37.5%），
+ * --geometry=37.5%x37.5% mpv 不认，解析参数就退出（退出码 1），之后每次都开不了播放器。
+ * 拿真 mpv 跑一遍开窗参数（无窗口、无声音、不需要片子）：退出码得是 0。
+ */
+const { spawnSync } = require('node:child_process');
+const MPV_BIN = path.join(__dirname, '..', 'vendor', 'bin', 'mpv.exe');
+test('真 mpv：记下的窗口大小带小数也照样认（交给 mpv 的是整数）', { skip: !(process.platform === 'win32' && fs.existsSync(MPV_BIN)) && '没有 vendor/bin/mpv.exe' }, () => {
+  for (const pref of [{ w: 37.5, h: 37.5 }, { w: 60, h: 55.5, maximized: true }, null]) {
+    const r = spawnSync(MPV_BIN, ['--no-config', '--idle=no', '--vo=null', '--ao=null', '--mute=yes', ...windowArgs(pref)], { encoding: 'utf8', timeout: 20000, windowsHide: true });
+    assert.equal(r.status, 0, `${JSON.stringify(pref)}：${(r.stdout || '') + (r.stderr || '')}`);
+  }
+  // 反过来确认 mpv 真的不认小数（这条测试守的就是它）
+  const bad = spawnSync(MPV_BIN, ['--no-config', '--idle=no', '--vo=null', '--ao=null', '--mute=yes', '--geometry=37.5%x37.5%'], { encoding: 'utf8', timeout: 20000, windowsHide: true });
+  assert.notEqual(bad.status, 0);
+});
+
+test('mpv 连上管道之前就退了：stdout 也收（参数不认的原文在 stdout 上），原文只进主进程日志', () => {
+  const src = read('src', 'main', 'mpv.js');
+  assert.match(src, /stdio: \['ignore', 'pipe', 'pipe'\]/);
+  assert.match(src, /this\.proc\.stdout\.on\('data', keepTail\);/);
+  assert.match(src, /if \(!this\.sock\) console\.warn\(`\[mpv\] 连上管道之前就退出了/);
 });

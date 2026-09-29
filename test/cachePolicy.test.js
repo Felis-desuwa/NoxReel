@@ -103,15 +103,44 @@ test('自动模式：收完的片关会话（换片、退房）不删，同一�
   assert.equal(library.findFile(manifest.fileId)?.persistent, false, '关了再登记回去');
 });
 
-test('自动模式：没收完的片关会话就删（没有断点续传，留着也用不上）', async (t) => {
+test('自动模式：没收完的片关会话不删、登记成没收完；同一部再开接着收，收过的片不用再传（断点续传）', async (t) => {
   const { library } = await setup(t);
   const chunks = makeChunks();
   const manifest = manifestFor('movie.mkv', chunks);
   const state = await store.openLeech(manifest);
   await store.writeChunk(state.sessionId, 0, chunks[0]);
   await store.close(state.sessionId);
-  assert.equal(fs.existsSync(path.dirname(state.filePath)), false);
+  assert.equal(fs.existsSync(state.filePath), true, '收到的片留着（跟着运行目录走，关软件时清掉）');
+  assert.equal(library.findFile(manifest.fileId)?.entry.partial, true);
+
+  const events = [];
+  const again = await store.openLeech(manifest, { onReuse: (e) => events.push(e) });
+  assert.equal(again.filePath, state.filePath, '接着收的是同一个文件');
+  assert.equal(again.haveCount, 1, '收过的那一片核对上了');
+  assert.equal(again.complete, false);
+  assert.equal(events[0].partial, true, '界面据此说「接着上次的收」，不说「本机已有」');
+  assert.equal((await store.writeChunk(again.sessionId, 1, chunks[1])).ok, true);
+  assert.equal((await store.writeChunk(again.sessionId, 2, chunks[2])).ok, true);
+  assert.equal(store.state(again.sessionId).complete, true);
+  await store.close(again.sessionId);
+  assert.equal(library.findFile(manifest.fileId)?.entry.partial, undefined, '收完了就是收完的临时条目');
+});
+
+test('一片都没收到就关的不留；同一部片已经有收完的一份时，没收完的这份不登记', async (t) => {
+  const { library } = await setup(t);
+  const chunks = makeChunks();
+  const manifest = manifestFor('movie.mkv', chunks);
+  const empty = await store.openLeech(manifest);
+  await store.close(empty.sessionId);
+  assert.equal(fs.existsSync(path.dirname(empty.filePath)), false);
   assert.equal(library.findFile(manifest.fileId), null);
+
+  const full = await store.openLeech(manifest);
+  await receiveAll(full, chunks);
+  await store.close(full.sessionId);
+  // 登记表里已经有收完的：没收完的这份用不上，addTempFile 返回 null
+  assert.equal(library.addTempFile({ manifest, filePath: path.join(path.dirname(full.filePath), 'x'), ownedDir: 'x', partial: true }), null);
+  assert.equal(library.findFile(manifest.fileId).entry.path, full.filePath);
 });
 
 test('discard（扫描发现威胁）：收完了也删，不登记', async (t) => {
@@ -270,17 +299,44 @@ test('手动模式：长期缓存文件夹里已经有同名文件就另起名�
   assert.equal(fs.existsSync(path.join(keptDir, WORK_DIR)), false);
 });
 
-test('手动模式：没收完的新文件关会话就删；复用来的没收完不删（对得上的片下次还能用）', async (t) => {
+test('手动模式：没收完的新文件开会话就登记、关会话留着；重启后接着收，收完挪成正式片名', async (t) => {
+  const { root, keptDir, library } = await setup(t, { mode: 'manual' });
+  const chunks = makeChunks();
+  const manifest = manifestFor('movie.mkv', chunks);
+  const empty = await store.openLeech(manifest);
+  await store.close(empty.sessionId);
+  assert.equal(fs.existsSync(empty.filePath), false, '一片都没收到的删掉');
+  assert.equal(fs.existsSync(path.dirname(path.dirname(empty.filePath))), false, '外层的 .noxreel-downloading 空了也删（E4-F）');
+  assert.equal(library.findFile(manifest.fileId), null, '登记一起摘掉');
+
+  const partial = await store.openLeech(manifest);
+  assert.equal(library.findFile(manifest.fileId)?.entry.partial, true, '开会话就登记：崩溃、断电时关会话那一步跑不到');
+  await store.writeChunk(partial.sessionId, 0, chunks[0]);
+  await store.close(partial.sessionId);
+  assert.equal(fs.existsSync(partial.filePath), true, '没收完的留在工作目录里');
+  assert.deepEqual(fs.readdirSync(keptDir), [WORK_DIR], '长期缓存文件夹根下照样没有顶着正式片名的半截文件');
+
+  // 「重启」：重新读登记表。启动时回收工作目录残留要避开它
+  const reloaded = await new MediaLibrary({ dataDir: path.join(root, 'userdata') }).load();
+  store.configureLibrary(reloaded);
+  assert.deepEqual(reloaded.partialWorkDirs(), [path.dirname(partial.filePath)]);
+  const again = await store.openLeech(manifest);
+  assert.equal(again.filePath, partial.filePath);
+  assert.equal(again.haveCount, 1, '收过的那一片不用再传');
+  assert.equal((await store.writeChunk(again.sessionId, 1, chunks[1])).ok, true);
+  assert.equal((await store.writeChunk(again.sessionId, 2, chunks[2])).ok, true);
+  await store.close(again.sessionId);
+  const saved = path.join(keptDir, 'movie.mkv');
+  assert.equal(reloaded.findFile(manifest.fileId)?.entry.path, saved, '收完挪成正式片名');
+  assert.equal(reloaded.findFile(manifest.fileId).entry.partial, undefined);
+  assert.equal(reloaded.persistent.filter((e) => e.fileId === manifest.fileId).length, 1, '工作目录那条换成正式的，不留两条');
+  assert.equal(fs.existsSync(path.join(keptDir, WORK_DIR)), false, '工作目录撤了');
+});
+
+test('手动模式：复用来的收完的副本坏了一片，关会话不删、改记成没收完，补上那一片就完整了', async (t) => {
   const { library } = await setup(t, { mode: 'manual' });
   const chunks = makeChunks();
   const manifest = manifestFor('movie.mkv', chunks);
-  const partial = await store.openLeech(manifest);
-  await store.writeChunk(partial.sessionId, 0, chunks[0]);
-  await store.close(partial.sessionId);
-  assert.equal(fs.existsSync(partial.filePath), false, '新建的、没收完的删掉');
-  assert.equal(fs.existsSync(path.dirname(partial.filePath)), false, '工作目录一起删');
-  assert.equal(fs.existsSync(path.dirname(path.dirname(partial.filePath))), false, '外层的 .noxreel-downloading 空了也删（E4-F）');
-
   const first = await store.openLeech(manifest);
   await receiveAll(first, chunks);
   await store.close(first.sessionId);
@@ -296,7 +352,7 @@ test('手动模式：没收完的新文件关会话就删；复用来的没收�
   assert.equal(reused.haveCount, chunks.length - 1, '坏掉的那一片不算，其余照用');
   await store.close(reused.sessionId);
   assert.equal(fs.existsSync(full.filePath), true, '复用来的没收完不删');
-  assert.ok(library.findFile(manifest.fileId), '登记还在');
+  assert.equal(library.findFile(manifest.fileId)?.entry.partial, true, '登记还在，改记成没收完');
 
   // 补上坏的那一片就完整了
   const again = await store.openLeech(manifest);
@@ -320,7 +376,41 @@ test('复用的文件一片都对不上：不用它、登记作废，但不删�
   assert.notEqual(state.filePath, full.filePath, '另起新文件接收');
   assert.equal(state.haveCount, 0);
   assert.equal(fs.existsSync(full.filePath), true, '那是用户现在的文件，不碰');
-  assert.equal(library.findFile(manifest.fileId), null, '旧登记作废');
+  const found = library.findFile(manifest.fileId);
+  assert.notEqual(found?.entry.path, full.filePath, '旧登记作废');
+  assert.equal(found?.entry.path, state.filePath, '新开的接收照常登记成没收完（断点续传）');
+  assert.equal(found.entry.partial, true);
+});
+
+test('启动时回收工作目录残留：登记着的没收完的片留着，别的（在线视频的半截文件等）照旧清掉', async (t) => {
+  const { LinkCache } = require('../src/main/linkCache');
+  const root = await tempDir(t, 'noxreel-leftover-');
+  const work = path.join(root, WORK_DIR);
+  for (const name of ['keep1', 'junk1']) {
+    await fsp.mkdir(path.join(work, name), { recursive: true });
+    await fsp.writeFile(path.join(work, name, 'a.mkv'), 'x');
+  }
+  const other = await tempDir(t, 'noxreel-leftover-dl-');
+  await fsp.mkdir(path.join(other, WORK_DIR, 'z'), { recursive: true });
+  const cache = Object.create(LinkCache.prototype);
+  await cache.cleanupLeftovers([root, other], { keep: [path.join(work, 'keep1')] });
+  assert.deepEqual(fs.readdirSync(work), ['keep1']);
+  assert.equal(fs.existsSync(path.join(other, WORK_DIR)), false, '没有要留的就整个删');
+});
+
+test('核对没收完的片：空洞（全是 0）不算对上；本来就全是 0 的片照样对得上', async (t) => {
+  const { library } = await setup(t);
+  const chunks = makeChunks();
+  chunks[1] = Buffer.alloc(store.CHUNK_SIZE, 0); // 这一片的内容本来就是全 0
+  const manifest = manifestFor('zeros.mkv', chunks);
+  const state = await store.openLeech(manifest);
+  await store.writeChunk(state.sessionId, 0, chunks[0]);
+  await store.close(state.sessionId);
+  assert.equal(library.findFile(manifest.fileId)?.entry.partial, true);
+  const again = await store.openLeech(manifest);
+  // 第 1 片在盘上是空洞，读出来是 0 —— 和清单里「全 0」的哈希一致，算对上；第 2 片（最后一片）不是全 0，空洞对不上
+  assert.equal(again.haveCount, 2);
+  assert.equal(store.state(again.sessionId).complete, false);
 });
 
 /* ------------------------------ 登记表 ------------------------------ */

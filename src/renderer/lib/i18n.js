@@ -327,6 +327,30 @@ const EN = new Map(Object.entries({
   '音量': 'Volume',
   '已静音': 'Muted',
   '倍速': 'Speed',
+  // 共享标记、表情反应、本机字幕
+  '标记': 'Mark',
+  '标记这一刻：大家的进度条上都看得到，可以写一句（播放器里按 K，Shift+K 先写一句）':
+    'Mark this moment: everyone sees it on their seek bar, and you can add a note (K in the player; Shift+K to add a note first)',
+  '点一下跳到这里': 'Click to jump here',
+  '右键删掉': 'Right-click to delete',
+  '标记得太快了，过几秒再标': 'Marking too fast; try again in a few seconds',
+  '写一句（可以不写）': 'Add a note (optional)',
+  '比如：这里好笑': 'e.g. this part is hilarious',
+  '大家的进度条上都看得到这个标记，房主和管理员点一下就能跳过来。':
+    'Everyone sees this mark on their seek bar, and the host and moderators can click it to jump here.',
+  '加载本机字幕…': 'Load a subtitle file…',
+  '发表情': 'Send a reaction',
+  '标记这一刻': 'Mark this moment',
+  '标记这一刻并写一句': 'Mark this moment with a note',
+  '不是文件': 'Not a file',
+  '字幕文件大小不对': 'The subtitle file size is not valid',
+  '认不出字幕的文字编码': 'Could not detect the subtitle text encoding',
+  // 接着看（上次看到哪）
+  '接着看': 'Resume',
+  '从头看': 'Start over',
+  '只能给正在放的这一部定起播点': 'The start point can only be set for the current video',
+  '已经开播了，直接拖进度条吧': 'Playback has already started; drag the seek bar instead',
+  '起播点超过了片长': 'The start point is past the end of the video',
   // 成员表：同步目标、转让房主
   '同步目标': 'Sync target',
   '设为同步目标': 'Make sync target',
@@ -509,6 +533,7 @@ const EN = new Map(Object.entries({
   '长期缓存': 'Long-term cache',
   '临时缓存': 'Temporary cache',
   '正在用': 'In use',
+  '没收完': 'Unfinished',
   '暂不可用（所在的盘不在）': 'Unavailable for now (its drive is not connected)',
   '还没有缓存文件': 'No cached files yet',
   '只列出本软件存下的片子，删的也只是这些；正在用的删不了。':
@@ -1102,8 +1127,10 @@ const EN = new Map(Object.entries({
   // 顶栏「离开房间」的确认：有没收完的接收，或者自己是房主而房里还有人
   '要离开房间吗？': 'Leave the room?',
   '这几部片还没收完：': 'These videos have not finished transferring:',
-  '离开后接收就停了。没有断点续传：没收完的片一般不会保留，下次进房要重新下载。':
-    'Leaving stops the transfer. There is no resume: unfinished videos are usually not kept, so you will have to download them again next time.',
+  '离开后接收就停了。收到的部分会留着，下次放同一部片接着收。':
+    'Leaving stops the transfer. What you have received is kept, and the transfer resumes the next time the same video plays.',
+  '离开后接收就停了。收到的部分留到关掉 NoxReel 为止，这之前再放同一部片会接着收；想关掉软件也留着，在设置里把缓存清理方式改成「手动」。':
+    'Leaving stops the transfer. What you have received is kept until you close NoxReel, and the transfer resumes if the same video plays before then. To keep it after closing the app, set the cache cleanup mode to “Manual” in Settings.',
   '他们都是经一对一邀请连到你这里的：你一走，所有人一起断开，这一场就结束了。':
     'They are all connected to you through one-to-one invites: once you leave, everyone is disconnected and this session ends.',
   '你一走这一场就没有房主了：播放列表停止更新，经一对一邀请进来的人会直接断开。':
@@ -1225,6 +1252,18 @@ const EN_PATTERNS = [
     /^和(.+?)差了 ([\d.]+) 秒，自动对齐$/,
     (_all, ref, n) => `${n} seconds off from ${syncRefEn(ref)}; realigned automatically`,
   ],
+  // 共享标记、表情反应、本机字幕（「你」开头的要排在「某人」前面）
+  [/^你标记了 ([\d:]+)(?:：(.*))?$/, (_all, at, note) => `You marked ${at}${note ? `: ${note}` : ''}`],
+  [/^(.+?)标记了 ([\d:]+)(?:：(.*))?$/, (_all, who, at, note) => `${who} marked ${at}${note ? `: ${note}` : ''}`],
+  [/^已标记 ([\d:]+)$/, 'Marked $1'],
+  [/^删掉了 ([\d:]+) 的标记$/, 'Deleted the mark at $1'],
+  [/^标记 ([\d:]+)$/, 'Mark $1'],
+  [/^发个表情（播放器里按 (\d)）$/, 'Send a reaction (press $1 in the player)'],
+  [/^已加载本机字幕：(.+)（只影响你自己）$/, 'Loaded subtitle file $1 (only for you)'],
+  [/^字幕用不了：(.+)$/, (_all, detail) => `Cannot use this subtitle: ${translate(detail, 'en')}`],
+  // 接着看
+  [/^这一部你上次看到 ([\d:]+)$/, 'You last watched this up to $1'],
+  [/^从 ([\d:]+) 接着看$/, 'Resume from $1'],
   // 同步目标、转让房主
   [/^同步到 (.+)$/, 'Sync to $1'],
   [/^已同步到 (.+) 的进度$/, 'Synced to $1'],
@@ -1587,6 +1626,10 @@ const EN_PATTERNS = [
   ],
   [/^本机的《(.+)》有 (\d+)\/(\d+) 片对得上，其余照常接收$/, '$2/$3 chunks of “$1” on this computer match; receiving the rest as usual'],
   [/^本机的《(.+)》和这一部对不上，重新接收$/, '“$1” on this computer does not match this video; receiving it again'],
+  // 断点续传
+  [/^《(.+)》上次收了一部分，正在核对…$/, 'Part of “$1” was received last time, checking it…'],
+  [/^《(.+)》上次收的部分和这一部对不上，重新接收$/, 'What was received of “$1” last time does not match this video; receiving it again'],
+  [/^接着上次的收《(.+)》：已有 (\d+)%，其余照常接收$/, 'Resuming “$1”: $2% already here, receiving the rest as usual'],
   // 在线视频的手动缓存
   [/^缓存中 (.+)$/, 'Caching $1'],
   [/^下载中 (.+)$/, 'Downloading $1'],

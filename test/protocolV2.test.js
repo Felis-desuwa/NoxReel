@@ -102,8 +102,11 @@ impl('v2 的版本号、帧头长度和新消息类型的线上字符串', async
   const values = Object.values(P.MSG);
   assert.equal(new Set(values).size, values.length);
 
-  // 只有这两类会大到需要分段；别的类型拼出来一律丢，免得绕过各自的校验
-  assert.deepEqual([...P.PART_INNER_TYPES].sort(), ['chat-history', 'playlist']);
+  // 只有这几类会大到需要分段（房主给新人的整张标记表也是）；别的类型拼出来一律丢，免得绕过各自的校验
+  assert.deepEqual([...P.PART_INNER_TYPES].sort(), ['chat-history', 'marks', 'playlist']);
+  assert.equal(P.MSG.MARK, 'mark');
+  assert.equal(P.MSG.REACT, 'react');
+  assert.equal(P.MSG.MARKS, 'marks');
   assert.equal(P.PART_CHARS, 45_000);
   assert.equal(P.PART_MAX_BYTES, MB);
   // 上限段数正好能装下 1MB 的 base64

@@ -131,6 +131,7 @@ const LINK_FNS = [
   'updateStripTone',
   'localReadyNow',
   'refreshNowLink',
+  'nowLinkOf',
 ];
 
 async function linkRoom({ peerId = 'victim-peer', inspect, isHost = false, paused = true, extraFns = [], extraGlobals = {}, sw = {} } = {}) {
@@ -186,6 +187,10 @@ async function linkRoom({ peerId = 'victim-peer', inspect, isHost = false, pause
     updatePresence: () => {}, // Discord 状态显示：这里不关心
     scheduleOscState: () => {}, // mpv 控制条：这里不关心
     forgetMpvOsc: () => {},
+    renderResumeOffer: () => {},
+    flushWatchProgress: () => {},
+    offerResume: () => {},
+    recordWatchProgress: () => {},
     // 在线链接和房主差多少秒：这里不关心（linkFollow.test.js 专门测）
     renderDrift: () => {},
     driftShown: () => false,

@@ -94,6 +94,11 @@ function fakeNative(extra = {}) {
       calls.push(['playerLoadUrl', url]);
       return fresh();
     },
+    // 分开音视频流的网站：一对直链
+    playerLoadSplit(videoUrl, videoHeaders, audioUrl, audioHeaders) {
+      calls.push(['playerLoadSplit', videoUrl, JSON.parse(videoHeaders), audioUrl, JSON.parse(audioHeaders)]);
+      return fresh();
+    },
     playerSetPause(paused) {
       calls.push(['setPause', paused]);
       if (!player) return;
@@ -1133,4 +1138,39 @@ test('新文案都有英文，带参数的几句翻得对', async () => {
     'Received 46% · 25.5 MB left before playback starts (around the current position) · ↓0 B/s'
   );
   assert.equal(translate('已收 66% · 距起播还差 8.0 MB · ↓0 B/s', 'en'), 'Received 66% · 8.0 MB left before playback starts · ↓0 B/s');
+});
+
+/* ================ 分开音视频流的网站（B 站）：房主给一对直链，手机合成一路播 ================ */
+
+test('在线链接只给分开的音视频流：房主给的一对直链交给原生层合成一路播，两条不同主机各问一次', async (t) => {
+  const phone = await roomPhone(t);
+  phone.send(playlistMsg({ rev: 1, seq: 1, queue: [linkItem(PAGE)] }));
+  await flush();
+  const video = { url: `${CDN}/v.m4s?sig=1`, headers: { referer: 'https://video.example.org/', 'x-evil': 'no' } };
+  const audio = { url: 'https://audio.example.org/a.m4s?sig=1', headers: { referer: 'https://video.example.org/' } };
+  phone.send({ t: 'now-link', seq: 1, playback: null, split: { video, audio }, resolvedAt: Date.now() });
+  await flush();
+  assert.equal(phone.$('status').textContent, '在线视频 · 等你允许连接这个网站');
+  phone.answerSite(true);
+  await flush();
+  // 音频在另一台主机上：再问一次
+  assert.equal(phone.nativeCalls('playerLoadSplit').length, 0);
+  phone.answerSite(true);
+  await flush();
+  const calls = phone.nativeCalls('playerLoadSplit');
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], ['playerLoadSplit', video.url, { referer: 'https://video.example.org/' }, audio.url, { referer: 'https://video.example.org/' }], '请求头只留那五种');
+  assert.equal(phone.nativeCalls('playerLoadUrl').length, 0);
+  assert.equal(phone.issueShown(), false);
+
+});
+
+test('一对直链里有一条不像样（不是 http(s)）：整对不要，照旧说没有直链', async (t) => {
+  const video = { url: `${CDN}/v.m4s?sig=1`, headers: {} };
+  const phone2 = await roomPhone(t);
+  phone2.send(playlistMsg({ rev: 1, seq: 1, queue: [linkItem(PAGE)] }));
+  await flush();
+  phone2.send({ t: 'now-link', seq: 1, playback: null, split: { video, audio: { url: 'file:///etc/passwd' } } });
+  await flush();
+  assert.equal(phone2.$('play-issue-text').textContent, '房主分享的是网页链接，但没有可供 Android 播放的安全直链');
 });

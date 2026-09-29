@@ -583,7 +583,12 @@ step(0.3, function()
   mp.commandv('keypress', 'c')
 end)
 step(0.3, function()
-  R.no_subs_toast = ass():find('这一部没有字幕', 1, true) ~= nil
+  -- 没有字幕也打开菜单：里面有「加载本机字幕…」
+  R.load_sub_item = ass():find('加载本机字幕…', 1, true) ~= nil
+  mp.commandv('keypress', 'ESC')
+end)
+step(0.3, function()
+  R.menu_closed = ass():find('加载本机字幕…', 1, true) == nil
   mp.commandv('keypress', 'b')
 end)
 step(0.3, function()
@@ -650,7 +655,11 @@ test('真 mpv：快捷键（点按 / 长按 →、Enter、↑↓、被去掉的�
     assert.equal(r.help_open, true, '? 打开快捷键一览');
     assert.equal(r.help_closed, true, 'Esc 关掉一览');
     assert.equal(r.fs_after_esc, false, '关一览的 Esc 没有顺带切全屏');
-    assert.equal(r.no_subs_toast, true, '没有字幕时按 C 说一声');
+    assert.equal(r.load_sub_item, true, '没有字幕时按 C 也打开菜单，能加载本机字幕');
+    assert.equal(r.menu_closed, true, 'Esc 关掉菜单');
+    // 1–8 在房间里是发表情（第几个，0 起）
+    assert.ok(r.msgs.includes('react 0'), r.msgs.join(' | '));
+    assert.ok(r.msgs.includes('react 3'));
     assert.equal(r.danmaku_toast, true, 'B 开关弹幕并提示');
     assert.ok(r.msgs.includes('danmaku'));
     assert.ok(r.guest_delta >= 0 && r.guest_delta < 2, '游客按 ← 不跳：' + r.guest_delta);

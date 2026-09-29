@@ -148,6 +148,10 @@ contextBridge.exposeInMainWorld('sw', {
     overlay: (text) => ipcRenderer.invoke('player:overlay', { text }),
     // mpv 控制条要画的房间状态（见 main.js 的 player:oscState）。外部播放器没有这一项，主进程静默忽略
     oscState: (state) => ipcRenderer.invoke('player:oscState', state),
+    // 在 mpv 画面上飘一个表情反应（e 是第几个，name 是谁发的）
+    reaction: (e, name) => ipcRenderer.invoke('player:reaction', { e, name }),
+    // 成员自己加本机字幕：主进程开文件对话框，路径不经过页面
+    loadLocalSubtitle: () => ipcRenderer.invoke('player:loadLocalSubtitle'),
     // 一帧弹幕 {w, h, gen?, items:[{text, x, y, fontSize?, opacity?, outline?}]}。
     // resolve 成 true 表示真画出去了，false 表示这一帧被丢掉（上一帧在途、暂停跳转在途、
     // 播放器没开或者代际不对）。调用方每秒发 30 次，reject 一定要接住。

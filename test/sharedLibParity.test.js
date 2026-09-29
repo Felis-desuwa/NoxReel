@@ -22,6 +22,8 @@ const SHARED = [
   'playlist.js',
   'chat.js',
   'danmaku.js',
+  // 共享标记和表情反应
+  'moments.js',
   // 房间链接（安卓也能用了）和 Cloudflare TURN 的用量计量
   'relaySignaling.js',
   'third_party/secp256k1.js',

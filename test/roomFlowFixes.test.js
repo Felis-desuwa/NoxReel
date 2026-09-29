@@ -216,6 +216,10 @@ async function makeRoom({ fns, stubs = {}, sync } = {}) {
     playerGate: new PlayerGate(),
     lastMpvBanner: '',
     forgetMpvOsc: noop, // mpv 控制条的去重缓存另有测试（mpvOsc.test.js）
+    renderResumeOffer: () => {},
+    flushWatchProgress: () => {},
+    offerResume: () => {},
+    recordWatchProgress: () => {},
     lastOscJson: '',
     roomEntered: true,
     scanningSession: null,

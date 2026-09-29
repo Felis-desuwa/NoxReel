@@ -81,6 +81,10 @@ test('只给分开音视频流的网站（B 站）：一次解析就拿到标题
   assert.equal(info.url, 'https://www.bilibili.com/video/BV1XPaY6hEes/', '桌面端交给 mpv 的还是网页地址');
   assert.equal(info.playback, null, '没有一条能单独播放的地址：不能把没声音的视频流当播放地址发给成员');
   assert.equal(info.split, true);
+  // 给安卓成员的一对直链（ExoPlayer 自己合），带上顶层的请求头（格式自己没带）
+  assert.equal(info.splitPlayback.video.url, 'https://upos.bilivideo.com/v.m4s');
+  assert.equal(info.splitPlayback.audio.url, 'https://upos.bilivideo.com/a.m4s');
+  assert.equal(info.splitPlayback.video.headers.referer, 'https://www.bilibili.com/');
 });
 
 test('音画合一的照旧给出播放地址、不标 split；网站不认的照旧换解析方式，最后退到隔离浏览器', async () => {

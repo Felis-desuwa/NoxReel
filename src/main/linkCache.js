@@ -203,10 +203,25 @@ class LinkCache extends EventEmitter {
     this.running = 0;
   }
 
-  /** 上次没下完就退出留下的半截文件（只认我们自己那个子目录名）。启动时清一次。 */
-  async cleanupLeftovers(dirs) {
+  /**
+   * 上次没下完就退出留下的半截文件（只认我们自己那个子目录名）。启动时清一次。
+   * keep：登记着的没收完的片（断点续传，见 mediaLibrary）所在的工作目录，留着下次接着收。
+   */
+  async cleanupLeftovers(dirs, { keep = [] } = {}) {
+    const key = (p) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
+    const kept = new Set(keep.map(key));
     for (const dir of dirs) {
-      if (dir) await fsp.rm(path.join(dir, WORK_DIR), { recursive: true, force: true }).catch(() => {});
+      if (!dir) continue;
+      const root = path.join(dir, WORK_DIR);
+      if (![...kept].some((k) => key(path.dirname(k)) === key(root))) {
+        await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
+        continue;
+      }
+      const names = await fsp.readdir(root).catch(() => []);
+      for (const name of names) {
+        const child = path.join(root, name);
+        if (!kept.has(key(child))) await fsp.rm(child, { recursive: true, force: true }).catch(() => {});
+      }
     }
   }
 

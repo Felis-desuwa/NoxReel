@@ -59,6 +59,13 @@ export const MSG = {
   // 转让房主之后，成员向新房主要一份现状（播放列表、在线视频地址、聊天历史）：{}。
   // 新人经原房主进房时，新房主那份列表先到、被当成不是房主发的丢了，认下新房主后靠它补上
   HOST_SYNC: 'host-sync',
+  // 共享标记（「标记这一刻」，大家的进度条上都看得到）：{ id, item, pos, note, ts, origin?, originName? }；
+  // 删除是 { id, del: 被删的那个标记的 id }。表情反应：{ id, e: 第几个表情, ts, origin?, originName? }。
+  // 和聊天一样发给所有连接、房主再转一遍（见 lib/moments.js）。房主给新人的整张标记表：{ items: [...] }。
+  // 老版本不认这几个类型，直接忽略
+  MARK: 'mark',
+  REACT: 'react',
+  MARKS: 'marks',
 };
 
 /**
@@ -267,7 +274,7 @@ export const PART_CHARS = 45_000;
 export const PART_MAX_BYTES = 1024 * 1024;
 export const PART_MAX_COUNT = Math.ceil(Math.ceil(PART_MAX_BYTES / 3) * 4 / PART_CHARS);
 /** 拼出来之后允许派发的内层消息。其余类型一律丢弃，免得绕过各自的校验。 */
-export const PART_INNER_TYPES = new Set([MSG.PLAYLIST, MSG.CHAT_HISTORY]);
+export const PART_INNER_TYPES = new Set([MSG.PLAYLIST, MSG.CHAT_HISTORY, MSG.MARKS]);
 
 function bytesToBase64(bytes) {
   let bin = '';

@@ -412,7 +412,7 @@ test('释放也占一个代号：release 落地前的快照不会被当成新播
 
 /* --------------------- 换片竞态：Kotlin 侧的位置关系 --------------------- */
 
-for (const name of ['load', 'loadRemote', 'release']) {
+for (const name of ['load', 'loadRemote', 'loadRemoteSplit', 'release']) {
   test(`${name}() 先同步分配代号再 post，并把代号返回给 JS`, () => {
     const fn = kotlinFun(playerSrc, name);
     assert.ok(fn, `SyncPlayer.kt 里没有 ${name}`);
@@ -520,9 +520,16 @@ test('playerLoadUrl / playerRelease 也返回代号，失败给 0', () => {
   const loadUrl = kotlinFun(bridgeSrc, 'playerLoadUrl');
   const lines = loadUrl.body.split('\n').map((s) => s.trim()).filter(Boolean);
   assert.ok(
-    lines.includes('player.loadRemote(url, headers)'),
+    lines.includes('player.loadRemote(url, parseHeaders(headersJson))'),
     'try 块的值不再是 loadRemote 的代号'
   );
+  // 分开音视频流的网站（B 站）：一对直链，同样返回代号、失败给 0，两条都过同一道检查
+  assert.match(bridgeSrc, /fun playerLoadSplit\(videoUrl: String, videoHeadersJson: String, audioUrl: String, audioHeadersJson: String\): Int/);
+  const split = kotlinFun(bridgeSrc, 'playerLoadSplit');
+  assert.match(split.body, /requirePublicHttpUrl\(videoUrl\)/);
+  assert.match(split.body, /requirePublicHttpUrl\(audioUrl\)/);
+  assert.match(split.body, /player\.loadRemoteSplit\(video, parseHeaders\(videoHeadersJson\), audio, parseHeaders\(audioHeadersJson\)\)/);
+  assert.match(split.body, /catch[\s\S]*\n\s*0\s*\n/);
   assert.ok(
     !/\b(true|false)\b/.test(loadUrl.body),
     'playerLoadUrl 还在返回布尔值：JS 拿不到代号'

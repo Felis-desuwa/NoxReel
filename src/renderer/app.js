@@ -6,6 +6,8 @@ import { encodeCode, decodeCode, shareLink, WsSignaling, randomRoomId, randomPee
 import { RelaySignaling, DEFAULT_RELAYS, newRoomSecret } from './lib/relaySignaling.js';
 import { currentLocale, setLocale, startI18n, translate as t } from './lib/i18n.js';
 import { haveRanges } from './lib/oscState.js';
+import { WatchProgress, progressKey } from './lib/watchProgress.js';
+import { MarkBook, MomentGate, REACTIONS, createMark, createReaction, createUnmark } from './lib/moments.js';
 import {
   applyOp,
   catalogOf,
@@ -129,7 +131,17 @@ function sentenceGap(prev, next) {
 
 const S = {
   peerId: randomPeerId(),
-  name: (localStorage.getItem('sw.name') || t(`观众-${randomInt(100, 999)}`)).slice(0, 40),
+  // 没起过昵称的人随机给一个，并且记下来：离开房间会刷新页面，不记的话再进来就换了个名字，
+  // 房里的人看到的是「观众-570 断开了 / 观众-764 加入了房间」，认不出是同一个人
+  name: (() => {
+    const saved = localStorage.getItem('sw.name');
+    if (saved) return saved.slice(0, 40);
+    const picked = t(`观众-${randomInt(100, 999)}`).slice(0, 40);
+    try {
+      localStorage.setItem('sw.name', picked);
+    } catch {}
+    return picked;
+  })(),
   mode: null, // 'manual' | 'server'
   // 有信令时走哪种传输：'ws' 自建信令服务器，'relay' 房间链接（公共 Nostr 中继）
   signalTransport: null,
@@ -252,6 +264,13 @@ const S = {
      * 换片、进出房、谁按了暂停这几个路口散在整个文件里，从 S 出发才能把「聊天相关的一切」找齐。
      */
     note: (text) => chatSystem(text),
+  },
+  // 共享标记和表情反应（见 lib/moments.js）：gate 是收端闸门（去重、限速、采信身份），
+  // book 是这个房间里大家标过的地方（按列表项分开，只在房间里，不落盘）
+  moments: {
+    gate: new MomentGate(),
+    book: new MarkBook(),
+    version: 0,
   },
   // 本机弹幕设置（开关、不透明度、字号、速度、显示区域），存 localStorage，只影响自己
   danmakuSettings: loadDanmakuSettings(),
@@ -2203,8 +2222,10 @@ function armAutoStart(op, before, after) {
   // 放完 A、B 上膛等人期间把 B 移除或把别的片拖到首位会白白卸膛；而开房后第一部还没开播就
   // 「跳过这一部」，反倒会把第二部上膛。
   const live = before.started || S.autoStartSeq === before.seq;
+  // 「接着看」只是给同一部换了起播点：上了膛的照样上膛，没上膛的照样等人手动开始
   const arm =
     op.type === 'playNow' ||
+    (live && op.type === 'resume') ||
     (live && after.autoplay && (op.type === 'ended' || op.type === 'remove' || op.type === 'move'));
   S.autoStartSeq = arm && after.queue.length ? after.seq : null;
   S.autoStartReason = S.autoStartSeq === null ? null : op.type === 'playNow' ? 'playNow' : 'auto';
@@ -2354,8 +2375,11 @@ async function switchCurrent(item) {
   // 刚放过的那部记个时间：磁盘不够时先清最久没放的
   const previous = currentSession();
   if (previous) previous.lastPlayedAt = Date.now();
+  // 上一部看到哪了先落盘
+  flushWatchProgress();
   S.currentSeq = seq;
   S.current = item;
+  offerResume(item);
   S.switchingMedia = true;
   $('btn-playpause').disabled = true;
   $('btn-reopen')?.classList.add('hidden');
@@ -4554,6 +4578,22 @@ function skipLinkItem(item) {
  * 房主：兜底地址放久了就重新解析一份发出去。晚到的成员拿到的是一小时前的签名地址，
  * 自己又解析不了（Android 根本不解析）时就没得放了。同一条链接同时只跑一次。
  */
+/**
+ * 发给成员的这一部的播放地址。分开音视频流的网站（B 站）没有 playback，另带一对直链 split
+ * （视频、音频各一条，安卓的 ExoPlayer 自己合；桌面成员用网页地址交给 mpv，用不上）。
+ * 老版本的成员不认 split，照旧只看 playback。
+ */
+function nowLinkOf(seq, info, resolvedAt) {
+  const sp = info?.splitPlayback;
+  const track = (x) => ({ url: x.url, headers: x.headers || {} });
+  return {
+    seq,
+    playback: info?.playback || null,
+    ...(sp?.video?.url && sp?.audio?.url ? { split: { video: track(sp.video), audio: track(sp.audio) } } : {}),
+    resolvedAt,
+  };
+}
+
 function refreshNowLink() {
   if (!isRoomHost() || !S.nowLink || S.nowLink.seq !== S.playlist.seq) return;
   if (Date.now() - (S.nowLink.resolvedAt || 0) <= LINK_INFO_TTL_MS) return;
@@ -4569,7 +4609,7 @@ function refreshNowLink() {
       const resolvedAt = info.resolvedAt || Date.now();
       S.links.set(key, { ...info, resolvedAt });
       if (!isRoomHost() || S.playlist.seq !== seq) return;
-      S.nowLink = { seq, playback: info.playback || null, resolvedAt };
+      S.nowLink = nowLinkOf(seq, info, resolvedAt);
       for (const p of S.swarm.peers.values()) {
         if (p.authenticated) p.send({ t: MSG.NOW_LINK, ...S.nowLink });
       }
@@ -4894,7 +4934,7 @@ async function useLinkInfo(item, info, seq) {
   S.filePath = /^https?:\/\//i.test(captured || '') ? captured : S.linkInfo.url;
   if (isRoomHost()) {
     // 解析时间要跟着发：晚到的成员据此判断这条签名地址是不是已经过期（见 linkFallback）
-    S.nowLink = { seq, playback: info.playback || null, resolvedAt: info.resolvedAt || Date.now() };
+    S.nowLink = nowLinkOf(seq, info, info.resolvedAt || Date.now());
     for (const p of S.swarm.peers.values()) {
       if (p.authenticated) p.send({ t: MSG.NOW_LINK, ...S.nowLink });
     }
@@ -5264,6 +5304,13 @@ function onRoomCtrl(msg, peer) {
       break;
     case MSG.CHAT_HISTORY:
       onChatHistory(msg, peer);
+      break;
+    case MSG.MARK:
+    case MSG.REACT:
+      onMomentMessage(msg, peer);
+      break;
+    case MSG.MARKS:
+      onMarksSnapshot(msg, peer);
       break;
     case MSG.HOST_SYNC:
       // 刚改认我当房主的人要一份现状（见 onHostChanged）。每人每 10 秒最多回一次，不然谁都能让我反复整包发列表
@@ -5662,6 +5709,233 @@ function onChatMessage(msg, peer) {
   for (const p of chatPeers()) p.send(wire);
 }
 
+/* --------------------------- 共享标记、表情反应 --------------------------- */
+// 线缆上和聊天一个走法（lib/moments.js）：发给所有连接，房主再转一遍、带上 origin，网状房间里按 id 去重。
+// 标记挂在列表的那一项上，大家的进度条上都看得到（房间窗口和 mpv 控制条），控制者点一下跳过去；
+// 本人和控制者能删。表情只是飘一下：房间窗口的聊天栏上、mpv 画面右下角。
+
+/** 列表里现在有的项（队列和已播放区）。 */
+function playlistItemIds() {
+  return new Set([...(S.playlist?.queue || []), ...(S.playlist?.history || [])].map((it) => it.id));
+}
+
+/** 正在放的这一部上的标记（按位置排好）。 */
+function currentMarks() {
+  return S.current ? S.moments.book.list(S.current.id) : [];
+}
+
+function marksChanged() {
+  S.moments.version++;
+  renderMarks();
+  scheduleOscState();
+}
+
+/** 聊天栏里的那一行（也用作 mpv 里的提示）。备注是用户写的，原样带上。 */
+function markLine(name, pos, note) {
+  return `${name}标记了 ${fmtTime(pos)}${note ? `：${note}` : ''}`;
+}
+
+/** 本人或控制者才能删一个标记。 */
+function canRemoveMark(mark, actor) {
+  return !!mark && (mark.origin === actor || !!S.sync?.isController?.(actor));
+}
+
+/**
+ * 标记这一刻。position 默认是房间现在放到哪（播放器里按 K 时带着按下那一刻的位置）；note 可以空。
+ * @returns {boolean} 标上了没有
+ */
+function sendMark({ position = null, note = '' } = {}) {
+  const item = S.current;
+  if (!item || !roomEntered || !S.moments) return false;
+  const pos = Number.isFinite(position) ? position : roomPositionSec();
+  const wire = createMark({ item: item.id, pos, note });
+  if (!wire) return false;
+  if (!S.moments.gate.allowOwn('mark', S.peerId)) {
+    const tooFast = '标记得太快了，过几秒再标';
+    log(tooFast, 'warn');
+    if (S.mpvRunning) window.sw.player.osd(t(tooFast), 2000);
+    return false;
+  }
+  S.moments.gate.remember(wire.id);
+  S.moments.book.add({ ...wire, origin: S.peerId, name: S.name });
+  const out = isRoomHost() ? { ...wire, origin: S.peerId, originName: S.name } : wire;
+  for (const p of chatPeers()) p.send(out);
+  chatSystem(markLine('你', wire.pos, wire.note));
+  if (S.mpvRunning) window.sw.player.osd(t(`已标记 ${fmtTime(wire.pos)}`), 1500, 'ok');
+  marksChanged();
+  return true;
+}
+
+function removeMark(id) {
+  const mark = S.moments.book.get(id);
+  if (!canRemoveMark(mark, S.peerId)) return false;
+  const wire = createUnmark(id);
+  if (!wire) return false;
+  S.moments.gate.remember(wire.id);
+  S.moments.book.remove(id);
+  const out = isRoomHost() ? { ...wire, origin: S.peerId, originName: S.name } : wire;
+  for (const p of chatPeers()) p.send(out);
+  log(`删掉了 ${fmtTime(mark.pos)} 的标记`);
+  marksChanged();
+  return true;
+}
+
+/** 发一个表情反应（第几个）。发得太快的连自己这边也不飘（别人那边反正会丢）。 */
+function sendReaction(e) {
+  if (!roomEntered || !S.moments) return false;
+  const wire = createReaction(e);
+  if (!wire || !S.moments.gate.allowOwn('react', S.peerId)) return false;
+  S.moments.gate.remember(wire.id);
+  const out = isRoomHost() ? { ...wire, origin: S.peerId, originName: S.name } : wire;
+  for (const p of chatPeers()) p.send(out);
+  showReaction(e, S.name);
+  return true;
+}
+
+/** 飘一个表情：房间窗口的聊天栏上一个，mpv 画面上一个（外部播放器画不了，主进程那边静默忽略）。 */
+function showReaction(e, name) {
+  floatReaction(e, name);
+  if (S.mpvRunning) window.sw.player.reaction(e, name)?.catch?.(() => {});
+}
+
+function floatReaction(e, name) {
+  const layer = $('reaction-float');
+  if (!layer || !REACTIONS[e]) return;
+  while (layer.children.length >= 12) layer.firstChild.remove();
+  const pop = make('div', { className: 'reaction-pop' }, [
+    make('span', { className: 'glyph', raw: true, text: REACTIONS[e] }),
+    make('span', { className: 'who', raw: true, text: name }),
+  ]);
+  pop.style.left = `${4 + ((layer.children.length * 23) % 44)}px`;
+  layer.append(pop);
+  setTimeout(() => pop.remove(), 2700);
+}
+
+/** 收到别人的标记、删标记、表情。身份以连接为准；只有房主转发来的才采信 origin。房主再转给其他人。 */
+function onMomentMessage(msg, peer) {
+  const res = S.moments.gate.accept(msg, {
+    senderId: peer.peerId,
+    senderName: peer.name,
+    hostId: S.hostId,
+    selfId: S.peerId,
+  });
+  if (!res.ok) return;
+  const v = res.value;
+  let relay = true;
+  if (res.kind === 'react') {
+    showReaction(v.e, v.name);
+  } else if (res.kind === 'mark') {
+    if (S.moments.book.add(v)) {
+      chatSystem(markLine(v.name, v.pos, v.note));
+      if (S.mpvRunning && S.current?.id === v.item) window.sw.player.osd(t(markLine(v.name, v.pos, v.note)), 2500);
+      marksChanged();
+    } else relay = false;
+  } else if (res.kind === 'unmark') {
+    const mark = S.moments.book.get(v.target);
+    // 只有标的人自己和控制者删得掉；别人删的不认，也不往外转
+    if (canRemoveMark(mark, v.origin)) {
+      S.moments.book.remove(v.target);
+      marksChanged();
+    } else relay = false;
+  }
+  if (!isRoomHost() || v.relayed || !relay) return;
+  const wire =
+    res.kind === 'react'
+      ? { t: MSG.REACT, id: v.id, e: v.e }
+      : res.kind === 'mark'
+      ? { t: MSG.MARK, id: v.id, item: v.item, pos: v.pos, note: v.note, ts: v.ts }
+      : { t: MSG.MARK, id: v.id, del: v.target };
+  for (const p of chatPeers([peer.peerId])) p.send({ ...wire, origin: v.origin, originName: v.name });
+}
+
+/** 房主给的整张标记表（进房时、改认新房主时）。只认房主。 */
+function onMarksSnapshot(msg, peer) {
+  if (!trustsRelay(peer.peerId, S.hostId) || !Array.isArray(msg.items)) return;
+  if (S.moments.book.load(msg.items)) marksChanged();
+}
+
+let marksKey = '';
+
+/** 房间窗口进度条上的标记。没变就不重画（renderProgress 每秒跑好几次）。 */
+function renderMarks() {
+  const box = $('buf-marks');
+  if (!box) return;
+  const markBtn = $('btn-mark');
+  if (markBtn) markBtn.disabled = !S.current;
+  const dur = S.sync?.duration || S.current?.durationSec || 0;
+  const marks = dur > 0 ? currentMarks() : [];
+  const control = !!S.sync?.canIControl?.();
+  const key = `${S.moments.version}|${S.current?.id || ''}|${Math.round(dur)}|${control ? 1 : 0}`;
+  if (key === marksKey) return;
+  marksKey = key;
+  replace(
+    box,
+    marks.map((m) => {
+      const lines = [`${fmtTime(m.pos)} · ${m.name}${m.note ? `：${m.note}` : ''}`];
+      if (control) lines.push(t('点一下跳到这里'));
+      if (canRemoveMark(m, S.peerId)) lines.push(t('右键删掉'));
+      const el = make('div', { className: 'buf-mark', attrs: { 'data-id': m.id, title: lines.join('\n') } });
+      el.style.left = `${Math.min(100, (m.pos / dur) * 100)}%`;
+      return el;
+    })
+  );
+}
+
+$('buf-marks').onclick = (e) => {
+  const el = e.target?.closest?.('.buf-mark');
+  if (!el) return;
+  // 别让外面进度条的点击再按鼠标位置跳一次
+  e.stopPropagation();
+  const mark = S.moments.book.get(el.dataset.id);
+  if (!mark) return;
+  if (!S.sync?.canIControl()) {
+    log('游客不能跳转进度', 'warn');
+    return;
+  }
+  S.sync.userSeek(mark.pos);
+};
+$('buf-marks').oncontextmenu = (e) => {
+  const el = e.target?.closest?.('.buf-mark');
+  if (!el) return;
+  e.preventDefault();
+  e.stopPropagation();
+  removeMark(el.dataset.id);
+};
+
+/** 房间窗口的「标记」按钮：写一句（可以不写），标在房间现在放到的地方。 */
+function openMarkModal() {
+  if (!S.current) return;
+  const pos = roomPositionSec();
+  const input = make('input', { attrs: { type: 'text', maxlength: 60, placeholder: t('比如：这里好笑') } });
+  openModal({
+    title: `标记 ${fmtTime(pos)}`,
+    body: [field('写一句（可以不写）', input), hint('大家的进度条上都看得到这个标记，房主和管理员点一下就能跳过来。')],
+    okText: '标记',
+    onOk: () => {
+      sendMark({ position: pos, note: input.value });
+      return true;
+    },
+  });
+  setTimeout(() => input.focus?.(), 0);
+}
+
+$('btn-mark').onclick = () => openMarkModal();
+
+/** 聊天栏上方那一排表情。 */
+function renderReactionBar() {
+  const bar = $('reaction-bar');
+  if (!bar || bar.childElementCount) return;
+  replace(
+    bar,
+    REACTIONS.map((glyph, i) => {
+      const b = make('button', { raw: true, text: glyph, attrs: { type: 'button', title: t(`发个表情（播放器里按 ${i + 1}）`) } });
+      b.onclick = () => sendReaction(i);
+      return b;
+    })
+  );
+}
+renderReactionBar();
+
 /** 自己那条被房主转回来了：「发送中」「未送达」改成「已送达」。 */
 function markChatDelivered(id) {
   clearTimeout(S.chat.acks.get(id));
@@ -6046,13 +6320,14 @@ async function useCachedLink(item, local, seq) {
     // （好让大家知道这一部开始了），解析时间记 0，refreshNowLink 看到就会在后台解析一份补发过去。
     // 缓存是本人点的，已经连过这个网站，再解析一次不用另问。
     const pre = cachedLinkInfo(item.url);
-    S.nowLink = pre?.playback
-      ? { seq, playback: pre.playback, resolvedAt: pre.resolvedAt || Date.now() }
-      : { seq, playback: null, resolvedAt: 0 };
+    S.nowLink =
+      pre?.playback || pre?.splitPlayback
+        ? nowLinkOf(seq, pre, pre.resolvedAt || Date.now())
+        : { seq, playback: null, resolvedAt: 0 };
     for (const p of S.swarm.peers.values()) {
       if (p.authenticated) p.send({ t: MSG.NOW_LINK, ...S.nowLink });
     }
-    if (!S.nowLink.playback) refreshNowLink();
+    if (!S.nowLink.playback && !S.nowLink.split) refreshNowLink();
   }
   updateLocalReady();
   await onLinkSessionReady();
@@ -8158,6 +8433,8 @@ function renderProgress(p) {
   if (!p) return;
   // 边收边播时 mpv 控制条的进度条上画「已收到」的几段（每收一片才变，见 oscRanges）
   scheduleOscState();
+  // 共享标记跟着片长和当前这一部走（没变就不重画）
+  renderMarks();
 
   if (S.sourceType === 'link') {
     $('buf-have').style.width = '100%';
@@ -8982,6 +9259,13 @@ const OSC_LABEL_TEXT = {
   hProgress: '看一眼进度',
   hHelp: '快捷键一览',
   hClose: '关闭播放器',
+  // 本机字幕、共享标记、表情反应
+  loadSub: '加载本机字幕…',
+  react: '发表情',
+  markTip: '点一下跳到这里',
+  hReact: '发表情',
+  hMark: '标记这一刻',
+  hMarkNote: '标记这一刻并写一句',
 };
 let oscLabelsCache = null;
 
@@ -9019,8 +9303,20 @@ function clipOscState(s) {
       options: s.quality.options.map((o) => ({ h: o.h, label: clipText(o.label, 40) })),
     };
   }
+  // 共享标记：最多 40 个（主进程 OSC_MAX_MARKS），每个的「谁：一句话」截到 120 字以内
+  if (s.marks) out.marks = s.marks.slice(0, OSC_MAX_MARKS).map((m) => ({ t: m.t, n: clipText(m.n, 120) }));
   out.labels = Object.fromEntries(Object.entries(s.labels || {}).map(([k, v]) => [k, clipText(v, 80)]));
   return out;
+}
+
+// mpv 控制条上最多画几个共享标记（和主进程 security.js 的 OSC_MAX_MARKS 一致）
+const OSC_MAX_MARKS = 40;
+
+/** 控制条进度条上的标记：正在放的这一部上的，按位置排好。「谁：一句话」。 */
+function oscMarks() {
+  const marks = currentMarks();
+  if (!marks.length) return undefined;
+  return marks.map((m) => ({ t: m.pos, n: m.note ? `${m.name}：${m.note}` : m.name }));
 }
 
 function oscLabels() {
@@ -9162,6 +9458,7 @@ function mpvOscState() {
     drift: oscDrift(),
     host: oscHost(st),
     quality: oscQuality(),
+    marks: oscMarks(),
     labels: oscLabels(),
   });
 }
@@ -9223,11 +9520,39 @@ window.sw.player.onOscAction?.((payload) => {
     }
     return;
   }
+  // 字幕菜单里的「加载本机字幕…」：不在房间里（单独开的播放器）也能用
+  if (action === 'load-sub') {
+    loadLocalSubtitle();
+    return;
+  }
   if (!roomEntered) return;
   if (action === 'danmaku') setDanmakuEnabled(S.danmakuSettings.enabled === false);
   // 正在换播放器（上一次换清晰度、换播放器还没完）：房间窗口里的下拉框这时是禁用的，这里同样不收
   else if (action === 'quality' && !S.switchingPlayer) setLinkQuality(payload.value);
+  // 1–8 键、控制条上的表情菜单
+  else if (action === 'react') sendReaction(payload.value);
+  // 按 K / Shift+K：位置是按下那一刻的
+  else if (action === 'mark') sendMark({ position: payload.position, note: payload.note || '' });
 });
+
+/** 成员自己加本机字幕（只影响自己）：主进程开文件对话框、交给 mpv。 */
+async function loadLocalSubtitle() {
+  let res;
+  try {
+    res = await window.sw.player.loadLocalSubtitle();
+  } catch (error) {
+    res = { ok: false, reason: 'invalid', message: error?.message || String(error) };
+  }
+  if (res?.ok) {
+    log(`已加载本机字幕：${res.name}（只影响你自己）`, 'good');
+    return;
+  }
+  if (res?.reason === 'invalid') {
+    const why = `字幕用不了：${res.message || '未知原因'}`;
+    log(why, 'warn');
+    window.sw.player.osd(t(why), 3000, 'warn');
+  }
+}
 
 /**
  * 房主面板：文件码率、上行带宽、当前上传，以及按码率算出的「最多能流畅供几个人」
@@ -9621,6 +9946,9 @@ function sendHostState(peer) {
   if (S.nowLink?.seq === S.playlist.seq) peer.send({ t: MSG.NOW_LINK, ...S.nowLink });
   refreshNowLink();
   S.swarm.sendLarge(peer, { t: MSG.CHAT_HISTORY, items: S.chat.history.snapshot() });
+  // 这个房间里大家标过的地方（列表里已经没有的项先摘掉）。一个都没有就不发
+  S.moments.book.retain(playlistItemIds());
+  if (S.moments.book.size) S.swarm.sendLarge(peer, { t: MSG.MARKS, items: S.moments.book.snapshot() });
 }
 
 /**
@@ -9665,7 +9993,7 @@ function takeOverAsHost() {
   }
   // 手机只认房主给的播放地址：本机解析出来的这一份发给大家（本地缓存的不算，那是本机的文件）
   if (S.sourceType === 'link' && S.linkInfo && !S.linkInfo.local && S.currentSeq === S.playlist.seq) {
-    S.nowLink = { seq: S.currentSeq, playback: S.linkInfo.playback || null, resolvedAt: S.linkInfo.resolvedAt || Date.now() };
+    S.nowLink = nowLinkOf(S.currentSeq, S.linkInfo, S.linkInfo.resolvedAt || Date.now());
     for (const p of S.swarm.peers.values()) {
       if (p.authenticated) p.send({ t: MSG.NOW_LINK, ...S.nowLink });
     }
@@ -9795,6 +10123,7 @@ function linkWaitText() {
 
 function renderStatus() {
   if (!S.sync) return;
+  renderResumeOffer();
   const st = S.sync.status();
   const banner = $('status-banner');
 
@@ -10147,6 +10476,7 @@ window.sw.player.onSyncRequest?.(() => syncToHost());
 // 在线链接：每秒核对一次和房主差多少。播放器静止时不推 tick，差距在变大只能靠这个看出来
 function driftTick() {
   if (!S.sync || !S.mpvRunning || S.switchingMedia) return;
+  recordWatchProgress();
   // 我是同步目标：报一下自己实际放到哪（引擎自己按间隔发）
   S.sync.beaconTick?.();
   // 在线链接一直核对；本地片子只在跟着同步目标时核对。
@@ -10157,6 +10487,85 @@ function driftTick() {
   scheduleOscState();
 }
 setInterval(driftTick, 1000);
+
+/* ------------------------------ 接着看 ------------------------------ */
+
+// 每部片上次看到哪，只存在本机（见 lib/watchProgress.js）。每台电脑都记自己看过的，问的只是房主
+let watchProgress = null;
+try {
+  watchProgress = new WatchProgress({ storage: window.localStorage });
+} catch {
+  watchProgress = new WatchProgress();
+}
+let watchFlushedAt = 0;
+const WATCH_FLUSH_MS = 15_000;
+
+/** 房间开播之后每秒记一次本机放到哪，隔一会儿落一次盘。 */
+function recordWatchProgress() {
+  const item = S.current;
+  if (!item || !S.playlist?.started || S.currentSeq !== S.playlist.seq) return;
+  const key = progressKey(item);
+  const pos = S.sync?.playerPositionNow?.();
+  if (!key || !Number.isFinite(pos) || pos <= 0) return;
+  watchProgress.record(key, { pos, dur: S.sync.duration || item.durationSec || 0, title: itemLabel(item) });
+  if (Date.now() - watchFlushedAt >= WATCH_FLUSH_MS) flushWatchProgress();
+}
+
+function flushWatchProgress() {
+  watchFlushedAt = Date.now();
+  watchProgress.flush();
+}
+
+/**
+ * 换上来的这一部房主上次看到哪了：还没开播、也还没定过起播点时问一句。
+ * 「接着看」在开播前是列表操作 resume（大家从那里重来一遍），开播之后就是一次跳转。
+ */
+function offerResume(item) {
+  S.resumeOffer = null;
+  if (!item || !isRoomHost() || item.resumeAt > 0 || S.playlist.started) return;
+  const key = progressKey(item);
+  const at = watchProgress.resumeFor(key, item.durationSec || 0);
+  if (!at) return;
+  S.resumeOffer = { seq: S.playlist.seq, id: item.id, at, seen: watchProgress.get(key).pos };
+}
+
+function renderResumeOffer() {
+  const offer = S.resumeOffer;
+  let show = !!offer && offer.seq === S.playlist.seq && S.current?.id === offer.id && isRoomHost();
+  // 开播之后已经放过了上次看到的地方（比如有人手动拖过去了）：不用再问
+  if (show && S.playlist.started && roomPositionSec() >= offer.at - 10) {
+    S.resumeOffer = null;
+    show = false;
+  }
+  $('resume-row').classList.toggle('hidden', !show);
+  $('btn-resume').classList.toggle('hidden', !show);
+  $('btn-resume-no').classList.toggle('hidden', !show);
+  if (!show) return;
+  $('resume-row').textContent = `这一部你上次看到 ${fmtTime(offer.seen)}`;
+  $('btn-resume').textContent = `从 ${fmtTime(offer.at)} 接着看`;
+}
+
+async function acceptResume() {
+  const offer = S.resumeOffer;
+  if (!offer || offer.seq !== S.playlist.seq || S.current?.id !== offer.id) return;
+  S.resumeOffer = null;
+  renderResumeOffer();
+  if (!S.playlist.started) {
+    const res = await runPlaylistOp({ type: 'resume', id: offer.id, at: offer.at });
+    if (res.ok) log(`从 ${fmtTime(offer.at)} 接着看`, 'good');
+    return;
+  }
+  // 已经开播了：就是一次跳转，全房跟着过去
+  if (!S.sync?.canIControl()) return;
+  S.sync.userSeek(offer.at);
+  log(`从 ${fmtTime(offer.at)} 接着看`, 'good');
+}
+
+$('btn-resume').onclick = () => acceptResume();
+$('btn-resume-no').onclick = () => {
+  S.resumeOffer = null;
+  renderResumeOffer();
+};
 
 /* ------------------------------ 播放器事件 ----------------------------- */
 
@@ -10282,9 +10691,19 @@ function mergeVerifiedChunks(e) {
 window.sw.store.onReuse?.((e) => {
   if (!e || typeof e.name !== 'string') return;
   mergeVerifiedChunks(e);
-  if (e.stage === 'start') log(`本机已有《${e.name}》，正在核对…`);
-  else if (e.stage === 'done') log(...reuseDoneLine(e));
+  // 上次没收完的（断点续传）：说法不一样，对不上的片是还没收到的，意料之中
+  if (e.stage === 'start') log(e.partial ? `《${e.name}》上次收了一部分，正在核对…` : `本机已有《${e.name}》，正在核对…`);
+  else if (e.stage === 'done') log(...(e.partial ? resumeDoneLine(e) : reuseDoneLine(e)));
 });
+
+/** 接着上次没收完的收：核对完的那一句。 */
+function resumeDoneLine(e) {
+  const fromPeer = Number(e.fromPeer) || 0;
+  const have = (Number(e.matched) || 0) + fromPeer;
+  if (!(e.matched > 0)) return [`《${e.name}》上次收的部分和这一部对不上，重新接收`, 'warn'];
+  const pct = Math.min(100, Math.floor((have / Math.max(1, e.total)) * 100));
+  return [`接着上次的收《${e.name}》：已有 ${pct}%，其余照常接收`, 'good'];
+}
 
 /**
  * 核对完的那一句。核对期间对端先送到的片（fromPeer）没核对，但也不是对不上：本机核对过的片全对得上，
@@ -10439,6 +10858,7 @@ $('btn-reveal').onclick = () => {
 
 async function leaveRoom() {
   S.leaving = true;
+  flushWatchProgress();
   // 还在算哈希、转封装的准备任务一并叫停，别让主进程白忙
   for (const job of [...S.prepJobs]) cancelPrepJob(job);
   // 取消只是发出一声招呼：主进程要读完手上这一片才知道，而转封装产物的回收、刚开的做种会话
@@ -10467,7 +10887,7 @@ async function leaveRoom() {
 
 /**
  * 离开会丢掉什么，一条一行；什么都不丢时是空的。
- * 两件事值得问一句：还有没收完的接收（离开会关会话，没收完的新文件删掉，没有断点续传），
+ * 两件事值得问一句：还有没收完的接收（离开会关会话，接收就停了；收到的部分留着下次接着收），
  * 以及自己是房主而房里还有人（一对一邀请都连在房主身上，房主一走这一场就散了）。
  */
 function leaveRoomLosses() {
@@ -10487,7 +10907,15 @@ function leaveRoomLosses() {
     lines.push(make('p', { text: '这几部片还没收完：' }));
     // 片名是房主那边来的，原样显示、不参与翻译
     for (const f of unfinished) lines.push(make('p', { raw: true, text: `《${f.name}》 ${pct(f.ratio)}` }));
-    lines.push(make('p', { text: '离开后接收就停了。没有断点续传：没收完的片一般不会保留，下次进房要重新下载。' }));
+    // 断点续传：收到的部分留着。自动清理方式下留到关掉软件为止（跟着本次运行的临时缓存走）
+    lines.push(
+      make('p', {
+        text:
+          S.cachePolicy?.mode === 'manual'
+            ? '离开后接收就停了。收到的部分会留着，下次放同一部片接着收。'
+            : '离开后接收就停了。收到的部分留到关掉 NoxReel 为止，这之前再放同一部片会接着收；想关掉软件也留着，在设置里把缓存清理方式改成「手动」。',
+      })
+    );
   }
   const others = connectedPeerCount();
   if (isRoomHost() && others > 0) {
@@ -10750,6 +11178,8 @@ function cachePolicyFields() {
       make('span', { className: 'cache-file-meta', text: file.kind === 'link' ? '在线视频' : 'P2P' }),
       make('span', { className: 'cache-file-meta', text: file.persistent ? '长期缓存' : '临时缓存' }),
       make('span', { className: 'cache-file-meta', text: fmtBytes(file.size) }),
+      // 断点续传留着的：下次放同一部片接着收
+      file.partial ? make('span', { className: 'cache-file-meta', text: '没收完' }) : null,
       file.inUse ? make('span', { className: 'cache-file-meta busy', text: '正在用' }) : null,
       unavailable ? make('span', { className: 'cache-file-meta busy', text: '暂不可用（所在的盘不在）' }) : null,
     ]);
@@ -11649,11 +12079,13 @@ $('modal-cancel').onclick = (e) => {
 
 window.addEventListener('resize', drawChunkMap);
 window.addEventListener('beforeunload', () => {
+  flushWatchProgress();
   S.signaling?.close();
   S.swarm?.destroy();
 });
 
 window.sw.app.onShutdownRequested(() => {
+  flushWatchProgress();
   S.signaling?.close();
   S.swarm?.destroy();
 });

@@ -13,6 +13,7 @@ import com.google.android.exoplayer2.source.ProgressiveMediaSource
 import com.google.android.exoplayer2.ui.StyledPlayerView
 import com.google.android.exoplayer2.source.DefaultMediaSourceFactory
 import com.google.android.exoplayer2.source.MediaSource
+import com.google.android.exoplayer2.source.MergingMediaSource
 import com.google.android.exoplayer2.upstream.HttpDataSource
 import java.util.concurrent.atomic.AtomicInteger
 import org.json.JSONObject
@@ -91,6 +92,29 @@ class SyncPlayer(private val context: Context) {
             val source = DefaultMediaSourceFactory(http)
                 .createMediaSource(MediaItem.fromUri(url))
             replacePlayer(source, generation)
+        }
+        return generation
+    }
+
+    /**
+     * 只给分开音视频流的网站（B 站全站是 DASH）：房主挑好一条视频、一条音频的直链，这里各自按整个文件读，
+     * 用 MergingMediaSource 合成一路播。两条的时长常差几十毫秒，按短的那条对齐（clipDurations）。
+     * 数据源同样是 [PublicHttpDataSource]，每条轨道带自己的请求头（B 站不带 Referer 就 403）。
+     * @return 这次换片的快照代号。
+     */
+    fun loadRemoteSplit(
+        videoUrl: String,
+        videoHeaders: Map<String, String>,
+        audioUrl: String,
+        audioHeaders: Map<String, String>,
+    ): Int {
+        val generation = generationSeq.incrementAndGet()
+        main.post {
+            val video = ProgressiveMediaSource.Factory(PublicHttpDataSource.Factory(videoHeaders))
+                .createMediaSource(MediaItem.fromUri(videoUrl))
+            val audio = ProgressiveMediaSource.Factory(PublicHttpDataSource.Factory(audioHeaders))
+                .createMediaSource(MediaItem.fromUri(audioUrl))
+            replacePlayer(MergingMediaSource(true, true, video, audio), generation)
         }
         return generation
     }

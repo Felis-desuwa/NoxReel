@@ -19,6 +19,11 @@
  *
  * 删除只删登记表里记着、而且大小还对得上的文件（大小变了说明已经不是我们存的那个），不凭名字删。
  *
+ * 没收完的片（partial）也登记（断点续传）：下次同一部片再来时照样拿来复用，逐片核对，对得上的不再下。
+ * 手动模式下它在长期缓存文件夹的工作目录（.noxreel-downloading/<号>/）里，开会话时就登记 ——
+ * 关机、崩溃、断电时关会话那一步跑不到，事后登记就来不及了；启动时回收工作目录要避开这些。
+ * 同一部片既有收完的又有没收完的，复用收完的。
+ *
  * 登记只在「确认文件真没了」时才摘（见 locateFile）：缓存放在移动硬盘上、这次开机没插，
  * 整个盘访问不了的时候判断不了文件在不在，登记留着、标成「暂不可用」。摘掉的话盘插回来，
  * 这些片既不复用、也不在手动清理里出现，只能去资源管理器里自己找出来删。
@@ -33,6 +38,8 @@ const VERSION = 1;
 // 登记表上限：手改的配置文件塞几十万条进来也不至于拖垮启动
 const MAX_ENTRIES = 5000;
 const ID_RE = /^[0-9a-f]{16}$/;
+// 和 linkCache.WORK_DIR 是同一个名字（这里不引 linkCache，免得循环依赖）
+const WORK_DIR_NAME = '.noxreel-downloading';
 const FILE_ID_RE = /^[0-9a-f]{16,128}$/;
 
 const pathKey = (p) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
@@ -87,6 +94,18 @@ async function reclaimableBytes(filePath) {
   }
 }
 
+/**
+ * 没收完的片删掉之后，它所在的工作目录（<长期缓存文件夹>/.noxreel-downloading/<号>/）空了就一起删，
+ * 外层也空了连外层一起删。只删空目录（rmdir），别的任务还在用、用户放了别的东西都删不掉。
+ */
+async function removeEmptyWorkDir(filePath) {
+  const work = path.dirname(filePath);
+  const parent = path.dirname(work);
+  if (path.basename(parent) !== WORK_DIR_NAME) return;
+  await fsp.rmdir(work).catch(() => {});
+  await fsp.rmdir(parent).catch(() => {});
+}
+
 /** 落盘的登记表是用户能手改的：一条条过一遍，认不出来的扔掉。 */
 function sanitizeEntries(raw) {
   if (!Array.isArray(raw)) return [];
@@ -110,6 +129,7 @@ function sanitizeEntries(raw) {
     if (e.kind === 'file') {
       if (typeof e.fileId !== 'string' || !FILE_ID_RE.test(e.fileId)) continue;
       entry.fileId = e.fileId;
+      if (e.partial === true) entry.partial = true;
     } else {
       if (typeof e.url !== 'string' || !/^https?:\/\//i.test(e.url)) continue;
       entry.url = e.url.slice(0, 8192);
@@ -167,13 +187,26 @@ class MediaLibrary {
 
   /* ------------------------------ 查 ------------------------------ */
 
-  /** 这部片（fileId）有没有收完的副本。临时的优先（就在本次运行的缓存里，最近用过）。正在删的不算。 */
+  /**
+   * 这部片（fileId）有没有副本。收完的优先于没收完的；同样收没收完，临时的优先（就在本次运行的缓存里，
+   * 最近用过）。正在删的不算。
+   */
   findFile(fileId) {
-    for (const entry of this.temp.values()) {
-      if (entry.fileId === fileId && !entry.removing) return { entry, persistent: false };
+    for (const partial of [false, true]) {
+      for (const entry of this.temp.values()) {
+        if (entry.fileId === fileId && !entry.removing && !!entry.partial === partial) return { entry, persistent: false };
+      }
+      const entry = this.persistent.find((e) => e.kind === 'file' && e.fileId === fileId && !!e.partial === partial);
+      if (entry) return { entry, persistent: true };
     }
-    const entry = this.persistent.find((e) => e.kind === 'file' && e.fileId === fileId);
-    return entry ? { entry, persistent: true } : null;
+    return null;
+  }
+
+  /** 登记着的没收完的片所在的工作目录（启动时回收残留要避开它们）。 */
+  partialWorkDirs() {
+    return this.persistent
+      .filter((e) => e.kind === 'file' && e.partial && path.basename(path.dirname(path.dirname(e.path))) === WORK_DIR_NAME)
+      .map((e) => path.dirname(e.path));
   }
 
   /** 这个链接有没有手动缓存好的副本（临时的优先）。正在删的不算。 */
@@ -216,15 +249,24 @@ class MediaLibrary {
       lastUsedAt: e.lastUsedAt,
       persistent,
       available: !unavailable.has(e),
+      partial: !!e.partial,
     });
     return [...this.persistent.map((e) => view(e, true)), ...[...this.temp.values()].map((e) => view(e, false))];
   }
 
   /* ------------------------------ 记 ------------------------------ */
 
-  /** 自动模式收完的片：只记在内存里，文件跟着运行目录走。 */
-  addTempFile({ manifest, filePath, ownedDir }) {
-    for (const [id, e] of this.temp) if (e.fileId === manifest.fileId) this.temp.delete(id);
+  /**
+   * 自动模式收的片（partial：没收完，这次运行里再放同一部时接着收）：只记在内存里，文件跟着运行目录走。
+   * 同一部片只留一条：新登记的顶掉旧的 —— 但没收完的不顶掉收完的（那份更有用），那种情况下这一份直接不要，
+   * 返回 null 让调用方删掉它的目录。
+   */
+  addTempFile({ manifest, filePath, ownedDir, partial = false }) {
+    for (const [id, e] of this.temp) {
+      if (e.fileId !== manifest.fileId) continue;
+      if (partial && !e.partial) return null;
+      this.temp.delete(id);
+    }
     const id = newId();
     this.temp.set(id, {
       id,
@@ -236,6 +278,7 @@ class MediaLibrary {
       ownedDir,
       savedAt: now(),
       lastUsedAt: now(),
+      ...(partial ? { partial: true } : {}),
     });
     return id;
   }
@@ -265,14 +308,19 @@ class MediaLibrary {
     return entry || null;
   }
 
-  /** 手动模式收完的片：登记下来，下次同一部片再来时直接复用（复用前逐片核对）。 */
-  async addFile({ manifest, filePath }) {
+  /**
+   * 手动模式收的片：登记下来，下次同一部片再来时直接复用（复用前逐片核对）。
+   * partial：还没收完（开会话时就登记，断电、崩溃之后照样接着收）；收完了再登记一次，这个标记就去掉。
+   */
+  async addFile({ manifest, filePath, partial = false }) {
     const key = pathKey(filePath);
     let entry = this.persistent.find((e) => e.kind === 'file' && pathKey(e.path) === key);
     if (entry) {
       entry.fileId = manifest.fileId;
       entry.size = manifest.size;
       entry.lastUsedAt = now();
+      if (partial) entry.partial = true;
+      else delete entry.partial;
     } else {
       // 同一部片换了位置又存了一份：旧登记指向的那份照样留着（手动清理里能看到、能删）
       entry = {
@@ -284,6 +332,7 @@ class MediaLibrary {
         fileId: manifest.fileId,
         savedAt: now(),
         lastUsedAt: now(),
+        ...(partial ? { partial: true } : {}),
       };
       this.persistent.push(entry);
     }
@@ -354,6 +403,7 @@ class MediaLibrary {
     if (status === 'ok' && stat.isFile() && stat.size === entry.size) await fsp.unlink(entry.path);
     this.persistent = this.persistent.filter((e) => e !== entry);
     await this._save();
+    if (entry.partial) await removeEmptyWorkDir(entry.path);
     return true;
   }
 

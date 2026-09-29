@@ -406,6 +406,7 @@ const LINK_FNS = [
   'reopenPlayer',
   'useCachedLink',
   'refreshNowLink',
+  'nowLinkOf',
   'onLinkCacheUpdate',
   'playCachedCurrentNow',
   'linkCacheOf',
@@ -503,6 +504,10 @@ async function linkBox({ isHost = false, inspect, localPath = null, paused = fal
     updatePresence: noop,
     scheduleOscState: noop, // mpv 控制条的状态推送另有测试（mpvOsc.test.js）
     forgetMpvOsc: noop,
+    renderResumeOffer: () => {},
+    flushWatchProgress: () => {},
+    offerResume: () => {},
+    recordWatchProgress: () => {},
     window: {
       sw: {
         media: {

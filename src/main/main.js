@@ -678,8 +678,8 @@ app.whenReady().then(async () => {
     }
     // 登记表（手动模式存的片、手动缓存的在线视频）。读不出来就当空的，不挡启动
     await mediaLibrary.load().catch(() => {});
-    // 上次没缓存完就退出留下的工作目录
-    await linkCache.cleanupLeftovers([keptCacheDir(), downloadDir]).catch(() => {});
+    // 上次没缓存完就退出留下的工作目录。登记着的没收完的片（断点续传）留着，下次接着收
+    await linkCache.cleanupLeftovers([keptCacheDir(), downloadDir], { keep: mediaLibrary.partialWorkDirs() }).catch(() => {});
     await cleanupLegacySidecars(LEGACY_DOWNLOAD_DIR).catch(() => {});
   } finally {
     startupSettled = true;
@@ -1156,6 +1156,19 @@ secureHandle('media:inspectLink', async (url) => {
     result.playback.url = await validate.publicHttpUrl(result.playback.url, '播放地址');
     result.playback.headers = validate.mediaHeaders(result.playback.headers);
   }
+  // 给安卓成员的一对直链（分开音视频流的网站）：两条都照同样的规矩查。任何一条不过关就整对不给，
+  // 安卓那边照旧说「没有可播放的直链」
+  if (result.splitPlayback) {
+    try {
+      for (const key of ['video', 'audio']) {
+        const track = result.splitPlayback[key];
+        track.url = await validate.publicHttpUrl(track.url, '播放地址');
+        track.headers = validate.mediaHeaders(track.headers);
+      }
+    } catch {
+      delete result.splitPlayback;
+    }
+  }
   return result;
 });
 
@@ -1326,6 +1339,67 @@ secureHandle('player:osd', async (payload) => {
 // mpv 控制条要画的房间状态（片名、房间状态、在等谁缓冲、收到了哪几段……）。
 // renderStatus 每个 tick 都会推一次，去重在 MpvController 里做；外部播放器没有这一项
 secureHandle('player:oscState', async (state) => players.setOscState(validate.oscState(state)));
+
+// 表情反应：在 mpv 画面上飘一下（谁发的写在下面）。外部播放器画不了，静默忽略
+secureHandle('player:reaction', async (payload) => {
+  const { e, name } = validate.plainObject(payload, '表情反应');
+  return players.showReaction(
+    validate.integer(e, '表情', { min: 0, max: 7 }),
+    // 昵称按码点截到 40 个，emoji 占两个 UTF-16 单位，这里按长度放宽
+    validate.string(name ?? '', '名字', { max: 160, allowEmpty: true })
+  );
+});
+
+/**
+ * 成员在 mpv 控制条的字幕菜单里点「加载本机字幕…」：主进程开文件对话框，选中的字幕交给 mpv，只影响本机。
+ * 路径只从对话框来，渲染进程递不进路径。这时 mpv 多半挡在最前面（可能还全屏着 —— 控制条脚本已经先退出全屏），
+ * 对话框挂在主窗口上、主窗口临时置顶，免得对话框被播放器盖住。GB18030 / Big5 这类老编码的字幕
+ * 先转成 UTF-8 放进本次运行的临时缓存再交给 mpv（和房主封 MKV 时同一个认编码的办法）。
+ * @returns {{ok: true, name: string} | {ok: false, reason: 'no-player'|'canceled'|'invalid', message?: string}}
+ */
+secureHandle('player:loadLocalSubtitle', async () => {
+  if (!players.canAddSubtitle()) return { ok: false, reason: 'no-player' };
+  let picked;
+  if (devPicks.length) picked = takeDevPick()[0];
+  else {
+    const owner = win && !win.isDestroyed() ? win : null;
+    if (owner) {
+      if (owner.isMinimized()) owner.restore();
+      owner.setAlwaysOnTop(true);
+      owner.show();
+      owner.focus();
+    }
+    try {
+      const r = await dialog.showOpenDialog(owner || undefined, {
+        title: '加载本机字幕（只影响你自己）',
+        properties: ['openFile'],
+        filters: SUBTITLE_FILTERS,
+      });
+      if (r.canceled || !r.filePaths.length) return { ok: false, reason: 'canceled' };
+      picked = r.filePaths[0];
+    } finally {
+      if (owner && !owner.isDestroyed()) owner.setAlwaysOnTop(false);
+    }
+  }
+  let info;
+  let loadPath;
+  try {
+    const realPath = await fsp.realpath(validate.absolutePath(picked, '字幕路径'));
+    info = await subtitles.describeFile(realPath, null);
+    const decoded = subtitles.decodeSubtitle(await fsp.readFile(realPath));
+    if (!decoded) throw new Error('认不出字幕的文字编码');
+    loadPath = realPath;
+    if (!/^utf-/.test(decoded.encoding)) {
+      const dir = await cache.createOwnedDir('subs');
+      loadPath = path.join(dir, info.name);
+      await fsp.writeFile(loadPath, decoded.text, 'utf8');
+    }
+  } catch (error) {
+    return { ok: false, reason: 'invalid', message: String(error?.message || error) };
+  }
+  await players.addSubtitle(loadPath);
+  return { ok: true, name: info.name };
+});
 
 // 常驻横幅。全屏看片时 Electron 窗口整个看不见，这是把房间状态送到用户眼前的唯一通道。
 // 层 id 不让渲染进程自己定，由各播放器适配器固定占房间状态那一层。

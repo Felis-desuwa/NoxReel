@@ -184,6 +184,10 @@ const EN = new Map(Object.entries({
   '自动同步没跟上': 'Auto-sync could not keep up',
   '已同步到房主的进度': 'Synced to the host’s position',
   '同步目标': 'Sync target',
+  // 共享标记、表情反应
+  '标记': 'Mark',
+  '标记得太快了，过几秒再标': 'Marking too fast; try again in a few seconds',
+  '发表情、标记': 'Send a reaction or mark this moment',
   '对方': 'them',
   '房主换人了，没成的请再试一次': 'The host changed; if it didn’t go through, try again',
   '你被设为同步目标：大家跟着你的画面走': 'You are the sync target: everyone follows your playback',
@@ -352,6 +356,10 @@ const EN = new Map(Object.entries({
 }));
 
 const PATTERNS = [
+  // 共享标记（「你」开头的要排在「某人」前面）
+  [/^你标记了 ([\d:]+)(?:：(.*))?$/, (_all, at, note) => `You marked ${at}${note ? `: ${note}` : ''}`],
+  [/^(.+?)标记了 ([\d:]+)(?:：(.*))?$/, (_all, who, at, note) => `${who} marked ${at}${note ? `: ${note}` : ''}`],
+  [/^已标记 ([\d:]+)$/, 'Marked $1'],
   [
     /^(.+) 用的是旧版 NoxReel（0\.6\.x），和 0\.7 不互通，已断开。$/,
     '$1 is using an older NoxReel (0.6.x), which cannot connect to 0.7, and was disconnected.',

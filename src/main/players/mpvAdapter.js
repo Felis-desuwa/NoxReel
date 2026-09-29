@@ -64,6 +64,16 @@ class MpvAdapter extends EventEmitter {
     return this.ctl.setRoomBanner(text);
   }
 
+  /** 飘一个表情反应，见 MpvController.showReaction。 */
+  showReaction(e, name) {
+    return this.ctl.showReaction(e, name);
+  }
+
+  /** 成员自己加的本机字幕，见 MpvController.addSubtitle。 */
+  addSubtitle(filePath) {
+    return this.ctl.addSubtitle(filePath);
+  }
+
   /** 控制条要画的房间状态，见 MpvController.setOscState。 */
   setOscState(state) {
     return this.ctl.setOscState(state);

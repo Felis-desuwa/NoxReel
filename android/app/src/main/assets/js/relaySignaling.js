@@ -329,6 +329,9 @@ export class RelaySignaling extends Emitter {
       relayQuiet: RELAY_QUIET_MS,
       eoseWait: EOSE_WAIT_MS,
       replaySlack: REPLAY_SLACK_MS,
+      listenMin: 3,
+      listenWait: 1500,
+      listenSettle: 300,
       ...(o.timing || {}),
     };
     this._pendingMax = Math.max(1, Math.floor(Number(o.pendingMax ?? this._t.pendingMax)) || PENDING_MAX);
@@ -401,6 +404,11 @@ export class RelaySignaling extends Emitter {
       return joined;
     }
 
+    // 先等几个中继的订阅真的生效再打招呼。hello 一发出去，房主几十毫秒内回 welcome、
+    // 收集完候选就发 offer（只发一次），老成员也一样 —— 这时我只在第一条连上的中继上听着的话，
+    // 这几条一次性的消息只能靠那一个中继送到，它丢一条就只剩 30 秒的握手超时兜底。
+    await this._waitListening();
+    if (this._closedByUs) throw relayError('已取消', 'CLOSED');
     // 新人：反复发 hello，直到房主的 welcome 到了。welcome 丢了也没事，房主收到重复的
     // hello 会原样再发一次。
     return new Promise((resolve, reject) => {
@@ -425,6 +433,26 @@ export class RelaySignaling extends Emitter {
       );
       this._pendingJoin = { resolve: (v) => done(resolve, v), reject: (e) => done(reject, e) };
       this._sayHello();
+    });
+  }
+
+  /** 订阅已生效（回了 EOSE，或者发出 REQ 已经 listenSettle 毫秒）的中继数。 */
+  _listeningCount(now = Date.now()) {
+    let n = 0;
+    for (const s of this._sockets.values()) if (s.open && s.sub && (s.eose || now - s.subAt >= this._t.listenSettle)) n++;
+    return n;
+  }
+
+  /** 等到 listenMin 个中继在听，最多等 listenWait（连不上几个中继的人也照样能进房）。 */
+  _waitListening() {
+    const want = Math.min(this._t.listenMin, this.relays.length);
+    const deadline = Date.now() + this._t.listenWait;
+    return new Promise((resolve) => {
+      const check = () => {
+        if (this._closedByUs || this._listeningCount() >= want || Date.now() >= deadline) return resolve();
+        setTimeout(check, 25);
+      };
+      check();
     });
   }
 
@@ -923,11 +951,29 @@ export class RelaySignaling extends Emitter {
       const slot = this._sockets.get(url);
       if (slot) slot.heard = true;
     }
+    // 中继把当前这次订阅关了（实测 nos.lol 忙的时候回「rate-limited: server busy, retry later」）：
+    // 之后它一条事件都不推，可我们发出去的它照回 OK，连接看着是活的、不会被当成断了回收 ——
+    // 不重新订阅的话这个中继就一直是聋的。退避之后重订（2 秒起翻倍，封顶 60 秒）
+    if (msg[0] === 'CLOSED') {
+      const slot = this._sockets.get(url);
+      if (slot?.sub && msg[1] === slot.sub && slot.ws) {
+        const ws = slot.ws;
+        const sub = slot.sub;
+        slot.closedRetry = (slot.closedRetry || 0) + 1;
+        clearTimeout(slot.resubTimer);
+        slot.resubTimer = setTimeout(() => {
+          if (!this._closedByUs && slot.ws === ws && slot.open && slot.sub === sub) this._subscribe(slot);
+        }, Math.min(60000, 2000 * 2 ** Math.min(5, slot.closedRetry - 1)));
+      }
+      return;
+    }
     if (msg[0] === 'EOSE') {
       // 只认当前这次订阅的：换话题（rekey）之前那次订阅迟到的 EOSE 不算
       const slot = this._sockets.get(url);
       if (slot?.sub && msg[1] === slot.sub) {
         slot.eose = true;
+        // 订阅正常了：之前被 CLOSED 退避的次数从头算
+        slot.closedRetry = 0;
         // 回了 EOSE：它在这之前送来的只能按存货算（不理 limit:0 的中继就是这样把旧事件送来的），扣着的扔掉
         this._dropHeld(slot);
       }
@@ -972,7 +1018,7 @@ export class RelaySignaling extends Emitter {
     // 密文里写着签它的公钥（0.7.4 的没有这一项）：别人照抄密文、自己另签一份的，对不上
     if (body.pk !== undefined && body.pk !== ev.pubkey) return;
     const cls = this._classify(body, ev.pubkey);
-    if (!cls) return;
+    if (!cls) return this._park(url, ev, room, early, body);
     // 中继表态之前送来的进房请求和握手：先挑出真正的回放（见 _earlyOk）
     if (early !== null && (body.t === 'hello' || body.t === 'signal') && !this._earlyOk(url, early, ev, room, body, cls)) return;
     const limit = cls === 'host' ? LIMITS.verifyHost : cls === 'stranger' ? LIMITS.verifyStranger : LIMITS.verifyMember;
@@ -1008,6 +1054,35 @@ export class RelaySignaling extends Emitter {
     if (t === 'signal' && body.to !== this.peerId) return null;
     if (!this._signedBy(from, pubkey)) return null;
     return from === this.hostId ? 'host' : pubkey;
+  }
+
+  /**
+   * 发给我的 signal，署名的成员我还不认识（他的公钥在房主给我的 welcome 名册里，
+   * 而那条 welcome 我还没收到 / 还没处理完）：先扣下，等绑定到了再从头处理一遍（照常验签）。
+   * 不扣的话老成员那份唯一的 offer 从每个中继来的副本都被当成冒名丢掉，只能等他 30 秒握手超时。
+   */
+  _park(url, ev, room, early, body) {
+    if (this.isHost || body.t !== 'signal' || body.to !== this.peerId) return;
+    const from = String(body.from || '');
+    if (from === this.hostId || this._bindings.has(from) || !ID_RE.test(from)) return;
+    this._parked ||= new Map();
+    if (this._parked.has(ev.id)) return;
+    while (this._parked.size >= 16) this._parked.delete(this._parked.keys().next().value);
+    this._parked.set(ev.id, { url, ev, room, early, from, at: Date.now() });
+  }
+
+  _unpark() {
+    if (!this._parked?.size) return;
+    const now = Date.now();
+    for (const [id, p] of this._parked) {
+      if (now - p.at > 30000 || this._room !== p.room) {
+        this._parked.delete(id);
+        continue;
+      }
+      if (!this._bindings.has(p.from)) continue;
+      this._parked.delete(id);
+      if (!this._seen.has(id)) this._enqueue(p.url, p.ev, p.room, p.early);
+    }
   }
 
   /** 这条消息是不是它自称的那个人签的。房主的公钥来自链接；其他人的来自房主签发的 welcome。 */
@@ -1273,6 +1348,7 @@ export class RelaySignaling extends Emitter {
         this._bindings.set(id, binding);
         added.push([id, binding]);
       }
+      this._unpark();
       if (this._joined) {
         // 进房之后又收到给我的 welcome（中继恢复后重新 hello 的回复）：名册里多出来的是我断线期间
         // 进房的人，他们的 welcome 我没收到。序号比我大的由我向他发起，跟平时一样
@@ -1294,6 +1370,7 @@ export class RelaySignaling extends Emitter {
     const binding = { pubkey: body.pubkey, name: safeName(body.memberName), seq, lastSeen: Date.now() };
     if (prev && (prev.pubkey !== body.pubkey || prev.seq !== seq)) this._announced.delete(peerId); // 走了又回来
     this._bindings.set(peerId, binding);
+    this._unpark();
     this._maybeAnnounce(peerId, binding);
   }
 

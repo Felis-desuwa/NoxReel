@@ -122,6 +122,7 @@ local C = {
   warn = 'D29922',
   host = 'F2B84B',
   hostText = '1F1500',
+  mark = 'E3B341',
   danger = 'C42B1C',
   white = 'FFFFFF',
   black = '000000',
@@ -185,6 +186,13 @@ local DEFAULT_LABELS = {
   hProgress = '看一眼进度',
   hHelp = '快捷键一览',
   hClose = '关闭播放器',
+  -- 本机字幕、共享标记、表情反应
+  loadSub = '加载本机字幕…',
+  react = '发表情',
+  markTip = '点一下跳到这里',
+  hReact = '发表情',
+  hMark = '标记这一刻',
+  hMarkNote = '标记这一刻并写一句',
 }
 
 -- 快捷键一览：{键, 说明的 label}。键名不翻译，「空格」「长按 →」除外（@ 开头的换成 label）
@@ -202,10 +210,20 @@ local HELP_ROWS = {
   { 'S', 'hSync' },
   { 'C', 'hSubs' },
   { 'A', 'hAudio' },
+  { '1 – 8', 'hReact' },
+  { 'K', 'hMark' },
+  { 'Shift + K', 'hMarkNote' },
   { 'O', 'hProgress' },
   { '? / F1', 'hHelp' },
   { 'Q', 'hClose' },
 }
+
+-- 表情反应（和 lib/moments.js 的 REACTIONS 同一个顺序）。libass 画出来是单色线条字形，按颜色区分
+local REACTIONS = { '❤', '😂', '😮', '😭', '👍', '👏', '🔥', '🎉' }
+local REACTION_COLORS = { 'FF5A6E', 'FFD23F', 'FFD23F', '6FB8FF', 'FFD23F', 'FFD23F', 'FF8A3D', 'C792FF' }
+-- 一个表情飘多久（秒）、同时最多飘几个
+local REACTION_S = 2.6
+local MAX_REACTIONS = 24
 
 local function bgr(hex)
   return hex:sub(5, 6) .. hex:sub(3, 4) .. hex:sub(1, 2)
@@ -469,6 +487,7 @@ local ICONS = {
   chevronUp = { stroke = { poly(6, 15, 12, 9, 18, 15) } },
   ffwd = { fill = { poly(4, 6, 12, 12, 4, 18), poly(12, 6, 20, 12, 12, 18) }, round = 1 },
   check = { stroke = { poly(20, 6, 9, 17, 4, 12) } },
+  smile = { stroke = { arc_path(12, 12, 9, 0, 360), arc_path(12, 12, 5, 25, 155), poly(9, 9.6, 9, 10.4), poly(15, 9.6, 15, 10.4) } },
   sync = { stroke = {
     with_line(arc_path(12, 12, 9, 180, 315), 21, 8), poly(21, 3, 21, 8, 16, 8),
     with_line(arc_path(12, 12, 9, 0, 135), 3, 16), poly(3, 21, 3, 16, 8, 16),
@@ -625,6 +644,8 @@ ui = {
   hold = { active = false, timer = nil, prev_speed = 1, quiet_until = 0 },
   -- 快捷键一览开着
   help = false,
+  -- 正在往上飘的表情反应：{ e = 第几个, name = 谁发的, t0 = 开始的时刻, x = 横向偏移 }
+  reactions = {},
 }
 
 local function now()
@@ -709,6 +730,15 @@ local function layout()
   -- 进度条那一行
   lay.seek = { x0 = P.x0 + 18, x1 = P.x1 - 18, cy = P.y0 + 12 + 9 }
   add_hit(lay.hits, 'seek', lay.seek.x0 - 6, P.y0 + 2, lay.seek.x1 + 6, P.y0 + 12 + 18 + 3)
+  -- 共享标记：进度条上方的小菱形，比进度条后登记（hit_at 倒着找，点到标记的时候算标记）
+  lay.marks = {}
+  if room.marks and media.duration > 0 then
+    local S = lay.seek
+    for _, m in ipairs(room.marks) do
+      local x = S.x0 + clamp(m.t / media.duration, 0, 1) * (S.x1 - S.x0)
+      lay.marks[#lay.marks + 1] = add_hit(lay.hits, 'mark', x - 6, S.cy - 17, x + 6, S.cy + 3, { t = m.t, note = m.n, cx = x })
+    end
+  end
 
   -- 按钮那一行
   local cy = P.y0 + 12 + 18 + 8 + 22
@@ -756,10 +786,16 @@ local function layout()
   end
   rbutton('audio', 40, { tip = audio_tracks > 1 and L('audio') or L('noAudio'), key = 'A', disabled = audio_tracks < 2 })
   rx = rx - 4
-  rbutton('subs', 40, { tip = sub_tracks > 0 and L('subs') or L('noSubs'), key = 'C', disabled = sub_tracks < 1 })
+  -- 没有字幕也能点：菜单里有「加载本机字幕…」
+  rbutton('subs', 40, { tip = sub_tracks > 0 and L('subs') or L('noSubs'), key = 'C' })
   if room.danmaku ~= nil then
     rx = rx - 4
     rbutton('danmaku', 40, { tip = room.danmaku and L('danmakuOn') or L('danmakuOff'), key = 'B' })
+    -- 表情反应只在房间里有（和弹幕开关同一个条件）
+    if W >= 560 then
+      rx = rx - 4
+      rbutton('react', 40, { tip = L('react'), key = '1–8' })
+    end
   end
   if room.quality then
     rx = rx - 10
@@ -938,6 +974,36 @@ local function draw_seek_bar(lay, f)
     text(hx, S.cy - 21, 5, 11, C.hostText, f, L('host'), true)
   end
 
+  -- 共享标记：进度条上方的小菱形，鼠标停着的那个放大，上面浮出「几分几秒 · 谁：一句话」
+  local hover_mark = ui.hover and ui.hover.id == 'mark' and ui.hover or nil
+  for _, m in ipairs(lay.marks or {}) do
+    local on = hover_mark and hover_mark.cx == m.cx and hover_mark.t == m.t
+    local r = on and 5 or 3.5
+    local y = S.cy - 10
+    fill_event({ poly(m.cx, y - r, m.cx + r, y, m.cx, y + r, m.cx - r, y) }, 0, 0, 1, C.mark, f * (on and 1 or 0.9))
+  end
+  if hover_mark and not dragging then
+    local label = fmt_time(hover_mark.t, false)
+    local note = hover_mark.note ~= '' and hover_mark.note or nil
+    local hint = can_seek() and L('markTip') or nil
+    local bw = math.max(text_width(label, 15, true), note and text_width(note, 13, false) or 0, hint and text_width(hint, 12, false) or 0) + 24
+    bw = math.min(math.max(bw, 76), 320)
+    local bh = 34 + (note and 20 or 0) + (hint and 18 or 0)
+    local bx0 = clamp(hover_mark.cx - bw / 2, lay.panel.x0, lay.panel.x1 - bw)
+    local by1 = lay.panel.y0 - 8
+    fill_rect(bx0, by1 - bh + 8, bx0 + bw, by1 + 8, 10, C.black, 0.4 * f, '\\blur8')
+    fill_rect(bx0, by1 - bh, bx0 + bw, by1, 10, C.panel, 0.96 * f)
+    ring_rect(bx0, by1 - bh, bx0 + bw, by1, 10, 1, C.mark, 0.5 * f)
+    local ty = by1 - bh + 8
+    text(bx0 + bw / 2, ty, 8, 15, C.mark, f, label, true)
+    ty = ty + 21
+    if note then
+      text(bx0 + bw / 2, ty, 8, 13, C.text, f, fit(note, 13, false, bw - 16))
+      ty = ty + 20
+    end
+    if hint then text(bx0 + bw / 2, ty, 8, 12, C.dim, f, hint) end
+  end
+
   local px = S.x0 + frac * (S.x1 - S.x0)
   if hover or dragging then
     circle(px, S.cy, 12, C.accent, 0.35 * f)
@@ -998,6 +1064,8 @@ local function draw_button(b, f)
     icon('captions', b.cx, lay_cy, 23, col, op * f)
   elseif b.id == 'audio' then
     icon('audio', b.cx, lay_cy, 22, col, op * f)
+  elseif b.id == 'react' then
+    icon('smile', b.cx, lay_cy, 22, col, op * f)
   elseif b.id == 'fullscreen' then
     icon(media.fullscreen and 'unfullscreen' or 'fullscreen', b.cx, lay_cy, 22, col, op * f)
   elseif b.id == 'quality' then
@@ -1343,6 +1411,29 @@ local function draw_mini(op)
     local hx = clamp(hp / media.duration, 0, 1) * W
     fill_rect(hx - 1, H - 7, hx + 1, H, 0, C.host, op)
   end
+  for _, m in ipairs(room.marks or {}) do
+    local mx = clamp(m.t / media.duration, 0, 1) * W
+    fill_rect(mx - 1.5, H - 7, mx + 1.5, H, 0, C.mark, op)
+  end
+end
+
+-- 表情反应：从右下往上飘，边飘边淡，下面写着谁发的
+local function draw_reactions()
+  local t = now()
+  for i = #ui.reactions, 1, -1 do
+    if t - ui.reactions[i].t0 >= REACTION_S then table.remove(ui.reactions, i) end
+  end
+  local base_x = ui.W - (ui.W < 700 and 70 or 110)
+  local base_y = ui.H - (ui.target > 0 and ui.layout and (ui.H - ui.layout.panel.y0 + 40) or 60)
+  for _, r in ipairs(ui.reactions) do
+    local age = (t - r.t0) / REACTION_S
+    local op = age < 0.1 and age / 0.1 or age > 0.6 and math.max(0, (1 - age) / 0.4) or 1
+    local x = base_x + r.x + math.sin(age * math.pi * 2 + r.x) * 8
+    local y = base_y - age * math.min(320, ui.H * 0.45)
+    local size = 44 * (age < 0.12 and (0.6 + age / 0.12 * 0.4) or 1)
+    text(x, y, 2, size, REACTION_COLORS[r.e + 1] or C.white, op, REACTIONS[r.e + 1], false, '\\bord1.2\\3c&H000000&\\3a&H60&')
+    if r.name ~= '' then text(x, y + 4, 8, 12, C.sub, op, fit(r.name, 12, false, 120), false, '\\bord1\\3c&H000000&\\3a&H80&') end
+  end
 end
 
 --------------------------------------------------------------------------------
@@ -1467,6 +1558,7 @@ local function render()
     toast_y = toast_y + 48
   end
   draw_toasts(toast_y)
+  draw_reactions()
   if ui.help then draw_help() end
 
   -- 转圈要一直转：显示着的时候每秒重画 15 次（再快看不出区别，4K 下白费 CPU）
@@ -1475,6 +1567,13 @@ local function render()
   elseif not spinning and timers.busy then
     timers.busy:kill()
     timers.busy = nil
+  end
+  -- 表情在飘的时候每秒重画 30 次，飘完就停
+  if #ui.reactions > 0 and not timers.react then
+    timers.react = mp.add_periodic_timer(1 / 30, function() request() end)
+  elseif #ui.reactions == 0 and timers.react then
+    timers.react:kill()
+    timers.react = nil
   end
 
   overlay.res_x = ui.W
@@ -1584,6 +1683,11 @@ local function track_label(t)
 end
 
 -- keep_offset：状态变了按新状态重开时，保持原来滚到的位置
+-- 发一个表情反应（第几个，0 起）。飘的那一下由 NoxReel 发给大家之后再推回来画，自己的也一样
+local function send_reaction(e)
+  mp.commandv('script-message', MESSAGE, 'react', tostring(e))
+end
+
 local function open_menu(kind, keep_offset)
   local m = { anchor = kind, items = {} }
   if kind == 'subs' then
@@ -1595,6 +1699,19 @@ local function open_menu(kind, keep_offset)
         local id = t.id
         m.items[#m.items + 1] = { label = track_label(t), selected = t.selected == true, run = function() mp.set_property_number('sid', id) end }
       end
+    end
+    -- 成员自己加的字幕，只影响自己。文件对话框由 NoxReel 开：全屏时它会被播放器挡住，先退出全屏
+    m.items[#m.items + 1] = {
+      label = L('loadSub'),
+      run = function()
+        if media.fullscreen then mp.set_property_bool('fullscreen', false) end
+        mp.commandv('script-message', MESSAGE, 'load-sub')
+      end,
+    }
+  elseif kind == 'react' then
+    for i, glyph in ipairs(REACTIONS) do
+      local e = i - 1
+      m.items[#m.items + 1] = { label = glyph .. '    ' .. i, run = function() send_reaction(e) end }
     end
   elseif kind == 'audio' then
     for _, t in ipairs(media.tracks) do
@@ -1736,6 +1853,7 @@ local ACTIONS = {
   end,
   subs = function() toggle_menu('subs') end,
   audio = function() toggle_menu('audio') end,
+  react = function() toggle_menu('react') end,
   quality = function() toggle_menu('quality') end,
   fullscreen = function() mp.commandv('cycle', 'fullscreen') end,
   minimize = function() mp.set_property_bool('window-minimized', true) end,
@@ -1812,6 +1930,9 @@ local function on_up()
       if h.id == 'item' then
         close_menu()
         h.item.run()
+      elseif h.id == 'mark' then
+        -- 点标记：控制者跳过去（和拖进度条一样同步给全房）；游客只提示
+        if can_seek() then mp.commandv('seek', string.format('%.3f', h.t), 'absolute+exact') else guest_toast() end
       elseif ACTIONS[h.id] and not (h.disabled and h.id ~= 'back' and h.id ~= 'fwd') then
         ACTIONS[h.id]()
       end
@@ -1933,7 +2054,7 @@ local function keyboard_menu(kind)
   for _, t in ipairs(media.tracks) do
     if t.type == (kind == 'subs' and 'sub' or 'audio') then count = count + 1 end
   end
-  if kind == 'subs' and count < 1 then return toast(L('noSubs'), 1500, 'info', 'track') end
+  -- 没有字幕也照样打开：菜单里有「加载本机字幕…」
   if kind == 'audio' and count < 2 then return toast(L('noAudio'), 1500, 'info', 'track') end
   if ui.menu and ui.menu.anchor == kind then return close_menu() end
   close_help()
@@ -1984,8 +2105,12 @@ for i, key in ipairs({ '[', ']', '{', '}' }) do
   bind(key, 'nx-speed-' .. i, function() toast(L('noSpeed'), 2500, 'info', 'speed') end)
 end
 bind('BS', 'nx-speed-reset', function() mp.set_property_number('speed', 1) end)
+-- 1–8 发表情（mpv 自带的是调对比度、亮度这些，OSD 文字关了改了什么都看不出来）。
+-- 不在房间里（没有弹幕开关）时什么都不做
 for d = 1, 8 do
-  bind(tostring(d), 'nx-digit-' .. d, function() end)
+  bind(tostring(d), 'nx-digit-' .. d, function()
+    if room.danmaku ~= nil then send_reaction(d - 1) end
+  end)
 end
 
 --------------------------------------------------------------------------------
@@ -2045,6 +2170,14 @@ local function apply_state(json)
   end
   if type(raw.host) == 'table' and num(raw.host.pos, 0) then
     next_room.host = { pos = raw.host.pos, playing = raw.host.playing == true }
+  end
+  if type(raw.marks) == 'table' then
+    local list = {}
+    for _, m in ipairs(raw.marks) do
+      if type(m) == 'table' and num(m.t, 0) then list[#list + 1] = { t = m.t, n = str(m.n, 120) or '' } end
+      if #list >= 40 then break end
+    end
+    next_room.marks = list
   end
   if type(raw.quality) == 'table' and type(raw.quality.options) == 'table' then
     local q = { current = num(raw.quality.current, 0, 10000) or 0, options = {} }
@@ -2264,6 +2397,17 @@ mp.register_script_message('noxreel-state', guard(apply_state))
 mp.register_script_message('noxreel-toast', guard(function(str_text, ms, tone)
   local t = tone == 'ok' and 'ok' or tone == 'warn' and 'warn' or 'info'
   toast(str_text, ms, t)
+end))
+-- 有人发了个表情（自己的也从这里来）：{ e = 第几个, name = 谁 }
+mp.register_script_message('noxreel-react', guard(function(json)
+  local raw = utils.parse_json(tostring(json or ''))
+  if type(raw) ~= 'table' or type(raw.e) ~= 'number' or raw.e < 0 or raw.e >= #REACTIONS or raw.e ~= math.floor(raw.e) then return end
+  local name = str(raw.name, 40) or ''
+  -- 横向错开一点，连着发的几个不叠成一个
+  local jitter = ((#ui.reactions * 37) % 90) - 45
+  ui.reactions[#ui.reactions + 1] = { e = raw.e, name = name, t0 = now(), x = jitter }
+  while #ui.reactions > MAX_REACTIONS do table.remove(ui.reactions, 1) end
+  request()
 end))
 
 mp.set_key_bindings({

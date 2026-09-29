@@ -218,7 +218,14 @@ test('E4-A：对端先送到的片不算对不上，本机核对过的全对得�
   assert.deepEqual(line({ name: 'big.mkv', total: 716, matched: 0 }), ['本机的《big.mkv》和这一部对不上，重新接收', 'warn']);
   // 抽查阶段就收尾的那条不带 fromPeer
   assert.deepEqual(line({ name: 'a.mkv', total: 6, matched: 6 }), ['本机已有的《a.mkv》核对通过，不用再传', 'good']);
-  assert.match(APP, /else if \(e\.stage === 'done'\) log\(\.\.\.reuseDoneLine\(e\)\);/);
+  // 接着上次没收完的收（断点续传）另有一句：对不上的片是还没收到的，不报 warn
+  assert.match(APP, /else if \(e\.stage === 'done'\) log\(\.\.\.\(e\.partial \? resumeDoneLine\(e\) : reuseDoneLine\(e\)\)\);/);
+  const resume = sandbox({ fns: ['resumeDoneLine'] });
+  assert.deepEqual(Array.from(resume.resumeDoneLine({ name: 'big.mkv', total: 200, matched: 90, fromPeer: 10 })), [
+    '接着上次的收《big.mkv》：已有 50%，其余照常接收',
+    'good',
+  ]);
+  assert.equal(resume.resumeDoneLine({ name: 'big.mkv', total: 200, matched: 0 })[1], 'warn');
 
   const { translate } = await load('src/renderer/lib/i18n.js');
   assert.equal(

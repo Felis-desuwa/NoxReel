@@ -64,7 +64,10 @@ function normalizeWindowPref(raw) {
 function windowArgs(pref) {
   const p = normalizeWindowPref(pref);
   if (!p) return ['--autofit=960x540', '--autofit-larger=92%x88%'];
-  return [`--geometry=${p.w}%x${p.h}%`, ...(p.maximized ? ['--window-maximized=yes'] : [])];
+  // mpv 的 --geometry 只认整数（百分比也是）：「37.5%」报 Error parsing option geometry，整个进程在连上管道
+  // 之前就退出（v0.41 实测，退出码 1），之后每次都开不了播放器 —— 0.7.10 拖过一次窗口的人就中了。
+  // 记的时候留一位小数，交给 mpv 时取整
+  return [`--geometry=${Math.round(p.w)}%x${Math.round(p.h)}%`, ...(p.maximized ? ['--window-maximized=yes'] : [])];
 }
 
 /**
@@ -161,6 +164,10 @@ const CHAT_SCRIPT_FILE = 'noxreel-chat.lua';
 const CHAT_MESSAGE_NAME = 'noxreel-chat';
 // 同一个脚本里「同步到房主」那个快捷键回传的消息名，不带参数
 const SYNC_MESSAGE_NAME = 'noxreel-sync';
+// 同一个脚本里「标记这一刻」（k 直接标、K 先写一句）：<按下时的秒数> <一句话>
+const MARK_MESSAGE_NAME = 'noxreel-mark';
+// 标记的一句话最多几个字（和 lib/moments.js 的 MAX_NOTE 一致）
+const MAX_MARK_NOTE = 60;
 
 /**
  * NoxReel 自己画的控制条（替掉 mpv 自带的 osc.lua），见 resources/mpv-scripts/noxreel-osc.lua。
@@ -171,11 +178,14 @@ const OSC_SCRIPT_FILE = 'noxreel-osc.lua';
 const OSC_CLIENT_NAME = 'noxreel_osc';
 // 脚本报回来的消息名：ready（画得出来了）、fallback（退回自带的了）、danmaku、quality <高度>
 const OSC_MESSAGE_NAME = 'noxreel-osc';
-// 推给脚本的房间状态（JSON）上限。正常是一两 KB，收到的分段最多几十段
-const MAX_OSC_STATE = 16 * 1024;
+// 推给脚本的房间状态（JSON）上限。正常是一两 KB，收到的分段最多几十段，共享标记最多 40 个
+const MAX_OSC_STATE = 32 * 1024;
 // 脚本把「画得出来 / 退回自带的了」也写进这个属性（ready / fallback），见 MpvController._subscribe
 const OSC_STATUS_PROP = 'user-data/noxreel_osc/status';
 const OSC_OBSERVE_ID = 200;
+// 表情反应（和 lib/moments.js 的 REACTIONS、控制条脚本里的 REACTIONS 一致）
+const REACTION_GLYPHS = ['❤', '😂', '😮', '😭', '👍', '👏', '🔥', '🎉'];
+const REACTION_COUNT = REACTION_GLYPHS.length;
 
 /** 控制条用的字体：各平台自带、中文和数字都好看的那一个。 */
 function oscFont(platform = process.platform) {
@@ -629,6 +639,17 @@ class MpvController extends EventEmitter {
       this.emit('osc-action', { action: 'danmaku' });
       return;
     }
+    // 字幕菜单里的「加载本机字幕…」：文件对话框由主进程开（只认用户在对话框里选的文件）
+    if (action === 'load-sub') {
+      this.emit('osc-action', { action: 'load-sub' });
+      return;
+    }
+    // 表情反应：1–8 键或控制条上的表情菜单，第几个（0 起）
+    if (action === 'react') {
+      const value = Number(args[2]);
+      if (Number.isInteger(value) && value >= 0 && value < REACTION_COUNT) this.emit('osc-action', { action: 'react', value });
+      return;
+    }
     if (action === 'quality') {
       const value = Number(args[2]);
       if (value === 0 || (Number.isSafeInteger(value) && value >= 144 && value <= 4320)) {
@@ -783,7 +804,9 @@ class MpvController extends EventEmitter {
       oscScript: findOscScript(),
     });
 
-    this.proc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: false, env: childEnv() });
+    // stdout 也收：参数解析失败（Error parsing option …）mpv 写在 stdout 上，不收的话「建立 IPC 连接前就退出了」
+    // 查不出原因（窗口大小记成 37.5% 那次就是这样，见 windowArgs）
+    this.proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: false, env: childEnv() });
     this.running = true;
     // 窗口大小记忆：从这次开窗用的那份起算（最大化着开的，平时的大小还是它）
     this._resetWindow(windowPref);
@@ -797,11 +820,15 @@ class MpvController extends EventEmitter {
     this._resetOsc();
 
     let stderr = '';
-    this.proc.stderr.on('data', (d) => {
+    const keepTail = (d) => {
       stderr += d.toString();
       if (stderr.length > 8192) stderr = stderr.slice(-4096);
-    });
+    };
+    this.proc.stdout.on('data', keepTail);
+    this.proc.stderr.on('data', keepTail);
     this.proc.on('exit', (code) => {
+      // 还没连上管道就退了：多半是参数不认（老版本 mpv 不认某个新参数也是这样），原文只进主进程日志，不上界面
+      if (!this.sock) console.warn(`[mpv] 连上管道之前就退出了（退出码 ${code}）：${stderr.slice(-600).trim()}`);
       this.running = false;
       if (this._idleTimer) clearTimeout(this._idleTimer);
       this._idleTimer = null;
@@ -1016,6 +1043,17 @@ class MpvController extends EventEmitter {
       this.emit('sync-request', {});
     }
 
+    // 播放器里按 k / K 标记这一刻：位置是按下那一刻的（写备注要花时间），一句话按上限截断
+    if (msg.event === 'client-message' && Array.isArray(msg.args) && msg.args[0] === MARK_MESSAGE_NAME) {
+      const raw = msg.args[1] === '' || msg.args[1] === undefined ? NaN : Number(msg.args[1]);
+      const note = typeof msg.args[2] === 'string' ? sliceCodePoints(msg.args[2], MAX_MARK_NOTE) : '';
+      this.emit('osc-action', {
+        action: 'mark',
+        position: Number.isFinite(raw) && raw >= 0 && raw <= 86400 ? raw : null,
+        note,
+      });
+    }
+
     // 自己画的控制条报上来的：画得出来了、退回自带的了、点了「弹幕」「清晰度」
     if (msg.event === 'client-message' && Array.isArray(msg.args) && msg.args[0] === OSC_MESSAGE_NAME) {
       this._onOscMessage(msg.args);
@@ -1117,6 +1155,24 @@ class MpvController extends EventEmitter {
       return this.command(['script-message-to', OSC_CLIENT_NAME, 'noxreel-toast', String(text), String(durationMs), kind]).catch(() => {});
     }
     return this.command(['show-text', text, durationMs, 0]).catch(() => {});
+  }
+
+  /**
+   * 飘一个表情反应（谁发的写在下面）。自己画的控制条画成往上飘的大字形；
+   * 退回自带控制条时只能用一行提示文字代替。
+   */
+  showReaction(e, name = '') {
+    if (!Number.isInteger(e) || e < 0 || e >= REACTION_COUNT) return Promise.resolve();
+    const who = sliceCodePoints(String(name || ''), 40);
+    if (this.oscReady) {
+      return this.command(['script-message-to', OSC_CLIENT_NAME, 'noxreel-react', JSON.stringify({ e, name: who })]).catch(() => {});
+    }
+    return this.command(['show-text', `${REACTION_GLYPHS[e]} ${who}`, 1500, 0]).catch(() => {});
+  }
+
+  /** 加载一条本机的外挂字幕并切过去（成员自己加的，只影响自己）。路径由主进程从文件对话框拿到。 */
+  addSubtitle(filePath) {
+    return this.command(['sub-add', filePath, 'select']);
   }
 
   /**

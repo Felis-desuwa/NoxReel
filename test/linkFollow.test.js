@@ -826,6 +826,10 @@ function driftUi({ drift, host = false, mpvRunning = true, sourceType = 'link', 
     updateStripTone: () => {},
     renderQualityControl: () => {}, // 清晰度下拉框另有测试（linkQuality.test.js）
     scheduleOscState: () => {}, // mpv 控制条的状态推送另有测试（mpvOsc.test.js）
+    renderResumeOffer: () => {},
+    flushWatchProgress: () => {},
+    offerResume: () => {},
+    recordWatchProgress: () => {},
     t: (s) => `«${s}»`,
     make: (tag, o = {}) => ({ tag, ...o }),
     replace: (node, ...kids) => rows.push({ node: node.id, kids: kids.map((k) => k.text) }),
@@ -923,7 +927,7 @@ test('换片后把「是不是在线链接」和跟随方式交给引擎；每�
 
   const calls = [];
   const S = { sync: { checkDrift: () => calls.push(1) }, sourceType: 'link', mpvRunning: true, switchingMedia: false };
-  const ctx = { S, scheduleOscState: () => {} };
+  const ctx = { S, scheduleOscState: () => {}, recordWatchProgress: () => {} };
   vm.createContext(ctx);
   vm.runInContext(['driftTick', 'followedLeader'].map(fnSource).join('\n\n'), ctx);
   ctx.driftTick();
