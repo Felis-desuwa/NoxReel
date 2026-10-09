@@ -313,6 +313,8 @@ const S = {
     linkQuality: normalizeLinkQuality(localStorage.getItem('sw.linkQuality')),
     // 边下边播：放到的每一部另存一份到下载位置（和缓存是两回事）。默认关，只存在本机
     downloadWhileWatching: localStorage.getItem('sw.downloadWhileWatching') === '1',
+    // mpv 控制条收起时底边那条进度细线。默认开，只存在本机
+    mpvMiniBar: localStorage.getItem('sw.mpvMiniBar') !== '0',
   },
   // 缓存清理方式和下载位置 { mode: 'auto'|'manual', keptDir, downloadDir }，主进程说了算（见 cache:policy）
   cachePolicy: null,
@@ -7256,6 +7258,8 @@ async function launchPlayer({ startAt = null, relaunch = false } = {}) {
       chatPrompt: t('弹幕：'),
       // 在线视频的清晰度上限（本机自己选的），见 renderQualityControl
       maxHeight: S.sourceType === 'link' ? S.settings.linkQuality : 0,
+      // 控制条收起时底边那条进度细线（设置里的「播放器底部进度线」）
+      miniBar: S.settings?.mpvMiniBar !== false,
     });
     // 认下这一代之后只收它的 tick / exit。seq 变了或票据作废，就不登记这一代
     const early = seq === S.currentSeq ? playerGate.confirm(info?.gen, ticket) : null;
@@ -9453,6 +9457,7 @@ function mpvOscState() {
     chip: oscChip(st, streamSelfOnly),
     ranges: oscRanges(),
     danmaku: S.danmakuSettings.enabled !== false,
+    miniBar: S.settings.mpvMiniBar !== false,
     canSeek: S.sync.canIControl(),
     stall: oscStall(st, streamSelfOnly),
     drift: oscDrift(),
@@ -11792,6 +11797,14 @@ $('btn-settings').onclick = () => {
         ),
         ...turnSettingsFields(),
         ...downloadFields(),
+        field(
+          '播放器底部进度线',
+          make('label', { className: 'check' }, [
+            make('input', { id: 'set-mpv-minibar', attrs: { type: 'checkbox' }, props: { checked: S.settings.mpvMiniBar !== false } }),
+            make('span', { text: '控制条收起时在画面底边显示一条细进度线' }),
+          ]),
+          hint('关掉后全屏看片时底边不再有那条蓝线；鼠标一动，完整的控制条照常出来。')
+        ),
         cacheField(),
         ...cachePolicyFields(),
         field(
@@ -11935,6 +11948,9 @@ $('btn-settings').onclick = () => {
       localStorage.setItem('sw.downloadWhileWatching', S.settings.downloadWhileWatching ? '1' : '0');
       // 放到一半才打开的：正在放的这一部也算「看了」，一样存
       if (!downloadWasOn && S.settings.downloadWhileWatching && roomEntered) wantDownload(S.current);
+      S.settings.mpvMiniBar = $('set-mpv-minibar').checked;
+      localStorage.setItem('sw.mpvMiniBar', S.settings.mpvMiniBar ? '1' : '0');
+      scheduleOscState();
       S.settings.turnEnabled = $('set-turn-on').checked;
       S.settings.turnUrl = $('set-turn-url').value.trim();
       S.settings.turnUser = $('set-turn-user').value.trim();

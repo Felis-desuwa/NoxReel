@@ -47,6 +47,10 @@ test('启动参数：找得到控制条脚本就关掉自带的、带上脚本�
   assert.ok(!own.includes('--osc=yes'));
   assert.ok(own.includes(`--script=${OSC_ABS}`));
   assert.ok(own.includes(`--script-opt=noxreel_osc-font=${oscFont()}`));
+  // 底边进度细线：默认画，设置里关掉就带 no
+  assert.ok(own.includes('--script-opt=noxreel_osc-mini_bar=yes'));
+  const noBar = buildLaunchArgs({ ipcPath: 'x', source: 'D:/a.mkv', oscScript: OSC_ABS, miniBar: false });
+  assert.ok(noBar.includes('--script-opt=noxreel_osc-mini_bar=no'));
   assert.ok(own.includes('--script-opt=osc-layout=bottombar'), '退回自带控制条时还是这套样子');
   assert.ok(own.indexOf(`--script=${OSC_ABS}`) < own.indexOf('--'));
 

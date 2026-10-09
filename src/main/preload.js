@@ -133,8 +133,9 @@ contextBridge.exposeInMainWorld('sw', {
     // kind 是播放器 id（mpv / pot / mpc），主进程只认它登记过的那几个；
     // exe 路径永远不从这里走 —— 那是一道授权，只能由主进程自己的对话框收。
     // maxHeight：在线视频的清晰度上限（0 = 不限），只对在线链接生效
-    launch: ({ filePath, startPaused = true, headers = {}, startAt = 0, chatPrompt = '', kind = 'mpv', maxHeight = 0 }) =>
-      ipcRenderer.invoke('player:launch', { filePath, startPaused, headers, startAt, chatPrompt, kind, maxHeight }),
+    // miniBar：mpv 控制条收起时底边那条进度细线画不画
+    launch: ({ filePath, startPaused = true, headers = {}, startAt = 0, chatPrompt = '', kind = 'mpv', maxHeight = 0, miniBar = true }) =>
+      ipcRenderer.invoke('player:launch', { filePath, startPaused, headers, startAt, chatPrompt, kind, miniBar, maxHeight }),
     // 有哪些播放器、能不能用、不能用是为什么（原因只有代号，文字在渲染进程这边生成）
     list: () => ipcRenderer.invoke('player:list'),
     select: (id) => ipcRenderer.invoke('player:select', id),

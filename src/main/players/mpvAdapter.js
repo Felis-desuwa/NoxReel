@@ -41,8 +41,9 @@ class MpvAdapter extends EventEmitter {
   // growing：本地文件还在接收（可信房间边收边播），关掉 mpv 的缓存，见 mpv.js 的 cacheArg
   // maxHeight：在线视频的清晰度上限，见 mpv.js 的 qualityArgs
   // windowPref：上次的窗口大小，见 mpv.js 的 windowArgs
-  launch({ source, startPaused = true, startAt = 0, headers = {}, muted = false, chatPrompt = '', proxy = null, growing = false, maxHeight = 0, windowPref = null }) {
-    return this.ctl.launch(source, { startPaused, startAt, headers, muted, chatPrompt, proxy, windowPref, maxHeight, growing });
+  // miniBar：控制条收起时底边那条进度细线画不画
+  launch({ source, startPaused = true, startAt = 0, headers = {}, muted = false, chatPrompt = '', proxy = null, growing = false, maxHeight = 0, windowPref = null, miniBar = true }) {
+    return this.ctl.launch(source, { startPaused, startAt, headers, muted, chatPrompt, proxy, windowPref, maxHeight, miniBar, growing });
   }
 
   setPause(paused) {

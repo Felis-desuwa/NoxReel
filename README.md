@@ -6,7 +6,7 @@
   <p>深色、轻量的多人同步观影工具。支持本地视频 P2P 分片传输、安全检查与同步播放，也支持视频链接解析；一整晚的片单、飘过画面的弹幕和你自己惯用的播放器都在里面。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.11-7C5CFF?style=for-the-badge" alt="Version 0.7.11">
+    <img src="https://img.shields.io/badge/version-0.7.12-7C5CFF?style=for-the-badge" alt="Version 0.7.12">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -59,7 +59,7 @@
 - **缓冲联动**：任何成员可播余量不足时全员暂停，恢复后继续。
 - **真实成员状态**：只显示已建立连接的用户，并给出上传、下载速度和延迟。
 - **播放器可恢复**：播放器窗口关闭后，可从房间页面重新打开。
-- **现代播放器界面**：mpv 使用 NoxReel 深色无边框外观、圆角窗口、底部控制栏与更清晰的进度反馈。
+- **现代播放器界面**：mpv 使用 NoxReel 深色无边框外观、圆角窗口、底部控制栏与更清晰的进度反馈。控制条收起时底边那条细进度线可以在设置里关掉。
 - **原生 EXE 入口**：源码目录直接双击带品牌图标的 `NoxReel.exe`，不再使用 BAT；信令服务对应 `NoxReel-Signal.exe`。
 - **自选安装位置**：Windows 完整版和联网版都使用向导式安装，可在安装前选择目标文件夹。
 - **Android 观众端**：点房间链接或一对一邀请加入，跟得上播放列表、能聊天、画面上有弹幕；被设成管理员后能编辑列表（改动交给房主执行）；TURN 中继、「隐藏我的 IP」、Cloudflare TURN 自动生成和电脑端一样可用。
@@ -70,6 +70,9 @@
 - **双模式安全门槛**：可信房间为默认，片头约 8 MB 到了、并且连续数据够放十几秒就边收边播，收完后仍补做扫描；也可切换安全模式，完整接收并通过 Microsoft Defender 扫描后才播放。
 - **模式握手**：邀请码和 P2P 数据通道都会核对协议版本和房间模式；任一项不一致会在媒体清单、控制消息和视频数据传输前断开。
 - **安全桌面外壳**：启用 Electron sandbox、受控 IPC、安全 DOM 渲染和严格的房间角色权限，并使用与主界面统一的深色 Windows 标题栏。
+
+> [!NOTE]
+> `v0.7.12` 是个小更新：设置里加了 **「播放器底部进度线」** 开关。mpv 控制条收起时，画面底边会留一条细细的蓝色进度线，全屏看片时嫌它碍眼的话，取消勾选就不画了（单独开播放器和在房间里都管用；在房间里保存后马上生效，单独开的要重开一次播放器）。鼠标一动，完整的控制条照常出来。**P2P 协议没变，和 0.7.x 互通**。
 
 > [!NOTE]
 > `v0.7.11` 加了**标记这一刻和表情反应**：看到好玩的地方点「标记」（播放器里按 `K`），全房的进度条上都出现一个小菱形，房主和管理员点一下就跳过去；点一排表情（播放器里按 `1`–`8`），全房画面上飘一个。**上次看到哪**：房主再放一部没看完的片会问一句「从 23:09 接着看？」。**断点续传**：片子收到一半离开房间，下次放同一部接着收，不用从头下（手动清理方式下重启之后也能接着收）。**手机能放哔哩哔哩了**（房主挑一对手机解得动的音视频直链发过去）。控制条的字幕菜单能**加载本机字幕**，只影响你自己。修了 **0.7.10 拖过一次播放器窗口之后 mpv 就打不开**（记下的窗口大小带小数，mpv 不认），以及新人偶尔要等 30 秒才和房里其他成员连上。**P2P 协议没变，和 0.7.x 互通**；标记、表情老版本看不到。
@@ -114,8 +117,8 @@
 
 | 版本 | 适合谁 | 下载 |
 |---|---|---|
-| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.11.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.11.exe) |
-| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.11.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.11.exe) |
+| Windows 完整版 | 推荐。内置 mpv、yt-dlp 与播放器桥接程序，可选择安装文件夹 | [NoxReel-Setup-0.7.12.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.12.exe) |
+| Windows 联网版 | 安装器体积小，可选择安装文件夹，安装时下载应用组件 | [NoxReel-WebSetup-0.7.12.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.12.exe) |
 | Android 测试版 | 作为观众加入电脑端房间 | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | 校验下载文件是否完整 | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 

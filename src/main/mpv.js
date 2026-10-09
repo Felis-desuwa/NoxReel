@@ -406,6 +406,7 @@ function buildLaunchArgs({
   maxHeight = 0,
   windowPref = null,
   oscScript = null,
+  miniBar = true,
 } = {}) {
   const isRemote = /^https?:\/\//i.test(source);
   // 自己画的控制条：和聊天脚本一样只认绝对路径（--load-scripts=no 仍在，别的脚本进不来）
@@ -431,7 +432,9 @@ function buildLaunchArgs({
     '--input-default-bindings=yes',
     // 有自己的控制条就关掉自带的；下面那些 osc-* 参数照旧带着，自己的画不出来时退回自带的还是这套配色
     ownOsc ? '--osc=no' : '--osc=yes',
-    ...(ownOsc ? [`--script=${oscScript}`, `--script-opt=noxreel_osc-font=${oscFont()}`] : []),
+    ...(ownOsc
+      ? [`--script=${oscScript}`, `--script-opt=noxreel_osc-font=${oscFont()}`, `--script-opt=noxreel_osc-mini_bar=${miniBar === false ? 'no' : 'yes'}`]
+      : []),
     '--script-opt=osc-layout=bottombar',
     '--script-opt=osc-seekbarstyle=bar',
     '--script-opt=osc-hidetimeout=900',
@@ -773,6 +776,7 @@ class MpvController extends EventEmitter {
       windowPref = null,
       maxHeight = 0,
       growing = false,
+      miniBar = true,
     } = {}
   ) {
     if (this.running) await this.quit();
@@ -802,6 +806,7 @@ class MpvController extends EventEmitter {
       maxHeight,
       windowPref,
       oscScript: findOscScript(),
+      miniBar,
     });
 
     // stdout 也收：参数解析失败（Error parsing option …）mpv 写在 stdout 上，不收的话「建立 IPC 连接前就退出了」

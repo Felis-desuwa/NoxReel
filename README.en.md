@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links — now with a playlist for the whole evening, danmaku comments over the picture, and your own preferred player.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.11-7C5CFF?style=for-the-badge" alt="Version 0.7.11">
+    <img src="https://img.shields.io/badge/version-0.7.12-7C5CFF?style=for-the-badge" alt="Version 0.7.12">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -59,7 +59,7 @@
 - **Buffer coordination:** playback pauses when a controlling member runs low on playable data and resumes after recovery.
 - **Real member status:** only established connections are listed, with upload rate, download rate, and latency.
 - **Recoverable player:** reopen the player from the room after its window is closed.
-- **Modern player UI:** mpv uses NoxReel's dark borderless appearance, rounded Windows corners, a bottom control bar, and clearer seek feedback.
+- **Modern player UI:** mpv uses NoxReel's dark borderless appearance, rounded Windows corners, a bottom control bar, and clearer seek feedback. The thin progress line shown along the bottom edge while the control bar is hidden can be turned off in Settings.
 - **Native EXE entry points:** double-click the branded `NoxReel.exe` from a source checkout instead of using a BAT file; `NoxReel-Signal.exe` starts the signaling service.
 - **Selectable install location:** both Windows installers use a guided setup and let you choose the destination folder before installation.
 - **Android viewer:** joins through a room link or a one-to-one invite, follows the playlist, sends and receives chat, and shows danmaku over the picture. Once the host makes you a moderator you can edit the playlist (the host applies the changes). TURN relays, “Hide my IP”, and Cloudflare TURN credentials work the same as on desktop.
@@ -70,6 +70,9 @@
 - **Two security modes:** Trusted room is the default: playback starts once about 8 MB of the file header and enough continuous data for a dozen or so seconds have arrived, and the video is still scanned once it is complete. Safe mode remains available and plays only after complete receipt and a Microsoft Defender scan.
 - **Version and mode handshake:** invite codes and the P2P data channel both verify the protocol version and the selected room mode. A mismatch disconnects before media manifests, room controls, or video data are exchanged.
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
+
+> [!NOTE]
+> `v0.7.12` is a small update: Settings has a new **“Player bottom progress line”** switch. When the mpv control bar hides, a thin blue progress line stays along the bottom edge of the picture; if it bothers you in fullscreen, untick the box and it is no longer drawn (works both for a player opened on its own and in a room; in a room it applies as soon as you save, otherwise reopen the player). Moving the mouse still brings up the full control bar. **The P2P protocol is unchanged and works with 0.7.x**.
 
 > [!NOTE]
 > `v0.7.11` adds **marks and reactions**: click “Mark” (or press `K` in the player) at a good moment and a small diamond appears on everyone's seek bar, which the host and moderators can click to jump there; tap an emoji (or press `1`–`8` in the player) to float it across everyone's screen. **Where you left off**: when the host plays a video they didn't finish, NoxReel asks “Resume from 23:09?”. **Resuming transfers**: leave the room halfway through receiving and the next time the same video plays it picks up where it stopped instead of starting over (in Manual cleanup mode even after a restart). **Phones can play Bilibili** (the host sends a matching pair of audio and video links the phone can decode). The subtitle menu can **load a subtitle file** just for you. Fixed **mpv failing to open at all in 0.7.10 after you had resized its window once** (the remembered size had a decimal, which mpv rejects), and newcomers sometimes waiting 30 seconds to connect to other members. **The P2P protocol is unchanged and works with 0.7.x**; older versions don't see marks or reactions.
@@ -114,8 +117,8 @@
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.11.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.11.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.11.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.11.exe) |
+| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.12.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.12.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.12.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.12.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 

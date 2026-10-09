@@ -1273,6 +1273,9 @@ secureHandle('player:launch', async (payload) => {
     payload,
     '播放器启动参数'
   );
+  // mpv 控制条收起时底边那条进度细线画不画（设置里的「播放器底部进度线」）
+  const miniBar = payload.miniBar ?? true;
+  if (typeof miniBar !== 'boolean') throw new TypeError('无效的进度线参数');
   // 在线视频的清晰度上限（本人自己选的，只影响本机这一路）
   const heightCap = validate.linkMaxHeight(maxHeight);
   // 只认登记过的 id：这个字符串最终会变成 new ADAPTERS[kind]()
@@ -1308,7 +1311,7 @@ secureHandle('player:launch', async (payload) => {
     // 还没收完的接收文件（可信房间边收边播）由主进程自己认，不听渲染进程的：mpv 要关掉缓存，
     // 否则它会把稀疏文件里还没收到的零读进去、在打开那一刻的水位线报 eof（见 mpv.js 的 cacheArg）
     const growing = !remote && store.isReceivingFile(source);
-    return await players.launch('mpv', { source, startPaused, startAt: start, headers: safeHeaders, muted: TEST_MUTE, chatPrompt: prompt, proxy: proxy && proxy.url, windowPref: mpvWindowPref, maxHeight: remote ? heightCap : 0, growing }, ticket);
+    return await players.launch('mpv', { source, startPaused, startAt: start, headers: safeHeaders, muted: TEST_MUTE, chatPrompt: prompt, proxy: proxy && proxy.url, windowPref: mpvWindowPref, miniBar, maxHeight: remote ? heightCap : 0, growing }, ticket);
   } catch (error) {
     throw withPlayerCode(error);
   }

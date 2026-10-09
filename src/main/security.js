@@ -245,6 +245,10 @@ function oscState(value) {
     if (typeof data.danmaku !== 'boolean') fail('控制条弹幕开关');
     out.danmaku = data.danmaku;
   }
+  if (data.miniBar !== undefined && data.miniBar !== null) {
+    if (typeof data.miniBar !== 'boolean') fail('控制条底边进度线开关');
+    out.miniBar = data.miniBar;
+  }
   const chip = object(data.chip, '控制条房间状态');
   if (chip) {
     if (!OSC_TONES.has(chip.tone)) fail('控制条房间状态');

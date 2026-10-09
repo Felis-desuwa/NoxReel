@@ -560,6 +560,11 @@ const EN = new Map(Object.entries({
   '存下来的是你自己的文件，缓存清理不会碰它；这个开关也不改变什么时候开始播。':
     'Saved copies are your own files, and cache cleanup never touches them; this switch does not change when playback starts.',
   '下载位置': 'Download folder',
+  // mpv 控件收起时贴在底边的那条进度细线
+  '播放器底部进度线': 'Player bottom progress line',
+  '控制条收起时在画面底边显示一条细进度线': 'Show a thin progress line along the bottom edge when the control bar is hidden',
+  '关掉后全屏看片时底边不再有那条蓝线；鼠标一动，完整的控制条照常出来。':
+    'Turn it off to get rid of the blue line at the bottom while watching fullscreen; moving the mouse still brings up the full control bar.',
   '已存到下载位置': 'Saved to download folder',
   '下载排队中': 'Queued for download',
   '下载失败': 'Download failed',

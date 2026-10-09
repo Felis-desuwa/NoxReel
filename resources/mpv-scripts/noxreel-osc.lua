@@ -28,6 +28,8 @@ local opts = {
   scale = 1,
   -- 鼠标不动多久收起控件（毫秒）
   hide_ms = 1600,
+  -- 控件收起时底边那条进度细线画不画（设置里的「播放器底部进度线」）；房间里推来的状态里有 miniBar 时以那个为准
+  mini_bar = true,
   -- 开发期的自动化测试用：把画好的内容放进 user-data，没有窗口时按这个尺寸排版（如 1280x720）
   debug = false,
   debug_size = '',
@@ -1397,6 +1399,7 @@ end
 -- 控件收起时贴在底边的一条细线
 local function draw_mini(op)
   if media.duration <= 0 or op <= 0 then return end
+  if room.miniBar == false or (room.miniBar == nil and not opts.mini_bar) then return end
   local W, H = ui.W, ui.H
   fill_rect(0, H - 3, W, H, 0, C.white, 0.12 * op)
   local ranges = ranges_now()
@@ -2153,6 +2156,7 @@ local function apply_state(json)
     next_room.ranges = list
   end
   if type(raw.danmaku) == 'boolean' then next_room.danmaku = raw.danmaku end
+  if type(raw.miniBar) == 'boolean' then next_room.miniBar = raw.miniBar end
   next_room.canSeek = raw.canSeek ~= false
   if type(raw.stall) == 'table' and str(raw.stall.title, 200) then
     local s = raw.stall

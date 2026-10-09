@@ -166,6 +166,7 @@ async function settingsBox({ settings = {}, form = {}, cfTurnState = null, cfTur
     'set-turn-on': S.settings.turnEnabled,
     'set-relay-only': S.settings.relayOnly,
     'set-download': false,
+    'set-mpv-minibar': true,
     'set-discord-on': false,
     'set-discord-join': true,
   };
@@ -206,6 +207,7 @@ async function settingsBox({ settings = {}, form = {}, cfTurnState = null, cfTur
     normalizeSecurityMode: (mode) => (mode === 'trusted' ? 'trusted' : 'safe'),
     saveCapacitySetting: () => {},
     wantDownload: () => {},
+    scheduleOscState: () => {},
     savePresenceSettings: () => {},
     updatePresence: () => {},
     localStorage: { setItem: (k, v) => storage.set(k, String(v)) },
