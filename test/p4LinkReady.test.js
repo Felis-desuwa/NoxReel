@@ -781,6 +781,8 @@ const CACHE_FNS = [
   'playCachedCurrentNow',
   'linkTransferView',
   'localMenu',
+  'ownCopyFor',
+  'canUseOwnCopy',
 ];
 
 async function cacheRoom({ localPath = { path: 'D:\saved\片子.mp4', title: '缓存的片子' }, ...opts } = {}) {

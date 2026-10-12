@@ -2185,6 +2185,16 @@ select:disabled {
   word-break: break-all;
   user-select: text;
 }
+/* 弹窗里的要点列表（「你的文件和房主的不是同一个」那几条可能的问题） */
+.modal-list {
+  margin: 4px 0 10px;
+  padding-left: 18px;
+  color: var(--text-dim, var(--text));
+}
+.modal-list li {
+  margin: 3px 0;
+  line-height: 1.5;
+}
 
 /* ------------------------- 房间页重排（0.7.1） ------------------------- */
 .ico {

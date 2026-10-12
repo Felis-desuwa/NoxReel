@@ -129,7 +129,9 @@ function kotlinToJs(text) {
     .replace(/\bmaxOf\(/g, 'Math.max(')
     .replace(/\bminOf\(/g, 'Math.min(')
     .replace(/\b(?:val|var)\s+/g, 'let ')
-    .replace(/JSONObject\(\)/g, 'J()');
+    .replace(/JSONObject\(\)/g, 'J()')
+    // Float 转 Double：JS 里本来就是同一种数
+    .replace(/\.toDouble\(\)/g, '');
 }
 
 /** org.json.JSONObject 的最小替身：put 可链式，toString 出 JSON。 */
@@ -145,21 +147,25 @@ function J() {
   return api;
 }
 
-/** data class Snap 的替身：位置参数一一对应，copy 同名。 */
-function Snap(generation, posMs, durMs, playWhenReady, state) {
+/** data class Snap 的替身：位置参数一一对应，copy 同名。failure / speed 在 Kotlin 里有默认值，这里同样放在最后。 */
+function Snap(generation, posMs, durMs, playWhenReady, state, failure = null, speed = 1) {
   const self = {
     generation,
     posMs,
     durMs,
     playWhenReady,
     state,
+    failure,
+    speed,
     copy(patch) {
       return Snap(
         patch.generation ?? generation,
         patch.posMs ?? posMs,
         patch.durMs ?? durMs,
         patch.playWhenReady ?? playWhenReady,
-        patch.state ?? state
+        patch.state ?? state,
+        patch.failure ?? failure,
+        patch.speed ?? speed
       );
     },
   };
@@ -318,9 +324,13 @@ test('resetSnap：新代号的初始快照是 0:00、暂停、idle', () => {
     buffering: false,
     idle: true,
     eof: false,
+    // 新播放器是 1 倍速（房间在快进时同步引擎会再把它调成房间的倍速）
+    speed: 1,
     // 没出过错：原因那两项是 null，JSONObject 不写进去
     loadFailed: false,
   });
+  // 房间倍速：有人长按 → 时全房 2 倍，快照报出来，同步引擎按它外推位置
+  assert.equal(kt.snapshot(s.copy({ speed: 2 })).speed, 2);
 });
 
 test('updateSnap：代号对不上的更新写不进去（旧播放器迟到的回调）', () => {
@@ -539,7 +549,7 @@ test('playerLoadUrl / playerRelease 也返回代号，失败给 0', () => {
 });
 
 test('playerSnapshot 的契约写在注释里（generation 是给 JS 用的，不是装饰）', () => {
-  assert.match(bridgeSrc, /\{generation, position, duration, paused, idle, eof\}/);
+  assert.match(bridgeSrc, /\{generation, position, duration, paused, idle, eof, speed\}/);
   assert.match(bridgeSrc, /整条丢弃/, '没写清代号对不上时该怎么做');
 });
 

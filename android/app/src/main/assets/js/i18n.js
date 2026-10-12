@@ -477,6 +477,10 @@ const PATTERNS = [
     /^(.+) (播放|暂停) @ (.+)$/,
     (_all, name, action, position) => `${name} ${{ 播放: 'played', 暂停: 'paused' }[action]} @ ${position}`,
   ],
+  // 电脑上有人长按 → 让全房快进，手机跟着一起
+  [/^(.+) 开始全房 ([\d.]+) 倍速快进$/, '$1 started fast-forwarding everyone at $2×'],
+  [/^(.+) 松开快进，全房回到正常速度 @ (.+)$/, '$1 let go — everyone is back to normal speed @ $2'],
+  [/^快进的人离开了，全房回到正常速度 @ (.+)$/, 'Whoever was fast-forwarding left — everyone is back to normal speed @ $1'],
   // 限速倒计时是动态的，单复数得跟着变
   [
     /^发得太快了（(\d+) 秒后再试）$/,

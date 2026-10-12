@@ -725,6 +725,8 @@ function initSwarmAndSync() {
   // 同步引擎驱动原生播放器（对应 PC 端驱动 mpv）
   S.sync.onSetPause = (paused) => window.swPlayer.setPause(paused);
   S.sync.onSeek = (sec) => window.swPlayer.seek(sec);
+  // 房间倍速：电脑上的房主 / 管理员长按 → 快进时全房 2 倍，手机跟着一起
+  S.sync.onSetRate = (rate) => window.swPlayer.setSpeed(rate);
 
   // 同步引擎要广播的指令 → 发给所有已连 peer 的 ctrl 通道
   S.sync.on('outbound', (msg) => {
@@ -738,6 +740,15 @@ function initSwarmAndSync() {
     // 不单独报），label 取不到就不记 —— 将来多出新的动作也不会在聊天流里冒出 undefined。
     const label = { play: '播放', pause: '暂停' }[kind];
     if (label) chatSystem(`${by} ${label} @ ${fmtTime(position)}`);
+  });
+  // 有人长按 → 让全房快进（手机自己发不起，只跟着）
+  S.sync.on('rate', ({ rate, by, position, orphan }) => {
+    let line;
+    if (orphan) line = `快进的人离开了，全房回到正常速度 @ ${fmtTime(position)}`;
+    else if (rate !== 1) line = `${by} 开始全房 ${rate} 倍速快进`;
+    else line = `${by} 松开快进，全房回到正常速度 @ ${fmtTime(position)}`;
+    log(line, 'good');
+    chatSystem(line);
   });
   S.sync.on('stall-change', renderWaiting);
   S.sync.on('state', renderWaiting);
@@ -1524,6 +1535,8 @@ function startPlayerTicks() {
       loadFailed: snap.loadFailed === true,
       streamPos: null,
       duration: snap.duration,
+      // 倍速（有人长按 → 时全房 2 倍）：引擎按它外推位置、核对和房间的倍速对没对上。老的原生层不报，就不带
+      ...(typeof snap.speed === 'number' ? { speed: snap.speed } : {}),
       at: performance.now(),
     };
 

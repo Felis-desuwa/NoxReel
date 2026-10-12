@@ -836,6 +836,17 @@ secureHandle('dialog:pickVideo', async () => {
   return r.canceled ? null : approveSource(r.filePaths[0]);
 });
 
+// 成员「用我自己的文件播放」：选本机的一份同一部片。和选片源一样经对话框批准，页面递不进路径
+secureHandle('dialog:pickOwnCopy', async () => {
+  if (devPicks.length) return approveSource(takeDevPick()[0]);
+  const r = await dialog.showOpenDialog(win, {
+    title: '选择你自己的这部片',
+    properties: ['openFile'],
+    filters: VIDEO_FILTERS,
+  });
+  return r.canceled ? null : approveSource(r.filePaths[0]);
+});
+
 // 播放列表一次加好几部片。取消返回空数组，渲染进程不必区分 null。
 secureHandle('dialog:pickVideos', async () => {
   if (devPicks.length) return approveSources(takeDevPick());
@@ -1183,6 +1194,17 @@ secureHandle('store:buildManifest', async (payload) => {
   );
 });
 
+// 成员自己的那份和房主的清单粗对一下（大小 + 头尾几片的哈希），只读、不开会话。见 fileStore.spotCheckFile
+// 清单还没到手（manifest 为 null）时只比大小
+secureHandle('store:spotCheck', async (payload) => {
+  const { manifest, filePath, size } = validate.plainObject(payload, '核对参数');
+  const expected =
+    manifest === null || manifest === undefined
+      ? { size: validate.integer(size, '文件大小', { min: 0, max: Number.MAX_SAFE_INTEGER }) }
+      : validate.manifest(manifest);
+  return store.spotCheckFile(await requireAllowedLocalPath(filePath), expected);
+});
+
 secureHandle('store:openSeed', async (payload) => {
   const { manifest, filePath } = validate.plainObject(payload, '做种参数');
   const sourcePath = await requireAllowedLocalPath(filePath);
@@ -1327,6 +1349,11 @@ secureHandle('player:seek', async (seconds, opts) => {
   const { dropBuffers = false } = opts === undefined ? {} : validate.plainObject(opts, '跳转参数');
   if (typeof dropBuffers !== 'boolean') throw new TypeError('无效的跳转参数');
   return players.seek(validate.finiteNumber(seconds, '播放位置', { min: 0, max: 10 ** 9 }), { dropBuffers });
+});
+
+// 房间倍速：长按 → 快进时全房 2 倍（同步引擎的房间倍速，范围和 syncEngine 的 RATE_MIN / RATE_MAX 一致）
+secureHandle('player:setSpeed', async (rate) => {
+  return players.setSpeed(validate.finiteNumber(rate, '倍速', { min: 0.5, max: 2 }));
 });
 
 secureHandle('player:osd', async (payload) => {

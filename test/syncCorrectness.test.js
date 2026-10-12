@@ -480,6 +480,7 @@ async function statusRoom({ role, safe = false }) {
     driftShown: () => false,
     currentUnavailable: () => false,
     currentSession: () => ({}),
+    currentFileCtx: () => null,
     setScanTicker: noop,
     renderNowKicker: noop,
     renderDrift: noop,

@@ -30,6 +30,12 @@ test('开窗参数：没记过按片子大小（autofit）；记过就 --geometr
   assert.ok(buildLaunchArgs({ ipcPath: 'x', source: 'D:/a.mkv' }).includes('--autofit=960x540'));
 });
 
+test('黑边是纯黑：按记的大小开窗时窗口比例常和片子不一样，空出来的地方用 --background-color 填', () => {
+  const args = buildLaunchArgs({ ipcPath: 'x', source: 'D:/a.mkv', windowPref: { w: 70, h: 60 } });
+  const bg = args.filter((a) => a.startsWith('--background-color='));
+  assert.deepEqual(bg, ['--background-color=#000000'], '界面的深蓝底色和片子里的黑挨着看得出是蓝的');
+});
+
 function controller(pref = null) {
   const ctl = new MpvController();
   const events = [];

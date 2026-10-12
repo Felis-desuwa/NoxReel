@@ -887,6 +887,40 @@ async function verifyChunk(session, i, buf) {
 }
 
 /**
+ * 成员拿自己的一份片子放（「用我自己的文件播放」）之前先粗查一下是不是房主那一部：
+ * 大小对不对，对的话抽查文件头 REUSE_HEAD_CHUNKS 片、文件尾 REUSE_TAIL_CHUNKS 片的 SHA-256
+ * （和复用副本时同一个抽法）。不开会话、只读，绝不改用户的文件。
+ * 「对得上」只是很可能是同一个文件；要当片源还得完整算一遍清单（buildManifest）比 fileId。
+ * @returns {Promise<{size: number, sizeMatch: boolean, checked: number, mismatched: number}>}
+ */
+async function spotCheckFile(filePath, manifest) {
+  const stat = await fsp.stat(filePath);
+  if (!stat.isFile()) throw new Error('选择的路径不是文件');
+  const out = { size: stat.size, sizeMatch: stat.size === manifest.size, checked: 0, mismatched: 0 };
+  // 清单还没到手（只给了大小）：只比得了大小
+  if (!out.sizeMatch || !Array.isArray(manifest.hashes)) return out;
+  const total = manifest.chunkCount;
+  const sample = new Set();
+  for (let i = 0; i < Math.min(REUSE_HEAD_CHUNKS, total); i++) sample.add(i);
+  for (let i = Math.max(0, total - REUSE_TAIL_CHUNKS); i < total; i++) sample.add(i);
+  const fh = await fsp.open(filePath, 'r');
+  try {
+    const buf = Buffer.allocUnsafe(manifest.chunkSize);
+    for (const i of sample) {
+      const len = chunkLengthAt(i, manifest.size);
+      const { bytesRead } = await fh.read(buf, 0, len, i * manifest.chunkSize);
+      const chunk = buf.subarray(0, bytesRead);
+      const digest = Buffer.from(await crypto.webcrypto.subtle.digest('SHA-256', chunk)).toString('hex');
+      out.checked++;
+      if (bytesRead !== len || digest !== manifest.hashes[i]) out.mismatched++;
+    }
+  } finally {
+    await fh.close().catch(() => {});
+  }
+  return out;
+}
+
+/**
  * 抽查之外的片在后台按顺序核对。会话一关就停；每半秒把进度连同最新 state 报一次。
  * 会话开出来之后调度器马上向对端要片，核对走到的时候有些片已经是对端送来的了：这些单独记成 fromPeer，
  * 不算「对不上」—— 以前混在一起，本机副本完好也报「有 715/716 片对得上」。
@@ -1161,6 +1195,7 @@ module.exports = {
   FLUSH_DELAY_MS,
   configureCache,
   buildManifest,
+  spotCheckFile,
   configureLibrary,
   setPolicy,
   openSeed,

@@ -190,6 +190,10 @@ const S = {
   // 扫描确认有威胁、已经销毁的片，这个房间里不再接收；磁盘放不下的片
   blockedFiles: new Set(),
   diskFull: new Set(),
+  // 「用我自己的文件播放」：fileId -> 本机那份的记录（见 ownCopyFor），只在这次运行里有效
+  ownCopies: new Map(),
+  // 当前项正在用的那份（镜像，见 syncCurrentMirrors）；null = 没在用
+  ownCopy: null,
   // 本机解析过的链接（按规范化后的地址）；房主给的临时播放地址 {seq, playback}
   links: new Map(),
   nowLink: null,
@@ -1763,6 +1767,7 @@ function syncCurrentMirrors() {
   S.filePath = null;
   S.linkInfo = null;
   S.isSeeder = false;
+  S.ownCopy = null;
   S.sourceType = item?.kind || null;
   if (!item) {
     S.mediaSafety = { sessionId: null, status: 'idle' };
@@ -1772,6 +1777,16 @@ function syncCurrentMirrors() {
     // 链接由每台电脑直接读取，不需要 P2P 分片
     S.isSeeder = true;
     S.mediaSafety = { sessionId: null, status: 'idle' };
+    return;
+  }
+  const own = ownCopyFor(item);
+  if (own) {
+    // 用本机自己的文件：和片源一样手里是整部片 —— 不收、不扫（不是从别人那里收来的），直接起播。
+    // 清单留空（没有接收会话，进度条、分片图都没有东西可画）
+    S.ownCopy = own;
+    S.filePath = own.path;
+    S.isSeeder = true;
+    S.mediaSafety = { sessionId: null, status: 'trusted-local' };
     return;
   }
   const sess = S.sessions.get(item.fileId);
@@ -2430,7 +2445,14 @@ async function switchCurrent(item) {
 }
 
 function onFileItemCurrent(item) {
+  // 本机用自己的文件放这一部（见 ownCopyFor）：和片源一样直接起播
+  if (ownCopyFor(item)) {
+    onOwnCopyCurrent();
+    return;
+  }
   const sess = S.sessions.get(item.fileId);
+  // 刚从「用自己的文件」改回来：那时引擎按片源算（不报卡顿），按现在有没有片源会话重新算
+  S.sync.isSeeder = !!sess?.isSeeder;
   renderFilmInfo();
   if (sess) {
     onCurrentSessionReady(sess);
@@ -2463,6 +2485,292 @@ function skipCurrentLocally() {
     renderFilmInfo();
     renderStatus();
   }
+}
+
+/* ---------------------- 用我自己的文件播放 ---------------------- */
+//
+// 成员本机已经有这部片（可能是别的版本）时，可以不从房主那里收、直接放自己的那一份，同步照常按时间点走。
+// 按 fileId 记在 S.ownCopies 里，只在这次运行里有效：
+//   { path, name, size, quick: 'same'|'different'|'unknown', reason: 'size'|'content'|null,
+//     full: null | {done, total}（正在完整核对）| 'same' | 'different', taskId }
+// quick 是粗查（大小 + 文件头尾几片的哈希，见 fileStore.spotCheckFile）：对不上就弹窗说清可能出什么问题，
+// 用户点了「仍然用」才换过去。对得上（或者只比得了大小）就直接用，后台再完整算一遍清单：fileId 一样
+// 就是同一个文件，开做种会话当片源（和本地加了同一部片一样），别人也能从这儿收；不一样再弹一次窗。
+// 用自己的文件时这一部本机不收、不扫，按「已收完」参与卡顿和就绪；文件只在本机放，不会传给别人。
+
+/** item 本机正在用自己的文件、又还不是片源（完整核对过、开了做种会话的按片源走）时，返回那条记录。 */
+function ownCopyFor(item) {
+  if (item?.kind !== 'file') return null;
+  const own = S.ownCopies?.get(item.fileId);
+  if (!own || S.sessions.get(item.fileId)?.isSeeder) return null;
+  return own;
+}
+
+/** 能不能给这一部换成自己的文件：本地片、我不是片源（自己加的、或者已经核对成片源了）。 */
+function canUseOwnCopy(item) {
+  return item?.kind === 'file' && !S.sessions.get(item.fileId)?.isSeeder;
+}
+
+/** 当前项用本机自己的文件放：和片源一样直接起播，按「已收完」参与卡顿和就绪。 */
+function onOwnCopyCurrent() {
+  if (S.leaving) return;
+  S.noAutoLaunchSeq = null;
+  syncCurrentMirrors();
+  S.sync.isSeeder = true;
+  refreshMediaUi();
+  if (!S.syncStarted) {
+    S.syncStarted = true;
+    S.sync.start();
+  }
+  // 撤掉之前按「一片都没有」报的卡顿
+  S.sync.onBufferProgress({ contiguousBytes: 0, runBytes: 0, complete: true });
+  launchPlayer();
+  updateLocalReady();
+  if (roomEntered) renderStatus();
+}
+
+/** 列表行和状态栏上「用我自己的文件播放」：选文件、粗查、对不上先问，然后换过去。 */
+async function chooseOwnCopy(item) {
+  if (!canUseOwnCopy(item)) return;
+  let filePath;
+  try {
+    filePath = await window.sw.dialog.pickOwnCopy();
+  } catch (error) {
+    log(`这个文件用不了：${error.message || error}`, 'bad');
+    return;
+  }
+  if (!filePath) return;
+  // 清单手上有就用；没有就向房里要（和开接收会话同一个办法），要不到就只比大小
+  let manifest = S.knownManifests.get(item.fileId) || null;
+  if (!manifest && S.swarm) {
+    log('正在向房里要这部片的清单，好核对你的文件…');
+    // 只是拿来粗查，等不了太久：要不到就只比大小，后台完整核对照样按 fileId 判
+    manifest = await S.swarm
+      .requestManifest(item.fileId, {
+        candidates: manifestCandidates(item),
+        expect: { name: item.name, size: item.size, chunkCount: item.chunkCount, durationSec: item.durationSec },
+        timeoutMs: 8000,
+      })
+      .catch(() => null);
+    if (manifest) S.knownManifests.set(item.fileId, manifest);
+  }
+  let check;
+  try {
+    check = await window.sw.store.spotCheck(manifest, filePath, item.size);
+  } catch (error) {
+    log(`这个文件用不了：${error.message || error}`, 'bad');
+    return;
+  }
+  if (!canUseOwnCopy(item) || !findItem(S.playlist, item.id)) return;
+  const entry = {
+    path: filePath,
+    name: baseName(filePath),
+    size: check.size,
+    quick: !check.sizeMatch || check.mismatched > 0 ? 'different' : check.checked > 0 ? 'same' : 'unknown',
+    reason: !check.sizeMatch ? 'size' : check.mismatched > 0 ? 'content' : null,
+    full: null,
+    taskId: null,
+  };
+  if (entry.quick === 'different') {
+    if (!(await ownCopyWarning(item, entry).done)) return;
+    if (!canUseOwnCopy(item) || !findItem(S.playlist, item.id)) return;
+    log(`《${itemLabel(item)}》用你自己的文件播放（和房主的不一样）`, 'warn');
+  } else {
+    log(
+      entry.quick === 'same'
+        ? `《${itemLabel(item)}》用你自己的文件播放：大小和开头结尾都和房主的一致，后台再完整核对一遍`
+        : `《${itemLabel(item)}》用你自己的文件播放：大小和房主的一致，后台再完整核对一遍`,
+      'good'
+    );
+  }
+  await adoptOwnCopy(item, entry);
+  if (entry.quick !== 'different' && S.ownCopies.get(item.fileId) === entry) verifyOwnCopy(item, entry);
+}
+
+/**
+ * 对不上时的提醒：可能出什么问题、同步照常。afterFull：粗查对上了、完整核对才发现不一样（这时已经在用了，
+ * 点「取消」改回从房主那里收）。返回 openModal 的句柄。
+ */
+function ownCopyWarning(item, entry, { afterFull = false } = {}) {
+  const sizeLine =
+    entry.reason === 'size'
+      ? `大小不一样：你的 ${fmtBytes(entry.size)}，房主的 ${fmtBytes(item.size)}`
+      : '大小一样，但内容对不上（可能是重新封装过、改过字幕或元数据的版本）';
+  return openModal({
+    title: '你的文件和房主的不是同一个',
+    body: [
+      make('p', { raw: true, className: 'modal-name', text: entry.name }),
+      hint(sizeLine),
+      make('p', { text: '仍然可以用它看，同步照常：播放、暂停、跳转都按时间点跟着房间走。可能会遇到：' }),
+      make('ul', { className: 'modal-list' }, [
+        make('li', { text: '版本不同（加长版、删减版、片头片尾长短不一样）：同一个时间点画面对不上，大家说的那一幕你可能还没到、或者已经过去了' }),
+        make('li', { text: '帧率不同（比如 23.976 帧和 25 帧）：时间轴会越放越偏' }),
+        make('li', { text: '时长不同：片尾不在同一时刻，房主那边放完就会换下一部' }),
+        make('li', { text: '字幕、音轨、画质可能和别人的不一样' }),
+      ]),
+      hint(
+        afterFull
+          ? '点「取消」改回从房主那里收。之后也可以在列表里这一部的「⋯」里换。'
+          : '对不上的话，在列表里这一部的「⋯」里选「不用我自己的文件了」，改回从房主那里收。'
+      ),
+    ],
+    okText: afterFull ? '继续用我的文件' : '仍然用我的文件',
+    ...(afterFull ? { onCancel: () => dropOwnCopy(item) } : {}),
+  });
+}
+
+/**
+ * 换成自己的文件：正在从别人那里收的这一部不收了（收到的部分按缓存规则留着，改回来时能接着收），
+ * 是当前项就先退掉播放器（它可能正读着接收缓存），再按自己的文件起播。
+ */
+async function adoptOwnCopy(item, entry) {
+  const { fileId } = item;
+  const prev = S.ownCopies.get(fileId);
+  if (prev?.taskId) window.sw.tasks.cancel(prev.taskId).catch(() => {});
+  S.ownCopies.set(fileId, entry);
+  const existing = S.sessions.get(fileId);
+  const leech = existing && !existing.isSeeder ? existing : null;
+  const wasCurrent = S.current?.kind === 'file' && S.current.fileId === fileId;
+  if (leech) S.sessions.delete(fileId);
+  if (wasCurrent) {
+    retirePlayer();
+    // 镜像先放开旧会话：要关的接收缓存不能再拿去起播
+    syncCurrentMirrors();
+    $('btn-playpause').disabled = true;
+    $('btn-reopen')?.classList.add('hidden');
+  }
+  // closeSession 自己会等播放器退完再关会话
+  if (leech) await closeSession(leech);
+  else await S.playerQuit;
+  if (S.ownCopies.get(fileId) !== entry || S.leaving) return;
+  updateTransfer();
+  if (wasCurrent && S.current?.kind === 'file' && S.current.fileId === fileId && !S.switchingMedia) {
+    onFileItemCurrent(S.current);
+  }
+  renderPlaylistSoon();
+  if (roomEntered) {
+    renderFilmInfo();
+    renderStatus();
+  }
+}
+
+/** 列表行菜单「不用我自己的文件了」：改回从房主那里收。 */
+async function dropOwnCopy(item) {
+  const own = S.ownCopies.get(item.fileId);
+  if (!own) return;
+  if (own.taskId) window.sw.tasks.cancel(own.taskId).catch(() => {});
+  S.ownCopies.delete(item.fileId);
+  const wasCurrent = !!S.ownCopy && S.ownCopy === own;
+  if (wasCurrent) {
+    retirePlayer();
+    syncCurrentMirrors();
+    $('btn-playpause').disabled = true;
+    $('btn-reopen')?.classList.add('hidden');
+    await S.playerQuit;
+    if (S.ownCopies.has(item.fileId) || S.leaving) return;
+    if (S.current?.kind === 'file' && S.current.fileId === item.fileId && !S.switchingMedia) onFileItemCurrent(S.current);
+  }
+  log(`《${itemLabel(item)}》改回从房主那里收`);
+  updateTransfer();
+  renderPlaylistSoon();
+  if (roomEntered) {
+    renderFilmInfo();
+    renderStatus();
+  }
+}
+
+/**
+ * 粗查对上了：后台完整算一遍清单（和房主加片时同一个办法），fileId 一样就是同一个文件、开做种会话当片源；
+ * 不一样再提醒一次。算的期间照样放着自己的文件。
+ */
+async function verifyOwnCopy(item, entry) {
+  const taskId = `own-${randomId(8)}`;
+  entry.taskId = taskId;
+  entry.full = { done: 0, total: 1 };
+  renderPlaylistSoon();
+  const off = window.sw.store.onHashProgress(({ done, total, taskId: owner }) => {
+    if (owner !== taskId || S.ownCopies.get(item.fileId) !== entry) return;
+    entry.full = { done, total };
+    renderPlaylistSoon();
+  });
+  let built;
+  try {
+    built = await window.sw.store.buildManifest(entry.path, taskId);
+  } catch (error) {
+    // 被换掉、撤掉（任务随之取消）就不用说了
+    if (S.ownCopies.get(item.fileId) === entry) {
+      entry.full = null;
+      entry.taskId = null;
+      log(`没能完整核对你的文件（照样用它放）：${error.message || error}`, 'warn');
+      renderPlaylistSoon();
+    }
+    return;
+  } finally {
+    off();
+  }
+  if (S.ownCopies.get(item.fileId) !== entry || S.leaving) return;
+  entry.taskId = null;
+  if (built.fileId !== item.fileId) {
+    entry.full = 'different';
+    entry.reason = 'content';
+    renderPlaylistSoon();
+    if (roomEntered) renderFilmInfo();
+    log(`完整核对：你的文件和房主的不是同一个（照样用它放）`, 'warn');
+    // 这时多半正全屏看着 mpv、看不到房间窗口里的弹窗：画面上也说一声
+    if (S.mpvRunning && S.ownCopy === entry) {
+      window.sw.player.osd(t('完整核对：你的文件和房主的不是同一个（照样用它放）'), 6000, 'warn').catch(() => {});
+    }
+    ownCopyWarning(item, entry, { afterFull: true });
+    return;
+  }
+  entry.full = 'same';
+  await adoptOwnCopyAsSeed(item, entry, built);
+}
+
+/**
+ * 完整核对过、和房主的是同一个文件：开做种会话当片源（和本地加了同一部片一样，见 addLocalFile），
+ * 别人也能从这儿收。清单用房主的（片名、时长以列表为准）；手上没有就用自己算的 —— 分片哈希一模一样。
+ * 正在放的那一部播放器不用动：做种会话的文件就是正在放的这个。
+ */
+async function adoptOwnCopyAsSeed(item, entry, built) {
+  const { fileId } = item;
+  const manifest =
+    S.knownManifests.get(fileId) ||
+    { ...built, name: item.name, ...(item.durationSec > 0 ? { durationSec: item.durationSec } : {}) };
+  let state;
+  try {
+    state = await trackPending(S.leechOpens, window.sw.store.openSeed(manifest, entry.path));
+  } catch (error) {
+    log(`你的文件和房主的是同一个，但没能拿它给别人供片：${error.message || error}`, 'warn');
+    renderPlaylistSoon();
+    return;
+  }
+  if (S.ownCopies.get(fileId) !== entry || S.leaving || S.sessions.get(fileId)?.isSeeder) {
+    await trackClosing(window.sw.store.close(state.sessionId).catch(() => {}));
+    return;
+  }
+  S.knownManifests.set(fileId, manifest);
+  S.sessions.set(fileId, newSession({ manifest, state, filePath: entry.path, sourcePath: entry.path, isSeeder: true }));
+  S.blockedFiles.delete(fileId);
+  S.diskFull.delete(fileId);
+  S.swarm.offerManifest(manifest);
+  log(`核对完了：你的文件和房主的《${itemLabel(item)}》是同一个，你也开始给别人供片`, 'good');
+  onPlaylistChanged();
+  const sess = S.sessions.get(fileId);
+  if (sess && sess.slot !== null && currentSession() === sess && S.playlist.seq === S.currentSeq && !S.switchingMedia) {
+    onCurrentSessionReady(sess);
+  }
+}
+
+/** 列表里这一部「传输」那一栏：用自己的文件时说清是哪种情况。 */
+function ownCopyTransferView(own) {
+  const full = own.full;
+  if (full && typeof full === 'object') {
+    const ratio = full.total > 0 ? Math.min(1, full.done / full.total) : 0;
+    return { text: `用你自己的文件 · 核对中 ${pct(ratio)}`, tone: '', ratio };
+  }
+  if (own.quick === 'different' || full === 'different') return { text: '用你自己的文件 · 和房主的不一样', tone: 'warn' };
+  return { text: '用你自己的文件', tone: 'good' };
 }
 
 /** 当前项的会话就绪：同步引擎开工（哪怕播放器还没起，也要参与 stall 计算）。 */
@@ -2526,6 +2834,8 @@ function updateTransfer() {
   let partial = null;
   const order = transferOrder(S.playlist, {
     isComplete: (it) => {
+      // 用自己的文件放的那一部本机不收（见 ownCopyFor）
+      if (S.ownCopies?.has(it.fileId)) return true;
       const sess = S.sessions.get(it.fileId);
       return !!sess && (sess.isSeeder || S.swarm.files.get(it.slot)?.complete === true);
     },
@@ -2560,7 +2870,9 @@ async function openLeechFor(item) {
     !S.leaving &&
     S.playlist.queue.some((it) => it.kind === 'file' && it.fileId === fileId) &&
     !S.sessions.has(fileId) &&
-    !S.pendingAdds.has(fileId);
+    !S.pendingAdds.has(fileId) &&
+    // 清单在路上时本人改用了自己的文件
+    !S.ownCopies?.has(fileId);
   try {
     const manifest =
       S.knownManifests.get(fileId) ||
@@ -4992,7 +5304,20 @@ function initSwarmAndSync() {
 
   S.sync.onSetPause = (p) => whilePlayerBusy(window.sw.player.setPause(p).catch(() => {}));
   S.sync.onSeek = (pos, opts) => whilePlayerBusy(applySeek(pos, opts));
+  // 房间倍速（长按 → 快进时全房 2 倍）。外部播放器调不了，主进程那边静默忽略
+  S.sync.onSetRate = (rate) => whilePlayerBusy(window.sw.player.setSpeed(rate).catch(() => {}));
   S.sync.on('data-end', () => log('播放到已接收内容的末尾，等后续分片', 'warn'));
+  // 长按 → 快进：全房一起变倍速。日志和聊天流里各记一行（和播放、暂停一样由界面统一翻译）
+  S.sync.on('rate', ({ rate, by, position, self, orphan }) => {
+    const who = self ? '你' : by;
+    let line;
+    if (orphan) line = `快进的人离开了，全房回到正常速度 @ ${fmtTime(position)}`;
+    else if (rate !== 1) line = `${who} 开始全房 ${rate} 倍速快进`;
+    else line = `${who} 松开快进，全房回到正常速度 @ ${fmtTime(position)}`;
+    log(line);
+    S.chat?.note(line);
+    scheduleOscState();
+  });
 
   // 同步引擎要发的消息，广播给所有 peer
   S.sync.on('outbound', (msg) => {
@@ -6118,6 +6443,8 @@ function scanStateView(status) {
  * 传输严格按列表顺序，同一时刻只向别人要一部，其余的停在原处、进度留着。
  */
 function fileTransferView(item) {
+  const own = ownCopyFor(item);
+  if (own) return ownCopyTransferView(own);
   if (S.blockedFiles.has(item.fileId)) return { text: '已拒绝接收', tone: 'bad' };
   const sess = S.sessions.get(item.fileId);
   if (sess?.isSeeder) return { text: item.sourceId === S.peerId ? '你是片源' : '本机有完整文件', tone: 'good' };
@@ -6391,10 +6718,22 @@ function linkNotice(item) {
 function localMenu(item) {
   const menu = [];
   const sess = item.kind === 'file' ? S.sessions.get(item.fileId) : null;
+  const own = ownCopyFor(item);
   if (sess?.filePath) {
     // 按文件真正在哪儿说：手动模式收的、复用了持久副本的在长期缓存文件夹里，不是退房就删的临时文件
     const label = sess.isSeeder ? '打开源文件位置' : sess.persistent ? '打开长期缓存位置' : '打开临时缓存位置';
     menu.push({ key: 'reveal', label });
+  } else if (own) {
+    menu.push({ key: 'reveal', label: '打开你的文件位置' });
+  }
+  // 本机有这部片（哪怕是别的版本）：不收了，直接放自己的
+  if (canUseOwnCopy(item)) {
+    if (own) {
+      menu.push({ key: 'own-copy', label: '换一个我自己的文件…' });
+      menu.push({ key: 'own-copy-drop', label: '不用我自己的文件了' });
+    } else {
+      menu.push({ key: 'own-copy', label: '用我自己的文件播放…' });
+    }
   }
   if (item.kind === 'link') {
     const cache = linkCacheOf(item);
@@ -6499,9 +6838,16 @@ async function onPlaylistAction(key, id) {
       return;
     case 'reveal': {
       const sess = item.kind === 'file' ? S.sessions.get(item.fileId) : null;
-      if (sess?.filePath) window.sw.store.reveal(sess.filePath);
+      const path = sess?.filePath || ownCopyFor(item)?.path;
+      if (path) window.sw.store.reveal(path);
       return;
     }
+    case 'own-copy':
+      await chooseOwnCopy(item);
+      return;
+    case 'own-copy-drop':
+      await dropOwnCopy(item);
+      return;
     case 'copy-link':
       if (item.kind !== 'link') return;
       await window.sw.clipboard.writeText(item.url);
@@ -6641,6 +6987,8 @@ function localReadyNow() {
   }
   // 本机收不下这一部：和卡顿判定一样不参与（见 localOptedOut）
   if (localOptedOut(item)) return true;
+  // 用自己的文件放：手上是整部片，和片源一样随时能开播
+  if (ownCopyFor(item)) return true;
   const sess = S.sessions.get(item.fileId);
   const ctx = sess && sess.slot === item.slot ? S.swarm?.files.get(item.slot) : null;
   const prog = ctx ? S.swarm.progress(item.slot) : null;
@@ -6826,14 +7174,17 @@ function currentUnavailable() {
 
 /** 我在给别人供当前这部：自己是片源，或者房主已经收完、在替片源转发。 */
 function servingCurrent() {
-  return S.isSeeder || (isRoomHost() && S.sourceType === 'file' && !!currentFileCtx()?.complete);
+  // 用自己的文件放的（还没核对成片源）只在本机放，不给别人供片
+  return (S.isSeeder && !S.ownCopy) || (isRoomHost() && S.sourceType === 'file' && !!currentFileCtx()?.complete);
 }
 
 function refreshMediaUi() {
   renderFilmInfo();
   renderProgress(S.swarm?.progress());
   $('btn-reveal').classList.toggle('hidden', S.sourceType !== 'file' || !S.filePath);
-  $('btn-reveal').textContent = S.isSeeder
+  $('btn-reveal').textContent = S.ownCopy
+    ? '打开你的文件位置'
+    : S.isSeeder
     ? '打开源文件位置'
     : currentSession()?.persistent
     ? '打开长期缓存位置'
@@ -6883,7 +7234,15 @@ function renderFilmInfo() {
     return;
   }
   if (!S.manifest) {
-    if (S.current?.kind === 'file') {
+    if (S.current?.kind === 'file' && S.ownCopy) {
+      // 用自己的文件放：没有接收会话、也不需要清单
+      const own = S.ownCopy;
+      $('room-file').textContent = currentTitle();
+      $('room-meta').textContent =
+        own.quick === 'different' || own.full === 'different'
+          ? `${fmtBytes(own.size)} · ${mode} · 用你自己的文件播放（和房主的不一样）`
+          : `${fmtBytes(own.size)} · ${mode} · 用你自己的文件播放`;
+    } else if (S.current?.kind === 'file') {
       // 列表已经告诉我放哪部了，清单还在路上
       $('room-file').textContent = currentTitle();
       $('room-meta').textContent = S.blockedFiles.has(S.current.fileId)
@@ -9240,7 +9599,7 @@ const OSC_LABEL_TEXT = {
   keySpace: '空格',
   keyHold: '长按 →',
   speedHold: '2 倍速快进中',
-  speedHoldNote: '松开后全房跟到这里',
+  speedHoldNote: '全房跟着一起快进',
   noSpeed: '一起看时不能改倍速，长按 → 可以临时 2 倍速快进',
   danmakuShown: '弹幕已打开',
   danmakuHidden: '弹幕已关闭',
@@ -9309,6 +9668,7 @@ function clipOscState(s) {
   }
   // 共享标记：最多 40 个（主进程 OSC_MAX_MARKS），每个的「谁：一句话」截到 120 字以内
   if (s.marks) out.marks = s.marks.slice(0, OSC_MAX_MARKS).map((m) => ({ t: m.t, n: clipText(m.n, 120) }));
+  if (s.rate) out.rate = { x: s.rate.x, text: clipText(s.rate.text, 120) };
   out.labels = Object.fromEntries(Object.entries(s.labels || {}).map(([k, v]) => [k, clipText(v, 80)]));
   return out;
 }
@@ -9337,7 +9697,16 @@ function oscLabels() {
 function forgetMpvOsc() {
   mpvOscReady = false;
   lastOscJson = '';
+  // 按着 → 快进时播放器没了（关窗口、崩溃、换清晰度重开）：松手那一条不会来了，全房的倍速由自己收回
+  if (S.speedHold) releaseSpeedHold(null);
   S.speedHold = false;
+}
+
+/** 长按 → 快进结束：房间倍速回到 1（自己是控制者、房间还在快进时）。position 为 null 时用房间时钟。 */
+function releaseSpeedHold(position) {
+  S.speedHold = false;
+  if (!roomEntered || !S.sync?.canIControl() || S.sync.roomRate() === 1) return;
+  S.sync.userSetRate(1, Number.isFinite(position) ? position : S.sync.sharedPositionNow());
 }
 
 /** 右上角那一小块：房间现在什么状态、几个人在看。房里只有自己时不画。 */
@@ -9464,8 +9833,22 @@ function mpvOscState() {
     host: oscHost(st),
     quality: oscQuality(),
     marks: oscMarks(),
+    rate: oscRate(),
     labels: oscLabels(),
   });
+}
+
+/**
+ * 全房在快进（别人按着 →）：控制条顶部那一条「全房 2 倍速 · 谁在快进」。自己按着时控制条画它自己的那一条，
+ * 这里照样给（脚本里自己按着的优先）。1 倍时不给。
+ */
+function oscRate() {
+  const rate = S.sync.roomRate();
+  if (rate === 1) return undefined;
+  const holder = S.sync.rateHolder();
+  // 「你」留给整句一起翻（英文要换说法），别人的昵称原样
+  const who = !holder ? '' : holder === S.peerId ? '你' : nameOfPeer(holder);
+  return { x: rate, text: who ? t(`全房 ${rate} 倍速 · ${who} 在快进`) : t(`全房 ${rate} 倍速快进中`) };
 }
 
 /** 推一份新状态给控制条。合并同一小段时间里的多次调用，没变就不发。 */
@@ -9516,12 +9899,18 @@ window.sw.player.onOscAction?.((payload) => {
     mpvOscReady = false;
     return;
   }
-  // 在 mpv 里长按 →：按住期间只有自己在 2 倍速（在线视频的自动对齐先停一停，不然两秒后就被拽回去）；
-  // 松手时房主 / 管理员把全房带到自己这里，和拖进度条松手一样。游客那边控制条就不让快进
+  // 在 mpv 里长按 →：房主 / 管理员按住时全房一起 2 倍速（房间倍速跟着同步走，见 syncEngine 的 userSetRate）；
+  // 按住期间本机的自动对齐先停一停（老版本的成员还是 1 倍，在线视频两秒后会被拽回去）。
+  // 松手时全房回到 1 倍、对齐到自己松手的地方，和拖进度条松手一样。游客那边控制条就不让快进
   if (action === 'speed-hold') {
-    S.speedHold = payload.value === 'start';
-    if (payload.value === 'end' && roomEntered && Number.isFinite(payload.position) && S.sync?.canIControl()) {
-      S.sync.userSeek(payload.position);
+    if (payload.value === 'start') {
+      S.speedHold = true;
+      if (roomEntered && S.sync?.canIControl()) S.sync.userSetRate(2, S.sync.playerPositionNow());
+    } else if (payload.value === 'end') {
+      releaseSpeedHold(payload.position);
+    } else {
+      // 换片途中收尾：报的位置是上一部的，倍速换片时已经回到 1 倍；同一部重开播放器的才要收回
+      releaseSpeedHold(null);
     }
     return;
   }
@@ -10163,6 +10552,9 @@ function renderStatus() {
     banner.className = driftShown() ? 'status-banner waiting' : 'status-banner playing';
     banner.textContent = driftShown()
       ? `播放中，但你和${driftRefName()}没对上`
+      : st.rate > 0 && st.rate !== 1
+      ? // 有人按着 → 让全房快进
+        `全房 ${st.rate} 倍速快进中`
       : guest
       ? '播放中（你在独立观看，操作不影响他人）'
       : '播放中，所有人同步';
@@ -10210,6 +10602,12 @@ function renderStatus() {
   $('btn-retry-link').classList.toggle('hidden', !(failed || playFailed));
   $('btn-skip-link').classList.toggle('hidden', !(asking || failed || playFailed) || skipped);
   $('btn-skip-current').classList.toggle('hidden', !(S.sync.canIControl() && currentUnavailable()));
+  // 这一部还在等传输（没收完、不是片源、也没在用自己的文件 —— 用着的时候镜像里 isSeeder 也是真）：
+  // 本机有这部片的话直接放自己的
+  $('btn-own-copy')?.classList.toggle(
+    'hidden',
+    !(cur?.kind === 'file' && !S.isSeeder && !S.switchingMedia && !currentFileCtx()?.complete)
+  );
 
   // 全屏看片时上面这块横幅整个看不见 —— mpv 是独立窗口。把同一句话推到 mpv 画面上。
   pushMpvBanner(st.stalled && !streamSelfOnly ? banner.textContent : '');
@@ -10609,7 +11007,8 @@ function handlePlayerTick(snap) {
     runBytes: prog?.runBytes || 0,
     // 和 runBytes 出自同一个核对过的播放位置：eof 守卫拿它判「是不是一路连到了文件尾」
     runEndBytes: prog ? prog.runEndBytes : undefined,
-    complete: S.sourceType === 'link' || !!ctx?.complete,
+    // 用自己的文件放的没有接收会话：整部都在手上，放到头就是放完了（不当成「数据断在半路」）
+    complete: S.sourceType === 'link' || !!S.ownCopy || !!ctx?.complete,
   });
   if (S.sourceType === 'link') noteLinkPlayback(snap);
 
@@ -10841,6 +11240,11 @@ $('btn-retry-link').onclick = () => {
 $('btn-skip-current').onclick = () => {
   if (!S.sync?.canIControl() || !S.current) return;
   runPlaylistOp({ type: 'ended', seq: S.playlist.seq });
+};
+
+// 本机有这部片（哪怕是别的版本）：不等传输，直接放自己的（见 chooseOwnCopy）
+$('btn-own-copy').onclick = () => {
+  if (S.current?.kind === 'file') chooseOwnCopy(S.current);
 };
 
 // 房主兜底推进：自己的播放器没开着时（关掉了、崩了），按房间时钟判断这一部放完没有。

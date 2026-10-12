@@ -368,6 +368,7 @@ const SWITCH_FNS = [
   'currentSession',
   'currentFileCtx',
   'syncCurrentMirrors',
+  'ownCopyFor',
   'playbackAllowed',
 ];
 
@@ -474,6 +475,7 @@ const HANDOVER_FNS = [
   'newSession',
   'currentSession',
   'syncCurrentMirrors',
+  'ownCopyFor',
   'onCurrentSessionReady',
   'launchPlayer',
   'playbackAllowed',
@@ -582,6 +584,7 @@ test('安全模式还没收完时改成本地做种：本地有完整文件就�
 
 const OPTOUT_FNS = [
   'onFileItemCurrent',
+  'ownCopyFor',
   'localOptedOut',
   'skipCurrentLocally',
   'openLeechFor',

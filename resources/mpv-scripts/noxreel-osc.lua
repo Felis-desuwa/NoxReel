@@ -165,7 +165,7 @@ local DEFAULT_LABELS = {
   keySpace = '空格',
   keyHold = '长按 →',
   speedHold = '2 倍速快进中',
-  speedHoldNote = '松开后全房跟到这里',
+  speedHoldNote = '全房跟着一起快进',
   noSpeed = '一起看时不能改倍速，长按 → 可以临时 2 倍速快进',
   danmakuShown = '弹幕已打开',
   danmakuHidden = '弹幕已关闭',
@@ -1301,7 +1301,7 @@ local function draw_toasts(start_y)
   end
 end
 
--- 长按 → 快进时顶部那一条：「▶▶ 2 倍速快进中 · 松开后全房跟到这里」（房里有别人时才说后半句）
+-- 长按 → 快进时顶部那一条：「▶▶ 2 倍速快进中 · 全房跟着一起快进」（房里有别人时才说后半句）
 local function draw_hold(y)
   local label = L('speedHold')
   local note = room.chip and L('speedHoldNote') or nil
@@ -1316,6 +1316,19 @@ local function draw_hold(y)
   icon('ffwd', x0 + 12 + 10, cy, 18, C.accent, 1)
   text(x0 + 12 + 20 + 10, cy, 4, 14, C.text, 1, label, true)
   if note then text(x0 + 12 + 20 + 10 + tw + 20, cy, 4, 13, C.sub, 1, fit(note, 13, false, w - (12 + 20 + 10 + tw + 20) - 16)) end
+end
+
+-- 别人按着 → 让全房快进时顶部那一条：「▶▶ 全房 2 倍速 · 谁在快进」（和自己按着时那一条一个样子）
+local function draw_room_rate(y)
+  local label = room.rate.text
+  local w = math.min(12 + 20 + 10 + text_width(label, 14, true) + 18, ui.W - 24)
+  local x0 = math.floor(ui.W / 2 - w / 2)
+  local cy = y + 20
+  fill_rect(x0, y + 8, x0 + w, y + 48, 20, C.black, 0.4, '\\blur12')
+  fill_rect(x0, y, x0 + w, y + 40, 20, C.panel, 0.88)
+  ring_rect(x0, y, x0 + w, y + 40, 20, 1, C.accent, 0.6)
+  icon('ffwd', x0 + 12 + 10, cy, 18, C.accent, 1)
+  text(x0 + 12 + 20 + 10, cy, 4, 14, C.text, 1, fit(label, 14, true, w - (12 + 20 + 10) - 16), true)
 end
 
 -- 快捷键一览（? / F1）：画面压暗，正中一张两列的表
@@ -1558,6 +1571,9 @@ local function render()
   local toast_y = (f > 0.5 or (lay and lay.drift)) and 72 or 24
   if ui.hold.active then
     draw_hold(toast_y)
+    toast_y = toast_y + 48
+  elseif room.rate then
+    draw_room_rate(toast_y)
     toast_y = toast_y + 48
   end
   draw_toasts(toast_y)
@@ -2175,6 +2191,10 @@ local function apply_state(json)
   if type(raw.host) == 'table' and num(raw.host.pos, 0) then
     next_room.host = { pos = raw.host.pos, playing = raw.host.playing == true }
   end
+  -- 全房在快进（别人按着 →）：顶部那一条的字由 NoxReel 拼好、翻译好
+  if type(raw.rate) == 'table' and num(raw.rate.x, 0.5, 2) and str(raw.rate.text, 120) then
+    next_room.rate = { x = raw.rate.x, text = str(raw.rate.text, 120) }
+  end
   if type(raw.marks) == 'table' then
     local list = {}
     for _, m in ipairs(raw.marks) do
@@ -2309,8 +2329,9 @@ observe('aid', 'native', function()
   if label then toast(L('audio') .. ' · ' .. label, 1500, 'info', 'track') end
 end)
 observe('speed', 'number', function(_, v)
-  -- 长按 → 的 2 倍速是我们自己改的，顶部另有一条「2 倍速快进中」
-  if ui.hold.active or now() < ui.hold.quiet_until then return end
+  -- 长按 → 的 2 倍速是我们自己改的，顶部另有一条「2 倍速快进中」。
+  -- 在房间里时倍速只会跟着房间变（别人按着 → 全房快进，顶部另有一条「全房 2 倍速」），也不弹
+  if ui.hold.active or now() < ui.hold.quiet_until or room.danmaku ~= nil then return end
   if not settled() or type(v) ~= 'number' then return end
   toast(string.format('%s %s×', L('speed'), (string.format('%.2f', v):gsub('0+$', ''):gsub('%.$', ''))), 1500, 'info', 'speed')
 end)

@@ -231,6 +231,15 @@ class PlayerManager extends EventEmitter {
     return this._require().seek(seconds, opts);
   }
 
+  /**
+   * 房间倍速（长按 → 快进时全房 2 倍）。只有 mpv 调得了：外部播放器没有这个接口，静默忽略，
+   * 照旧 1 倍走，松手那一条同步把它拉过来。播放器没开时也静默忽略（起来之后同步引擎会再对一次）。
+   */
+  setSpeed(rate) {
+    const adapter = this.current?.adapter;
+    if (adapter && typeof adapter.setSpeed === 'function') return adapter.setSpeed(rate);
+  }
+
   /** 提示和横幅是锦上添花，播放器没开时静默忽略。 */
   osd(text, durationMs, tone) {
     if (this.current) return this.current.adapter.osd(text, durationMs, tone);

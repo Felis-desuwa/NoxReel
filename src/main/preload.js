@@ -73,6 +73,8 @@ contextBridge.exposeInMainWorld('sw', {
   dialog: {
     pickVideo: () => ipcRenderer.invoke('dialog:pickVideo'),
     pickVideos: () => ipcRenderer.invoke('dialog:pickVideos'),
+    // 「用我自己的文件播放」：选本机的一份同一部片（返回批准过的路径，取消是 null）
+    pickOwnCopy: () => ipcRenderer.invoke('dialog:pickOwnCopy'),
     pickCacheDir: () => ipcRenderer.invoke('dialog:pickCacheDir'),
     pickDownloadDir: () => ipcRenderer.invoke('dialog:pickDownloadDir'),
     // 这里**不**暴露「按路径批准片源」：页面传一个字符串就能批准本机任意视频（连同旁边的字幕）
@@ -107,6 +109,9 @@ contextBridge.exposeInMainWorld('sw', {
       ipcRenderer.invoke('store:buildManifest', taskId ? { filePath, taskId } : filePath),
     onHashProgress: on('store:hashProgress'),
     openSeed: (manifest, filePath) => ipcRenderer.invoke('store:openSeed', { manifest, filePath }),
+    // 自己的那份和房主的清单粗对一下：{size, sizeMatch, checked, mismatched}。
+    // 清单还没到手（manifest 为 null）时只比大小（size 是列表里写的大小）
+    spotCheck: (manifest, filePath, size) => ipcRenderer.invoke('store:spotCheck', { manifest, filePath, size }),
     openLeech: (manifest) => ipcRenderer.invoke('store:openLeech', manifest),
     // 本机有收完的副本时，打开会话前要逐片核对：开始 / 进度 / 结束
     onReuse: on('store:reuse'),
@@ -144,6 +149,8 @@ contextBridge.exposeInMainWorld('sw', {
     setPause: (paused) => ipcRenderer.invoke('player:setPause', paused),
     // dropBuffers：先丢掉播放器缓存里的旧数据再跳（只有 mpv 认）
     seek: (seconds, opts) => ipcRenderer.invoke('player:seek', seconds, { dropBuffers: opts?.dropBuffers === true }),
+    // 房间倍速（长按 → 快进时全房 2 倍）
+    setSpeed: (rate) => ipcRenderer.invoke('player:setSpeed', rate),
     // tone：ok / warn，mpv 控制条上的提示条据此配图标（盾牌 / 警告），不传就是普通提示
     osd: (text, duration = 2000, tone = 'info') => ipcRenderer.invoke('player:osd', { text, duration, tone }),
     overlay: (text) => ipcRenderer.invoke('player:overlay', { text }),

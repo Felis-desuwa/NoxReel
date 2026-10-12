@@ -36,6 +36,8 @@ const OBSERVED = [
   'seeking',
   'paused-for-cache',
   'idle-active',
+  // 倍速：长按 → 快进时全房 2 倍速（房间倍速），同步引擎按它外推播放位置
+  'speed',
 ];
 
 /**
@@ -427,7 +429,9 @@ function buildLaunchArgs({
     '--osd-outline-color=#B0000000',
     '--osd-back-color=#66070C17',
     '--osd-bar-marker-style=line',
-    '--background-color=#030711',
+    // 黑边（窗口比例和片子不一样时上下 / 左右空出来的地方）就是这个颜色，必须是纯黑：
+    // 以前用界面的深蓝底色 #030711，和片子里真正的黑一挨着就看得出是蓝的
+    '--background-color=#000000',
     '--cursor-autohide=700',
     '--input-default-bindings=yes',
     // 有自己的控制条就关掉自带的；下面那些 osc-* 参数照旧带着，自己的画不出来时退回自带的还是这套配色
@@ -1088,6 +1092,7 @@ class MpvController extends EventEmitter {
       eof: this.props['eof-reached'] === true,
       seeking: this.props['seeking'] === true,
       pausedForCache: this.props['paused-for-cache'] === true,
+      speed: typeof this.props['speed'] === 'number' ? this.props['speed'] : 1,
       loadFailed: !!this.loadError,
       loadError: this.loadError ? { ...this.loadError } : null,
     };
@@ -1143,6 +1148,11 @@ class MpvController extends EventEmitter {
     const go = () => this.command(['seek', seconds, 'absolute', 'exact']);
     if (!dropBuffers) return this._hold(go());
     return this._hold(this.command(['drop-buffers']).catch(() => {}).then(go));
+  }
+
+  /** 房间倍速（长按 → 快进时全房 2 倍）。范围由 main.js 的 player:setSpeed 卡住。 */
+  setSpeed(rate) {
+    return this._hold(this.command(['set_property', 'speed', Number(rate)]));
   }
 
   getProperty(name) {

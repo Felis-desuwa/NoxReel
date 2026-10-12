@@ -308,7 +308,7 @@ impl('非房主 resetMedia 不发消息、不推时钟；房主带 broadcast 时
   assert.equal(a.outbound.length, 0);
   assert.equal(a.eng.clock, 10);
   assert.equal(a.eng.seq, 4);
-  assert.deepEqual(a.eng.shared, { paused: true, position: 0, lamport: -1, by: '', byName: '' });
+  assert.deepEqual(a.eng.shared, { paused: true, position: 0, lamport: -1, by: '', byName: '', rate: 1 });
 
   // 游客就算上层误传了 broadcast 也发不出去
   const g = await makeEngine(dir, { peerId: 'gst', guests: ['gst'] });

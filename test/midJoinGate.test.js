@@ -54,6 +54,7 @@ const FNS = [
   'announceMidJoin',
   'maybeLaunchPlayer',
   'localReadyNow',
+  'ownCopyFor',
   'tailIndexMissing',
   'applySeek',
 ];

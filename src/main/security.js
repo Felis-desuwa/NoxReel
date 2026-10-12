@@ -308,6 +308,14 @@ function oscState(value) {
       return { t: finiteNumber(item.t, '控制条标记', { min: 0, max: 10 ** 7 }), n: string(item.n, '控制条标记', { max: 120, allowEmpty: true }) };
     });
   }
+  // 全房在快进（别人按着 →）：倍速和顶部那一条的字
+  const rate = object(data.rate, '控制条房间倍速');
+  if (rate) {
+    out.rate = {
+      x: finiteNumber(rate.x, '控制条房间倍速', { min: 0.5, max: 2 }),
+      text: string(rate.text, '控制条房间倍速', { max: 120 }),
+    };
+  }
   const labels = object(data.labels, '控制条文字');
   if (labels) {
     const entries = Object.entries(labels);

@@ -944,6 +944,7 @@ test('后台扫的片切成当前项后，扫描已用时间会自己走起来',
   const ctx = sandbox(fns('renderStatus', 'renderNowKicker', 'updateStripTone', 'setScanTicker', 'scanProgressLabel'), {
     S,
     $,
+    currentFileCtx: () => null,
     updatePresence: () => {}, // Discord 状态显示：这里不关心
     scheduleOscState: () => {}, // mpv 控制条：这里不关心
     forgetMpvOsc: () => {},
@@ -1004,6 +1005,7 @@ test('本机已经能播、只是播放器没开着：横幅说「播放器没�
     {
       S,
       $,
+      currentFileCtx: () => null,
       updatePresence: () => {},
       scheduleOscState: () => {},
       renderResumeOffer: () => {},

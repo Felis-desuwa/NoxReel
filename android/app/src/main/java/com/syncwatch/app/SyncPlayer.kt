@@ -171,7 +171,7 @@ class SyncPlayer(private val context: Context) {
                 if (snap.generation != generation) return
                 player?.let { p ->
                     val dur = if (p.duration == C.TIME_UNSET) 0L else p.duration
-                    updateSnap(generation) { s -> s.copy(posMs = p.currentPosition, durMs = dur) }
+                    updateSnap(generation) { s -> s.copy(posMs = p.currentPosition, durMs = dur, speed = p.playbackParameters.speed) }
                 }
                 if (snap.generation == generation) main.postDelayed(this, 250)
             }
@@ -185,6 +185,11 @@ class SyncPlayer(private val context: Context) {
 
     fun seek(seconds: Double) {
         main.post { player?.seekTo((seconds * 1000).toLong()) }
+    }
+
+    /** 房间倍速（有人长按 → 快进时全房 2 倍）。范围由 [NativeBridge.playerSetSpeed] 卡住。 */
+    fun setSpeed(speed: Double) {
+        main.post { player?.setPlaybackSpeed(speed.toFloat()) }
     }
 
     /** 快照 JSON，见 [snapJson]。 */
@@ -229,6 +234,8 @@ class SyncPlayer(private val context: Context) {
             .put("buffering", s.state == Player.STATE_BUFFERING)
             .put("idle", s.state == Player.STATE_IDLE)
             .put("eof", s.state == Player.STATE_ENDED)
+            // 倍速：同步引擎按它外推播放位置、核对和房间倍速对没对上
+            .put("speed", s.speed.toDouble())
             // 这个播放器出过错、放不了了。原因只给代号和 HTTP 状态码，文字在页面那边生成、翻译
             // （没出错时这两项是 null，JSONObject 不写进去）
             .put("loadFailed", s.failure != null)
@@ -268,6 +275,8 @@ class SyncPlayer(private val context: Context) {
         val playWhenReady: Boolean,
         val state: Int,
         val failure: Failure? = null,
+        // 倍速（房间倍速：有人长按 → 时全房 2 倍）
+        val speed: Float = 1f,
     )
 
     companion object {

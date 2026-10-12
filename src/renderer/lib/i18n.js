@@ -386,7 +386,7 @@ const EN = new Map(Object.entries({
   '空格': 'Space',
   '长按 →': 'Hold →',
   '2 倍速快进中': 'Fast-forwarding at 2×',
-  '松开后全房跟到这里': 'the room jumps here when you let go',
+  '全房跟着一起快进': 'everyone speeds up with you',
   '一起看时不能改倍速，长按 → 可以临时 2 倍速快进': 'Speed can’t be changed while watching together — hold → to fast-forward at 2×',
   '弹幕已打开': 'Danmaku on',
   '弹幕已关闭': 'Danmaku off',
@@ -848,6 +848,34 @@ const EN = new Map(Object.entries({
     'Even clearing every played cache would not make room for this video, so they are all kept',
   '房主已离开，列表暂停更新；已经连上的成员之间照常传输': 'The host left; the playlist is no longer updated, but connected members keep transferring',
   '房主已离开，这个房间结束了': 'The host left; this room has ended',
+  // 用我自己的文件播放（本机有这部片，不从房主那里收）
+  '用你自己的文件': 'Using your own file',
+  '用你自己的文件 · 和房主的不一样': 'Using your own file · differs from the host’s',
+  '用我自己的文件播放…': 'Play my own copy…',
+  '换一个我自己的文件…': 'Use a different copy of mine…',
+  '不用我自己的文件了': 'Stop using my own copy',
+  '打开你的文件位置': 'Open your file location',
+  '用我自己的文件': 'Use my own copy',
+  '本机有这部片就直接放自己的，不用等传输；和房主的不是同一个文件时会先提醒':
+    'If you already have this video, play your own copy instead of waiting for the transfer; you’ll be warned if it isn’t the same file as the host’s',
+  '你的文件和房主的不是同一个': 'Your file isn’t the same as the host’s',
+  '大小一样，但内容对不上（可能是重新封装过、改过字幕或元数据的版本）':
+    'Same size, but the contents differ (it may have been remuxed, or had its subtitles or metadata changed)',
+  '仍然可以用它看，同步照常：播放、暂停、跳转都按时间点跟着房间走。可能会遇到：':
+    'You can still watch with it and stay in sync — play, pause and seeks follow the room by timestamp. You may run into:',
+  '版本不同（加长版、删减版、片头片尾长短不一样）：同一个时间点画面对不上，大家说的那一幕你可能还没到、或者已经过去了':
+    'A different cut (extended, edited, longer or shorter intro/credits): the same timestamp shows a different scene, so what everyone is talking about may not have reached you yet, or already passed',
+  '帧率不同（比如 23.976 帧和 25 帧）：时间轴会越放越偏': 'A different frame rate (e.g. 23.976 vs 25 fps): the timelines drift further apart as it plays',
+  '时长不同：片尾不在同一时刻，房主那边放完就会换下一部': 'A different length: the ending won’t line up, and the room moves on when the host’s copy ends',
+  '字幕、音轨、画质可能和别人的不一样': 'Subtitles, audio tracks and picture quality may differ from everyone else’s',
+  '点「取消」改回从房主那里收。之后也可以在列表里这一部的「⋯」里换。':
+    'Click “Cancel” to go back to receiving it from the host. You can also change this later from this video’s “⋯” menu in the playlist.',
+  '对不上的话，在列表里这一部的「⋯」里选「不用我自己的文件了」，改回从房主那里收。':
+    'If it doesn’t line up, choose “Stop using my own copy” in this video’s “⋯” menu in the playlist to go back to receiving it from the host.',
+  '继续用我的文件': 'Keep using my file',
+  '仍然用我的文件': 'Use my file anyway',
+  '完整核对：你的文件和房主的不是同一个（照样用它放）': 'Full check: your file isn’t the same as the host’s (still playing it)',
+  '正在向房里要这部片的清单，好核对你的文件…': 'Asking the room for this video’s manifest to check your file against…',
   // 传输一栏
   '本机有完整文件': 'Full file on this computer',
   '已拒绝接收': 'Refused',
@@ -1289,6 +1317,25 @@ const EN_PATTERNS = [
   // 播放列表表格、就绪、行内加片（0.7）
   [/^传输中 (\d+)%$/, 'Transferring $1%'],
   [/^传输已暂停 (\d+)%$/, 'Transfer paused $1%'],
+  [/^用你自己的文件 · 核对中 (\d+)%$/, 'Using your own file · checking $1%'],
+  [/^大小不一样：你的 (.+)，房主的 (.+)$/, 'Different size: yours is $1, the host’s is $2'],
+  [/^这个文件用不了：(.*)$/, (_all, detail) => `This file can’t be used: ${translate(detail, 'en')}`],
+  [/^《(.+)》用你自己的文件播放（和房主的不一样）$/, 'Playing your own copy of “$1” (it differs from the host’s)'],
+  [
+    /^《(.+)》用你自己的文件播放：大小和开头结尾都和房主的一致，后台再完整核对一遍$/,
+    'Playing your own copy of “$1”: the size and the start and end match the host’s; checking the whole file in the background',
+  ],
+  [
+    /^《(.+)》用你自己的文件播放：大小和房主的一致，后台再完整核对一遍$/,
+    'Playing your own copy of “$1”: the size matches the host’s; checking the whole file in the background',
+  ],
+  [/^《(.+)》改回从房主那里收$/, 'Receiving “$1” from the host again'],
+  [/^没能完整核对你的文件（照样用它放）：(.*)$/, (_all, detail) => `Couldn’t check your whole file (still playing it): ${translate(detail, 'en')}`],
+  [
+    /^你的文件和房主的是同一个，但没能拿它给别人供片：(.*)$/,
+    (_all, detail) => `Your file is the same as the host’s, but it couldn’t be shared with others: ${translate(detail, 'en')}`,
+  ],
+  [/^核对完了：你的文件和房主的《(.+)》是同一个，你也开始给别人供片$/, 'Check done: your file is the same as the host’s “$1” — you’re now sharing it with others too'],
   [/^等待片源 (\d+)%$/, 'Waiting for the source $1%'],
   [/^片源已离开 (\d+)%$/, 'Source left $1%'],
   [/^暂时没人能提供 (\d+)%$/, 'Nobody can provide it right now $1%'],
@@ -1333,13 +1380,15 @@ const EN_PATTERNS = [
     (_all, mode) => `Video link · Resolving… · ${translate(mode, 'en')}`,
   ],
   [
-    /^(.+) · (安全模式 · 扫描后播放|可信房间 · 边下边播|Safe mode · Play after scanning|Trusted room · Progressive playback) · (正在获取清单…|这部片已被拒绝接收|本机磁盘放不下，这一部跳过)$/,
+    /^(.+) · (安全模式 · 扫描后播放|可信房间 · 边下边播|Safe mode · Play after scanning|Trusted room · Progressive playback) · (正在获取清单…|这部片已被拒绝接收|本机磁盘放不下，这一部跳过|用你自己的文件播放|用你自己的文件播放（和房主的不一样）)$/,
     (_all, size, mode, state) =>
       `${size} · ${translate(mode, 'en')} · ${
         {
           '正在获取清单…': 'Fetching the manifest…',
           '这部片已被拒绝接收': 'This video was refused',
           '本机磁盘放不下，这一部跳过': "Doesn't fit on this computer's disk; skipped here",
+          '用你自己的文件播放': 'Playing your own copy',
+          '用你自己的文件播放（和房主的不一样）': 'Playing your own copy (differs from the host’s)',
         }[state]
       }`,
   ],
@@ -1494,6 +1543,15 @@ const EN_PATTERNS = [
     (_all, action, position) => `You ${{ 播放: 'played', 暂停: 'paused', 跳转: 'seeked' }[action]} @ ${position}`,
   ],
   [/^(.+) (播放|暂停|跳转) @ (.+)$/, (_all, name, action, position) => `${name} ${{ 播放: 'played', 暂停: 'paused', 跳转: 'seeked' }[action]} @ ${position}`],
+  // 长按 → 快进：全房一起变倍速（「你」要翻，别人的昵称原样）
+  [/^你 开始全房 ([\d.]+) 倍速快进$/, 'You started fast-forwarding everyone at $1×'],
+  [/^(.+) 开始全房 ([\d.]+) 倍速快进$/, '$1 started fast-forwarding everyone at $2×'],
+  [/^你 松开快进，全房回到正常速度 @ (.+)$/, 'You let go — everyone is back to normal speed @ $1'],
+  [/^(.+) 松开快进，全房回到正常速度 @ (.+)$/, '$1 let go — everyone is back to normal speed @ $2'],
+  [/^快进的人离开了，全房回到正常速度 @ (.+)$/, 'Whoever was fast-forwarding left — everyone is back to normal speed @ $1'],
+  [/^全房 ([\d.]+) 倍速 · 你 在快进$/, 'Everyone at $1× · you’re fast-forwarding'],
+  [/^全房 ([\d.]+) 倍速 · (.+) 在快进$/, 'Everyone at $1× · $2 is fast-forwarding'],
+  [/^全房 ([\d.]+) 倍速快进中$/, 'Everyone fast-forwarding at $1×'],
   [/^已拒绝不安全的媒体清单：(.*)$/, (_all, detail) => `Rejected an unsafe media manifest: ${translate(detail, 'en')}`],
   [/^开始接收：(.*)（(.*)，(\d+) 片）$/, 'Receiving: $1 ($2, $3 chunks)'],
   [/^分片 (\d+) 校验未通过（(.*)），已丢弃重下$/, 'Chunk $1 failed verification ($2) and will be downloaded again'],

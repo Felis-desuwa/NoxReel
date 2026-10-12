@@ -65,6 +65,11 @@ class MpvAdapter extends EventEmitter {
     return this.ctl.setRoomBanner(text);
   }
 
+  /** 房间倍速（长按 → 快进时全房 2 倍），见 MpvController.setSpeed。 */
+  setSpeed(rate) {
+    return this.ctl.setSpeed(rate);
+  }
+
   /** 飘一个表情反应，见 MpvController.showReaction。 */
   showReaction(e, name) {
     return this.ctl.showReaction(e, name);

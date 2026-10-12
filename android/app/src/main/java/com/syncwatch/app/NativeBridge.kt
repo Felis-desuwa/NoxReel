@@ -210,8 +210,15 @@ class NativeBridge(
         player.seek(seconds.coerceAtLeast(0.0))
     }
 
+    /** 房间倍速（有人长按 → 快进时全房 2 倍）。和同步引擎的 RATE_MIN / RATE_MAX 一样只认 0.5–2，别的不送进播放器。 */
+    @JavascriptInterface
+    fun playerSetSpeed(speed: Double) {
+        if (!speed.isFinite() || speed < 0.5 || speed > 2.0) return
+        player.setSpeed(speed)
+    }
+
     /**
-     * @return 播放快照 JSON：{generation, position, duration, paused, idle, eof}（位置单位秒）。
+     * @return 播放快照 JSON：{generation, position, duration, paused, idle, eof, speed}（位置单位秒）。
      * `generation` 是这组读数属于哪个播放器：和最后一次 playerLoad/playerLoadUrl/playerRelease
      * 返回的数对不上，说明换片还没落到主线程，这条快照是上一部片的，整条丢弃。
      */

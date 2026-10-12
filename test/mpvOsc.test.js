@@ -171,7 +171,7 @@ test('控制条上点的按钮：只认弹幕开关和清晰度（0 或 144–43
   assert.deepEqual(actions, [{ action: 'danmaku' }, { action: 'quality', value: 720 }, { action: 'quality', value: 0 }]);
 });
 
-test('长按 → 的 2 倍速：主进程转出开始 / 松手（带位置）/ 换片收尾；渲染进程松手时由控制者把全房带过来', () => {
+test('长按 → 的 2 倍速：主进程转出开始 / 松手（带位置）/ 换片收尾；渲染进程按住时全房一起 2 倍速，松手全房回到 1 倍并对齐', () => {
   const { ctl, fromOsc } = fakeController();
   const actions = [];
   ctl.on('osc-action', (a) => actions.push(a));
@@ -189,7 +189,10 @@ test('长按 → 的 2 倍速：主进程转出开始 / 松手（带位置）/ �
     { action: 'speed-hold', value: 'cancel' },
   ]);
   const app = read('src', 'renderer', 'app.js');
-  assert.match(app, /S\.speedHold = payload\.value === 'start';\n\s+if \(payload\.value === 'end' && roomEntered && Number\.isFinite\(payload\.position\) && S\.sync\?\.canIControl\(\)\) \{\n\s+S\.sync\.userSeek\(payload\.position\);/);
+  // 按住：控制者把房间倍速改成 2（见 roomRate.test.js）；松手：回到 1 倍、报松手的位置
+  assert.match(app, /if \(payload\.value === 'start'\) \{\s+S\.speedHold = true;\s+if \(roomEntered && S\.sync\?\.canIControl\(\)\) S\.sync\.userSetRate\(2, S\.sync\.playerPositionNow\(\)\);/);
+  assert.match(app, /\} else if \(payload\.value === 'end'\) \{\s+releaseSpeedHold\(payload\.position\);/);
+  assert.match(app, /function releaseSpeedHold\(position\) \{\s+S\.speedHold = false;\s+if \(!roomEntered \|\| !S\.sync\?\.canIControl\(\) \|\| S\.sync\.roomRate\(\) === 1\) return;\s+S\.sync\.userSetRate\(1, Number\.isFinite\(position\) \? position : S\.sync\.sharedPositionNow\(\)\);/);
   // 快进中不做在线视频的自动对齐，不然两秒后就被拽回去
   assert.match(app, /\|\| S\.speedHold\) return;\n\s+S\.sync\.checkDrift\(\);/);
   // 发弹幕的 D 在聊天脚本里，和 Ctrl+Shift+D 同一个输入框

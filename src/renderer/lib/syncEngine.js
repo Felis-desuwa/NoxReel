@@ -66,6 +66,13 @@ import { MSG } from './protocol.js';
  * 改报 stream-cut（由上层提示本人重新连接），不然控制者网络一抖，全房就跳到下一部。
  * 断流时 mpv 同一刻先推 pause、再推 eof，偶尔被拆成两条 tick：在线链接里播放器报的暂停因此先只停本机，
  * 等 STREAM_PAUSE_CONFIRM_MS 没见到断流的迹象才当成本人按的暂停报出去（见 _deferPause）。
+ *
+ * ── 房间倍速（rate）──
+ * 控制者在 mpv 里长按 → 是 2 倍速快进：全房一起 2 倍速，松手一起回到 1 倍（userSetRate）。
+ * 倍速是房间共识的一部分，跟着 SYNC 走（字段 rate，1 倍时不带），房间时钟按它外推；
+ * 每次落状态（_reconcile）顺带把播放器的倍速对上房间的。老版本不认这个字段，照旧按 1 倍走、
+ * 松手那一条 SYNC 的位置把他们拉过来（和以前「只有自己快进、松手全房跟过来」一样）。
+ * 正在快进的人掉线了，房主替他把倍速收回 1 倍（见 peerGone），不然全房一直 2 倍速放下去。
  */
 
 const STALL_THRESHOLD_SECONDS = 5; // 身前不足 5 秒的连续数据 → 喊停
@@ -162,6 +169,13 @@ const MAX_ROLE_ENTRIES = 128;
 // （他断了、卡住了、客户端没这个能力）—— 退回跟房间进度
 const BEACON_INTERVAL_MS = 2000;
 const BEACON_STALE_MS = 6000;
+// 房间倍速的范围（长按 → 只会用到 2）。SYNC 里不是数、超出范围的一律当 1 倍
+const RATE_MIN = 0.5;
+const RATE_MAX = 2;
+const normalizeRate = (v) =>
+  typeof v === 'number' && Number.isFinite(v) && v >= RATE_MIN && v <= RATE_MAX ? Math.round(v * 100) / 100 : 1;
+// 播放器报的倍速和房间的差这么多以内就不去改它
+const RATE_EPSILON = 0.01;
 const clampName = (v) => (typeof v === 'string' ? v.slice(0, MAX_NAME) : '');
 
 /** 按插入顺序封顶的 Map.set：超了挤掉最早的。 */
@@ -200,12 +214,15 @@ export class SyncEngine extends Emitter {
     // 我把房主转给了别人（transferHost）。房间入口（房间链接的签名、信令服务器的房主凭据）还在我这里，
     // 新人照旧从我这儿进来、只认我 —— greet 时我替现在的房主作保（发一条带新 hostId 的 ROLE）
     this._handedOver = false;
+    // 谁把房间倍速改成了快进（长按 →）。他掉线、被降成游客时由房主收回 1 倍，见 _releaseOrphanRate
+    this._rateBy = null;
 
     // 时钟可注入，测试里用假时钟
     this.now = () => performance.now();
 
     // 房间共识状态。lamport 是这份状态的时间戳；clock 是本机见过的最大 Lamport，发新指令从它往上加。
-    this.shared = { paused: true, position: 0, lamport: 0, by: peerId, byName: name || '' };
+    // rate 是房间倍速（见类注释「房间倍速」），1 倍时 SYNC 里不带
+    this.shared = { paused: true, position: 0, lamport: 0, by: peerId, byName: name || '', rate: 1 };
     this.clock = 0;
     // Lamport 窗口和自己发指令时封顶的基准：经房主那条连接得知的最大值，加上自己发出过的
     // （房主自己则是他采信过的）。不能用 clock / shared.lamport —— 网状下别人只直连发给我、
@@ -234,7 +251,7 @@ export class SyncEngine extends Emitter {
     this._readyTimer = null;
     // 房间时钟。shared.position 只是「最后一次有人操作时」的位置，房间一直在播的话它早就过时了 ——
     // 新人入房、重开播放器、换播放器都要的是「现在」房间播到哪。这里记下起点，按需外推。
-    this._clock = { base: 0, at: 0, running: false };
+    this._clock = { base: 0, at: 0, running: false, rate: 1 };
 
     // 我方本地状态
     this.localStalled = false;
@@ -356,7 +373,9 @@ export class SyncEngine extends Emitter {
     this.intendedPaused = true;
     const willBroadcast = broadcast && this.canIControl();
     // 不广播的一方把这份状态的时间戳置成 -1：这一部的任何一条合法 SYNC 都比它新。
-    this.shared = { paused: true, position: start, lamport: -1, by: '', byName: '' };
+    // 倍速回到 1：换片时还按着 → 的人，控制条脚本自己收尾（不报位置）
+    this.shared = { paused: true, position: start, lamport: -1, by: '', byName: '', rate: 1 };
+    this._rateBy = null;
     this._syncClock(start);
     if (willBroadcast) this._broadcastSync(start);
     this.emit('state', this.status());
@@ -434,12 +453,15 @@ export class SyncEngine extends Emitter {
     });
   }
 
+  // 两道线按「墙上的秒」算：2 倍速时同样 5 秒的余量只够放 2.5 秒，所以跟着房间倍速放大
   get stallThresholdBytes() {
-    return this.bytesPerSecond ? this.bytesPerSecond * STALL_THRESHOLD_SECONDS : FALLBACK_STALL_BYTES;
+    const scale = Math.max(1, normalizeRate(this.shared.rate));
+    return (this.bytesPerSecond ? this.bytesPerSecond * STALL_THRESHOLD_SECONDS : FALLBACK_STALL_BYTES) * scale;
   }
 
   get resumeThresholdBytes() {
-    return this.bytesPerSecond ? this.bytesPerSecond * RESUME_THRESHOLD_SECONDS : FALLBACK_RESUME_BYTES;
+    const scale = Math.max(1, normalizeRate(this.shared.rate));
+    return (this.bytesPerSecond ? this.bytesPerSecond * RESUME_THRESHOLD_SECONDS : FALLBACK_RESUME_BYTES) * scale;
   }
 
   /** 有人卡着就必须暂停，跟用户想不想播无关。 */
@@ -486,7 +508,7 @@ export class SyncEngine extends Emitter {
    */
   sharedPositionNow(clamp = true) {
     const c = this._clock;
-    let pos = c.base + (c.running ? Math.max(0, this.now() - c.at) / 1000 : 0);
+    let pos = c.base + (c.running ? (Math.max(0, this.now() - c.at) / 1000) * (c.rate || 1) : 0);
     if (clamp && this.duration > 0) pos = Math.min(pos, this.duration);
     return Math.max(0, pos);
   }
@@ -497,7 +519,7 @@ export class SyncEngine extends Emitter {
    */
   _syncClock(base) {
     const pos = typeof base === 'number' ? base : this.sharedPositionNow();
-    this._clock = { base: pos, at: this.now(), running: this._clockRunning() };
+    this._clock = { base: pos, at: this.now(), running: this._clockRunning(), rate: normalizeRate(this.shared.rate) };
     // 房间时钟变了，停着等它追上的放行时刻跟着变（用户在播放器里拖进度条广播出去时不经过 _reconcile）
     this._scheduleLead();
   }
@@ -513,7 +535,12 @@ export class SyncEngine extends Emitter {
     if (!t || t.loadFailed === true || this._streamCut || !Number.isFinite(t.position)) return null;
     const base = t.position;
     if (!this._advancing(t)) return base;
-    return base + Math.max(0, this.now() - t.at) / 1000;
+    return base + (Math.max(0, this.now() - t.at) / 1000) * this._speedOf(t);
+  }
+
+  /** 这条 tick 时播放器的倍速。报不出来的（外部播放器、老的原生层）按 1 倍算。 */
+  _speedOf(t) {
+    return typeof t?.speed === 'number' && Number.isFinite(t.speed) && t.speed > 0 ? t.speed : 1;
   }
 
   /**
@@ -622,6 +649,8 @@ export class SyncEngine extends Emitter {
     if (released) this._reconcile();
     this._broadcastRoles();
     this.emit('roles', this.roleSnapshot());
+    // 正在长按 → 快进的人被降成游客：他松手的那一条会被拒，替他收回 1 倍。排在发角色表之后
+    if (!this.isController(peerId)) this._releaseOrphanRate(peerId);
   }
 
   _roleMessage() {
@@ -929,7 +958,15 @@ export class SyncEngine extends Emitter {
       // 上一条 tick 时位置停着（暂停、缓冲、跳转后重新起播）就不能按「在走」外推：
       // 在线链接缓冲了十秒，缓冲完的第一条 tick 会比预期落后十秒，被当成用户往回拖了进度条 ——
       // 控制者会把全房拽回他缓冲的地方，游客会被往前拽、缓冲的那段直接跳过去。
-      const expected = this._advancing(prev) ? prev.position + elapsed : prev.position;
+      // 2 倍速快进时位置每秒走两秒（tick 带着播放器的倍速），按 1 倍外推的话快进几秒就像往前拖了一截。
+      // 两条 tick 之间倍速可能刚变过（长按 → 开始、松手）：按前后两条的倍速各推一个，落在两者之间都算正常在走，
+      // 拿离得最近的那一头比（游客被拉回原处时也拉到这里）
+      const moving = this._advancing(prev);
+      const s1 = this._speedOf(prev);
+      const s2 = this._speedOf(snap);
+      const lo = moving ? prev.position + elapsed * Math.min(s1, s2) : prev.position;
+      const hi = moving ? prev.position + elapsed * Math.max(s1, s2) : prev.position;
+      const expected = Math.min(hi, Math.max(lo, snap.position));
       const cmd = this._lastSeekCmd;
       const echo =
         !!cmd && this.now() - cmd.at < SEEK_ECHO_MS && Math.abs(snap.position - cmd.position) <= this.seekTolerance;
@@ -1115,15 +1152,18 @@ export class SyncEngine extends Emitter {
     this._reconcile();
   }
 
-  _broadcastSync(position) {
+  /** rate：顺带改房间倍速（长按 → 快进的开始和松手）；不给就沿用房间现在的。 */
+  _broadcastSync(position, { rate } = {}) {
     // 这一条带着此刻的暂停状态出去，还没确认的那下暂停（如果有）不用再单独报
     this._dropPendingPause();
+    const nextRate = normalizeRate(rate === undefined ? this.shared.rate : rate);
     this.shared = {
       paused: this.intendedPaused,
       position,
       lamport: this._bump(),
       by: this.peerId,
       byName: this.name,
+      rate: nextRate,
     };
     this._syncClock(position);
     this.emit('outbound', {
@@ -1134,6 +1174,8 @@ export class SyncEngine extends Emitter {
       by: this.peerId,
       name: this.name,
       seq: this.seq,
+      // 1 倍时不带：和以前的消息一模一样，老版本本来也只会按 1 倍走
+      ...(nextRate !== 1 ? { rate: nextRate } : {}),
     });
     if (!this.intendedPaused) this.emit('playing', { seq: this.seq });
   }
@@ -1302,7 +1344,8 @@ export class SyncEngine extends Emitter {
   referencePositionNow() {
     const b = this._freshBeacon();
     if (!b) return this.sharedPositionNow();
-    let pos = b.position + (b.moving ? Math.max(0, this.now() - b.at) / 1000 : 0);
+    // 他的播放器和房间一样按房间倍速走（长按 → 快进时是 2 倍）
+    let pos = b.position + (b.moving ? (Math.max(0, this.now() - b.at) / 1000) * normalizeRate(this.shared.rate) : 0);
     if (this.duration > 0) pos = Math.min(pos, this.duration);
     return Math.max(0, pos);
   }
@@ -1377,14 +1420,24 @@ export class SyncEngine extends Emitter {
     }
     // 手动同步的人只跟真正的跳转，要拿「这条指令之前房间播到哪」来比，所以在改时钟之前取
     const seekTo = this._followTarget(msg.position, this.sharedPositionNow());
+    const prevRate = normalizeRate(this.shared.rate);
+    const prevPaused = this.shared.paused;
+    // 不带 rate 的（1 倍，或者老版本发的）就是 1 倍
+    const rate = normalizeRate(msg.rate);
     this.shared = {
       paused: msg.paused,
       position: msg.position,
       lamport: msg.lamport,
       by: author,
       byName,
+      rate,
     };
     this._syncClock(msg.position);
+    if (rate !== prevRate) {
+      // 记下是谁开始快进的：他走了由房主收回（见 _releaseOrphanRate）
+      this._rateBy = rate !== 1 ? author : null;
+      this.emit('rate', { rate, by: byName, position: msg.position, self: false });
+    }
     if (correction) {
       // 只是校正房间时钟，不是谁刚操作了。游客自己的暂停/播放不广播，本来就可以和房间不同 ——
       // 不去改它；和房间不一致时也不拽他的进度。
@@ -1397,11 +1450,14 @@ export class SyncEngine extends Emitter {
     this._dropPendingPause();
     this.intendedPaused = msg.paused;
     this._relay(msg, { ...from, origin: author, name: byName });
-    this.emit('remote-action', {
-      kind: msg.paused ? 'pause' : 'play',
-      by: from.name,
-      position: msg.position,
-    });
+    // 只是倍速变了（长按 → 开始快进、松手）：上面的 rate 事件已经说了，不再报成一次「播放」
+    if (rate === prevRate || msg.paused !== prevPaused) {
+      this.emit('remote-action', {
+        kind: msg.paused ? 'pause' : 'play',
+        by: from.name,
+        position: msg.position,
+      });
+    }
     if (!msg.paused) this.emit('playing', { seq: this.seq });
     this._reconcile(seekTo === null ? {} : { seekTo });
     return true;
@@ -1642,6 +1698,8 @@ export class SyncEngine extends Emitter {
       }
       this.emit('ready-change', { who: peerId, ready: false, gone: true, self: false });
     }
+    // 正在长按 → 快进的人掉线了：他松手的那一条永远来不了
+    this._releaseOrphanRate(peerId);
   }
 
   /* ---------------------------- 状态收敛 ---------------------------- */
@@ -1690,6 +1748,10 @@ export class SyncEngine extends Emitter {
       // 暂停落下去了：之后再见它在走，就是用户自己按的播放（见 _checkLead）
       const t = this.lastTick;
       if (this._lead && t?.paused && t.at >= this._lead.at) this._lead.held = true;
+      // 倍速对上房间的（长按 → 快进时全房 2 倍）。只看报得出倍速的播放器：外部播放器调不了倍速，
+      // 照旧 1 倍走，松手那一条同步把它拉过来
+      const rate = normalizeRate(this.shared.rate);
+      if (t && typeof t.speed === 'number' && Math.abs(t.speed - rate) > RATE_EPSILON) await this.emit_rate(rate);
     } finally {
       this._reconciling--;
       this._applyEnd();
@@ -1779,7 +1841,8 @@ export class SyncEngine extends Emitter {
     if (this._leadTimer) clearTimeout(this._leadTimer);
     this._leadTimer = null;
     if (!this._lead || !this._clockRunning()) return;
-    const wait = Math.max(0, this._leadAhead() - LEAD_HOLD_END_SECONDS);
+    // 差的是片子里的秒，房间 2 倍速时墙上只要一半
+    const wait = Math.max(0, this._leadAhead() - LEAD_HOLD_END_SECONDS) / normalizeRate(this.shared.rate);
     this._leadTimer = setTimeout(() => this._onLeadTimer(), wait * 1000);
   }
 
@@ -1879,6 +1942,10 @@ export class SyncEngine extends Emitter {
     if (this.onSetPause) await this.onSetPause(paused);
   }
 
+  async emit_rate(rate) {
+    if (this.onSetRate) await this.onSetRate(rate);
+  }
+
   // opts.dropBuffers：先丢掉播放器缓存里的旧数据再跳（只在数据尽头的重放里带，只有 mpv 认）
   // 返回播放器报的跳转结果（外部播放器带落点 position），拿不到就是 undefined
   async emit_seek(position, opts = null) {
@@ -1915,6 +1982,51 @@ export class SyncEngine extends Emitter {
     }
     this._broadcastSync(position);
     this._reconcile({ seekTo: position });
+  }
+
+  /**
+   * 长按 → 快进（rate 2）和松手（rate 1）：控制者把全房一起带到这个倍速。position 是本机此刻放到哪。
+   * 开始时报的是 _actionPosition（手动同步的人、停着等房间追上的报房间的位置，不把全房拽到自己那里）；
+   * 松手时报自己的 —— 快进就是要全房到这里，和拖进度条松手一样（大家一直跟着 2 倍速，差得不多就不跳）。
+   * 游客不能改倍速（控制条那层已经拦了，这里再兜一道底）。返回有没有发出去。
+   */
+  userSetRate(rate, position) {
+    if (!this.canIControl()) {
+      this.emit('denied', { action: 'rate' });
+      return false;
+    }
+    const next = normalizeRate(rate);
+    const prev = normalizeRate(this.shared.rate);
+    const here = Number.isFinite(position) ? position : this.playerPositionNow() ?? this.sharedPositionNow();
+    const at = next > prev ? this._actionPosition(here) : here;
+    this._broadcastSync(at, { rate: next });
+    this._rateBy = next !== 1 ? this.peerId : null;
+    if (next !== prev) this.emit('rate', { rate: next, by: this.name, position: at, self: true });
+    this._reconcile({ seekTo: at });
+    return true;
+  }
+
+  /** 房间现在的倍速（1 是正常速度）。 */
+  roomRate() {
+    return normalizeRate(this.shared.rate);
+  }
+
+  /** 谁让全房快进的（peerId），没在快进或者不知道是谁时是 null。 */
+  rateHolder() {
+    return this.roomRate() !== 1 ? this._rateBy : null;
+  }
+
+  /**
+   * 把倍速改成快进的那个人走了（掉线，或者被降成游客）：他松手的那一条永远来不了，全房会一直 2 倍速放下去。
+   * 只由房主收回（一个人说了算，免得几个控制者同时各发一条），位置用房间时钟。
+   */
+  _releaseOrphanRate(peerId) {
+    if (this.myRole() !== 'host' || this.roomRate() === 1 || !this._rateBy || this._rateBy !== peerId) return;
+    const at = this.sharedPositionNow();
+    this._broadcastSync(at, { rate: 1 });
+    this._rateBy = null;
+    this.emit('rate', { rate: 1, by: this.name, position: at, self: true, orphan: true });
+    this._reconcile({ seekTo: at });
   }
 
   /* ------------------------ 在线链接的跟随方式 ------------------------ */
@@ -2157,6 +2269,8 @@ export class SyncEngine extends Emitter {
       name: this.name,
       seq: this.seq,
       snapshot: true,
+      // 正在全房 2 倍速快进：新人进来也按这个倍速放
+      ...(normalizeRate(this.shared.rate) !== 1 ? { rate: normalizeRate(this.shared.rate) } : {}),
       ...(withAuthor ? { origin: author, originName: clampName(this.shared.byName) || author } : {}),
     });
     // 房主替其他正卡着的人补发：星型拓扑下新人收不到他们的消息
@@ -2227,6 +2341,8 @@ export class SyncEngine extends Emitter {
       stalled: this.anyoneStalled,
       waitingFor: waiting,
       lamport: this.shared.lamport,
+      // 房间倍速（长按 → 快进时是 2）
+      rate: normalizeRate(this.shared.rate),
     };
   }
 }
@@ -2250,4 +2366,7 @@ export {
   MAX_NAME,
   LAMPORT_WINDOW,
   LAMPORT_LEAD,
+  RATE_MIN,
+  RATE_MAX,
+  normalizeRate,
 };

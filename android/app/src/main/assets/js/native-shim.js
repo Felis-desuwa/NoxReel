@@ -88,6 +88,10 @@ window.swPlayer = {
   seek(seconds) {
     Native.playerSeek(Number(seconds) || 0);
   },
+  // 房间倍速（有人长按 → 快进时全房 2 倍）
+  setSpeed(rate) {
+    Native.playerSetSpeed(Number(rate) || 1);
+  },
   snapshot() {
     return JSON.parse(Native.playerSnapshot());
   },
