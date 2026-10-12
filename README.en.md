@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links — now with a playlist for the whole evening, danmaku comments over the picture, and your own preferred player.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.12-7C5CFF?style=for-the-badge" alt="Version 0.7.12">
+    <img src="https://img.shields.io/badge/version-0.7.13-7C5CFF?style=for-the-badge" alt="Version 0.7.13">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -43,6 +43,8 @@
 - **Where you left off:** when you watch a long film over several nights or follow a series, the host is asked “You last watched this up to 23:14 — resume from 23:09?” and one click starts the whole room there.
 - **Resuming transfers:** if you leave the room or switch videos halfway through receiving, playing the same video again picks up where the transfer stopped instead of starting over. In Manual cleanup mode this also survives closing the app, crashes, and power loss.
 - **Your own subtitles:** “Load a subtitle file…” in the control bar's subtitle menu adds an ASS / SSA / SRT / VTT file for you only (older Chinese encodings are detected automatically).
+- **Fast-forward the whole room at 2×:** the host and admins hold `→` in the player and everyone plays at 2× together, phones included; let go and everyone is back to normal speed, lined up where you let go. While someone else is fast-forwarding, the top of the picture says “Everyone at 2× · who is fast-forwarding”.
+- **Play my own copy** (desktop): if you already have the video, don't wait for the host's transfer — choose “Play my own copy…” in that video's “⋯” menu in the playlist (there's also a button in the status bar while you wait), and stay in sync as usual. Your file is checked against the host's first: if it's different you're warned what may go wrong (a different cut, frame rate or length makes scenes not line up) and it's only used once you confirm; if it's identical, you also become a source others can receive from.
 - **Switchable player:** a dropdown on the control bar switches between mpv, PotPlayer, and MPC-BE. The change takes effect immediately and carries the playback position and pause state across — no need to leave the room. See [Player support](#player-support).
 - **Joining mid-playback does not stall the room:** a late joiner first receives the part the room is currently at, so a missing first half no longer pauses everyone else. Every member's buffer margin is measured from their own playback position.
 - **No file size limit:** MP4, MOV, M4V, and MKV local videos; receivers check free disk space first and evict caches from the played section when space runs short.
@@ -70,6 +72,9 @@
 - **Two security modes:** Trusted room is the default: playback starts once about 8 MB of the file header and enough continuous data for a dozen or so seconds have arrived, and the video is still scanned once it is complete. Safe mode remains available and plays only after complete receipt and a Microsoft Defender scan.
 - **Version and mode handshake:** invite codes and the P2P data channel both verify the protocol version and the selected room mode. A mismatch disconnects before media manifests, room controls, or video data are exchanged.
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
+
+> [!NOTE]
+> `v0.7.13`: the host and admins **hold `→` in the player to fast-forward the whole room at 2×** (before, only you sped up and everyone jumped to you when you let go), phones included, and everyone goes back to normal speed together when you let go. Members can **play their own copy**: if you already have the video you don't have to wait for the transfer; if it isn't the same file as the host's you're warned first what may go wrong, and if it's identical you also become a source. Fixed **mpv's letterbox bars being dark blue** (the space left above and below, or at the sides, when the window's shape doesn't match the video) — they're pure black now. **The P2P protocol is unchanged and works with 0.7.x**; members on older versions don't speed up, and still get lined up when you let go.
 
 > [!NOTE]
 > `v0.7.12` is a small update: Settings has a new **“Player bottom progress line”** switch. When the mpv control bar hides, a thin blue progress line stays along the bottom edge of the picture; if it bothers you in fullscreen, untick the box and it is no longer drawn (works both for a player opened on its own and in a room; in a room it applies as soon as you save, otherwise reopen the player). Moving the mouse still brings up the full control bar. **The P2P protocol is unchanged and works with 0.7.x**.
@@ -117,8 +122,8 @@
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.12.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.12.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.12.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.12.exe) |
+| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.13.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.13.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.13.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.13.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
@@ -177,14 +182,14 @@ While an online video plays, “Quality” appears on the control bar with the l
   |---|---|---|---|
   | Space | Play / pause | `D` | Send danmaku |
   | `←` `→` | Back / forward 5 s | `B` | Toggle danmaku |
-  | **Hold `→`** | Fast-forward at 2× while held | `S` | Sync to host (online video, manual sync) |
+  | **Hold `→`** | Fast-forward the whole room at 2× while held | `S` | Sync to host (online video, manual sync) |
   | `Shift` + `←` `→` | Back / forward 30 s | `C` / `A` | Choose subtitles / audio track |
   | `↑` `↓` | Volume | `O` | Show progress |
   | `M` | Mute | `?` / `F1` | Show shortcuts |
   | `Enter` / `F` | Toggle full screen | `Q` | Close the player |
   | `PgUp` `PgDn` | Previous / next chapter | | |
 
-  Seeking moves the whole room, so while you hold `→` only you fast-forward; when you let go (as host or moderator) the room jumps to your position. Guests can't seek, so they can't fast-forward either. Changing the speed (`[` `]`) would drift you away from the room, so those keys only show a hint; `Home` (back to the start) and `1`–`8` (picture adjustments) are disabled too.
+  Seeking moves the whole room, so while you hold `→` (as host or moderator) the whole room plays at 2× with you (members on 0.7.12 or earlier don't speed up); when you let go everyone is back to normal speed and lined up where you let go. Guests can't seek, so they can't fast-forward either. Changing the speed (`[` `]`) would drift you away from the room, so those keys only show a hint; `Home` (back to the start) and `1`–`8` (picture adjustments) are disabled too.
 - **Switch at any time:** the control-bar dropdown lists what is installed locally, and anything missing offers “Set path…”. Switching takes effect immediately and carries the position and pause state across.
 - **Why external players are not progressive:** in testing, PotPlayer and MPC-BE both seek away and stop when opening a file that is still growing. mpv therefore covers the progressive part of a Trusted room, and once the file is complete the control bar and the player OSD offer a one-click “Fully received · switch to PotPlayer”. Nothing switches by itself mid-playback.
 - **Danmaku is invisible under exclusive fullscreen:** danmaku for external players is painted on a click-through transparent overlay window, and an exclusive-fullscreen picture is scanned out by the GPU directly, so no window can sit above it. NoxReel detects this and suggests switching the player to borderless fullscreen.
