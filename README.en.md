@@ -6,7 +6,7 @@
   <p>A lightweight, dark-themed watch-party app for synchronized P2P local video sharing and public video links — now with a playlist for the whole evening, danmaku comments over the picture, and your own preferred player.</p>
 
   <p>
-    <img src="https://img.shields.io/badge/version-0.7.13-7C5CFF?style=for-the-badge" alt="Version 0.7.13">
+    <img src="https://img.shields.io/badge/version-0.7.14-7C5CFF?style=for-the-badge" alt="Version 0.7.14">
     <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
     <img src="https://img.shields.io/badge/Android-Beta-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android Beta">
     <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
@@ -61,7 +61,7 @@
 - **Buffer coordination:** playback pauses when a controlling member runs low on playable data and resumes after recovery.
 - **Real member status:** only established connections are listed, with upload rate, download rate, and latency.
 - **Recoverable player:** reopen the player from the room after its window is closed.
-- **Modern player UI:** mpv uses NoxReel's dark borderless appearance, rounded Windows corners, a bottom control bar, and clearer seek feedback. The thin progress line shown along the bottom edge while the control bar is hidden can be turned off in Settings.
+- **Modern player UI:** mpv uses NoxReel's dark borderless appearance and rounded Windows corners, with a control bar in a Liquid Glass style: rounded glass panels, capsule buttons and springy animations. The volume button stays collapsed and stretches into a slider when you hover it. The thin progress line shown along the bottom edge while the control bar is hidden can be turned off in Settings.
 - **Native EXE entry points:** double-click the branded `NoxReel.exe` from a source checkout instead of using a BAT file; `NoxReel-Signal.exe` starts the signaling service.
 - **Selectable install location:** both Windows installers use a guided setup and let you choose the destination folder before installation.
 - **Android viewer:** joins through a room link or a one-to-one invite, follows the playlist, sends and receives chat, and shows danmaku over the picture. Once the host makes you a moderator you can edit the playlist (the host applies the changes). TURN relays, “Hide my IP”, and Cloudflare TURN credentials work the same as on desktop.
@@ -72,6 +72,9 @@
 - **Two security modes:** Trusted room is the default: playback starts once about 8 MB of the file header and enough continuous data for a dozen or so seconds have arrived, and the video is still scanned once it is complete. Safe mode remains available and plays only after complete receipt and a Microsoft Defender scan.
 - **Version and mode handshake:** invite codes and the P2P data channel both verify the protocol version and the selected room mode. A mismatch disconnects before media manifests, room controls, or video data are exchanged.
 - **Hardened desktop shell:** Electron sandboxing, constrained IPC, safe DOM rendering, strict room-role authorization, and a unified dark Windows title bar.
+
+> [!NOTE]
+> `v0.7.14`: the mpv control bar on desktop now has a **Liquid Glass look** — rounded glass panels, capsule buttons and springy animations. **The volume button stays collapsed** until you hover it, then stretches into a slider that thickens while you drag, shows the value above it, springs back if you pull past the end, and marks anything above 100 as "Boost"; while the controls are showing, changing the volume no longer pops up a second indicator at the top. **The P2P protocol is unchanged and works with 0.7.x**; nothing changed on Android.
 
 > [!NOTE]
 > `v0.7.13`: the host and admins **hold `→` in the player to fast-forward the whole room at 2×** (before, only you sped up and everyone jumped to you when you let go), phones included, and everyone goes back to normal speed together when you let go. Members can **play their own copy**: if you already have the video you don't have to wait for the transfer; if it isn't the same file as the host's you're warned first what may go wrong, and if it's identical you also become a source. Fixed **mpv's letterbox bars being dark blue** (the space left above and below, or at the sides, when the window's shape doesn't match the video) — they're pure black now. **The P2P protocol is unchanged and works with 0.7.x**; members on older versions don't speed up, and still get lined up when you let go.
@@ -122,8 +125,8 @@
 
 | Build | Best for | Download |
 |---|---|---|
-| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.13.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.13.exe) |
-| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.13.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.13.exe) |
+| Windows full installer | Recommended. Bundles mpv, yt-dlp, and the player bridge, and lets you choose the install folder | [NoxReel-Setup-0.7.14.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-Setup-0.7.14.exe) |
+| Windows web installer | Smaller guided installer with a selectable folder; downloads components during setup | [NoxReel-WebSetup-0.7.14.exe](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/NoxReel-WebSetup-0.7.14.exe) |
 | Android beta | Join a desktop room as a viewer | [app-debug.apk](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/app-debug.apk) |
 | SHA-256 | Verify downloaded files | [SHA256SUMS.txt](https://github.com/Felis-desuwa/NoxReel/releases/latest/download/SHA256SUMS.txt) |
 
