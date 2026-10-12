@@ -223,10 +223,10 @@ test('控制条脚本：1–8 发表情（不在房间里不发）、表情按�
   assert.match(OSC, /local REACTIONS = \{ '❤', '😂', '😮', '😭', '👍', '👏', '🔥', '🎉' \}/);
   assert.match(OSC, /if room\.danmaku ~= nil then send_reaction\(d - 1\) end/);
   assert.match(OSC, /mp\.commandv\('script-message', MESSAGE, 'react', tostring\(e\)\)/);
-  assert.match(OSC, /rbutton\('react', 40,/);
+  assert.match(OSC, /rbutton\('react', 44,/);
   assert.match(OSC, /react = function\(\) toggle_menu\('react'\) end,/);
   assert.match(OSC, /if media\.fullscreen then mp\.set_property_bool\('fullscreen', false\) end\n\s+mp\.commandv\('script-message', MESSAGE, 'load-sub'\)/);
-  assert.match(OSC, /rbutton\('subs', 40, \{ tip = sub_tracks > 0 and L\('subs'\) or L\('noSubs'\), key = 'C' \}\)/, '没有字幕也能点');
+  assert.match(OSC, /rbutton\('subs', 44, \{ tip = sub_tracks > 0 and L\('subs'\) or L\('noSubs'\), key = 'C' \}\)/, '没有字幕也能点');
   // 点进度条上的标记：控制者跳过去，游客只提示
   assert.match(OSC, /elseif h\.id == 'mark' then\n\s+-- [^\n]+\n\s+if can_seek\(\) then mp\.commandv\('seek', string\.format\('%\.3f', h\.t\), 'absolute\+exact'\) else guest_toast\(\) end/);
   assert.match(OSC, /mp\.register_script_message\('noxreel-react'/);

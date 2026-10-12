@@ -3,9 +3,10 @@
 -- 为什么自己画：自带控制条能调的只有颜色和几个尺寸，房间里的事（在等谁缓冲、和房主差多少、
 -- 收到了哪几段、弹幕开没开）它画不出来；全屏看片时 NoxReel 的主窗口整个看不见，这些只能画在这里。
 --
--- 怎么画：一个 osd 覆盖层（ass-events），全部用 ASS 矢量绘图 —— 圆角面板、半透明、柔和阴影都画得出来；
--- 毛玻璃（把身后的画面模糊掉）画不出来，所以面板是纯色半透明。图标也是画出来的：libass 会把画出来的
--- 路径自动闭合，线条一律画成「去程 + 原路返回」的零面积路径再描边（见 stroke_event）。
+-- 怎么画：一个 osd 覆盖层（ass-events），全部用 ASS 矢量绘图。样子照着苹果的 Liquid Glass：圆角玻璃面板、
+-- 胶囊形的小件、会弹的动效。真正的毛玻璃（把身后的画面模糊掉）libass 画不出来，玻璃是几层叠出来的近似
+-- （见 glass）。图标也是画出来的：libass 会把画出来的路径自动闭合，线条一律画成「去程 + 原路返回」的
+-- 零面积路径再描边（见 stroke_event）。
 -- 尺寸按屏幕缩放比例（display-hidpi-scale）定，不跟着窗口大小缩放：窗口开小了控件照样看得清。
 --
 -- 和 NoxReel 怎么说话：
@@ -111,24 +112,29 @@ end
 --------------------------------------------------------------------------------
 
 local C = {
-  panel = '0A0D13',
-  menu = '0C1017',
+  -- 玻璃的底色：面板、按钮旁的小件用 GLASS_OP 的不透明度，菜单、卡片这种要读一堆字的用 DEEP_OP
+  glass = '121722',
+  deep = '0E121B',
   text = 'F2F5F9',
   body = 'E6EDF3',
   sub = 'A8B3C2',
   dim = '8E9AAB',
   faint = '7D8898',
   accent = '4C8DFF',
+  accentText = '7FAEFF',
   manual = '8AB4FF',
   ok = '3FB950',
   warn = 'D29922',
   host = 'F2B84B',
   hostText = '1F1500',
   mark = 'E3B341',
+  boost = 'FFB547',
   danger = 'C42B1C',
   white = 'FFFFFF',
   black = '000000',
 }
+local GLASS_OP = 0.5
+local DEEP_OP = 0.8
 
 -- 界面上的字。NoxReel 按界面语言整份推过来（state.labels），没推的用这里的
 local DEFAULT_LABELS = {
@@ -158,6 +164,7 @@ local DEFAULT_LABELS = {
   guestSeek = '游客不能跳转进度',
   volume = '音量',
   muted = '已静音',
+  boost = '增益',
   speed = '倍速',
   track = '轨道',
   host = '房主',
@@ -331,10 +338,10 @@ local function fill_rect(x0, y0, x1, y1, r, color, op, extra)
 end
 
 -- 圆角矩形的边框：外圈顺时针、内圈逆时针，中间挖空。线宽和位置都准，不靠 libass 的描边
-local function ring_rect(x0, y0, x1, y1, r, width, color, op)
+local function ring_rect(x0, y0, x1, y1, r, width, color, op, extra)
   if op <= 0 then return end
   push(
-    head(string.format('\\1c&H%s&\\1a&H%s&\\p3}', bgr(color), alpha(op)))
+    head(string.format('\\1c&H%s&\\1a&H%s&%s\\p3}', bgr(color), alpha(op), extra or ''))
       .. rr_path(x0, y0, x1, y1, r)
       .. ' '
       .. rr_path(x0 + width, y0 + width, x1 - width, y1 - width, math.max(0, r - width), true)
@@ -344,6 +351,49 @@ end
 
 local function circle(cx, cy, r, color, op, extra)
   fill_rect(cx - r, cy - r, cx + r, cy + r, r, color, op, extra)
+end
+
+-- 裁剪：只画矩形里面的部分；按圆角矩形的形状裁（inverse 为真时反过来，只画形状外面的）
+local function clip_rect(x0, y0, x1, y1)
+  return string.format('\\clip(%d,%d,%d,%d)', math.floor(x0), math.floor(y0), math.ceil(x1), math.ceil(y1))
+end
+
+local function clip_shape(x0, y0, x1, y1, r, inverse)
+  return (inverse and '\\iclip(3,' or '\\clip(3,') .. rr_path(x0, y0, x1, y1, r) .. ')'
+end
+
+-- 玻璃。真正的 Liquid Glass 靠把身后的画面模糊、折射，libass 做不到；画得出的是这几层：
+-- 投影（挖掉面板底下那块，不然面板中间被压暗）、半透明底色、顶部往下淡出的一层高光（按形状裁）、
+-- 一圈细边、顶边一道更亮的光。op 乘在每一层上（控件淡入淡出用）。
+-- o：base / base_op 底色，rim / rim_op 细边（用颜色表示语气），glow / glow_op 外面一圈光，shadow 投影浓度
+local function glass(x0, y0, x1, y1, r, op, o)
+  if op <= 0 or x1 <= x0 or y1 <= y0 then return end
+  o = o or {}
+  local h = y1 - y0
+  r = math.min(r, h / 2, (x1 - x0) / 2)
+  local shadow = o.shadow or 0.34
+  if shadow > 0 then
+    local dy = math.min(10, h * 0.15 + 2)
+    fill_rect(x0, y0 + dy, x1, y1 + dy, r, C.black, shadow * op,
+      string.format('\\blur%.1f', math.min(16, h * 0.2 + 4)) .. clip_shape(x0, y0, x1, y1, r, true))
+  end
+  if o.glow then
+    fill_rect(x0, y0, x1, y1, r, o.glow, (o.glow_op or 0.3) * op, '\\blur10' .. clip_shape(x0, y0, x1, y1, r, true))
+  end
+  fill_rect(x0, y0, x1, y1, r, o.base or C.glass, (o.base_op or GLASS_OP) * op)
+  -- 高光带最多 30 高：卡片、一览这种高的玻璃上整块发白就不像玻璃了
+  fill_rect(x0, y0 - math.min(h * 0.2, 20), x1, y0 + math.min(h * 0.32, 30), 0, C.white, 0.09 * op,
+    string.format('\\blur%.1f', math.min(h * 0.16, 14)) .. clip_shape(x0, y0, x1, y1, r))
+  ring_rect(x0, y0, x1, y1, r, 1, o.rim or C.white, (o.rim_op or 0.09) * op)
+  ring_rect(x0, y0, x1, y1, r, 1, C.white, 0.22 * op, clip_rect(x0, y0, x1, y0 + math.max(3, r * 0.5)))
+end
+
+-- 按钮底下那颗玻璃珠（悬停、按下、展开的音量胶囊）：比面板亮一层，顶边一道光
+local function bead(x0, y0, x1, y1, r, op, fill_op, top_op)
+  if op <= 0 then return end
+  fill_rect(x0, y0, x1, y1, r, C.white, (fill_op or 0.12) * op)
+  ring_rect(x0, y0, x1, y1, r, 1, C.white, 0.08 * op)
+  ring_rect(x0, y0, x1, y1, r, 1, C.white, (top_op or 0.24) * op, clip_rect(x0, y0, x1, y0 + math.max(3, r * 0.5)))
 end
 
 local function text(x, y, an, size, color, op, str, bold, extra)
@@ -471,6 +521,7 @@ local ICONS = {
   speaker = { fill = { poly(3, 9, 6.5, 9, 11, 5, 11, 19, 6.5, 15, 3, 15) }, round = 0.8 },
   wave1 = { stroke = { arc_path(11, 12, 4.5, -48, 48) } },
   wave2 = { stroke = { arc_path(11, 12, 8.2, -52, 52) } },
+  wave3 = { stroke = { arc_path(11, 12, 11.6, -54, 54) } },
   muteX = { stroke = { poly(15.5, 9.5, 20.5, 14.5), poly(20.5, 9.5, 15.5, 14.5) } },
   captions = { stroke = { rr_sub(3, 5, 21, 19, 3), poly(7, 15, 11, 15), poly(14, 15, 17, 15), poly(7, 11, 9, 11), poly(12, 11, 17, 11) } },
   audio = { stroke = { poly(3, 10, 3, 14), poly(7, 6.5, 7, 17.5), poly(11, 3.5, 11, 20.5), poly(15, 8, 15, 16), poly(19, 5.5, 19, 18.5) } },
@@ -677,36 +728,346 @@ local function host_position()
   return p
 end
 
+local request
+
+--------------------------------------------------------------------------------
+-- 动效
+--------------------------------------------------------------------------------
+-- 两种会动的值：弹簧（越过目标一点再落回，像液体）和按时长走的渐变。有值在动时每秒重画 60 次，
+-- 全停了就不再画（平时的开销不变）；提示条进场、退场那零点几秒也算在动。
+-- 弹簧按角频率 w 和阻尼比 z 走：z 小于 1 会越过目标，越小越弹；等于 1 正好不越过
+
+local motion = { springs = {}, tweens = {}, last = 0, tick = nil }
+-- 提示条落下来、收上去各用多久（秒）
+local TOAST_S = { enter = 0.3, leave = 0.24 }
+
+local function kick()
+  if timers.anim or fell_back then return end
+  if timers.anim_wake then
+    timers.anim_wake:kill()
+    timers.anim_wake = nil
+  end
+  motion.last = now()
+  timers.anim = mp.add_periodic_timer(1 / 60, function() motion.tick() end)
+end
+
+local function new_spring(x)
+  local s = { x = x, v = 0, target = x, w = 20, z = 1 }
+  motion.springs[#motion.springs + 1] = s
+  return s
+end
+
+local function spring_to(s, target, w, z)
+  if w then s.w = w end
+  if z then s.z = z end
+  if s.target == target then return end
+  s.target = target
+  kick()
+end
+
+local function spring_set(s, x)
+  s.x, s.v, s.target = x, 0, x
+end
+
+local function new_tween(x)
+  local t = { x = x, from = x, target = x, dur = 0.16, t0 = 0 }
+  motion.tweens[#motion.tweens + 1] = t
+  return t
+end
+
+-- delay 秒之后才开始动（声波一条接一条）
+local function tween_to(t, target, dur, delay)
+  if t.target == target then return end
+  t.from, t.target, t.dur, t.t0 = t.x, target, dur or t.dur, now() + (delay or 0)
+  kick()
+end
+
+local function tween_set(t, x)
+  t.x, t.from, t.target = x, x, x
+end
+
+-- 越过一点再落回的缓动（0 → 1，中途最多到约 1.1）
+local function back_out(p)
+  local q = p - 1
+  return 1 + 2.70158 * q * q * q + 1.70158 * q * q
+end
+
+motion.tick = guard(function()
+  local t = now()
+  local dt = clamp(t - motion.last, 0, 0.05)
+  motion.last = t
+  local busy = false
+  for _, s in ipairs(motion.springs) do
+    if s.x ~= s.target or s.v ~= 0 then
+      -- 小步积分：卡了一下、dt 很大时也不会发散
+      local steps = math.max(1, math.ceil(dt * 240))
+      local h = dt / steps
+      local k, c = s.w * s.w, 2 * s.z * s.w
+      for _ = 1, steps do
+        s.v = s.v + ((s.target - s.x) * k - s.v * c) * h
+        s.x = s.x + s.v * h
+      end
+      local scale = math.max(1, math.abs(s.target))
+      if math.abs(s.target - s.x) < 0.002 * scale and math.abs(s.v) < 0.02 * scale then s.x, s.v = s.target, 0 end
+      busy = true
+    end
+  end
+  for _, tw in ipairs(motion.tweens) do
+    if tw.x ~= tw.target then
+      if t >= tw.t0 then
+        local p = tw.dur > 0 and clamp((t - tw.t0) / tw.dur, 0, 1) or 1
+        tw.x = p >= 1 and tw.target or tw.from + (tw.target - tw.from) * p
+      end
+      busy = true
+    end
+  end
+  -- 提示条：进场、退场时在动；中间那段不动，到退场前再叫醒
+  local wake = nil
+  for _, item in ipairs(ui.toasts) do
+    if t - item.t0 < TOAST_S.enter + 0.05 or item.until_t - t < TOAST_S.leave + 0.05 then
+      busy = true
+    else
+      wake = math.min(wake or math.huge, item.until_t - TOAST_S.leave - 0.03)
+    end
+  end
+  request()
+  if not busy and timers.anim then
+    timers.anim:kill()
+    timers.anim = nil
+    if wake then timers.anim_wake = mp.add_timeout(math.max(0, wake - t), function() kick() end) end
+  end
+end)
+
 --------------------------------------------------------------------------------
 -- 提示条
 --------------------------------------------------------------------------------
-
-local request
 
 local function toast(str, ms, tone, kind)
   str = tostring(str or '')
   if str == '' then return end
   ms = clamp(tonumber(ms) or 2000, 500, 15000)
+  local t = now()
   if kind then
     for i = #ui.toasts, 1, -1 do
-      if ui.toasts[i].kind == kind then table.remove(ui.toasts, i) end
+      local old = ui.toasts[i]
+      if old.kind == kind then
+        -- 同一类还挂着（连按 ↑↓、连着切轨道）：原地换字、续时间，不重新落一遍
+        if old.until_t - t > TOAST_S.leave then
+          old.text, old.tone, old.until_t = str, tone or 'info', t + ms / 1000
+          kick()
+          request()
+          return
+        end
+        table.remove(ui.toasts, i)
+      end
     end
   end
-  ui.toasts[#ui.toasts + 1] = { text = str, tone = tone or 'info', kind = kind, until_t = now() + ms / 1000 }
+  ui.toasts[#ui.toasts + 1] = { text = str, tone = tone or 'info', kind = kind, t0 = t, until_t = t + ms / 1000 }
   while #ui.toasts > 3 do table.remove(ui.toasts, 1) end
+  kick()
   request()
 end
 
-local function volume_toast()
-  local muted = media.mute or media.volume <= 0
-  toast(muted and L('muted') or string.format('%d%%', math.floor(media.volume + 0.5)), 1200, 'volume', 'volume')
+--------------------------------------------------------------------------------
+-- 音量
+--------------------------------------------------------------------------------
+-- 平时只有一个喇叭按钮。鼠标停上去，按钮底下那颗玻璃珠拉长成胶囊、露出音量条，移开 0.7 秒后收回；
+-- 拖的时候音量条变粗、面板上方冒出数值气泡；拖过右端轨道被拉长、松手弹回（音量停在 100）；
+-- 100 以上（滚轮、↑ 键能调到 volume-max）接一段琥珀色。数值变化一律滑过去，不跳。
+-- 控件显示着时音量变了只在胶囊上反馈，收起着才从顶部落下一条音量胶囊（以前两边都给，拖的时候顶部还弹一条）
+
+local VOL = {
+  track = 96,    -- 0–100 那一段多长
+  boost = 16,    -- 100 到 volume-max 那一段最长多长
+  stretch = 16,  -- 拖过右端最多拉长多少
+  open = 126,    -- 展开时胶囊比按钮宽出多少：轨道、增益段和两头的留白
+}
+
+local vol = {
+  open = new_spring(0),     -- 胶囊展开多少：0 收起、1 展开（弹的时候会稍微超过 1）
+  bead = new_tween(0),      -- 收起时按钮底下那颗玻璃珠（悬停）
+  fat = new_spring(0),      -- 轨道变粗：0 是 6 像素，1 是 10 像素
+  fill = new_spring(-1),    -- 画出来的音量（0–130），跟着真实音量滑过去；-1 是还没收到过
+  stretch = new_spring(0),  -- 拖过右端时轨道被拉长了多少（像素）
+  bubble = new_tween(0),    -- 面板上方的数值气泡
+  ghost = new_tween(0),     -- 静音时留在原来音量处的那道刻痕
+  waves = { new_tween(1), new_tween(1), new_tween(0) },
+  xa = new_tween(0),        -- 静音叉的两笔
+  xb = new_tween(0),
+  digits = {},              -- 气泡里每一位数字滚到哪了（个位在前），各自一个弹簧
+  hover = false,            -- 鼠标在胶囊上
+  track_hover = false,      -- 鼠标在音量条上
+  bubble_until = 0,         -- 键盘、滚轮调的：气泡挂到这时候
+}
+
+-- 进度条鼓起来（悬停、拖动）
+local seek_fat = new_spring(0)
+
+function vol.dragging()
+  return ui.drag ~= nil and ui.drag.kind == 'vol'
+end
+
+-- 100 以上那段占增益段的几成（按 volume-max 算，默认 130）
+function vol.boost_frac(v)
+  local span = media.volume_max - 100
+  if span <= 0 then return 0 end
+  return clamp((v - 100) / span, 0, 1)
+end
+
+-- 声波几条：静音或 0 一条不画
+function vol.level()
+  if media.mute or media.volume <= 0 then return 0 end
+  if media.volume < 34 then return 1 end
+  if media.volume < 67 then return 2 end
+  return 3
+end
+
+-- 音量或静音变了：声波、静音叉、填充、刻痕都朝新的样子动过去。instant 为真时直接到位（刚收到第一个值）
+function vol.retarget(instant)
+  local level = vol.level()
+  local muted = level == 0
+  local fill = muted and 0 or media.volume
+  local ghost = (media.mute and media.volume > 0) and 1 or 0
+  if instant or vol.fill.x < 0 then
+    spring_set(vol.fill, fill)
+    for i, w in ipairs(vol.waves) do tween_set(w, level >= i and 1 or 0) end
+    tween_set(vol.xa, muted and 1 or 0)
+    tween_set(vol.xb, muted and 1 or 0)
+    tween_set(vol.ghost, ghost)
+    return
+  end
+  -- 拖的时候 60ms 跟手；滚轮、键盘、静音滑过去，略带一点回弹
+  if vol.dragging() then spring_to(vol.fill, fill, 60, 1) else spring_to(vol.fill, fill, 22, 0.75) end
+  for i, w in ipairs(vol.waves) do
+    local on = level >= i and 1 or 0
+    -- 长出来由内向外、收起来由外向内，一条接一条
+    tween_to(w, on, 0.16, on == 1 and (i - 1) * 0.045 or (3 - i) * 0.045)
+  end
+  -- 静音：声波先收，叉再一笔一笔画出来；取消静音倒过来
+  if muted then
+    tween_to(vol.xa, 1, 0.16, 0.08)
+    tween_to(vol.xb, 1, 0.16, 0.16)
+  else
+    tween_to(vol.xb, 0, 0.12, 0)
+    tween_to(vol.xa, 0, 0.12, 0.05)
+  end
+  tween_to(vol.ghost, ghost, 0.2, ghost == 1 and 0.15 or 0)
+end
+
+-- 气泡里的数字：每一位一个弹簧，往近的方向滚（9 → 0 往前滚一格，不倒着滚过 8、7……）。返回有几位
+function vol.roll_digits(value)
+  local s = tostring(math.floor(value + 0.5))
+  local count = #s
+  for i = 1, count do
+    local d = tonumber(s:sub(count - i + 1, count - i + 1))
+    local sp = vol.digits[i]
+    if not sp then
+      sp = new_spring(d)
+      vol.digits[i] = sp
+    end
+    spring_to(sp, d + 10 * math.floor((sp.target - d) / 10 + 0.5), 20, 0.7)
+  end
+  return count
+end
+
+function vol.expand()
+  if timers.vol_close then
+    timers.vol_close:kill()
+    timers.vol_close = nil
+  end
+  tween_to(vol.bead, 1, 0.12)
+  spring_to(vol.open, 1, 18, 0.62)
+end
+
+function vol.collapse()
+  if timers.vol_close then
+    timers.vol_close:kill()
+    timers.vol_close = nil
+  end
+  vol.track_hover = false
+  spring_to(vol.fat, 0, 24, 1)
+  tween_to(vol.bubble, 0, 0.14)
+  spring_to(vol.open, 0, 22, 1)
+  if not vol.hover then tween_to(vol.bead, 0, 0.2, 0.1) end
+end
+
+function vol.collapse_later(s)
+  if timers.vol_close then timers.vol_close:kill() end
+  timers.vol_close = mp.add_timeout(s, guard(function()
+    timers.vol_close = nil
+    if vol.hover or vol.dragging() then return end
+    vol.collapse()
+  end))
+end
+
+-- 冒出数值气泡，s 秒后收回（鼠标停在音量条上、拖动中不收）
+function vol.show_bubble(s)
+  vol.bubble_until = math.max(vol.bubble_until, now() + s)
+  tween_to(vol.bubble, 1, 0.16)
+  if timers.vol_bubble then timers.vol_bubble:kill() end
+  timers.vol_bubble = mp.add_timeout(s, guard(function()
+    timers.vol_bubble = nil
+    if not vol.track_hover and not vol.dragging() then tween_to(vol.bubble, 0, 0.14) end
+  end))
+end
+
+-- 鼠标动了：进出胶囊决定展开 / 收起，进出音量条决定变粗、冒气泡
+function vol.update_hover(x, y)
+  local lay = ui.layout
+  local c = lay and lay.volcap
+  local inside = c ~= nil and ui.target > 0 and x >= c.x0 and x < c.x1 and y >= c.y0 and y < c.y1
+  if inside and not vol.hover then
+    vol.hover = true
+    vol.expand()
+  elseif not inside and vol.hover then
+    vol.hover = false
+    if not vol.dragging() then vol.collapse_later(0.7) end
+  end
+  local v = lay and lay.vol
+  local on_track = inside and v ~= nil and x >= v.x0 and x < v.x1 and y >= v.y0 and y < v.y1
+  if on_track ~= vol.track_hover then
+    vol.track_hover = on_track
+    if not vol.dragging() then
+      spring_to(vol.fat, on_track and 1 or 0, 24, on_track and 0.55 or 1)
+      if on_track then
+        tween_to(vol.bubble, 1, 0.16)
+      elseif now() >= vol.bubble_until then
+        tween_to(vol.bubble, 0, 0.14)
+      end
+    end
+  end
+end
+
+-- 松手：拉长的那截弹回去（比展开弹得更明显），变粗、气泡看鼠标还在不在音量条上
+function vol.drag_end()
+  spring_to(vol.stretch, 0, 20, 0.4)
+  spring_to(vol.fat, vol.track_hover and 1 or 0, 24, vol.track_hover and 0.55 or 1)
+  spring_to(vol.fill, vol.fill.target, 22, 0.75)
+  if not vol.track_hover then vol.show_bubble(0.6) end
+  if not vol.hover then vol.collapse_later(0.7) end
+end
+
+-- 音量变了怎么告诉人：控件显示着就在面板里的胶囊上（展开、冒出数值），收起着才从顶部落下一条音量胶囊
+function vol.feedback()
+  if ui.target > 0 and ui.layout then
+    if vol.dragging() then return end
+    vol.expand()
+    vol.show_bubble(1.1)
+    if not vol.hover then vol.collapse_later(1.5) end
+  else
+    local muted = media.mute or media.volume <= 0
+    toast(muted and L('muted') or string.format('%d%%', math.floor(media.volume + 0.5)), 1300, 'volume', 'volume')
+  end
 end
 
 --------------------------------------------------------------------------------
 -- 排版
 --------------------------------------------------------------------------------
 
-local PANEL_H = 94
+local PANEL_H = 112
+local PANEL_R = 30
+-- 菜单一行多高
+local MENU_ROW = 40
 
 local function window_controls_shown()
   return (not media.border or not media.title_bar) and not media.fullscreen
@@ -730,48 +1091,51 @@ local function layout()
   add_hit(lay.hits, 'panel', P.x0, P.y0, P.x1, P.y1)
 
   -- 进度条那一行
-  lay.seek = { x0 = P.x0 + 18, x1 = P.x1 - 18, cy = P.y0 + 12 + 9 }
-  add_hit(lay.hits, 'seek', lay.seek.x0 - 6, P.y0 + 2, lay.seek.x1 + 6, P.y0 + 12 + 18 + 3)
+  lay.seek = { x0 = P.x0 + 24, x1 = P.x1 - 24, cy = P.y0 + 24 }
+  add_hit(lay.hits, 'seek', lay.seek.x0 - 6, P.y0 + 6, lay.seek.x1 + 6, P.y0 + 44)
   -- 共享标记：进度条上方的小菱形，比进度条后登记（hit_at 倒着找，点到标记的时候算标记）
   lay.marks = {}
   if room.marks and media.duration > 0 then
     local S = lay.seek
     for _, m in ipairs(room.marks) do
       local x = S.x0 + clamp(m.t / media.duration, 0, 1) * (S.x1 - S.x0)
-      lay.marks[#lay.marks + 1] = add_hit(lay.hits, 'mark', x - 6, S.cy - 17, x + 6, S.cy + 3, { t = m.t, note = m.n, cx = x })
+      lay.marks[#lay.marks + 1] = add_hit(lay.hits, 'mark', x - 6, S.cy - 19, x + 6, S.cy + 1, { t = m.t, note = m.n, cx = x })
     end
   end
 
   -- 按钮那一行
-  local cy = P.y0 + 12 + 18 + 8 + 22
+  local cy = P.y0 + 78
   lay.cy = cy
-  local bx = P.x0 + 18
+  local bx = P.x0 + 16
   local function button(id, w, extra)
-    local b = add_hit(lay.hits, id, bx, cy - 22, bx + w, cy + 22, extra)
+    local half = id == 'play' and 26 or 22
+    local b = add_hit(lay.hits, id, bx, cy - half, bx + w, cy + half, extra)
     b.cx = bx + w / 2
     lay.buttons[#lay.buttons + 1] = b
     bx = bx + w
     return b
   end
-  button('play', 44, { round = true, tip = media.pause and L('play') or L('pause'), key = L('keySpace') })
-  bx = bx + 8
+  button('play', 52, { round = true, tip = media.pause and L('play') or L('pause'), key = L('keySpace') })
+  bx = bx + 14
   if W >= 640 then
-    button('back', 40, { tip = L('back'), key = '←', disabled = not can_seek() })
+    button('back', 44, { tip = L('back'), key = '←', disabled = not can_seek() })
     bx = bx + 4
-    button('fwd', 40, { tip = L('fwd'), key = '→', disabled = not can_seek() })
-    bx = bx + 8
+    button('fwd', 44, { tip = L('fwd'), key = '→', disabled = not can_seek() })
+    bx = bx + 4
   end
-  button('mute', 40, { tip = (media.mute and L('unmute') or L('mute')), key = 'M' })
-  if W >= 760 then
-    bx = bx + 6
-    lay.vol = add_hit(lay.hits, 'vol', bx - 4, cy - 12, bx + 84 + 4, cy + 12)
-    lay.vol.tx0, lay.vol.tx1 = bx, bx + 84
-    bx = bx + 84
+  -- 音量胶囊：收起时就是喇叭按钮，展开时往右长出音量条（宽度跟着弹簧走，时间跟着往右让）
+  local open = math.max(0, vol.open.x)
+  local mute = button('mute', 44, { tip = (media.mute and L('unmute') or L('mute')), key = 'M' })
+  lay.volcap = { x0 = mute.x0, x1 = mute.x0 + 44 + VOL.open * open, y0 = cy - 22, y1 = cy + 22, open = open }
+  if open > 0.6 then
+    local tx0 = mute.x0 + 46
+    lay.vol = add_hit(lay.hits, 'vol', tx0 - 6, cy - 16, tx0 + VOL.track + VOL.boost + 4, cy + 16)
+    lay.vol.tx0, lay.vol.tx1 = tx0, tx0 + VOL.track
   end
-  bx = bx + 16
-  lay.time_x = bx
+  bx = lay.volcap.x1 + 4
+  lay.time_x = bx + 10
 
-  local rx = P.x1 - 18
+  local rx = P.x1 - 16
   local function rbutton(id, w, extra)
     local b = add_hit(lay.hits, id, rx - w, cy - 22, rx, cy + 22, extra)
     b.cx = rx - w / 2
@@ -779,30 +1143,30 @@ local function layout()
     rx = rx - w
     return b
   end
-  rbutton('fullscreen', 40, { tip = media.fullscreen and L('exitFullscreen') or L('fullscreen'), key = 'Enter' })
-  lay.divider = rx - 7
-  rx = rx - 14
+  rbutton('fullscreen', 44, { tip = media.fullscreen and L('exitFullscreen') or L('fullscreen'), key = 'Enter' })
+  lay.divider = rx - 4 - 6.5
+  rx = rx - 4 - 13 - 4
   local audio_tracks, sub_tracks = 0, 0
   for _, t in ipairs(media.tracks) do
     if t.type == 'audio' then audio_tracks = audio_tracks + 1 elseif t.type == 'sub' then sub_tracks = sub_tracks + 1 end
   end
-  rbutton('audio', 40, { tip = audio_tracks > 1 and L('audio') or L('noAudio'), key = 'A', disabled = audio_tracks < 2 })
+  rbutton('audio', 44, { tip = audio_tracks > 1 and L('audio') or L('noAudio'), key = 'A', disabled = audio_tracks < 2 })
   rx = rx - 4
   -- 没有字幕也能点：菜单里有「加载本机字幕…」
-  rbutton('subs', 40, { tip = sub_tracks > 0 and L('subs') or L('noSubs'), key = 'C' })
+  rbutton('subs', 44, { tip = sub_tracks > 0 and L('subs') or L('noSubs'), key = 'C' })
   if room.danmaku ~= nil then
     rx = rx - 4
-    rbutton('danmaku', 40, { tip = room.danmaku and L('danmakuOn') or L('danmakuOff'), key = 'B' })
+    rbutton('danmaku', 44, { tip = room.danmaku and L('danmakuOn') or L('danmakuOff'), key = 'B' })
     -- 表情反应只在房间里有（和弹幕开关同一个条件）
     if W >= 560 then
       rx = rx - 4
-      rbutton('react', 40, { tip = L('react'), key = '1–8' })
+      rbutton('react', 44, { tip = L('react'), key = '1–8' })
     end
   end
   if room.quality then
     rx = rx - 10
     local label = room.quality.label or ''
-    local w = math.floor(text_width(label, 13, true) + 11 + 4 + 14 + 8 + 0.5)
+    local w = math.floor(text_width(label, 13, true) + 12 + 6 + 14 + 10 + 0.5)
     local b = add_hit(lay.hits, 'quality', rx - w, cy - 16, rx, cy + 16, { tip = L('quality') })
     b.cx = rx - w / 2
     b.label = label
@@ -816,32 +1180,37 @@ local function layout()
   lay.wc = window_controls_shown()
   local chip_right = W - 24
   if lay.wc then
-    local x = W - 46 * 3
+    -- 窗口按钮收在右上角一颗玻璃胶囊里；能点到的范围一直伸到窗口的顶边和右边（甩到角上就能点到关闭）
+    local x1 = W - 14
+    local x0 = x1 - (3 + 40 * 3 + 3)
+    lay.wc_rect = { x0 = x0, y0 = 12, x1 = x1, y1 = 48 }
     for i, id in ipairs({ 'minimize', 'maximize', 'close' }) do
-      add_hit(lay.hits, id, x + (i - 1) * 46, 0, x + i * 46, 34, { win = true })
+      local vx0 = x0 + 3 + (i - 1) * 40
+      add_hit(lay.hits, id, vx0, 0, i == 3 and W or vx0 + 40, 48, { win = true, vx0 = vx0, vx1 = vx0 + 40 })
     end
-    lay.wc_x0 = x
-    chip_right = x - 16
+    lay.wc_x0 = x0
+    chip_right = x0 - 12
   end
   if room.chip and room.chip.text then
     local tw = text_width(room.chip.text, 13, false)
-    lay.chip = { x1 = chip_right, x0 = chip_right - (12 + 8 + 8 + tw + 12), y0 = 22, y1 = 52 }
+    lay.chip = { x1 = chip_right, x0 = chip_right - (12 + 8 + 9 + tw + 14), y0 = 14, y1 = 46 }
   end
   if room.drift then
     local dt = room.drift.text or ''
     local bt = room.drift.button or ''
     local kt = room.drift.key or ''
     local tw = text_width(dt, 14, false)
-    local bw = 12 + 15 + 8 + text_width(bt, 13, true) + (kt ~= '' and (8 + text_width(kt, 11, false) + 12) or 0) + 6
-    local w = 14 + 8 + 10 + tw + 10 + bw + 5
+    -- 按钮：左边留 12、图标 15、间隔 8、字、（快捷键：间隔 8、键名左右各 8）、右边留 6
+    local bw = 12 + 15 + 8 + text_width(bt, 13, true) + (kt ~= '' and (8 + text_width(kt, 11, false) + 16) or 0) + 6
+    local w = 34 + tw + 12 + bw + 5
     local x0 = math.floor(W / 2 - w / 2)
-    lay.drift = { x0 = x0, x1 = x0 + w, y0 = 22, y1 = 60, tw = tw, bw = bw }
-    lay.drift_btn = add_hit(lay.hits, 'sync', x0 + w - 5 - bw, 27, x0 + w - 5, 55)
+    lay.drift = { x0 = x0, x1 = x0 + w, y0 = 14, y1 = 58, tw = tw, bw = bw }
+    lay.drift_btn = add_hit(lay.hits, 'sync', x0 + w - 5 - bw, 19, x0 + w - 5, 53)
   end
   -- 窗口窄时居中的差开提示会压到右上角的房间状态上：差开提示本身就说了同步状态，房间状态让路
   if lay.drift and lay.chip and lay.drift.x1 + 12 > lay.chip.x0 then lay.chip = nil end
-  local title_max = (lay.chip and lay.chip.x0 or chip_right) - 28 - 24
-  if lay.drift then title_max = math.min(title_max, lay.drift.x0 - 28 - 24) end
+  local title_max = (lay.chip and lay.chip.x0 or chip_right) - 32 - 24
+  if lay.drift then title_max = math.min(title_max, lay.drift.x0 - 32 - 24) end
   lay.title_max = title_max
 
   -- 菜单（在按钮上方、右边对齐）。放不下的项目滚着看（滚轮），不截掉：YouTube 的字幕常有几十种语言
@@ -850,11 +1219,11 @@ local function layout()
     local anchor = nil
     for _, b in ipairs(lay.buttons) do if b.id == m.anchor then anchor = b end end
     if anchor then
-      local header = m.title and 30 or 0
+      local header = m.title and 34 or 0
       local n = #m.items
       -- 上面留出窗口按钮那一行
-      local top = lay.wc and 44 or 12
-      local fit_n = math.max(1, math.floor((P.y0 - 8 - top - 10 - header - 8) / 38))
+      local top = lay.wc and 56 or 12
+      local fit_n = math.max(1, math.floor((P.y0 - 10 - top - 8 - header - 8) / MENU_ROW))
       local visible = math.min(n, fit_n)
       if m.want then
         -- 刚打开：让选中的那一项落在可见范围中间
@@ -864,21 +1233,21 @@ local function layout()
       m.offset = clamp(m.offset or 0, 0, math.max(0, n - visible))
       m.visible = visible
       local scroll = n > visible
-      local w = 200
-      for _, it in ipairs(m.items) do w = math.max(w, text_width(it.label, 14, true) + 20 + 26 + (scroll and 10 or 0)) end
-      if m.title then w = math.max(w, text_width(m.title, 13, true) + (m.note and text_width(m.note, 12, false) + 40 or 0) + 16) end
+      local w = 220
+      for _, it in ipairs(m.items) do w = math.max(w, text_width(it.label, 14, true) + 16 + 24 + 30 + (scroll and 10 or 0)) end
+      if m.title then w = math.max(w, text_width(m.title, 13, true) + (m.note and text_width(m.note, 12, false) + 40 or 0) + 40) end
       w = math.min(w, W - 24)
-      local hh = 10 + header + visible * 38 + 8
+      local hh = 8 + header + visible * MENU_ROW + 8
       local x1 = math.min(anchor.x1 + 8, W - 12)
       local x0 = math.max(12, x1 - w)
-      local y1 = P.y0 - 8
+      local y1 = P.y0 - 10
       local y0 = y1 - hh
-      lay.menu = { x0 = x0, x1 = x0 + w, y0 = y0, y1 = y1, scroll = scroll, list_y0 = y0 + 10 + header }
+      lay.menu = { x0 = x0, x1 = x0 + w, y0 = y0, y1 = y1, scroll = scroll, list_y0 = y0 + 8 + header }
       add_hit(lay.hits, 'menu', x0, y0, x0 + w, y1, { menu = true })
-      local iy = y0 + 10 + header
+      local iy = y0 + 8 + header
       for i = m.offset + 1, m.offset + visible do
-        add_hit(lay.hits, 'item', x0 + 8, iy, x0 + w - 8 - (scroll and 10 or 0), iy + 36, { menu = true, item = m.items[i], index = i })
-        iy = iy + 38
+        add_hit(lay.hits, 'item', x0 + 8, iy, x0 + w - 8 - (scroll and 10 or 0), iy + MENU_ROW, { menu = true, item = m.items[i], index = i })
+        iy = iy + MENU_ROW
       end
     end
   end
@@ -952,28 +1321,50 @@ local function chapter_at(t)
   return title
 end
 
+-- 键帽：快捷键一览、按钮说明后面的键名。返回宽度
+local function keycap(x0, cy, label, size, op, h)
+  h = h or 22
+  local kw = text_width(label, size, false) + 14
+  fill_rect(x0, cy - h / 2, x0 + kw, cy + h / 2, 8, C.white, 0.06 * op)
+  ring_rect(x0, cy - h / 2, x0 + kw, cy + h / 2, 8, 1, C.white, 0.2 * op)
+  text(x0 + kw / 2, cy, 5, size, C.body, op, label)
+  return kw
+end
+
+-- 带一圈光的小圆点（房间状态、差开提示）
+local function glow_dot(cx, cy, color, op)
+  circle(cx, cy, 7, color, 0.3 * op, '\\blur3')
+  circle(cx, cy, 4, color, op)
+end
+
 local function draw_seek_bar(lay, f)
   local S = lay.seek
   local hover = ui.hover and ui.hover.id == 'seek' and can_seek()
   local dragging = ui.drag and ui.drag.kind == 'seek'
-  local thick = (hover or dragging) and 6 or 4
+  -- 鼠标停上去轨道鼓起来（5 → 9），拖柄从中间长出来
+  if hover or dragging then spring_to(seek_fat, 1, 24, 0.55) else spring_to(seek_fat, 0, 26, 1) end
+  local fat = math.max(0, seek_fat.x)
+  local thick = 5 + 4 * fat
   local y0, y1 = S.cy - thick / 2, S.cy + thick / 2
   local gaps = chapter_gaps(S.x1 - S.x0)
-  bar_piece(S.x0, S.x1, y0, y1, 0, 1, C.white, 0.14 * f, gaps)
+  bar_piece(S.x0, S.x1, y0, y1, 0, 1, C.white, 0.16 * f, gaps)
   local ranges = ranges_now()
   if ranges then
-    for _, r in ipairs(ranges) do bar_piece(S.x0, S.x1, y0, y1, r[1], r[2], C.white, 0.34 * f, gaps) end
+    for _, r in ipairs(ranges) do bar_piece(S.x0, S.x1, y0, y1, r[1], r[2], C.white, 0.3 * f, gaps) end
   end
   local frac = media.duration > 0 and clamp(position() / media.duration, 0, 1) or 0
-  bar_piece(S.x0, S.x1, y0, y1, 0, frac, C.accent, f, gaps)
+  bar_piece(S.x0, S.x1, y0, y1, 0, frac, C.white, f, gaps)
 
   local hp = host_position()
   if hp and media.duration > 0 then
     local hx = S.x0 + clamp(hp / media.duration, 0, 1) * (S.x1 - S.x0)
-    fill_rect(hx - 1, S.cy - 6, hx + 1, S.cy + 6, 1, C.host, f)
-    local lw = text_width(L('host'), 11, true) + 14
-    fill_rect(hx - lw / 2, S.cy - 30, hx + lw / 2, S.cy - 12, 9, C.host, f)
-    text(hx, S.cy - 21, 5, 11, C.hostText, f, L('host'), true)
+    fill_rect(hx - 1, S.cy - 7, hx + 1, S.cy + 7, 1, C.host, f)
+    local lw = text_width(L('host'), 11, true) + 16
+    local py = S.cy - 34
+    fill_rect(hx - lw / 2, py + 2, hx + lw / 2, py + 20, 9, C.black, 0.3 * f, '\\blur3')
+    fill_rect(hx - lw / 2, py, hx + lw / 2, py + 18, 9, C.host, f)
+    ring_rect(hx - lw / 2, py, hx + lw / 2, py + 18, 9, 1, C.white, 0.45 * f, clip_rect(hx - lw / 2, py, hx + lw / 2, py + 5))
+    text(hx, py + 9, 5, 11, C.hostText, f, L('host'), true)
   end
 
   -- 共享标记：进度条上方的小菱形，鼠标停着的那个放大，上面浮出「几分几秒 · 谁：一句话」
@@ -981,51 +1372,96 @@ local function draw_seek_bar(lay, f)
   for _, m in ipairs(lay.marks or {}) do
     local on = hover_mark and hover_mark.cx == m.cx and hover_mark.t == m.t
     local r = on and 5 or 3.5
-    local y = S.cy - 10
+    local y = S.cy - 12
+    fill_event({ poly(m.cx, y - r - 1.5, m.cx + r + 1.5, y, m.cx, y + r + 1.5, m.cx - r - 1.5, y) }, 0, 0, 1, C.black, 0.4 * f)
     fill_event({ poly(m.cx, y - r, m.cx + r, y, m.cx, y + r, m.cx - r, y) }, 0, 0, 1, C.mark, f * (on and 1 or 0.9))
   end
   if hover_mark and not dragging then
     local label = fmt_time(hover_mark.t, false)
     local note = hover_mark.note ~= '' and hover_mark.note or nil
     local hint = can_seek() and L('markTip') or nil
-    local bw = math.max(text_width(label, 15, true), note and text_width(note, 13, false) or 0, hint and text_width(hint, 12, false) or 0) + 24
-    bw = math.min(math.max(bw, 76), 320)
-    local bh = 34 + (note and 20 or 0) + (hint and 18 or 0)
+    local bw = math.max(text_width(label, 15, true), note and text_width(note, 13, false) or 0, hint and text_width(hint, 12, false) or 0) + 32
+    bw = math.min(math.max(bw, 80), 320)
+    local bh = 36 + (note and 20 or 0) + (hint and 18 or 0)
     local bx0 = clamp(hover_mark.cx - bw / 2, lay.panel.x0, lay.panel.x1 - bw)
-    local by1 = lay.panel.y0 - 8
-    fill_rect(bx0, by1 - bh + 8, bx0 + bw, by1 + 8, 10, C.black, 0.4 * f, '\\blur8')
-    fill_rect(bx0, by1 - bh, bx0 + bw, by1, 10, C.panel, 0.96 * f)
-    ring_rect(bx0, by1 - bh, bx0 + bw, by1, 10, 1, C.mark, 0.5 * f)
-    local ty = by1 - bh + 8
+    local by1 = lay.panel.y0 - 10
+    glass(bx0, by1 - bh, bx0 + bw, by1, 18, f, { base = C.deep, base_op = DEEP_OP, rim = C.mark, rim_op = 0.55 })
+    local ty = by1 - bh + 9
     text(bx0 + bw / 2, ty, 8, 15, C.mark, f, label, true)
     ty = ty + 21
     if note then
-      text(bx0 + bw / 2, ty, 8, 13, C.text, f, fit(note, 13, false, bw - 16))
+      text(bx0 + bw / 2, ty, 8, 13, C.text, f, fit(note, 13, false, bw - 20))
       ty = ty + 20
     end
     if hint then text(bx0 + bw / 2, ty, 8, 12, C.dim, f, hint) end
   end
 
   local px = S.x0 + frac * (S.x1 - S.x0)
+  if fat > 0.02 then
+    local kr = 8 * math.min(fat, 1.15)
+    circle(px, S.cy + 2, kr + 1, C.black, 0.45 * f, '\\blur4')
+    circle(px, S.cy, kr + 4 * math.min(fat, 1), C.white, 0.18 * f)
+    circle(px, S.cy, kr, C.white, f)
+  end
   if hover or dragging then
-    circle(px, S.cy, 12, C.accent, 0.35 * f)
-    circle(px, S.cy, 8, C.white, f)
     local mx = dragging and px or clamp(ui.mx, S.x0, S.x1)
     local t = (mx - S.x0) / (S.x1 - S.x0) * media.duration
-    if not dragging then fill_rect(mx - 1, S.cy - 6, mx + 1, S.cy + 6, 1, C.white, f) end
+    if not dragging then fill_rect(mx - 1, S.cy - 7, mx + 1, S.cy + 7, 1, C.white, 0.8 * f) end
     local label = fmt_time(t, false)
     local chap = chapter_at(t)
-    local bw = math.max(text_width(label, 15, true), chap and text_width(chap, 12, false) or 0) + 24
-    bw = math.min(math.max(bw, 76), 240)
-    local bh = chap and 52 or 34
+    local bw = math.max(text_width(label, 15, true), chap and text_width(chap, 12, false) or 0) + 32
+    bw = math.min(math.max(bw, 80), 240)
+    local bh = chap and 52 or 36
     local bx0 = clamp(mx - bw / 2, lay.panel.x0, lay.panel.x1 - bw)
-    local by1 = lay.panel.y0 - 8
-    fill_rect(bx0, by1 - bh + 8, bx0 + bw, by1 + 8, 10, C.black, 0.4 * f, '\\blur8')
-    fill_rect(bx0, by1 - bh, bx0 + bw, by1, 10, C.panel, 0.96 * f)
-    ring_rect(bx0, by1 - bh, bx0 + bw, by1, 10, 1, C.white, 0.1 * f)
-    text(bx0 + bw / 2, by1 - bh + 8, 8, 15, C.text, f, label, true)
-    if chap then text(bx0 + bw / 2, by1 - bh + 29, 8, 12, C.sub, f, fit(chap, 12, false, bw - 16)) end
+    local by1 = lay.panel.y0 - 10
+    glass(bx0, by1 - bh, bx0 + bw, by1, 18, f)
+    text(bx0 + bw / 2, by1 - bh + (chap and 9 or 10), 8, 15, C.text, f, label, true)
+    if chap then text(bx0 + bw / 2, by1 - bh + 30, 8, 12, 'B4BFCD', f, fit(chap, 12, false, bw - 20)) end
   end
+end
+
+-- 喇叭：声波按音量分三档，一条接一条从喇叭口长出来 / 收回去；静音时叉一笔一笔画出来
+local function draw_speaker(cx, cy, size, color, op)
+  if op <= 0 then return end
+  local k = size / 24
+  local ox, oy = cx - 12 * k, cy - 12 * k
+  local sw = 1.75 * k
+  fill_event(ICONS.speaker.fill, ox, oy, k, color, op, ICONS.speaker.round)
+  for i, w in ipairs(vol.waves) do
+    local p = clamp(w.x, 0, 1)
+    if p > 0.01 then
+      local k2 = k * (0.5 + 0.5 * back_out(p))
+      stroke_event(ICONS['wave' .. i].stroke, ox + 11 * (k - k2), oy + 12 * (k - k2), k2, sw, color, op * p)
+    end
+  end
+  local a, b = clamp(vol.xa.x, 0, 1), clamp(vol.xb.x, 0, 1)
+  if a > 0.01 then stroke_event({ poly(15.5, 9.5, 15.5 + 5 * a, 9.5 + 5 * a) }, ox, oy, k, sw, color, op) end
+  if b > 0.01 then stroke_event({ poly(20.5, 9.5, 20.5 - 5 * b, 9.5 + 5 * b) }, ox, oy, k, sw, color, op) end
+end
+
+-- 一位数字占多宽：量「00」减「0」（只量一个字时量出来的宽度会多带一截边距）
+local function digit_w(size)
+  local w = text_width('00', size, true) - text_width('0', size, true)
+  return w > 0 and w or size * 0.58
+end
+
+-- 一串上下滚着换的数字（像老式计数器），右边缘在 xr。返回左边缘
+local function draw_digits(xr, cy, size, color, op, value)
+  local count = vol.roll_digits(value)
+  local dw = digit_w(size)
+  local lh = size * 1.2
+  local x = xr
+  for i = 1, count do
+    local p = vol.digits[i].x
+    local base = math.floor(p)
+    local frac = p - base
+    local cx = x - dw / 2
+    local cl = clip_rect(cx - dw, cy - lh / 2, cx + dw, cy + lh / 2)
+    text(cx, cy - frac * lh, 5, size, color, op, tostring(base % 10), true, cl)
+    if frac > 0.01 then text(cx, cy + (1 - frac) * lh, 5, size, color, op, tostring((base + 1) % 10), true, cl) end
+    x = x - dw
+  end
+  return x
 end
 
 -- 按钮那一行的中线，draw_panel 画按钮前设好
@@ -1033,74 +1469,139 @@ local lay_cy = 0
 
 local function draw_button(b, f)
   local hovered = ui.hover and ui.hover.id == b.id
+  local pressed = ui.pressed and ui.pressed.id == b.id
   local col = b.disabled and C.faint or C.body
-  local op = b.disabled and 0.7 or 1
+  local op = b.disabled and 0.75 or 1
   if b.id == 'play' then
-    circle(b.cx, lay_cy, 22, C.accent, f * (hovered and 0.88 or 1))
-    icon(media.pause and 'play' or 'pause', b.cx + (media.pause and 1 or 0), lay_cy, 22, C.white, f)
+    -- 播放键是一颗更亮的玻璃珠，图标纯白
+    fill_rect(b.cx - 26, lay_cy - 20, b.cx + 26, lay_cy + 32, 26, C.black, 0.25 * f, '\\blur8' .. clip_shape(b.cx - 26, lay_cy - 26, b.cx + 26, lay_cy + 26, 26, true))
+    bead(b.cx - 26, lay_cy - 26, b.cx + 26, lay_cy + 26, 26, f, pressed and 0.26 or hovered and 0.22 or 0.16, 0.42)
+    icon(media.pause and 'play' or 'pause', b.cx + (media.pause and 1 or 0), lay_cy, pressed and 22 or 24, C.white, f)
     return
   end
-  if hovered and not b.disabled then fill_rect(b.x0, lay_cy - 20, b.x1, lay_cy + 20, 10, C.white, 0.1 * f) end
+  if b.id == 'mute' then return end
+  if b.id == 'quality' then
+    local open = ui.menu and ui.menu.anchor == 'quality'
+    fill_rect(b.x0, b.y0, b.x1, b.y1, 16, C.white, (hovered and 0.13 or 0.07) * f)
+    ring_rect(b.x0, b.y0, b.x1, b.y1, 16, 1, open and C.accent or C.white, (open and 1 or 0.12) * f)
+    ring_rect(b.x0, b.y0, b.x1, b.y1, 16, 1, C.white, 0.22 * f, clip_rect(b.x0, b.y0, b.x1, b.y0 + 8))
+    text(b.x0 + 12, lay_cy, 4, 13, C.text, f, b.label, true)
+    icon('chevronUp', b.x1 - 10 - 7, lay_cy, 14, C.text, f, 2.2)
+    return
+  end
+  local open_menu_here = ui.menu and ui.menu.anchor == b.id
+  if (hovered or pressed or open_menu_here) and not b.disabled then
+    bead(b.cx - 22, lay_cy - 22, b.cx + 22, lay_cy + 22, 22, f, pressed and 0.18 or (open_menu_here and 0.14 or 0.12))
+  end
+  local s = pressed and 0.92 or 1
   if b.id == 'back' or b.id == 'fwd' then
-    icon(b.id, b.cx, lay_cy, 24, col, op * f, 1.7)
-    text(b.cx + (b.id == 'back' and 0.4 or -0.4), lay_cy + 0.6, 5, 7.5, col, op * f, '10', true)
-  elseif b.id == 'mute' then
-    icon('speaker', b.cx, lay_cy, 22, col, op * f)
-    if media.mute or media.volume <= 0 then
-      icon('muteX', b.cx, lay_cy, 22, col, op * f)
-    else
-      icon('wave1', b.cx, lay_cy, 22, col, op * f)
-      if media.volume >= 40 then icon('wave2', b.cx, lay_cy, 22, col, op * f) end
-    end
+    icon(b.id, b.cx, lay_cy, 24 * s, col, op * f, 1.7)
+    text(b.cx + (b.id == 'back' and 0.4 or -0.4), lay_cy + 0.6, 5, 7.5 * s, col, op * f, '10', true)
   elseif b.id == 'danmaku' then
     local on = room.danmaku == true
     local x0, x1, y0, y1 = b.cx - 12, b.cx + 12, lay_cy - 10.5, lay_cy + 10.5
     if on then
-      fill_rect(x0, y0, x1, y1, 6, C.accent, f)
+      fill_rect(x0, y0, x1, y1, 7, C.accent, 0.45 * f, '\\blur5')
+      fill_rect(x0, y0, x1, y1, 7, C.accent, f)
+      ring_rect(x0, y0, x1, y1, 7, 1, C.white, 0.4 * f, clip_rect(x0, y0, x1, y0 + 4))
       text(b.cx, lay_cy, 5, 12.5, C.white, f, '弹', true)
     else
-      ring_rect(x0, y0, x1, y1, 6, 1.7, C.sub, f)
+      ring_rect(x0, y0, x1, y1, 7, 1.7, C.sub, f)
       text(b.cx, lay_cy, 5, 12.5, C.sub, f, '弹', true)
     end
   elseif b.id == 'subs' then
-    icon('captions', b.cx, lay_cy, 23, col, op * f)
+    icon('captions', b.cx, lay_cy, 23 * s, col, op * f)
   elseif b.id == 'audio' then
-    icon('audio', b.cx, lay_cy, 22, col, op * f)
+    icon('audio', b.cx, lay_cy, 22 * s, col, op * f)
   elseif b.id == 'react' then
-    icon('smile', b.cx, lay_cy, 22, col, op * f)
+    icon('smile', b.cx, lay_cy, 22 * s, col, op * f)
   elseif b.id == 'fullscreen' then
-    icon(media.fullscreen and 'unfullscreen' or 'fullscreen', b.cx, lay_cy, 22, col, op * f)
-  elseif b.id == 'quality' then
-    local open = ui.menu and ui.menu.anchor == 'quality'
-    if hovered then fill_rect(b.x0, b.y0, b.x1, b.y1, 8, C.white, 0.08 * f) end
-    ring_rect(b.x0, b.y0, b.x1, b.y1, 8, 1, open and C.accent or C.white, (open and 1 or 0.18) * f)
-    text(b.x0 + 11, lay_cy, 4, 13, C.text, f, b.label, true)
-    icon('chevronUp', b.x1 - 8 - 7, lay_cy, 14, C.text, f, 2.2)
+    icon(media.fullscreen and 'unfullscreen' or 'fullscreen', b.cx, lay_cy, 22 * s, col, op * f)
   end
+end
+
+-- 音量胶囊：玻璃珠、喇叭、音量条（增益段、拉长、静音刻痕）。数值气泡另画在面板上方
+local function draw_volume(lay, f)
+  local c = lay.volcap
+  if not c then return end
+  local cy = lay.cy
+  local open = c.open
+  local pressed = ui.pressed and ui.pressed.id == 'mute'
+  -- 底下那颗玻璃珠：悬停时出现，展开时跟着拉长
+  local bop = math.max(vol.bead.x, clamp(open * 3, 0, 1))
+  if bop > 0.01 then bead(c.x0, c.y0, c.x1, c.y1, 22, bop * f, pressed and 0.18 or 0.11) end
+  draw_speaker(c.x0 + 22, cy, pressed and 20 or 22, C.body, f)
+  lay.vol_anchor = nil
+  local a = clamp((open - 0.4) / 0.45, 0, 1) * f
+  if a <= 0 then return end
+  -- 收的时候音量条不能伸到胶囊外面
+  local clip = clip_rect(c.x0, c.y0, c.x1, c.y1)
+  local tx0 = c.x0 + 46
+  local fat = math.max(0, vol.fat.x)
+  local stretch = math.max(0, vol.stretch.x)
+  local h = 6 + 4 * fat - 2 * stretch / VOL.stretch
+  local fv = math.max(0, vol.fill.x)
+  local boost_w = VOL.boost * vol.boost_frac(fv)
+  local y0, y1 = cy - h / 2, cy + h / 2
+  fill_rect(tx0, y0, tx0 + VOL.track + boost_w + stretch, y1, h / 2, C.white, 0.2 * a, clip)
+  local fill_px = clamp(fv, 0, 100) / 100 * VOL.track + (fv >= 99.5 and stretch or 0)
+  if fill_px > 0.5 then
+    if fat > 0.05 then fill_rect(tx0, y0, tx0 + fill_px, y1, h / 2, C.white, 0.35 * math.min(fat, 1) * a, '\\blur5' .. clip) end
+    fill_rect(tx0, y0, tx0 + fill_px, y1, h / 2, C.white, a, clip)
+  end
+  if boost_w > 2.5 then
+    fill_rect(tx0 + VOL.track + 2, y0, tx0 + VOL.track + boost_w, y1, h / 2, C.boost, a, clip)
+  end
+  local real = clamp(media.volume, 0, 100) / 100 * VOL.track
+  if vol.ghost.x > 0.01 then
+    fill_rect(tx0 + real - 1, y0 - 3, tx0 + real + 1, y1 + 3, 1, C.white, 0.55 * vol.ghost.x * a, clip)
+  end
+  -- 气泡跟着填充的末端走（静音时跟着刻痕）
+  lay.vol_anchor = tx0 + ((media.mute or media.volume <= 0) and real or fill_px + boost_w)
+end
+
+local function draw_vol_bubble(lay, f)
+  local b = vol.bubble.x
+  if b <= 0.01 or not lay.vol_anchor then return end
+  local op = b * f
+  local muted = media.mute or media.volume <= 0
+  local boost = not muted and media.volume > 100.5
+  local label_w
+  if muted then
+    label_w = text_width(L('muted'), 13, true)
+  else
+    label_w = #tostring(math.floor(media.volume + 0.5)) * digit_w(14)
+    if boost then label_w = label_w + 5 + text_width(L('boost'), 11, true) end
+  end
+  local w = math.max(46, label_w + 22)
+  local h = 30
+  local cx = clamp(lay.vol_anchor, lay.panel.x0 + w / 2, lay.panel.x1 - w / 2)
+  local cyb = lay.panel.y0 - 10 - h / 2 + 8 * (1 - b)
+  glass(cx - w / 2, cyb - h / 2, cx + w / 2, cyb + h / 2, h / 2, op)
+  if muted then
+    text(cx, cyb, 5, 13, C.text, op, L('muted'), true)
+    return
+  end
+  local x0 = cx - label_w / 2
+  local digits_w = #tostring(math.floor(media.volume + 0.5)) * digit_w(14)
+  draw_digits(x0 + digits_w, cyb, 14, C.text, op, media.volume)
+  if boost then text(x0 + digits_w + 5, cyb, 4, 11, C.boost, op, L('boost'), true) end
 end
 
 local function draw_panel(lay, f)
   local P = lay.panel
-  -- 面板后面压暗一层，面板本身再加一圈柔和的阴影
+  -- 面板后面压暗一层，免得浅色的画面上看不清
   fill_rect(-40, P.y0 - 70, ui.W + 40, ui.H + 60, 0, C.black, 0.5 * f, '\\blur45')
-  fill_rect(P.x0, P.y0 + 12, P.x1, P.y1 + 12, 16, C.black, 0.45 * f, '\\blur18')
-  fill_rect(P.x0, P.y0, P.x1, P.y1, 16, C.panel, 0.82 * f)
-  ring_rect(P.x0, P.y0, P.x1, P.y1, 16, 1, C.white, 0.08 * f)
+  glass(P.x0, P.y0, P.x1, P.y1, PANEL_R, f)
 
   draw_seek_bar(lay, f)
 
   lay_cy = lay.cy
+  draw_volume(lay, f)
   for _, b in ipairs(lay.buttons) do draw_button(b, f) end
 
-  if lay.vol then
-    local v = lay.vol
-    local frac = media.mute and 0 or clamp(media.volume / 100, 0, 1)
-    fill_rect(v.tx0, lay.cy - 2, v.tx1, lay.cy + 2, 2, C.white, 0.2 * f)
-    fill_rect(v.tx0, lay.cy - 2, v.tx0 + frac * (v.tx1 - v.tx0), lay.cy + 2, 2, C.body, f)
-    circle(v.tx0 + frac * (v.tx1 - v.tx0), lay.cy, 6, C.white, f)
-  end
-
-  -- 时间：当前位置亮一些、总时长暗一些，同一行里换颜色；放不下总时长就只写当前位置
+  -- 时间：当前位置亮一些、总时长暗一些，同一行里换颜色；放不下总时长就只写当前位置。
+  -- 跟着音量胶囊的宽度走（胶囊展开时往右让）
   local cur = fmt_time(position(), false)
   local total = media.duration > 0 and (' / ' .. fmt_time(media.duration, false)) or ''
   local room_w = lay.right_x - lay.time_x
@@ -1110,64 +1611,77 @@ local function draw_panel(lay, f)
     text(lay.time_x, lay.cy, 4, 15, C.text, f, cur)
   end
 
-  if lay.divider then fill_rect(lay.divider - 0.5, lay.cy - 10, lay.divider + 0.5, lay.cy + 10, 0, C.white, 0.12 * f) end
+  if lay.divider then fill_rect(lay.divider - 0.5, lay.cy - 11, lay.divider + 0.5, lay.cy + 11, 0, C.white, 0.14 * f) end
 
-  -- 鼠标停在按钮上：上方给一句说明。按这一次排版里的按钮取（点完按钮说明会变，比如弹幕开关）
+  -- 鼠标停在按钮上：上方给一句说明。按这一次排版里的按钮取（点完按钮说明会变，比如弹幕开关）。
+  -- 音量的数值气泡出来了就不再叠说明
   local h = nil
   if ui.hover then
     for _, b in ipairs(lay.buttons) do
       if b.id == ui.hover.id then h = b end
     end
   end
+  if h and h.id == 'mute' and vol.bubble.x > 0.05 then h = nil end
   if h and h.tip and not ui.menu and not ui.drag then
-    -- 说明后面跟着快捷键（暗一些、加个小框）
-    local kw = h.key and (text_width(h.key, 11, false) + 12) or 0
-    local tw = text_width(h.tip, 13, false) + 20 + (h.key and kw + 8 or 0)
+    -- 说明后面跟着快捷键（暗一些、加个键帽）
+    local kw = h.key and (text_width(h.key, 11, false) + 14) or 0
+    local tw = 14 + text_width(h.tip, 13, false) + (h.key and (10 + kw + 6) or 14)
     local x0 = clamp(h.cx - tw / 2, 12, ui.W - 12 - tw)
-    local y1 = P.y0 - 8
-    fill_rect(x0, y1 - 28, x0 + tw, y1, 8, C.panel, 0.94 * f)
-    text(x0 + 10, y1 - 14, 4, 13, C.body, f, h.tip)
-    if h.key then
-      local kx = x0 + tw - 10 - kw
-      ring_rect(kx, y1 - 23, kx + kw, y1 - 5, 5, 1, C.white, 0.18 * f)
-      text(kx + kw / 2, y1 - 14, 5, 11, C.sub, f, h.key)
-    end
+    local y1 = P.y0 - 10
+    glass(x0, y1 - 34, x0 + tw, y1, 17, f)
+    text(x0 + 14, y1 - 17, 4, 13, C.body, f, h.tip)
+    if h.key then keycap(x0 + tw - 6 - kw, y1 - 17, h.key, 11, f) end
   end
+
+  draw_vol_bubble(lay, f)
 end
 
 local function draw_top(lay, f)
   local W = ui.W
   fill_rect(-40, -80, W + 40, 100, 0, C.black, 0.55 * f, '\\blur40')
   local title = room.title and room.title ~= '' and room.title or media.title
-  text(28, 20, 7, 19, C.text, f, fit(title, 19, true, lay.title_max), true)
+  text(32, 22, 7, 20, C.text, f, fit(title, 20, true, lay.title_max), true)
   if room.subtitle and room.subtitle ~= '' then
-    text(28, 47, 7, 13, C.sub, f, fit(room.subtitle, 13, false, lay.title_max))
+    text(32, 52, 7, 13, 'B4BFCD', f, fit(room.subtitle, 13, false, lay.title_max))
   end
 
   if lay.chip then
     local c = lay.chip
     local tone = room.chip.tone
-    local border_col, border_op = C.white, 0.08
-    if tone == 'wait' then border_col, border_op = C.warn, 0.45 end
-    fill_rect(c.x0, c.y0, c.x1, c.y1, 15, C.panel, 0.74 * f)
-    ring_rect(c.x0, c.y0, c.x1, c.y1, 15, 1, border_col, border_op * f)
-    local dot = ({ sync = C.ok, wait = C.warn, paused = C.dim, manual = C.manual })[tone]
-    local dx = c.x0 + 16
-    if dot then
-      circle(dx, (c.y0 + c.y1) / 2, 4, dot, f)
+    local cy = (c.y0 + c.y1) / 2
+    if tone == 'wait' then
+      glass(c.x0, c.y0, c.x1, c.y1, 16, f, { rim = C.host, rim_op = 0.5 })
     else
-      ring_rect(dx - 4, (c.y0 + c.y1) / 2 - 4, dx + 4, (c.y0 + c.y1) / 2 + 4, 4, 1.5, C.sub, f)
+      glass(c.x0, c.y0, c.x1, c.y1, 16, f)
     end
-    text(c.x0 + 28, (c.y0 + c.y1) / 2, 4, 13, C.body, f, room.chip.text)
+    local dot = ({ sync = C.ok, wait = C.host, paused = C.dim, manual = C.manual })[tone]
+    local dx = c.x0 + 16
+    if dot == C.dim then
+      circle(dx, cy, 4, dot, f)
+    elseif dot then
+      glow_dot(dx, cy, dot, f)
+    else
+      ring_rect(dx - 4, cy - 4, dx + 4, cy + 4, 4, 1.5, C.sub, f)
+    end
+    text(c.x0 + 29, cy, 4, 13, C.body, f, room.chip.text)
   end
 
   if lay.wc then
+    local r = lay.wc_rect
+    glass(r.x0, r.y0, r.x1, r.y1, 18, f)
     for _, h in ipairs(lay.hits) do
       if h.win then
         local hovered = ui.hover and ui.hover.id == h.id
-        if hovered then fill_rect(h.x0, h.y0, h.x1, h.y1, 0, h.id == 'close' and C.danger or C.white, (h.id == 'close' and 1 or 0.12) * f) end
+        local cy = (r.y0 + r.y1) / 2
+        if hovered then
+          if h.id == 'close' then
+            fill_rect(h.vx0, cy - 15, h.vx1, cy + 15, 15, C.danger, f)
+          else
+            bead(h.vx0, cy - 15, h.vx1, cy + 15, 15, f, 0.14)
+          end
+        end
         local name = h.id == 'minimize' and 'winMin' or h.id == 'close' and 'winClose' or (media.maximized and 'winRestore' or 'winMax')
-        icon(name, (h.x0 + h.x1) / 2, 17, 17, hovered and h.id == 'close' and C.white or 'C9D2DE', f, 1.1)
+        icon(name, (h.vx0 + h.vx1) / 2, cy, 17, hovered and h.id == 'close' and C.white or 'C9D2DE', f, 1.1)
       end
     end
   end
@@ -1177,23 +1691,23 @@ end
 local function draw_drift(lay)
   local d = lay.drift
   if not d then return end
-  fill_rect(d.x0, d.y0 + 8, d.x1, d.y1 + 8, 19, C.black, 0.4, '\\blur12')
-  fill_rect(d.x0, d.y0, d.x1, d.y1, 19, C.panel, 0.88)
-  ring_rect(d.x0, d.y0, d.x1, d.y1, 19, 1, C.warn, 0.5)
+  glass(d.x0, d.y0, d.x1, d.y1, 22, 1, { rim = C.host, rim_op = 0.45, glow = C.host, glow_op = 0.18 })
   local cy = (d.y0 + d.y1) / 2
-  circle(d.x0 + 18, cy, 4, C.warn, 1)
-  text(d.x0 + 32, cy, 4, 14, C.text, 1, room.drift.text)
+  glow_dot(d.x0 + 20, cy, C.host, 1)
+  text(d.x0 + 34, cy, 4, 14, C.text, 1, room.drift.text)
   local b = lay.drift_btn
   local hovered = ui.hover and ui.hover.id == 'sync'
-  fill_rect(b.x0, b.y0, b.x1, b.y1, 14, C.accent, hovered and 0.88 or 1)
+  fill_rect(b.x0, b.y0 + 3, b.x1, b.y1 + 3, 17, C.accent, 0.35, '\\blur6' .. clip_shape(b.x0, b.y0, b.x1, b.y1, 17, true))
+  fill_rect(b.x0, b.y0, b.x1, b.y1, 17, C.accent, hovered and 0.82 or 0.92)
+  ring_rect(b.x0, b.y0, b.x1, b.y1, 17, 1, C.white, 0.42, clip_rect(b.x0, b.y0, b.x1, b.y0 + 8))
   icon('sync', b.x0 + 12 + 7.5, cy, 15, C.white, 1, 2.2)
   local tx = b.x0 + 12 + 15 + 8
   text(tx, cy, 4, 13, C.white, 1, room.drift.button, true)
   local key = room.drift.key
   if key and key ~= '' then
     local kx = tx + text_width(room.drift.button, 13, true) + 8
-    local kw = text_width(key, 11, false) + 12
-    fill_rect(kx, cy - 9, kx + kw, cy + 9, 5, C.black, 0.22)
+    local kw = text_width(key, 11, false) + 16
+    fill_rect(kx, cy - 11, kx + kw, cy + 11, 11, C.black, 0.22)
     text(kx + kw / 2, cy, 5, 11, C.white, 1, key)
   end
 end
@@ -1219,9 +1733,7 @@ local function draw_stall(lay, f)
   local x0 = math.floor(W / 2 - w / 2)
   local y0 = math.floor(H / 2 - h / 2)
   if lay and f > 0 then y0 = math.max(8, math.min(y0, lay.panel.y0 - 12 - h)) end
-  fill_rect(x0, y0 + 16, x0 + w, y0 + h + 16, 20, C.black, 0.55, '\\blur24')
-  fill_rect(x0, y0, x0 + w, y0 + h, 20, C.panel, 0.9)
-  ring_rect(x0, y0, x0 + w, y0 + h, 20, 1, C.white, 0.08)
+  glass(x0, y0, x0 + w, y0 + h, 30, 1, { base = C.deep, base_op = DEEP_OP, shadow = 0.5 })
   local cx = W / 2
   local y = y0 + 28
   draw_spinner(cx, y + 22, 18, 4, C.accent)
@@ -1229,34 +1741,63 @@ local function draw_stall(lay, f)
   text(cx, y, 8, 22, C.text, 1, title, true)
   y = y + 30
   if sub then
-    text(cx, y, 8, 14, C.sub, 1, sub)
+    text(cx, y, 8, 14, 'B4BFCD', 1, sub)
     y = y + 26
   end
   if has_bar or s.left or s.right then
     y = y + 8
     if has_bar then
+      local fx = x0 + 32 + clamp(s.progress, 0, 1) * inner
       fill_rect(x0 + 32, y, x0 + w - 32, y + 6, 3, C.white, 0.12)
-      fill_rect(x0 + 32, y, x0 + 32 + clamp(s.progress, 0, 1) * inner, y + 6, 3, C.accent, 1)
+      if fx > x0 + 33 then
+        fill_rect(x0 + 32, y, fx, y + 6, 3, C.accent, 0.5, '\\blur4')
+        fill_rect(x0 + 32, y, fx, y + 6, 3, C.accent, 1)
+      end
     end
     if s.left then text(x0 + 32, y + 14, 7, 13, C.body, 1, fit(s.left, 13, false, inner / 2)) end
-    if s.right then text(x0 + w - 32, y + 14, 9, 13, C.sub, 1, fit(s.right, 13, false, inner / 2)) end
+    if s.right then text(x0 + w - 32, y + 14, 9, 13, 'B4BFCD', 1, fit(s.right, 13, false, inner / 2)) end
     y = y + 34
   end
   if note then
     fill_rect(x0 + 32, y + 6, x0 + w - 32, y + 7, 0, C.white, 0.08)
-    text(cx, y + 18, 8, 13, C.dim, 1, note)
+    text(cx, y + 18, 8, 13, '9AA6B6', 1, note)
   end
 end
 
--- 刚打开、在线视频在缓冲：正中一个转圈
+-- 刚打开、在线视频在缓冲：正中一颗玻璃珠里转圈
 local function draw_busy(label)
   local cx, cy = ui.W / 2, ui.H / 2
-  circle(cx, cy - 8, 34, C.panel, 0.6)
+  glass(cx - 38, cy - 46, cx + 38, cy + 30, 38, 1)
   draw_spinner(cx, cy - 8, 18, 4, C.accent)
   if label and label ~= '' then
-    local tw = text_width(label, 14, false) + 24
-    fill_rect(cx - tw / 2, cy + 36, cx + tw / 2, cy + 64, 14, C.panel, 0.7)
-    text(cx, cy + 50, 5, 14, C.body, 1, label)
+    local tw = text_width(label, 14, false) + 28
+    glass(cx - tw / 2, cy + 40, cx + tw / 2, cy + 72, 16, 1)
+    text(cx, cy + 56, 5, 14, C.body, 1, label)
+  end
+end
+
+-- 控件收起时调音量：顶部那条音量胶囊（喇叭、音量条、滚动的数字）
+local function draw_volume_hud(y, op)
+  local muted = media.mute or media.volume <= 0
+  local boost_w = 22 * vol.boost_frac(math.max(0, vol.fill.x))
+  local bar_w = 150 + boost_w
+  local w = 14 + 22 + 12 + bar_w + 12 + 56 + 18
+  local x0 = math.floor(ui.W / 2 - w / 2)
+  local cy = y + 24
+  glass(x0, y, x0 + w, y + 48, 24, op)
+  draw_speaker(x0 + 14 + 11, cy, 22, C.body, op)
+  local bx = x0 + 14 + 22 + 12
+  fill_rect(bx, cy - 3, bx + bar_w, cy + 3, 3, C.white, 0.2 * op)
+  local fv = clamp(vol.fill.x, 0, 100) / 100 * 150
+  if fv > 0.5 then fill_rect(bx, cy - 3, bx + fv, cy + 3, 3, C.white, op) end
+  if boost_w > 2.5 then fill_rect(bx + 152, cy - 3, bx + 150 + boost_w, cy + 3, 3, C.boost, op) end
+  local xr = x0 + w - 18
+  if muted then
+    text(xr, cy, 6, 14, 'C9D2DE', op, L('muted'), true)
+  else
+    local pw = text_width('%', 12, true)
+    text(xr, cy + 0.5, 6, 12, C.sub, op, '%', true)
+    draw_digits(xr - pw - 1, cy, 15, C.text, op, media.volume)
   end
 end
 
@@ -1265,70 +1806,58 @@ local function draw_toasts(start_y)
   local t = now()
   for _, item in ipairs(ui.toasts) do
     if item.until_t > t then
-      local icon_name = item.tone == 'ok' and 'shield' or item.tone == 'warn' and 'warning' or nil
-      local tw = text_width(item.text, 14, item.tone == 'volume')
-      local w, x0
+      -- 进场：从上面落下来、略微越过一点；退场：往上收、淡掉
+      local appear = clamp((t - item.t0) / TOAST_S.enter, 0, 1)
+      local leave = clamp((item.until_t - t) / TOAST_S.leave, 0, 1)
+      local op = math.min(clamp((t - item.t0) / 0.2, 0, 1), leave)
+      local ty = y - 14 * (1 - back_out(appear)) - 10 * (1 - leave)
       if item.tone == 'volume' then
-        w = 12 + 19 + 12 + 120 + 12 + tw + 16
+        draw_volume_hud(ty, op)
+        y = y + 56
       else
-        w = (icon_name and (12 + 19 + 10) or 16) + tw + 16
-      end
-      w = math.min(w, ui.W - 24)
-      x0 = math.floor(ui.W / 2 - w / 2)
-      local cy = y + 20
-      fill_rect(x0, y + 8, x0 + w, y + 48, 20, C.black, 0.4, '\\blur12')
-      fill_rect(x0, y, x0 + w, y + 40, 20, C.panel, 0.86)
-      ring_rect(x0, y, x0 + w, y + 40, 20, 1, item.tone == 'warn' and C.warn or C.white, item.tone == 'warn' and 0.45 or 0.1)
-      if item.tone == 'volume' then
-        local muted = media.mute or media.volume <= 0
-        icon('speaker', x0 + 12 + 9.5, cy, 19, C.body, 1)
-        if muted then icon('muteX', x0 + 12 + 9.5, cy, 19, C.body, 1) else icon('wave1', x0 + 12 + 9.5, cy, 19, C.body, 1) end
-        local bx = x0 + 12 + 19 + 12
-        local frac = muted and 0 or clamp(media.volume / math.max(100, media.volume_max), 0, 1)
-        fill_rect(bx, cy - 2, bx + 120, cy + 2, 2, C.white, 0.16)
-        fill_rect(bx, cy - 2, bx + 120 * frac, cy + 2, 2, C.body, 1)
-        text(bx + 120 + 12, cy, 4, 14, C.sub, 1, item.text)
-      else
+        local icon_name = item.tone == 'ok' and 'shield' or item.tone == 'warn' and 'warning' or nil
+        local tw = text_width(item.text, 14, false)
+        local w = math.min((icon_name and (12 + 19 + 10) or 16) + tw + 16, ui.W - 24)
+        local x0 = math.floor(ui.W / 2 - w / 2)
+        local cy = ty + 20
+        if item.tone == 'warn' then
+          glass(x0, ty, x0 + w, ty + 40, 20, op, { rim = C.warn, rim_op = 0.55 })
+        else
+          glass(x0, ty, x0 + w, ty + 40, 20, op)
+        end
         local tx = x0 + 16
         if icon_name then
-          icon(icon_name, x0 + 12 + 9.5, cy, 19, item.tone == 'ok' and C.ok or C.warn, 1, 1.9)
+          icon(icon_name, x0 + 12 + 9.5, cy, 19, item.tone == 'ok' and C.ok or C.mark, op, 1.9)
           tx = x0 + 12 + 19 + 10
         end
-        text(tx, cy, 4, 14, C.text, 1, fit(item.text, 14, false, w - (tx - x0) - 16))
+        text(tx, cy, 4, 14, C.text, op, fit(item.text, 14, false, w - (tx - x0) - 16))
+        y = y + 48
       end
-      y = y + 48
     end
   end
 end
 
--- 长按 → 快进时顶部那一条：「▶▶ 2 倍速快进中 · 全房跟着一起快进」（房里有别人时才说后半句）
-local function draw_hold(y)
-  local label = L('speedHold')
-  local note = room.chip and L('speedHoldNote') or nil
+-- 2 倍速快进那一条（自己按着、别人按着都是这个样子）：蓝色描边、带一圈光
+local function draw_rate_bar(y, label, note)
   local tw = text_width(label, 14, true)
-  local nw = note and (text_width(note, 13, false) + 20) or 0
+  local nw = note and (text_width(note, 13, false) + 10) or 0
   local w = math.min(12 + 20 + 10 + tw + nw + 18, ui.W - 24)
   local x0 = math.floor(ui.W / 2 - w / 2)
   local cy = y + 20
-  fill_rect(x0, y + 8, x0 + w, y + 48, 20, C.black, 0.4, '\\blur12')
-  fill_rect(x0, y, x0 + w, y + 40, 20, C.panel, 0.88)
-  ring_rect(x0, y, x0 + w, y + 40, 20, 1, C.accent, 0.6)
-  icon('ffwd', x0 + 12 + 10, cy, 18, C.accent, 1)
-  text(x0 + 12 + 20 + 10, cy, 4, 14, C.text, 1, label, true)
-  if note then text(x0 + 12 + 20 + 10 + tw + 20, cy, 4, 13, C.sub, 1, fit(note, 13, false, w - (12 + 20 + 10 + tw + 20) - 16)) end
+  glass(x0, y, x0 + w, y + 40, 20, 1, { rim = C.accent, rim_op = 0.6, glow = C.accent, glow_op = 0.22 })
+  icon('ffwd', x0 + 12 + 10, cy, 18, '6FA3FF', 1)
+  text(x0 + 12 + 20 + 10, cy, 4, 14, C.text, 1, fit(label, 14, true, w - (12 + 20 + 10) - 16), true)
+  if note then text(x0 + 12 + 20 + 10 + tw + 10, cy, 4, 13, 'B4BFCD', 1, fit(note, 13, false, w - (12 + 20 + 10 + tw + 10) - 16)) end
 end
 
--- 别人按着 → 让全房快进时顶部那一条：「▶▶ 全房 2 倍速 · 谁在快进」（和自己按着时那一条一个样子）
+-- 长按 → 快进时顶部那一条：「▶▶ 2 倍速快进中 全房跟着一起快进」（房里有别人时才说后半句）
+local function draw_hold(y)
+  draw_rate_bar(y, L('speedHold'), room.chip and L('speedHoldNote') or nil)
+end
+
+-- 别人按着 → 让全房快进时顶部那一条：「▶▶ 全房 2 倍速 · 谁在快进」
 local function draw_room_rate(y)
-  local label = room.rate.text
-  local w = math.min(12 + 20 + 10 + text_width(label, 14, true) + 18, ui.W - 24)
-  local x0 = math.floor(ui.W / 2 - w / 2)
-  local cy = y + 20
-  fill_rect(x0, y + 8, x0 + w, y + 48, 20, C.black, 0.4, '\\blur12')
-  fill_rect(x0, y, x0 + w, y + 40, 20, C.panel, 0.88)
-  ring_rect(x0, y, x0 + w, y + 40, 20, 1, C.accent, 0.6)
-  icon('ffwd', x0 + 12 + 10, cy, 18, C.accent, 1)
-  text(x0 + 12 + 20 + 10, cy, 4, 14, C.text, 1, fit(label, 14, true, w - (12 + 20 + 10) - 16), true)
+  draw_rate_bar(y, room.rate.text, nil)
 end
 
 -- 快捷键一览（? / F1）：画面压暗，正中一张两列的表
@@ -1353,34 +1882,27 @@ local function draw_help()
   local h = 28 + 22 + 20 + per * 32 + 12 + 20 + 22
   local x0 = math.floor(W / 2 - w / 2)
   local y0 = math.max(12, math.floor(H / 2 - h / 2))
-  fill_rect(x0, y0 + 16, x0 + w, y0 + h + 16, 18, C.black, 0.55, '\\blur24')
-  fill_rect(x0, y0, x0 + w, y0 + h, 18, C.menu, 0.97)
-  ring_rect(x0, y0, x0 + w, y0 + h, 18, 1, C.white, 0.1)
+  glass(x0, y0, x0 + w, y0 + h, 24, 1, { base = C.deep, base_op = 0.9, shadow = 0.5 })
   text(x0 + 32, y0 + 28, 7, 18, C.text, 1, L('helpTitle'), true)
   local ry = y0 + 28 + 22 + 20
   for i, r in ipairs(rows) do
     local col = math.floor((i - 1) / per)
     local cx = x0 + 32 + col * (colw + 40)
     local cy = ry + ((i - 1) % per) * 32 + 11
-    local kwi = text_width(r[1], 12, false) + 14
-    fill_rect(cx, cy - 11, cx + kwi, cy + 11, 6, C.white, 0.06)
-    ring_rect(cx, cy - 11, cx + kwi, cy + 11, 6, 1, C.white, 0.2)
-    text(cx + kwi / 2, cy, 5, 12, C.body, 1, r[1])
-    text(cx + kw + 14, cy, 4, 14, C.sub, 1, fit(r[2], 14, false, dw + 4))
+    keycap(cx, cy, r[1], 12, 1)
+    text(cx + kw + 14, cy, 4, 14, 'C9D2DE', 1, fit(r[2], 14, false, dw + 4))
   end
-  text(x0 + 32, y0 + h - 22 - 10, 4, 12, C.dim, 1, fit(note, 12, false, w - 64))
+  text(x0 + 32, y0 + h - 22 - 10, 4, 12, '9AA6B6', 1, fit(note, 12, false, w - 64))
 end
 
 local function draw_menu(lay)
   local M = lay.menu
   if not M or not ui.menu then return end
   local m = ui.menu
-  fill_rect(M.x0, M.y0 + 14, M.x1, M.y1 + 14, 14, C.black, 0.6, '\\blur20')
-  fill_rect(M.x0, M.y0, M.x1, M.y1, 14, C.menu, 1)
-  ring_rect(M.x0, M.y0, M.x1, M.y1, 14, 1, C.white, 0.1)
+  glass(M.x0, M.y0, M.x1, M.y1, 22, 1, { base = C.deep, base_op = DEEP_OP, shadow = 0.5 })
   if m.title then
-    text(M.x0 + 18, M.y0 + 22, 4, 13, C.text, 1, m.title, true)
-    if m.note then text(M.x1 - 18, M.y0 + 22, 6, 12, C.dim, 1, m.note) end
+    text(M.x0 + 20, M.y0 + 8 + 17, 4, 13, C.text, 1, m.title, true)
+    if m.note then text(M.x1 - 20, M.y0 + 8 + 17, 6, 12, C.dim, 1, m.note) end
   end
   for _, h in ipairs(lay.hits) do
     if h.id == 'item' then
@@ -1388,19 +1910,22 @@ local function draw_menu(lay)
       -- 鼠标停着的、或者键盘移到的那一项
       local hovered = (ui.hover and ui.hover.id == 'item' and ui.hover.index == h.index) or (m.kbd and m.cursor == h.index)
       if it.selected then
-        fill_rect(h.x0, h.y0, h.x1, h.y1, 8, C.accent, 0.18)
+        fill_rect(h.x0, h.y0, h.x1, h.y1, 13, C.accent, 0.24)
+        ring_rect(h.x0, h.y0, h.x1, h.y1, 13, 1, '6EA0FF', 0.22)
+        ring_rect(h.x0, h.y0, h.x1, h.y1, 13, 1, 'A0C3FF', 0.32, clip_rect(h.x0, h.y0, h.x1, h.y0 + 7))
+        if hovered then fill_rect(h.x0, h.y0, h.x1, h.y1, 13, C.white, 0.05) end
       elseif hovered then
-        fill_rect(h.x0, h.y0, h.x1, h.y1, 8, C.white, 0.07)
+        fill_rect(h.x0, h.y0, h.x1, h.y1, 13, C.white, 0.08)
       end
       local cy = (h.y0 + h.y1) / 2
-      text(h.x0 + 10, cy, 4, 14, it.selected and C.white or 'C9D2DE', 1, fit(it.label, 14, it.selected, h.x1 - h.x0 - 44), it.selected)
-      if it.selected then icon('check', h.x1 - 10 - 8, cy, 16, C.accent, 1, 2.4) end
+      text(h.x0 + 12, cy, 4, 14, it.selected and C.white or 'C9D2DE', 1, fit(it.label, 14, it.selected, h.x1 - h.x0 - 48), it.selected)
+      if it.selected then icon('check', h.x1 - 12 - 8, cy, 16, C.accentText, 1, 2.4) end
     end
   end
   -- 放不下、要滚着看：右边一条滚动条，看得出上下还有多少
   if M.scroll then
     local n = #m.items
-    local ty0, ty1 = M.list_y0, M.list_y0 + m.visible * 38 - 2
+    local ty0, ty1 = M.list_y0, M.list_y0 + m.visible * MENU_ROW - 2
     local tx = M.x1 - 10
     fill_rect(tx, ty0, tx + 3, ty1, 1.5, C.white, 0.08)
     local th = math.max(18, (ty1 - ty0) * m.visible / n)
@@ -1421,7 +1946,7 @@ local function draw_mini(op)
       fill_rect(clamp(r[1], 0, 1) * W, H - 3, clamp(r[2], 0, 1) * W, H, 0, C.white, 0.3 * op)
     end
   end
-  fill_rect(0, H - 3, clamp(position() / media.duration, 0, 1) * W, H, 0, C.accent, op)
+  fill_rect(0, H - 3, clamp(position() / media.duration, 0, 1) * W, H, 0, C.white, op)
   local hp = host_position()
   if hp then
     local hx = clamp(hp / media.duration, 0, 1) * W
@@ -1481,7 +2006,7 @@ local function update_input(lay)
   end
   set_section('nx-bottom', (shown and lay ~= nil) or ui.menu ~= nil or ui.help)
   if shown and lay and lay.wc then
-    set_area('nx-wc', lay.wc_x0, 0, ui.W, 34)
+    set_area('nx-wc', lay.wc_x0, 0, ui.W, lay.wc_rect.y1)
     set_section('nx-wc', true)
   else
     set_area('nx-wc', 0, 0, 0, 0)
@@ -1652,6 +2177,11 @@ local function check_visibility()
   local target = want_visible() and 1 or 0
   if target ~= ui.target then
     ui.target = target
+    if target == 0 then
+      -- 控件收起：音量胶囊跟着收，下次露出来是收起的
+      vol.hover = false
+      vol.collapse()
+    end
     ui.fade_from = ui.fade
     ui.fade_start = now()
     if not timers.fade then timers.fade = mp.add_periodic_timer(1 / 60, guard(step_fade)) end
@@ -1710,6 +2240,7 @@ end
 local function open_menu(kind, keep_offset)
   local m = { anchor = kind, items = {} }
   if kind == 'subs' then
+    m.title, m.note = L('subs'), 'C'
     local any = false
     for _, t in ipairs(media.tracks) do if t.type == 'sub' and t.selected then any = true end end
     m.items[#m.items + 1] = { label = L('subsOff'), selected = not any, run = function() mp.set_property('sid', 'no') end }
@@ -1733,6 +2264,7 @@ local function open_menu(kind, keep_offset)
       m.items[#m.items + 1] = { label = glyph .. '    ' .. i, run = function() send_reaction(e) end }
     end
   elseif kind == 'audio' then
+    m.title, m.note = L('audio'), 'A'
     for _, t in ipairs(media.tracks) do
       if t.type == 'audio' then
         local id = t.id
@@ -1810,7 +2342,7 @@ local function over_ui(x, y)
   local P = lay.panel
   if x >= P.x0 and x < P.x1 and y >= P.y0 - 6 and y < P.y1 then return true end
   if lay.menu and x >= lay.menu.x0 and x < lay.menu.x1 and y >= lay.menu.y0 and y < lay.menu.y1 then return true end
-  if lay.wc and x >= lay.wc_x0 and y < 34 then return true end
+  if lay.wc and x >= lay.wc_x0 and y < lay.wc_rect.y1 + 6 then return true end
   return false
 end
 
@@ -1820,8 +2352,13 @@ local function seek_frac(x)
 end
 
 local function set_volume_at(x)
-  local v = ui.layout.vol
-  local frac = clamp((x - v.tx0) / (v.tx1 - v.tx0), 0, 1)
+  local v = ui.layout and ui.layout.vol
+  if not v then return end
+  local px = x - v.tx0
+  local frac = clamp(px / VOL.track, 0, 1)
+  -- 拖过右端：轨道被拉长（越往外越拉不动），音量停在 100
+  local over = px - VOL.track
+  spring_to(vol.stretch, over > 0 and math.min(VOL.stretch, over * 0.35) or 0, 60, 1)
   mp.set_property_number('volume', math.floor(frac * 100 + 0.5))
   if media.mute and frac > 0 then mp.set_property_bool('mute', false) end
 end
@@ -1838,6 +2375,7 @@ local function on_move()
   check_visibility()
   ui.hover = hit_at(ui.mx, ui.my)
   ui.over = over_ui(ui.mx, ui.my)
+  vol.update_hover(ui.mx, ui.my)
   check_visibility()
   request()
 end
@@ -1846,6 +2384,7 @@ local function on_leave()
   ui.mouse_in = false
   ui.hover = nil
   ui.over = false
+  vol.update_hover(-1, -1)
   -- 鼠标离开窗口：菜单也收起来，不然它一直挂在画面上，回来第一下点击还会被吃掉
   close_menu()
   check_visibility()
@@ -1924,6 +2463,8 @@ local function on_down()
     if media.duration > 0 then ui.drag = { kind = 'seek', frac = seek_frac(x) } end
   elseif h.id == 'vol' then
     ui.drag = { kind = 'vol' }
+    spring_to(vol.fat, 1, 24, 0.55)
+    tween_to(vol.bubble, 1, 0.16)
     set_volume_at(x)
   else
     ui.pressed = h
@@ -1941,6 +2482,7 @@ local function on_up()
     if d.kind == 'seek' and media.duration > 0 and can_seek() then
       mp.commandv('seek', string.format('%.3f', d.frac * media.duration), 'absolute+exact')
     end
+    if d.kind == 'vol' then vol.drag_end() end
   elseif ui.pressed then
     local p = ui.pressed
     ui.pressed = nil
@@ -2281,13 +2823,15 @@ observe('duration', 'number', function(_, v)
 end)
 observe('volume', 'number', function(_, v)
   media.volume = v or 100
-  if volume_seen then volume_toast() end
+  vol.retarget(not volume_seen)
+  if volume_seen then vol.feedback() end
   volume_seen = true
   request()
 end)
 observe('mute', 'bool', function(_, v)
   media.mute = v == true
-  if mute_seen then volume_toast() end
+  vol.retarget(not mute_seen)
+  if mute_seen then vol.feedback() end
   mute_seen = true
   request()
 end)

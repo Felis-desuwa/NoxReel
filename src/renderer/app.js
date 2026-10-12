@@ -9593,6 +9593,8 @@ const OSC_LABEL_TEXT = {
   guestSeek: '游客不能跳转进度',
   volume: '音量',
   muted: '已静音',
+  // 音量调到 100 以上（到 volume-max）时数值气泡里那个小字
+  boost: '增益',
   speed: '倍速',
   track: '轨道',
   // 快捷键：按钮说明后面的键名、长按 → 快进时顶部那一条、? 键的一览（见 noxreel-osc.lua 的「快捷键」一节）
