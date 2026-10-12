@@ -326,6 +326,7 @@ const EN = new Map(Object.entries({
   '正在缓冲': 'Buffering',
   '音量': 'Volume',
   '已静音': 'Muted',
+  '增益': 'Boost',
   '倍速': 'Speed',
   // 共享标记、表情反应、本机字幕
   '标记': 'Mark',
